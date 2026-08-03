@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction};
 
-use crate::aggregate::AggAcc;
+use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, CompareOp, Expr, Literal, Pattern, PropAccess, QueryPart, RelDirection, ReturnExpr,
     ReturnItem, SortDir, Statement, Tail, WithClause, WithExpr,
@@ -356,15 +356,14 @@ impl<'a> Executor<'a> {
     /// graph identity for bare-var grouping keys) and each caller does its
     /// own thin final conversion.
     ///
-    /// Grouping-key lookup is a **linear scan** (walk existing groups
-    /// comparing key `Binding`s via `binding_eq`, append a new group on no
-    /// match) — O(rows × groups), not a hash-based grouping. Deliberate:
-    /// neither `PropertyValue` nor `Node`/`Edge` derive `Eq`/`Hash`
-    /// (`PropertyValue::Float` has no natural bit-exact hash without a
-    /// wrapper type), and this follows the same "correctness first,
-    /// document Big-O honestly, optimize later with benchmarks" precedent
-    /// already established for the unindexed `all_nodes` scan and the
-    /// label-index trade-off (see `BENCHMARKS.md`).
+    /// Grouping-key lookup is a hash-map lookup (`group_index`, keyed by
+    /// `binding_hash_key`'s output — `Binding`/`PropertyValue` don't
+    /// derive `Eq`/`Hash` themselves, `PropertyValue::Float` can't, so
+    /// `HashKey` stands in for them; see its docs) into `groups`, which
+    /// stays a plain `Vec` for insertion-order-stable output when there's
+    /// no ORDER BY. O(1) average per row, not the O(rows × groups) linear
+    /// scan this used to be — see BENCHMARKS.md for the measured
+    /// before/after.
     ///
     /// Callers must call `validate_return_items` first — this function
     /// assumes every aggregate `Call` item has already been checked to
@@ -395,16 +394,16 @@ impl<'a> Executor<'a> {
                 })
                 .collect()
         }
-        fn key_bindings_eq(a: &[Option<Binding>], b: &[Option<Binding>]) -> bool {
-            a.len() == b.len()
-                && a.iter().zip(b).all(|pair| match pair {
-                    (Some(x), Some(y)) => binding_eq(x, y),
-                    (None, None) => true,
-                    _ => false,
-                })
-        }
 
+        // Groups live in `groups` (insertion order, for stable output when
+        // there's no ORDER BY) with `group_index` as a hash-based lookup
+        // into it, keyed by a hashable stand-in for `key_bindings` (see
+        // `HashKey` — `Binding`/`PropertyValue` don't derive `Eq`/`Hash`
+        // themselves, `PropertyValue::Float` can't). O(1) average lookup
+        // per row instead of the O(groups) linear scan this replaced —
+        // see BENCHMARKS.md for the measured before/after.
         let mut groups: Vec<Group> = Vec::new();
+        let mut group_index: HashMap<Vec<Option<HashKey>>, usize> = HashMap::new();
         for row in rows {
             let mut key_bindings = Vec::with_capacity(items.len());
             for item in items {
@@ -414,17 +413,16 @@ impl<'a> Executor<'a> {
                     Some(self.item_binding(txn, &item.expr, row)?)
                 });
             }
-            let group_idx = match groups.iter().position(|g| key_bindings_eq(&g.key_bindings, &key_bindings)) {
-                Some(idx) => idx,
-                None => {
-                    groups.push(Group {
-                        key_bindings: key_bindings.clone(),
-                        accs: fresh_accs(items),
-                        row_count: 0,
-                    });
-                    groups.len() - 1
-                }
-            };
+            let hash_key: Vec<Option<HashKey>> =
+                key_bindings.iter().map(|b| b.as_ref().map(binding_hash_key)).collect();
+            let group_idx = *group_index.entry(hash_key).or_insert_with(|| {
+                groups.push(Group {
+                    key_bindings: key_bindings.clone(),
+                    accs: fresh_accs(items),
+                    row_count: 0,
+                });
+                groups.len() - 1
+            });
             let group = &mut groups[group_idx];
             group.row_count += 1;
             for (i, item) in items.iter().enumerate() {
@@ -1056,18 +1054,18 @@ fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
     Ok(())
 }
 
-/// Grouping-key equality — deliberately at the `Binding` level (`NodeId`/
+/// Grouping-key hashing — deliberately at the `Binding` level (`NodeId`/
 /// `EdgeId`/`PropertyValue`), not `Value`: cheaper (no `GraphStore` fetch
-/// just to compare) and the correct semantics (two `Binding::Node`s are
+/// just to compute) and the correct semantics (two `Binding::Node`s are
 /// the same group iff the same node **identity**, not equal-by-struct-
-/// contents).
-fn binding_eq(a: &Binding, b: &Binding) -> bool {
-    match (a, b) {
-        (Binding::Node(x), Binding::Node(y)) => x == y,
-        (Binding::Edge(x), Binding::Edge(y)) => x == y,
-        (Binding::Value(x), Binding::Value(y)) => x == y,
-        (Binding::List(x), Binding::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q)),
-        _ => false,
+/// contents). `Binding::List`'s elements are `Value`s already, so those
+/// delegate to `value_hash_key` directly.
+fn binding_hash_key(b: &Binding) -> HashKey {
+    match b {
+        Binding::Node(id) => HashKey::Node(*id),
+        Binding::Edge(id) => HashKey::Edge(*id),
+        Binding::Value(pv) => property_value_hash_key(pv),
+        Binding::List(items) => HashKey::List(items.iter().map(value_hash_key).collect()),
     }
 }
 

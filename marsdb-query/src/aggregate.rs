@@ -3,24 +3,86 @@
 //! and driving one `AggAcc` per aggregate return item per group; this
 //! module only owns what happens to a single accumulator as values arrive.
 
+use std::collections::HashSet;
+
 use marsdb_graph::PropertyValue;
 
 use crate::ast::Literal;
 use crate::error::QueryError;
-use crate::executor::{comparable_ordering, value_eq};
+use crate::executor::comparable_ordering;
 use crate::value::Value;
+
+/// A hashable, `Eq` stand-in for `Value` — `Value`/`PropertyValue` don't
+/// derive `Eq`/`Hash` themselves (`PropertyValue::Float(f64)` can't: IEEE
+/// floats have no reflexive equality, so Rust's std deliberately excludes
+/// `Eq`/`Hash` for `f64`). `FloatBits` hashes/compares by bit pattern
+/// instead — the practical trade-off every DB doing this makes: ordinary
+/// float grouping/dedup is completely unaffected (equal floats have equal
+/// bits), the only visible difference is at the edges (`NaN` groups with
+/// `NaN` here, unlike IEEE `NaN != NaN`; `+0.0`/`-0.0` are distinct here,
+/// unlike IEEE `==`) — the same class of documented trade-off as the
+/// label index and the linear-scan grouping this type replaces. `Node`/
+/// `Edge` hash by id (graph identity), matching `value_eq`'s existing
+/// convention. Used for both `resolve_grouped_rows`' grouping-key lookup
+/// (`executor.rs`, via `binding_hash_key`) and `DISTINCT`'s "seen" set
+/// below — same underlying problem, same fix.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) enum HashKey {
+    Node(marsdb_graph::NodeId),
+    Edge(marsdb_graph::EdgeId),
+    Null,
+    Bool(bool),
+    Int(i64),
+    FloatBits(u64),
+    Str(String),
+    List(Vec<HashKey>),
+}
+
+pub(crate) fn value_hash_key(v: &Value) -> HashKey {
+    match v {
+        Value::Null => HashKey::Null,
+        Value::Node(n) => HashKey::Node(n.id),
+        Value::Edge(e) => HashKey::Edge(e.id),
+        Value::Property(pv) => property_value_hash_key(pv),
+        Value::Literal(lit) => literal_hash_key(lit),
+        Value::List(items) => HashKey::List(items.iter().map(value_hash_key).collect()),
+    }
+}
+
+pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
+    match pv {
+        PropertyValue::Null => HashKey::Null,
+        PropertyValue::Bool(b) => HashKey::Bool(*b),
+        PropertyValue::Int(i) => HashKey::Int(*i),
+        PropertyValue::Float(f) => HashKey::FloatBits(f.to_bits()),
+        PropertyValue::String(s) => HashKey::Str(s.clone()),
+    }
+}
+
+fn literal_hash_key(lit: &Literal) -> HashKey {
+    match lit {
+        Literal::Null => HashKey::Null,
+        Literal::Bool(b) => HashKey::Bool(*b),
+        Literal::Int(i) => HashKey::Int(*i),
+        Literal::Float(f) => HashKey::FloatBits(f.to_bits()),
+        Literal::String(s) => HashKey::Str(s.clone()),
+        Literal::Param(name) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+    }
+}
 
 /// Running accumulator for one `count`/`sum`/`avg`/`min`/`max`/`collect`
 /// return item within one group. `count(*)` has no accumulator — it's
 /// computed directly as the group's row count, independent of any per-row
 /// argument (see `resolve_grouped_rows`), so it isn't represented here.
 pub(crate) enum AggAcc {
-    Count { distinct: Option<Vec<Value>>, n: i64 },
-    Sum { distinct: Option<Vec<Value>>, total_int: i64, total_float: f64, saw_float: bool },
-    Avg { distinct: Option<Vec<Value>>, total: f64, n: i64 },
-    Min { distinct: Option<Vec<Value>>, best: Option<Value> },
-    Max { distinct: Option<Vec<Value>>, best: Option<Value> },
-    Collect { distinct: Option<Vec<Value>>, items: Vec<Value> },
+    Count { distinct: Option<HashSet<HashKey>>, n: i64 },
+    Sum { distinct: Option<HashSet<HashKey>>, total_int: i64, total_float: f64, saw_float: bool },
+    Avg { distinct: Option<HashSet<HashKey>>, total: f64, n: i64 },
+    Min { distinct: Option<HashSet<HashKey>>, best: Option<Value> },
+    Max { distinct: Option<HashSet<HashKey>>, best: Option<Value> },
+    Collect { distinct: Option<HashSet<HashKey>>, items: Vec<Value> },
 }
 
 enum Numeric {
@@ -46,20 +108,13 @@ fn value_type_name(v: &Value) -> &'static str {
     }
 }
 
-/// `distinct`'s "seen" list is a linear scan + `value_eq`, not a `HashSet`
-/// — same rationale as `resolve_grouped_rows`' grouping-key lookup:
-/// `Value`/`PropertyValue`/`Node`/`Edge` don't derive `Eq`/`Hash`.
-fn dedup_seen(distinct: &mut Option<Vec<Value>>, v: &Value) -> bool {
+/// True iff `v` hasn't been seen before in this accumulator's DISTINCT set
+/// (and records it if so) — `HashKey` is what makes this an O(1) average
+/// hash-set insert instead of a linear rescan-and-compare per value.
+fn dedup_seen(distinct: &mut Option<HashSet<HashKey>>, v: &Value) -> bool {
     match distinct {
         None => true,
-        Some(seen) => {
-            if seen.iter().any(|s| value_eq(s, v)) {
-                false
-            } else {
-                seen.push(v.clone());
-                true
-            }
-        }
+        Some(seen) => seen.insert(value_hash_key(v)),
     }
 }
 
@@ -68,7 +123,7 @@ impl AggAcc {
     /// only ever construct one for a return item already classified as an
     /// aggregate call by `has_aggregate`/`validate_return_items`.
     pub(crate) fn identity(name: &str, distinct: bool) -> Self {
-        let d = || if distinct { Some(Vec::new()) } else { None };
+        let d = || if distinct { Some(HashSet::new()) } else { None };
         match name.to_ascii_lowercase().as_str() {
             "count" => AggAcc::Count { distinct: d(), n: 0 },
             "sum" => AggAcc::Sum {
