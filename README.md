@@ -35,9 +35,7 @@ let result = db.execute("MATCH (n:Person) RETURN n.name")?;
 **Python**:
 
 ```
-cd marsdb-python
-python3 -m venv .venv && source .venv/bin/activate
-pip install maturin && maturin develop
+pip install marsdb
 ```
 
 ```python
@@ -48,7 +46,15 @@ db.execute("MATCH (n:Person) RETURN n.name")
 # -> [{'n.name': 'Alice'}, {'n.name': 'Bob'}]
 ```
 
-Not yet on PyPI.
+Prebuilt wheel currently covers macOS arm64 / Python 3.14; other platforms
+install from the source distribution and need a Rust toolchain. To build
+from source directly:
+
+```
+cd marsdb-python
+python3 -m venv .venv && source .venv/bin/activate
+pip install maturin && maturin develop
+```
 
 ## CLI usage
 
