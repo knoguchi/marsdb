@@ -1173,3 +1173,37 @@ fn optional_match_disjoint_pattern_does_not_panic() {
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(str_value(&result.rows[0][1]), "X");
 }
+
+#[test]
+fn string_literal_escaped_quote_round_trips() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, r"CREATE (:Person {name: 'O\'Brien'})");
+    let result = run(&store, "MATCH (n:Person) RETURN n.name");
+    assert_eq!(str_value(&result.rows[0][0]), "O'Brien");
+}
+
+#[test]
+fn string_literal_escaped_backslash_and_common_escapes() {
+    // Cypher source (raw string below is literal, no extra doubling
+    // needed): `\\` is one escaped backslash, `\t`/`\n` are tab/newline.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, r"CREATE (:Path {p: 'C:\\Users\\x', tab: 'a\tb', nl: 'a\nb'})");
+    let result = run(&store, "MATCH (n:Path) RETURN n.p, n.tab, n.nl");
+    assert_eq!(str_value(&result.rows[0][0]), r"C:\Users\x");
+    assert_eq!(str_value(&result.rows[0][1]), "a\tb");
+    assert_eq!(str_value(&result.rows[0][2]), "a\nb");
+}
+
+#[test]
+fn string_literal_unrecognized_escape_errors() {
+    let err = parse(r"MATCH (n {x: 'a\qb'}) RETURN n").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("escape"));
+}
+
+#[test]
+fn string_literal_without_backslash_unaffected() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    let result = run(&store, "MATCH (n:Person) RETURN n.name");
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+}

@@ -505,6 +505,43 @@ fn parse_prop_map(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>, QueryError
         .collect()
 }
 
+/// Resolves `\`-escapes in a `string_literal`'s already-quote-stripped
+/// inner text. The grammar accepts any `\`-prefixed char (see
+/// `cypher.pest`'s comment); only a fixed recognized set actually means
+/// something -- an unrecognized escape (e.g. `\q`) errors here rather
+/// than silently dropping the backslash or passing it through, matching
+/// this codebase's stance elsewhere (error on an untested shape, don't
+/// guess). No `\uXXXX` unicode escapes -- not needed yet, noted as a gap
+/// in the README alongside the other documented Cypher-coverage gaps.
+fn unescape_string(s: &str) -> Result<String, QueryError> {
+    if !s.contains('\\') {
+        return Ok(s.to_string());
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some(other) => {
+                return Err(QueryError::Parse(format!("unrecognized string escape '\\{other}'")))
+            }
+            None => return Err(QueryError::Parse("string ends with a trailing '\\'".into())),
+        }
+    }
+    Ok(out)
+}
+
 fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
     let inner = pair.into_inner().next().expect("literal has one child");
     Ok(match inner.as_rule() {
@@ -522,7 +559,7 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
         ),
         Rule::string_literal => {
             let s = inner.as_str();
-            Literal::String(s[1..s.len() - 1].to_string())
+            Literal::String(unescape_string(&s[1..s.len() - 1])?)
         }
         Rule::bool_literal => Literal::Bool(inner.as_str().eq_ignore_ascii_case("true")),
         Rule::null_literal => Literal::Null,

@@ -106,7 +106,17 @@ prop_access = { identifier ~ "." ~ identifier }
 literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal | param }
 int_literal    = @{ "-"? ~ ASCII_DIGIT+ }
 float_literal  = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
-string_literal = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+// `\` escapes the next character (so `\'` doesn't terminate the string
+// early -- without this, `(!"'" ~ ANY)*` has no concept of escaping and
+// `'it\'s'` silently mis-terminates at the escaped quote instead of
+// erroring, leaving a dangling `s'` that breaks whatever follows with a
+// confusing, seemingly-unrelated parse error). Which escapes are
+// recognized (`\\ \' \" \n \r \t \b \f`) is checked in parser.rs, not
+// here -- this rule accepts any `\`-prefixed char permissively, same
+// precedent as this grammar's other permissive/semantic-check-in-Rust
+// rules (see call_args's DISTINCT-validity comment).
+string_literal = @{ "'" ~ (escaped_char | (!("'" | "\\") ~ ANY))* ~ "'" }
+escaped_char   =  { "\\" ~ ANY }
 bool_literal   = @{ ^"true" | ^"false" }
 null_literal   = @{ ^"null" }
 param          = { "$" ~ identifier }
