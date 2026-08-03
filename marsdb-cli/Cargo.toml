@@ -3,6 +3,8 @@ name = "marsdb-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "CLI for MarsDB, an embeddable property-graph database: single binary, single file."
 
 [[bin]]

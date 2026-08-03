@@ -3,6 +3,8 @@ name = "marsdb-graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Property graph model and CRUD storage layer used internally by MarsDB."
 
 [dependencies]

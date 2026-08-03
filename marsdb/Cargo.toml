@@ -3,6 +3,8 @@ name = "marsdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Embeddable property-graph database with an openCypher query subset: single binary, single file, optional in-memory mode."
 
 [lib]
