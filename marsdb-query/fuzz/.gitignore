@@ -1,0 +1,10 @@
+target
+artifacts
+coverage
+# Corpus is gitignored except the one seed below -- running against a
+# genuinely empty corpus made libFuzzer's own startup take upwards of an
+# hour instead of seconds on this target (see README's Testing section);
+# a seeded corpus doesn't hit it.
+corpus/*
+!corpus/parse/
+!corpus/parse/seed1
