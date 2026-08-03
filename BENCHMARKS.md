@@ -6,7 +6,8 @@ No other graph database was benchmarked under the same conditions — these
 numbers aren't a competitive comparison, they're here to track regressions
 and show where the current architecture's cost is.
 
-Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb`.
+Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
+both `cypher_ops` and `ldbc_ops`).
 
 ## Storage layer (`marsdb-graph/benches/graph_ops.rs`)
 
@@ -63,6 +64,50 @@ only returns 10 rows, because the query planner evaluates the full scan and
 expand before truncating to the limit. `LIMIT` short-circuiting is on the
 roadmap.
 
+## LDBC-era features (`marsdb/benches/ldbc_ops.rs`)
+
+Benchmarks for the Cypher features added during the LDBC SNB Interactive
+(IS1-IS7) push — `cypher_ops.rs` above only covers `CREATE` and a plain
+1-hop `MATCH`, none of which exercise these. All queries run against the
+same `(n0:Item)-[:R]->(n1:Item)-> ... ` chain fixture as the table above.
+
+| Operation | Result |
+|---|---|
+| `WITH`-chaining (`MATCH...WITH...ORDER BY...LIMIT...MATCH...RETURN`), 100-node dataset | 654 µs |
+| Same query, 1,000-node dataset | 6.18 ms |
+| Same query, 10,000-node dataset | 62.3 ms |
+| `OPTIONAL MATCH`, 100-node dataset | 603 µs |
+| Same query, 1,000-node dataset | 6.16 ms |
+| Same query, 10,000-node dataset | 62.4 ms |
+| Undirected 1-hop (`-[:R]-`) + `LIMIT 10`, 100-node dataset | 606 µs |
+| Same query, 1,000-node dataset | 5.94 ms |
+| Same query, 10,000-node dataset | 61.8 ms |
+| Variable-length `[:R*1..5]`, 1,000-node chain | 1.98 ms |
+| Variable-length `[:R*1..30]`, 1,000-node chain | 2.08 ms |
+| Variable-length `[:R*0..]` (unbounded, capped at 30 hops), 25-node chain | 154 µs |
+
+`WITH`-chaining, `OPTIONAL MATCH`, and the undirected pattern all land in the
+same range as each other and close to the plain directed 1-hop `MATCH` in
+the table above (2.03 ms at 1,000 rows, 21.0 ms at 10,000) — the dominant
+cost in all of them is still the unindexed label scan, not the new
+mechanism layered on top. The undirected query is the one clear outlier
+(61.8 ms vs 21.0 ms at 10,000 rows, ~3x): it runs `neighbors_in_txn` twice
+per row (once per direction) plus a dedupe-by-edge-id pass, so it pays
+roughly double the traversal work on top of the same scan.
+
+Variable-length cost scales with the hop bound actually walked, not the
+bound written in the query: `*1..5` and `*1..30` cost about the same
+(1.98 ms vs 2.08 ms) on a 1,000-node chain because both terminate once the
+chain runs out at ~30 hops in from any interior start node — see the depth
+cap note below. The unbounded case uses a 25-node chain instead of the
+1,000-node one: `*0..` on a chain longer than the 30-hop safety cap
+(`executor.rs::VAR_EXPAND_DEPTH_CAP`) errors by design rather than silently
+truncating (see README roadmap / `LogicalPlan::VarExpand`), so it can't be
+measured at the same dataset sizes as the rest of this table without
+tripping that guard.
+
+Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
+
 ## Scope of these numbers
 
 - No concurrent-access benchmarks — every statement currently runs through a
@@ -73,3 +118,6 @@ roadmap.
   hasn't been measured separately.
 - No comparison against Neo4j, JanusGraph, Neptune, or any other graph
   database.
+- No benchmarks yet for `CASE`/function calls (`coalesce()`/`toInteger()`)
+  in isolation — they're cheap scalar operations exercised inside the
+  `WITH`-chaining query above, but not measured standalone.
