@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Generates a Cypher batch (one `;`-separated statement per line, see
-DEMO.md) that builds a graph of this repo's own git history: one `Commit`
-node per commit, one `File` node per file ever touched, and a `TOUCHES`
-edge from a commit to every file it modified.
+"""Generates a `;`-separated Cypher batch that builds a graph of this
+repo's own git history: one `Commit` node per commit, one `File` node per
+file ever touched, and a `TOUCHES` edge from a commit to every file it
+modified. Run from the repo root, so `git log` sees the right history:
 
-Usage:
-    python3 examples/commit_graph.py > commit_graph.cypher
+    python3 marsdb-python/examples/commit_graph.py > commit_graph.cypher
+    marsdb commit_graph.db "$(cat commit_graph.cypher)"
 
 MarsDB's string literals have no escape mechanism (no `\\'`), so this
 strips single quotes out of commit subjects/author names rather than
-escaping them -- see DEMO.md for why.
+escaping them.
 """
 
 import subprocess

@@ -11,7 +11,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 license = { text = "MIT OR Apache-2.0" }
-readme = "../README.md"
+readme = "README.md"
 dynamic = ["version"]
 
 [project.urls]
