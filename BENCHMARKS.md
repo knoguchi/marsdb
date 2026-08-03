@@ -126,47 +126,46 @@ Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
 ## Aggregation (`marsdb/benches/aggregate_ops.rs`)
 
 `resolve_grouped_rows` (the grouping core behind `count`/`sum`/`avg`/`min`/
-`max`/`collect` and implicit `GROUP BY`) does a linear scan over the groups
-formed so far to find a row's group, not a hash lookup — see its doc comment
-in `executor.rs` for why (`PropertyValue`/`Node`/`Edge` don't derive `Eq`/
-`Hash`). These benchmarks exist specifically to show that cost, not just
-confirm aggregation works. All queries run against `n` `Item` nodes created
-in one `CREATE` (one transaction), `cat` = `idx % num_groups`.
+`max`/`collect` and implicit `GROUP BY`) looks up a row's group via a
+`HashMap` keyed by `HashKey` — a hashable stand-in for `Binding`/`Value`,
+needed because `PropertyValue`/`Node`/`Edge` don't derive `Eq`/`Hash`
+themselves (`PropertyValue::Float(f64)` can't; `HashKey` hashes floats by
+bit pattern instead — see its doc comment in `aggregate.rs`). `DISTINCT`
+dedup (`count(DISTINCT ...)`, `collect(DISTINCT ...)`, etc.) uses the same
+`HashKey` in a `HashSet`. Both used to be a linear scan/rescan instead —
+this table is the direct before/after. All queries run against `n` `Item`
+nodes created in one `CREATE` (one transaction), `cat` = `idx % num_groups`.
 
-| Operation | Result |
-|---|---|
-| Global aggregate (`count(*)`/`sum`/`avg`/`min`/`max`, 1 group), 100 rows | 638 µs |
-| Same query, 1,000 rows | 6.53 ms |
-| Same query, 10,000 rows | 69.2 ms |
-| `GROUP BY cat` (10 groups), 100 rows | 371 µs |
-| Same query, 1,000 rows | 3.78 ms |
-| Same query, 10,000 rows | 39.9 ms |
-| `GROUP BY cat` (every row its own group), 100 rows | 406 µs |
-| Same query, 1,000 rows | 5.06 ms |
-| Same query, 10,000 rows | 141 ms |
-| `collect(n.idx)`, 100 rows | 237 µs |
-| Same query, 1,000 rows | 2.43 ms |
-| Same query, 10,000 rows | 25.9 ms |
-| `count(DISTINCT n.cat)` (every row a distinct value), 100 rows | 253 µs |
-| Same query, 1,000 rows | 4.02 ms |
-| Same query, 10,000 rows | 187 ms |
-| `WITH...WHERE` on an aggregate result (10 groups), 100 rows | 374 µs |
-| Same query, 1,000 rows | 3.76 ms |
-| Same query, 10,000 rows | 40.0 ms |
+| Operation | Result | vs. linear scan |
+|---|---|---|
+| Global aggregate (`count(*)`/`sum`/`avg`/`min`/`max`, 1 group), 100 rows | 460 µs | -28% |
+| Same query, 1,000 rows | 4.78 ms | -27% |
+| Same query, 10,000 rows | 51.6 ms | -25% |
+| `GROUP BY cat` (10 groups), 100 rows | 268 µs | -28% |
+| Same query, 1,000 rows | 2.75 ms | -27% |
+| Same query, 10,000 rows | 29.5 ms | -26% |
+| `GROUP BY cat` (every row its own group), 100 rows | 302 µs | -26% |
+| Same query, 1,000 rows | 3.18 ms | -37% |
+| Same query, 10,000 rows | 33.7 ms | **-76%** |
+| `collect(n.idx)`, 100 rows | 172 µs | -27% |
+| Same query, 1,000 rows | 1.83 ms | -25% |
+| Same query, 10,000 rows | 19.7 ms | -24% |
+| `count(DISTINCT n.cat)` (every row a distinct value), 100 rows | 175 µs | -31% |
+| Same query, 1,000 rows | 1.87 ms | -54% |
+| Same query, 10,000 rows | 20.1 ms | **-89%** |
+| `WITH...WHERE` on an aggregate result (10 groups), 100 rows | 268 µs | -28% |
+| Same query, 1,000 rows | 2.75 ms | -27% |
+| Same query, 10,000 rows | 29.5 ms | -26% |
 
-The 10-groups case scales close to linearly with row count (10x rows is
-~10-11x time, both 100->1,000 and 1,000->10,000) — group lookup stays cheap
-because there are only ever 10 groups to scan. The all-distinct case (every
-row its own group, so the group list grows as long as the row count) doesn't:
-100->1,000 is ~12.5x, 1,000->10,000 is ~27.9x — visibly super-linear, and
-getting worse as the dataset grows, consistent with the linear-scan-per-row
-group lookup this is meant to expose. `count(DISTINCT n.cat)` under the same
-all-distinct condition is worse still (100->1,000 ~15.9x, 1,000->10,000
-~46.5x) — its DISTINCT "seen" list has the identical linear-rescan-per-row
-shape (see `aggregate.rs::dedup_seen`), and unlike grouping it doesn't get a
-match on the very first comparison for repeat values, since here there are
-none. `WITH...WHERE` costs about the same as the 10-groups case it filters —
-the filter pass itself is cheap; the group-scan it runs after is not.
+The 10-groups case was already close to linear before this (few groups to
+scan either way), so it just gets a flat ~26-28% win from lower per-row
+constant overhead. The two cases this was actually for — every row its own
+group, and `DISTINCT` over all-distinct values — used to be visibly
+super-linear (10,000-row `GROUP BY` took 141 ms, `count(DISTINCT)` took
+187 ms) and are now close to linear: 100->1,000->10,000 scales roughly
+10x->10x for both (`GROUP BY`: 302 µs -> 3.18 ms -> 33.7 ms; `count(DISTINCT)`:
+175 µs -> 1.87 ms -> 20.1 ms), instead of the ~28x/~46x-per-decade blowup
+the old linear scan/rescan showed at the same sizes.
 
 Reproduce: `cargo bench -p marsdb --bench aggregate_ops`.
 

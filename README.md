@@ -117,8 +117,6 @@ beyond a single linear chain (general cross-joins), or chaining past one
 ## Roadmap
 
 - `LIMIT` short-circuiting
-- Hash-based grouping key for aggregation (currently a linear scan over
-  groups — correct, but O(rows × groups); see `resolve_grouped_rows`)
 - `UNWIND`, named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
