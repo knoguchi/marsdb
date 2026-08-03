@@ -51,7 +51,16 @@ pub enum ReturnExpr {
     Var(String),
     Prop(PropAccess),
     Lit(Literal),
-    Call(String, Vec<ReturnExpr>),
+    Call {
+        name: String,
+        args: Vec<ReturnExpr>,
+        distinct: bool,
+    },
+    /// `count(*)` — its own variant, not `Call` with a magic `"*"`-sentinel
+    /// argument, so evaluation physically cannot mishandle it as an
+    /// ordinary function call (no args to evaluate, no DISTINCT target —
+    /// it counts rows, not values).
+    CountStar,
     /// Simple/value `CASE`: `CASE <test> WHEN <value> THEN <result> ... [ELSE
     /// <else>] END`. `test` is `Some` for every form the parser currently
     /// produces; kept `Option` so a future searched-`CASE` (`CASE WHEN
@@ -62,6 +71,14 @@ pub enum ReturnExpr {
         whens: Vec<(ReturnExpr, ReturnExpr)>,
         else_: Option<Box<ReturnExpr>>,
     },
+}
+
+/// Case-insensitive aggregate-function recognition, shared by `parser.rs`
+/// (DISTINCT-validity check) and `executor.rs` (grouping classification —
+/// a RETURN/WITH item list "has an aggregate" iff any item's top-level
+/// expression is `CountStar` or a `Call` whose name passes this check).
+pub fn is_aggregate_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "count" | "sum" | "avg" | "min" | "max" | "collect")
 }
 
 #[derive(Debug, Clone)]
@@ -121,12 +138,29 @@ pub enum Tail {
     Set(Vec<(PropAccess, Literal)>),
 }
 
+/// WITH's HAVING-equivalent: filters on the already-projected/aggregated
+/// row (e.g. `WITH p, count(f) AS c WHERE c > 10`). Same And/Or/Not/
+/// Compare shape as `Expr`, but the comparison's LHS is a `ReturnExpr`
+/// (a WITH alias or raw expression) instead of a raw-property
+/// `PropAccess` — deliberately a separate type from `Expr` rather than a
+/// widened reuse of it, since `Expr::Compare` is what the planner pushes
+/// into pre-projection `Filter`/`Expand` nodes, and this filter
+/// fundamentally belongs *post*-projection instead (see `materialize_with`).
+#[derive(Debug, Clone)]
+pub enum WithExpr {
+    And(Box<WithExpr>, Box<WithExpr>),
+    Or(Box<WithExpr>, Box<WithExpr>),
+    Not(Box<WithExpr>),
+    Compare(ReturnExpr, CompareOp, Literal),
+}
+
 /// A `WITH` clause: projects/renames the current bindings, optionally
 /// filtered/sorted/limited at that boundary, and becomes the binding scope
 /// for whatever follows (the next `QueryPart`, or the final `Tail`).
 #[derive(Debug, Clone)]
 pub struct WithClause {
     pub items: Vec<ReturnItem>,
+    pub where_clause: Option<WithExpr>,
     pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
     pub limit: Option<i64>,
 }

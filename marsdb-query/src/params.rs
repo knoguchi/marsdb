@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use marsdb_graph::PropertyValue;
 
-use crate::ast::{Expr, Literal, NodePattern, Pattern, QueryPart, ReturnExpr, Statement, Tail, WithClause};
+use crate::ast::{Expr, Literal, NodePattern, Pattern, QueryPart, ReturnExpr, Statement, Tail, WithClause, WithExpr};
 use crate::error::QueryError;
 
 /// Resolves every `$name` placeholder in `stmt` to a concrete `Literal`
@@ -51,9 +51,27 @@ fn substitute_with_clause(with: &mut WithClause, params: &HashMap<String, Proper
     for item in &mut with.items {
         substitute_return_expr(&mut item.expr, params)?;
     }
+    if let Some(where_clause) = &mut with.where_clause {
+        substitute_with_expr(where_clause, params)?;
+    }
     if let Some(items) = &mut with.order_by {
         for (expr, _) in items {
             substitute_return_expr(expr, params)?;
+        }
+    }
+    Ok(())
+}
+
+fn substitute_with_expr(expr: &mut WithExpr, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    match expr {
+        WithExpr::And(l, r) | WithExpr::Or(l, r) => {
+            substitute_with_expr(l, params)?;
+            substitute_with_expr(r, params)?;
+        }
+        WithExpr::Not(e) => substitute_with_expr(e, params)?,
+        WithExpr::Compare(lhs, _, lit) => {
+            substitute_return_expr(lhs, params)?;
+            substitute_literal(lit, params)?;
         }
     }
     Ok(())
@@ -110,9 +128,9 @@ fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> 
 
 fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
     match expr {
-        ReturnExpr::Var(_) | ReturnExpr::Prop(_) => {}
+        ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
         ReturnExpr::Lit(lit) => substitute_literal(lit, params)?,
-        ReturnExpr::Call(_, args) => {
+        ReturnExpr::Call { args, .. } => {
             for arg in args {
                 substitute_return_expr(arg, params)?;
             }

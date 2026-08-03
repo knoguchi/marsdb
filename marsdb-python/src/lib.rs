@@ -75,6 +75,13 @@ fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<
             dict.set_item("props", props)?;
             dict.into_any()
         }
+        ::marsdb::Value::List(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(value_to_py(py, item)?)?;
+            }
+            list.into_any()
+        }
     })
 }
 

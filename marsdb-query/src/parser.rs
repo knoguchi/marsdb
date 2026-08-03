@@ -127,17 +127,69 @@ fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
 
 fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     let mut items = Vec::new();
+    let mut where_clause = None;
     let mut order_by = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::return_item => items.push(parse_return_item(p)?),
+            Rule::with_where_clause => {
+                let expr_pair = p.into_inner().next().expect("WITH...WHERE has a with_expr");
+                where_clause = Some(parse_with_expr(expr_pair)?);
+            }
             Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
             Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
             r => unreachable!("unexpected with_clause child rule {r:?}"),
         }
     }
-    Ok(WithClause { items, order_by, limit })
+    Ok(WithClause {
+        items,
+        where_clause,
+        order_by,
+        limit,
+    })
+}
+
+fn parse_with_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    // with_expr = { with_or_expr }
+    parse_with_or_expr(pair.into_inner().next().expect("with_expr has a with_or_expr"))
+}
+
+fn parse_with_or_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    let mut parts = pair.into_inner();
+    let mut acc = parse_with_and_expr(parts.next().expect("with_or_expr has at least one with_and_expr"))?;
+    for rest in parts {
+        acc = WithExpr::Or(Box::new(acc), Box::new(parse_with_and_expr(rest)?));
+    }
+    Ok(acc)
+}
+
+fn parse_with_and_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    let mut parts = pair.into_inner();
+    let mut acc = parse_with_unary_expr(parts.next().expect("with_and_expr has at least one with_unary_expr"))?;
+    for rest in parts {
+        acc = WithExpr::And(Box::new(acc), Box::new(parse_with_unary_expr(rest)?));
+    }
+    Ok(acc)
+}
+
+fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    let inner = pair.into_inner().next().expect("with_unary_expr has one child");
+    match inner.as_rule() {
+        Rule::with_unary_expr => Ok(WithExpr::Not(Box::new(parse_with_unary_expr(inner)?))),
+        Rule::with_comparison => parse_with_comparison(inner),
+        Rule::with_expr => parse_with_expr(inner),
+        r => unreachable!("unexpected with_unary_expr child rule {r:?}"),
+    }
+}
+
+fn parse_with_comparison(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let lhs = parse_return_expr(inner.next().expect("with_comparison has a return_expr"))?;
+    let op_pair = inner.next().expect("with_comparison has a compare_op");
+    let op = parse_compare_op(op_pair);
+    let literal = parse_literal(inner.next().expect("with_comparison has a literal"))?;
+    Ok(WithExpr::Compare(lhs, op, literal))
 }
 
 fn parse_order_by_clause(pair: Pair<Rule>) -> Result<Vec<(ReturnExpr, SortDir)>, QueryError> {
@@ -301,8 +353,30 @@ fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
     let name = inner.next().expect("function_call has a name").as_str().to_string();
-    let args = inner.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?;
-    Ok(ReturnExpr::Call(name, args))
+    let call_args = inner.next().expect("function_call has call_args");
+    let is_star = call_args.as_str().trim() == "*";
+    if is_star {
+        if !name.eq_ignore_ascii_case("count") {
+            return Err(QueryError::Parse(format!(
+                "'{name}(*)' isn't valid — '*' is only meaningful for count(*)"
+            )));
+        }
+        return Ok(ReturnExpr::CountStar);
+    }
+    let mut distinct = false;
+    let mut args = Vec::new();
+    for p in call_args.into_inner() {
+        match p.as_rule() {
+            Rule::distinct_kw => distinct = true,
+            _ => args.push(parse_return_expr(p)?),
+        }
+    }
+    if distinct && !is_aggregate_name(&name) {
+        return Err(QueryError::Parse(format!(
+            "'{name}(DISTINCT ...)' isn't valid — DISTINCT is only meaningful inside an aggregate function"
+        )));
+    }
+    Ok(ReturnExpr::Call { name, args, distinct })
 }
 
 fn parse_prop_access(pair: Pair<Rule>) -> PropAccess {
@@ -489,8 +563,13 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
 fn parse_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
     let mut inner = pair.into_inner();
     let prop_access = parse_prop_access(inner.next().expect("comparison has a prop_access"));
-    let op_pair = inner.next().expect("comparison has a compare_op");
-    let op = match op_pair.as_str() {
+    let op = parse_compare_op(inner.next().expect("comparison has a compare_op"));
+    let literal = parse_literal(inner.next().expect("comparison has a literal"))?;
+    Ok(Expr::Compare(prop_access, op, literal))
+}
+
+fn parse_compare_op(pair: Pair<Rule>) -> CompareOp {
+    match pair.as_str() {
         "=" => CompareOp::Eq,
         "<>" => CompareOp::Ne,
         "<" => CompareOp::Lt,
@@ -498,7 +577,5 @@ fn parse_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
         ">" => CompareOp::Gt,
         ">=" => CompareOp::Ge,
         other => unreachable!("unexpected compare_op {other:?}"),
-    };
-    let literal = parse_literal(inner.next().expect("comparison has a literal"))?;
-    Ok(Expr::Compare(prop_access, op, literal))
+    }
 }
