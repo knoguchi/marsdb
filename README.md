@@ -85,7 +85,8 @@ Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 - Concurrent reads (split the executor's read path onto `ReadTransaction`)
 - Multi-pattern `MATCH` (comma-separated joins)
 - `LIMIT` short-circuiting
-- Hand-rolled storage engine as an alternate `marsdb-storage` backend
+- From-scratch storage engine (page format, B-tree, crash recovery) as an
+  alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
 
 ## Testing

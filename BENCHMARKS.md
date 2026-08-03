@@ -2,10 +2,9 @@
 
 Measured 2026-08-02 on a single MacBook (Apple Silicon, arm64), release build,
 in-process (`cargo bench`, [criterion](https://github.com/bheisler/criterion.rs)).
-Not a comparison against any other graph database — no other engine was
-benchmarked under the same conditions, so don't read these as competitive
-claims. They're here to track regressions and to be honest about where the
-current v1 architecture's ceiling is.
+No other graph database was benchmarked under the same conditions — these
+numbers aren't a competitive comparison, they're here to track regressions
+and show where the current architecture's cost is.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb`.
 
@@ -24,25 +23,26 @@ Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb`.
 | `all_nodes` scan, 1,000 rows | 619.5 µs |
 | `all_nodes` scan, 10,000 rows | 6.22 ms |
 
-`all_nodes` is a **linear scan** — there's no secondary index on label yet
-(see Limitations below), so this scales O(n) with total table size, not with
-the number of matching rows. At 10M rows this would be roughly 6 seconds, not
-milliseconds.
+`all_nodes` is a linear scan of the whole node table filtered by label —
+there's no secondary index on label, so cost scales with total table size,
+not with the number of matching rows. At 10M rows this would be roughly
+6 seconds, not milliseconds. A label index is on the roadmap (see README).
 
 ### Transaction batching
 
-Direct comparison of one write-transaction per node vs. one shared
-transaction for 1,000 node creates:
+Comparison of one write-transaction per node vs. one shared transaction for
+1,000 node creates:
 
 | Strategy | Result |
 |---|---|
 | One `WriteTransaction` per node | 17.6 ms |
-| One shared `WriteTransaction` for all 1,000 | 6.17 ms (**2.85x faster**) |
+| One shared `WriteTransaction` for all 1,000 | 6.17 ms (2.85x faster) |
 
-This is why the query executor drives an entire Cypher statement through a
-single transaction (see the crash-safety boundary in the architecture notes)
-rather than one transaction per graph operation — it's both the correctness
-fix and the performance win.
+MarsDB runs each Cypher statement inside a single transaction rather than
+one transaction per graph operation, for two reasons this table shows: it's
+faster, and it means a statement that touches multiple nodes/edges (e.g.
+`CREATE (a)-[:R]->(b)`) either fully applies or fully rolls back — no
+partially-created pattern if the process dies mid-statement.
 
 ## Cypher layer (`marsdb/benches/cypher_ops.rs`)
 
@@ -58,21 +58,18 @@ fix and the performance win.
 | Same query, 1,000-node dataset | 2.03 ms |
 | Same query, 10,000-node dataset | 21.0 ms |
 
-**`LIMIT` does not short-circuit in v1.** The last row above is the tell:
-21 ms for a query that only returns 10 rows, because the planner eagerly
-scans and expands the full dataset before truncating. Not a bug — a known
-consequence of the "no cost-based optimizer, nothing to misoptimize" v1
-scope — but a real cost if you run `LIMIT`-heavy queries against large
-datasets today.
+`LIMIT` does not short-circuit: the last row shows 21 ms for a query that
+only returns 10 rows, because the query planner evaluates the full scan and
+expand before truncating to the limit. `LIMIT` short-circuiting is on the
+roadmap.
 
-## What these numbers don't tell you
+## Scope of these numbers
 
-- No concurrent-access benchmarks. v1's query executor drives every
-  statement — reads included — through a `WriteTransaction`, so reads
-  currently serialize behind redb's single-writer lock instead of running
-  concurrently. See Limitations in the README.
-- No disk-backed sustained-write benchmarks (all of the above ran against
-  `Database::in_memory()`); file-backed throughput under real fsync pressure
-  hasn't been separately measured.
+- No concurrent-access benchmarks — every statement currently runs through a
+  single-writer transaction (see README), so this doesn't measure
+  concurrent-reader throughput.
+- No disk-backed sustained-write benchmarks — everything above ran against
+  `Database::in_memory()`; file-backed throughput under real fsync pressure
+  hasn't been measured separately.
 - No comparison against Neo4j, JanusGraph, Neptune, or any other graph
-  database. Don't extrapolate a competitive ranking from this file.
+  database.
