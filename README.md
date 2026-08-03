@@ -30,6 +30,10 @@ cargo add marsdb
 let db = marsdb::Database::in_memory()?; // or Database::open("path/to.db")
 db.execute("CREATE (a:Person {name: 'Alice'})")?;
 let result = db.execute("MATCH (n:Person) RETURN n.name")?;
+
+// Or run a `;`-separated batch, one transaction per statement, one
+// QueryResult per statement back:
+let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
 ```
 
 **Python**:
@@ -63,6 +67,7 @@ marsdb                                  # in-memory REPL
 marsdb mydata.db                        # file-backed REPL
 marsdb mydata.db "MATCH (n) RETURN n"   # run one query, exit
 marsdb :memory: "..."                   # explicit in-memory, one-shot
+marsdb mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
 ```
 
 ## Architecture

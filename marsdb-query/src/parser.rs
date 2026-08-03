@@ -20,6 +20,20 @@ pub fn parse(input: &str) -> Result<Statement, QueryError> {
     parse_statement(statement_pair)
 }
 
+/// Parses a `;`-separated batch of one or more statements (e.g.
+/// `"CREATE (a); CREATE (b); MATCH (n) RETURN n"`). A `;` inside a string
+/// literal doesn't split anything — see `queries`' grammar comment.
+pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
+    let mut pairs = CypherParser::parse(Rule::queries, input)
+        .map_err(|e| QueryError::Parse(e.to_string()))?;
+    let queries_pair = pairs.next().expect("queries rule always produces one pair");
+    queries_pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::statement)
+        .map(parse_statement)
+        .collect()
+}
+
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let inner = pair.into_inner().next().expect("statement has one child");
     match inner.as_rule() {

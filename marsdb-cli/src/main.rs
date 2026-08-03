@@ -42,9 +42,11 @@ fn main() -> ExitCode {
     };
 
     if let Some(query) = &cli.query {
-        return match db.execute(query) {
-            Ok(result) => {
-                format::print_table(&result);
+        return match db.execute_batch(query) {
+            Ok(results) => {
+                for result in &results {
+                    format::print_table(result);
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

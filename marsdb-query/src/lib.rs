@@ -12,6 +12,6 @@ pub use ast::{Literal, Statement};
 pub use error::QueryError;
 pub use executor::Executor;
 pub use params::substitute_params;
-pub use parser::parse;
+pub use parser::{parse, parse_many};
 pub use result::QueryResult;
 pub use value::Value;

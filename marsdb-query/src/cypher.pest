@@ -2,6 +2,13 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 query = { SOI ~ statement ~ ";"? ~ EOI }
 
+// A `;`-separated batch of statements — `parse_many` uses this, `parse`
+// (single-statement) still uses `query` above unchanged. `;` only ever
+// separates `statement`s here; a `;` inside a `string_literal` is
+// consumed as part of that atomic rule and never reaches this level, so
+// no special-casing is needed to avoid splitting inside a string.
+queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
+
 statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }

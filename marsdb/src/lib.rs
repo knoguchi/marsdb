@@ -57,4 +57,21 @@ impl Database {
         let result = marsdb_query::Executor::new(&self.store).execute(&stmt)?;
         Ok(result)
     }
+
+    /// Runs a `;`-separated batch of statements (e.g.
+    /// `"CREATE (a); CREATE (b); MATCH (n) RETURN n"`), returning one
+    /// `QueryResult` per statement in order.
+    ///
+    /// The whole batch is parsed up front — a syntax error anywhere in it
+    /// means nothing runs at all. Execution, though, is one transaction
+    /// per statement (same crash-safety model as a single `execute()`
+    /// call): if a statement fails at *run* time (e.g. an unbound
+    /// variable), every statement before it in the batch is already
+    /// committed and stays that way — this returns `Err` immediately
+    /// rather than continuing, but doesn't roll anything back.
+    pub fn execute_batch(&self, cypher: &str) -> Result<Vec<QueryResult>, Error> {
+        let stmts = marsdb_query::parse_many(cypher)?;
+        let executor = marsdb_query::Executor::new(&self.store);
+        stmts.iter().map(|stmt| Ok(executor.execute(stmt)?)).collect()
+    }
 }

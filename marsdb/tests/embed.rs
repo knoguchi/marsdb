@@ -55,3 +55,48 @@ fn execute_with_params_substitutes_dollar_placeholders() {
         .unwrap_err();
     assert!(err.to_string().contains("missing"));
 }
+
+#[test]
+fn execute_batch_runs_each_statement_and_returns_one_result_per_statement() {
+    let db = Database::in_memory().unwrap();
+    let results = db
+        .execute_batch(
+            "CREATE (a:Person {name: 'Alice'}); \
+             CREATE (b:Person {name: 'Bob'}); \
+             MATCH (n:Person) RETURN n.name",
+        )
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results[0].columns.is_empty(), "CREATE returns no columns");
+    assert!(results[1].columns.is_empty());
+    assert_eq!(results[2].rows.len(), 2, "both prior CREATEs must be visible to the final MATCH");
+}
+
+#[test]
+fn execute_batch_semicolon_inside_string_literal_does_not_split() {
+    let db = Database::in_memory().unwrap();
+    let results = db.execute_batch("CREATE (n:Item {name: 'a;b'}); MATCH (n:Item) RETURN n.name").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[1].rows.len(), 1);
+}
+
+#[test]
+fn execute_batch_bad_syntax_anywhere_runs_nothing() {
+    let db = Database::in_memory().unwrap();
+    let err = db.execute_batch("CREATE (a:Item); NOT VALID CYPHER").unwrap_err();
+    assert!(matches!(err, marsdb::Error::Query(_)));
+    // Nothing committed -- the parse error was caught before any statement ran.
+    let result = db.execute("MATCH (n:Item) RETURN n").unwrap();
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn execute_batch_stops_at_first_runtime_failure_but_keeps_earlier_commits() {
+    let db = Database::in_memory().unwrap();
+    let err = db
+        .execute_batch("CREATE (a:Item {idx: 1}); MATCH (missing) DELETE nonexistent; CREATE (b:Item {idx: 2})")
+        .unwrap_err();
+    assert!(matches!(err, marsdb::Error::Query(_)));
+    let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
+    assert_eq!(result.rows.len(), 1, "the first CREATE must stay committed even though a later statement failed");
+}
