@@ -113,6 +113,27 @@ Kenji Noguchi | 52
 (Single-author repo, so this one's not very interesting here — but it's
 the same query shape you'd run on a real multi-contributor project.)
 
+## 4. Visualize it
+
+```
+pip install marsdb networkx matplotlib
+python3 examples/visualize_commit_graph.py commit_graph.db commit_graph.png
+```
+
+Uses the `marsdb` Python package directly (the real PyPI bindings, not
+the CLI) — `Database.open()`, `execute()`, same two queries as above plus
+the raw edge list, fed into `networkx`/`matplotlib` for a bipartite
+layout. Only files touched more than 5 times are drawn (`min-touches` is
+an optional third argument) — below that there are too many single/
+double-edge `File` nodes for the layout to stay readable, even though it
+renders fine either way. Node size scales with churn:
+
+![Commit-to-file graph, generated 2026-08-03](./examples/commit_graph_example.png)
+
+(That image is a snapshot from when this doc was written — it'll drift
+from `git log`'s actual current output as the repo keeps changing.
+Regenerate it with the commands above for current numbers.)
+
 ## Why this is a real test, not just a toy
 
 This graph is 35x the edge count of the first version of this demo (a
