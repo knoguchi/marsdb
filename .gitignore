@@ -1,2 +1,6 @@
 /target
+marsdb-python/target
+marsdb-python/.venv
+__pycache__/
+*.pyc
 *.db
