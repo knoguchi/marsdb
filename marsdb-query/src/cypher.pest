@@ -42,7 +42,7 @@ with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clau
 // 2`), which `comparison` structurally cannot express at all (only
 // `x.prop > 2` is representable there).
 unwind_clause = { ^"UNWIND" ~ unwind_source ~ ^"AS" ~ identifier ~ with_where_clause? ~ with_clause? }
-unwind_source = { list_literal | identifier }
+unwind_source = { list_literal | null_literal | identifier }
 list_literal  = { "[" ~ (literal ~ ("," ~ literal)*)? ~ "]" }
 
 // No WHERE here -- real Cypher's MERGE has none either; the pattern's own

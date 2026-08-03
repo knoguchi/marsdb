@@ -114,7 +114,6 @@ pub struct NodePattern {
 pub struct RelPattern {
     pub var: Option<String>,
     pub rel_type: Option<String>,
-    #[allow(dead_code)] // property-map on relationships parsed but not filtered on in v1
     pub props: Vec<(String, Literal)>,
     pub direction: RelDirection,
     /// `[:TYPE*min..max]` — `None` means a fixed single hop (existing

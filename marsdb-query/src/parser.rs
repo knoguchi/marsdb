@@ -208,6 +208,9 @@ fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
                 .map(parse_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
+        // `UNWIND null AS x` is real Cypher -- unwinding null behaves like
+        // unwinding an empty list (zero rows), not a bound variable lookup.
+        Rule::null_literal => Ok(UnwindSource::List(vec![])),
         Rule::identifier => Ok(UnwindSource::Var(inner.as_str().to_string())),
         r => unreachable!("unexpected unwind_source child rule {r:?}"),
     }
@@ -380,10 +383,14 @@ fn parse_order_by_clause(pair: Pair<Rule>) -> Result<Vec<(ReturnExpr, SortDir)>,
 
 fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
     let n_pair = pair.into_inner().next().expect("LIMIT has an int_literal");
-    n_pair
+    let n = n_pair
         .as_str()
         .parse::<i64>()
-        .map_err(|_| QueryError::Parse("invalid LIMIT value".into()))
+        .map_err(|_| QueryError::Parse("invalid LIMIT value".into()))?;
+    if n < 0 {
+        return Err(QueryError::Parse("LIMIT can't be negative".into()));
+    }
+    Ok(n)
 }
 
 /// Merges comma-separated patterns within one `MATCH` into a single linear
