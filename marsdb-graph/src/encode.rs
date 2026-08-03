@@ -5,7 +5,7 @@ use crate::model::PropertyValue;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct NodeRecord {
-    pub label_id: u32,
+    pub label_ids: Vec<u32>,
     pub props: BTreeMap<String, PropertyValue>,
 }
 

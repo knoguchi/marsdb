@@ -18,7 +18,7 @@ pub enum PropertyValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: NodeId,
-    pub label: String,
+    pub labels: Vec<String>,
     pub props: BTreeMap<String, PropertyValue>,
 }
 

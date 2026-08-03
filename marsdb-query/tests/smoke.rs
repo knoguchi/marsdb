@@ -94,3 +94,43 @@ fn set_updates_property() {
         other => panic!("unexpected value {other:?}"),
     }
 }
+
+#[test]
+fn multi_label_create_and_match() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (p:Post:Message {id: 1})");
+    run(&store, "CREATE (c:Comment:Message {id: 2})");
+    run(&store, "CREATE (p2:Post {id: 3})"); // single-label, must NOT match :Message
+
+    let as_message = run(&store, "MATCH (m:Message) RETURN m.id");
+    let mut ids: Vec<i64> = as_message
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+
+    let as_post = run(&store, "MATCH (p:Post) RETURN p.id");
+    let mut post_ids: Vec<i64> = as_post
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    post_ids.sort();
+    assert_eq!(post_ids, vec![1, 3]);
+
+    // multi-label pattern match: AND semantics
+    let both = run(&store, "MATCH (n:Post:Message) RETURN n.id");
+    assert_eq!(both.rows.len(), 1);
+    match &both.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(v)) => assert_eq!(*v, 1),
+        other => panic!("unexpected value {other:?}"),
+    }
+}

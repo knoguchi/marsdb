@@ -8,8 +8,10 @@
 //! assert_eq!(result.rows.len(), 2);
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
 
+pub use marsdb_graph::PropertyValue;
 pub use marsdb_query::{Literal, QueryResult, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +42,18 @@ impl Database {
     }
 
     pub fn execute(&self, cypher: &str) -> Result<QueryResult, Error> {
-        let stmt = marsdb_query::parse(cypher)?;
+        self.execute_with_params(cypher, &HashMap::new())
+    }
+
+    /// Run a Cypher statement with `$name` placeholders resolved from
+    /// `params` before execution.
+    pub fn execute_with_params(
+        &self,
+        cypher: &str,
+        params: &HashMap<String, PropertyValue>,
+    ) -> Result<QueryResult, Error> {
+        let mut stmt = marsdb_query::parse(cypher)?;
+        marsdb_query::substitute_params(&mut stmt, params)?;
         let result = marsdb_query::Executor::new(&self.store).execute(&stmt)?;
         Ok(result)
     }

@@ -59,7 +59,10 @@ pub fn build_match_plan(pattern: &Pattern, where_clause: &Option<Expr>) -> Logic
 }
 
 fn scan_for(var: &str, node: &NodePattern) -> LogicalPlan {
-    let base = match &node.label {
+    // The first label (if any) narrows the scan; any additional labels
+    // (`(n:Post:Message)`) become extra HasLabel filters — a node must
+    // have ALL listed labels, matching Cypher's multi-label AND semantics.
+    let base = match node.labels.first() {
         Some(label) => LogicalPlan::NodeByLabelScan {
             var: var.to_string(),
             label: label.clone(),
@@ -69,11 +72,17 @@ fn scan_for(var: &str, node: &NodePattern) -> LogicalPlan {
     wrap_node_filters(base, var, node)
 }
 
-/// Inline node-pattern properties (`(a:Person {name:'Alice'})`) compile to
-/// the same Filter/Compare machinery as a WHERE clause, just synthesized
-/// from the pattern instead of parsed from an explicit predicate.
+/// Inline node-pattern properties (`(a:Person {name:'Alice'})`) and
+/// additional labels beyond the first compile to the same Filter machinery
+/// as a WHERE clause, just synthesized from the pattern.
 fn wrap_node_filters(plan: LogicalPlan, var: &str, node: &NodePattern) -> LogicalPlan {
     let mut plan = plan;
+    for extra_label in node.labels.iter().skip(1) {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: Expr::HasLabel(var.to_string(), extra_label.clone()),
+        };
+    }
     for (key, lit) in &node.props {
         let predicate = Expr::Compare(
             PropAccess {

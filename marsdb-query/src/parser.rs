@@ -158,19 +158,19 @@ fn parse_pattern(pair: Pair<Rule>) -> Result<Pattern, QueryError> {
 
 fn parse_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, QueryError> {
     let mut var = None;
-    let mut label = None;
+    let mut labels = Vec::new();
     let mut props = Vec::new();
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::node_var => var = Some(p.as_str().to_string()),
             Rule::node_label => {
-                label = Some(p.into_inner().next().expect("node_label has an identifier").as_str().to_string())
+                labels.push(p.into_inner().next().expect("node_label has an identifier").as_str().to_string())
             }
             Rule::prop_map => props = parse_prop_map(p)?,
             r => unreachable!("unexpected node_pattern child rule {r:?}"),
         }
     }
-    Ok(NodePattern { var, label, props })
+    Ok(NodePattern { var, labels, props })
 }
 
 fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
@@ -234,6 +234,10 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
         }
         Rule::bool_literal => Literal::Bool(inner.as_str().eq_ignore_ascii_case("true")),
         Rule::null_literal => Literal::Null,
+        Rule::param => {
+            let name = inner.into_inner().next().expect("param has an identifier").as_str().to_string();
+            Literal::Param(name)
+        }
         r => unreachable!("unexpected literal child rule {r:?}"),
     })
 }

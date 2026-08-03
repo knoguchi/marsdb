@@ -58,14 +58,14 @@ impl<'a> Executor<'a> {
 
     fn execute_create(&self, write_txn: &WriteTransaction, patterns: &[Pattern]) -> Result<QueryResult, QueryError> {
         for pattern in patterns {
-            let start_label = pattern.start.label.clone().unwrap_or_else(|| "Node".to_string());
+            let start_labels = pattern_labels(&pattern.start.labels);
             let start_props = literal_props_to_values(&pattern.start.props);
-            let mut prev_id = GraphStore::create_node_in_txn(write_txn, &start_label, start_props)?;
+            let mut prev_id = GraphStore::create_node_in_txn(write_txn, &start_labels, start_props)?;
 
             for (rel, node) in &pattern.hops {
-                let label = node.label.clone().unwrap_or_else(|| "Node".to_string());
+                let labels = pattern_labels(&node.labels);
                 let props = literal_props_to_values(&node.props);
-                let node_id = GraphStore::create_node_in_txn(write_txn, &label, props)?;
+                let node_id = GraphStore::create_node_in_txn(write_txn, &labels, props)?;
 
                 let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
                 let rel_props = literal_props_to_values(&rel.props);
@@ -176,6 +176,14 @@ impl<'a> Executor<'a> {
             Expr::Compare(pa, op, lit) => {
                 let prop_value = self.lookup_prop(write_txn, pa, row)?;
                 compare(&prop_value, *op, lit)
+            }
+            Expr::HasLabel(var, label) => {
+                let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                let Binding::Node(id) = binding else {
+                    return Err(QueryError::UnboundVariable(var.clone()));
+                };
+                let node = GraphStore::get_node_in_txn(write_txn, *id)?;
+                node.is_some_and(|n| n.labels.iter().any(|l| l == label))
             }
         })
     }
@@ -333,11 +341,22 @@ fn literal_to_value(lit: &Literal) -> PropertyValue {
         Literal::String(s) => PropertyValue::String(s.clone()),
         Literal::Bool(b) => PropertyValue::Bool(*b),
         Literal::Null => PropertyValue::Null,
+        Literal::Param(name) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
     }
 }
 
 fn literal_props_to_values(props: &[(String, Literal)]) -> BTreeMap<String, PropertyValue> {
     props.iter().map(|(k, v)| (k.clone(), literal_to_value(v))).collect()
+}
+
+fn pattern_labels(labels: &[String]) -> Vec<&str> {
+    if labels.is_empty() {
+        vec!["Node"]
+    } else {
+        labels.iter().map(|s| s.as_str()).collect()
+    }
 }
 
 fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {

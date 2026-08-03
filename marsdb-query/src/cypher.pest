@@ -24,7 +24,7 @@ limit_clause = { ^"LIMIT" ~ int_literal }
 
 pattern = { node_pattern ~ (rel_pattern ~ node_pattern)* }
 
-node_pattern = { "(" ~ node_var? ~ node_label? ~ prop_map? ~ ")" }
+node_pattern = { "(" ~ node_var? ~ node_label* ~ prop_map? ~ ")" }
 node_var     = { identifier }
 node_label   = { ":" ~ identifier }
 
@@ -46,11 +46,12 @@ compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" }
 
 prop_access = { identifier ~ "." ~ identifier }
 
-literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal }
+literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal | param }
 int_literal    = @{ "-"? ~ ASCII_DIGIT+ }
 float_literal  = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 string_literal = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
 bool_literal   = @{ ^"true" | ^"false" }
 null_literal   = @{ ^"null" }
+param          = { "$" ~ identifier }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

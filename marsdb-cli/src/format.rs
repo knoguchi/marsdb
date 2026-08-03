@@ -16,7 +16,7 @@ fn format_value(value: &Value) -> String {
     match value {
         Value::Node(n) => {
             let props: Vec<String> = n.props.iter().map(|(k, v)| format!("{k}: {}", format_property(v))).collect();
-            format!("(:{} {{{}}})", n.label, props.join(", "))
+            format!("(:{} {{{}}})", n.labels.join(":"), props.join(", "))
         }
         Value::Edge(e) => format!("[:{}]", e.label),
         Value::Property(p) => format_property(p),
@@ -42,5 +42,6 @@ fn format_literal(l: &Literal) -> String {
         Literal::String(s) => s.clone(),
         Literal::Bool(b) => b.to_string(),
         Literal::Null => "null".to_string(),
+        Literal::Param(name) => format!("${name}"),
     }
 }

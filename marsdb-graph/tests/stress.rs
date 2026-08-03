@@ -34,7 +34,7 @@ fn stress_50k_node_chain_correctness() {
     for i in 0..N {
         let mut props = BTreeMap::new();
         props.insert("idx".to_string(), PropertyValue::Int(i));
-        let id = store.create_node("Item", props).unwrap();
+        let id = store.create_node(&["Item"], props).unwrap();
         if let Some(p) = prev {
             store.create_edge("NEXT", p, id, BTreeMap::new()).unwrap();
         }
@@ -69,13 +69,13 @@ fn stress_50k_node_chain_correctness() {
 fn stress_supernode_fanout_10k() {
     const FANOUT: usize = 10_000;
     let store = GraphStore::open_memory().unwrap();
-    let center = store.create_node("Hub", BTreeMap::new()).unwrap();
+    let center = store.create_node(&["Hub"], BTreeMap::new()).unwrap();
 
     let mut leaves = HashSet::with_capacity(FANOUT);
     for i in 0..FANOUT {
         let mut props = BTreeMap::new();
         props.insert("idx".to_string(), PropertyValue::Int(i as i64));
-        let leaf = store.create_node("Leaf", props).unwrap();
+        let leaf = store.create_node(&["Leaf"], props).unwrap();
         // Alternate edge label to exercise label filtering at scale too.
         let label = if i % 2 == 0 { "EVEN" } else { "ODD" };
         store.create_edge(label, center, leaf, BTreeMap::new()).unwrap();
@@ -110,7 +110,7 @@ fn stress_random_create_delete_matches_oracle() {
     for _ in 0..OPS {
         let create = live.is_empty() || rng.below(3) != 0; // ~66% create, else delete
         if create {
-            let id = store.create_node("N", BTreeMap::new()).unwrap();
+            let id = store.create_node(&["N"], BTreeMap::new()).unwrap();
             live.push(id);
         } else {
             let idx = rng.below(live.len());

@@ -8,18 +8,18 @@ fn create_and_traverse_in_memory() {
 
     let mut alice_props = BTreeMap::new();
     alice_props.insert("name".to_string(), PropertyValue::String("Alice".into()));
-    let alice = store.create_node("Person", alice_props).unwrap();
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
 
     let mut bob_props = BTreeMap::new();
     bob_props.insert("name".to_string(), PropertyValue::String("Bob".into()));
-    let bob = store.create_node("Person", bob_props).unwrap();
+    let bob = store.create_node(&["Person"], bob_props).unwrap();
 
     store
         .create_edge("KNOWS", alice, bob, BTreeMap::new())
         .unwrap();
 
     let node = store.get_node(alice).unwrap().unwrap();
-    assert_eq!(node.label, "Person");
+    assert_eq!(node.labels, vec!["Person".to_string()]);
     assert_eq!(
         node.props.get("name"),
         Some(&PropertyValue::String("Alice".into()))
@@ -50,8 +50,8 @@ fn create_and_traverse_in_memory() {
 #[test]
 fn delete_node_detach() {
     let store = GraphStore::open_memory().unwrap();
-    let a = store.create_node("Person", BTreeMap::new()).unwrap();
-    let b = store.create_node("Person", BTreeMap::new()).unwrap();
+    let a = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let b = store.create_node(&["Person"], BTreeMap::new()).unwrap();
     store
         .create_edge("KNOWS", a, b, BTreeMap::new())
         .unwrap();

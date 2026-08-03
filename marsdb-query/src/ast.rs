@@ -5,6 +5,10 @@ pub enum Literal {
     String(String),
     Bool(bool),
     Null,
+    /// `$name` placeholder — resolved to a concrete `Literal` by
+    /// `params::substitute_params` before execution, never seen by the
+    /// executor.
+    Param(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +33,10 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Compare(PropAccess, CompareOp, Literal),
+    /// Does the node bound to `var` have label `label` among its (possibly
+    /// multiple) labels? Synthesized by the planner for the 2nd+ label in a
+    /// multi-label pattern like `(n:Post:Message)` — never user-typed.
+    HasLabel(String, String),
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +63,7 @@ pub enum RelDirection {
 #[derive(Debug, Clone)]
 pub struct NodePattern {
     pub var: Option<String>,
-    pub label: Option<String>,
+    pub labels: Vec<String>,
     pub props: Vec<(String, Literal)>,
 }
 

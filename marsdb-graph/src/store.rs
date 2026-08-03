@@ -60,23 +60,26 @@ impl GraphStore {
 
     pub fn create_node(
         &self,
-        label: &str,
+        labels: &[&str],
         props: BTreeMap<String, PropertyValue>,
     ) -> Result<NodeId, GraphError> {
         let write_txn = self.begin_write()?;
-        let id = Self::create_node_in_txn(&write_txn, label, props)?;
+        let id = Self::create_node_in_txn(&write_txn, labels, props)?;
         write_txn.commit()?;
         Ok(id)
     }
 
     pub fn create_node_in_txn(
         write_txn: &WriteTransaction,
-        label: &str,
+        labels: &[&str],
         props: BTreeMap<String, PropertyValue>,
     ) -> Result<NodeId, GraphError> {
-        let label_id = intern_label(write_txn, label)?;
+        let label_ids = labels
+            .iter()
+            .map(|l| intern_label(write_txn, l))
+            .collect::<Result<Vec<_>, _>>()?;
         let id = next_id(write_txn, "next_node_id")?;
-        let record = NodeRecord { label_id, props };
+        let record = NodeRecord { label_ids, props };
         let bytes = encode(&record)?;
         let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
         nodes.insert(id, bytes.as_slice())?;
@@ -100,10 +103,14 @@ impl GraphStore {
             found
         };
         let Some(record) = record else { return Ok(None) };
-        let label = resolve_label(write_txn, record.label_id)?;
+        let labels = record
+            .label_ids
+            .iter()
+            .map(|&lid| resolve_label(write_txn, lid))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Node {
             id,
-            label,
+            labels,
             props: record.props,
         }))
     }
@@ -384,11 +391,15 @@ impl GraphStore {
         for item in nodes.iter()? {
             let (key, value) = item?;
             let record: NodeRecord = decode(value.value())?;
-            if label_id_filter.is_none_or(|lid| lid == record.label_id) {
-                let label = resolve_label(write_txn, record.label_id)?;
+            if label_id_filter.is_none_or(|lid| record.label_ids.contains(&lid)) {
+                let labels = record
+                    .label_ids
+                    .iter()
+                    .map(|&lid| resolve_label(write_txn, lid))
+                    .collect::<Result<Vec<_>, _>>()?;
                 result.push(Node {
                     id: NodeId(key.value()),
-                    label,
+                    labels,
                     props: record.props,
                 });
             }

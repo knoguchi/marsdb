@@ -54,7 +54,7 @@ fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<
         ::marsdb::Value::Node(n) => {
             let dict = PyDict::new(py);
             dict.set_item("id", n.id.0)?;
-            dict.set_item("label", &n.label)?;
+            dict.set_item("labels", n.labels.clone())?;
             let props = PyDict::new(py);
             for (k, v) in &n.props {
                 props.set_item(k, property_to_py(py, v)?)?;

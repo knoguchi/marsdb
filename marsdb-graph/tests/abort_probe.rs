@@ -17,7 +17,7 @@ fn many_inserts_then_explicit_abort_leaves_nothing() {
         for i in 0..3000 {
             let mut props = BTreeMap::new();
             props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
-            GraphStore::create_node_in_txn(&write_txn, "Item", props).unwrap();
+            GraphStore::create_node_in_txn(&write_txn, &["Item"], props).unwrap();
         }
         GraphStore::abort(write_txn).unwrap();
     }
