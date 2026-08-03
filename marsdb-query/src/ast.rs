@@ -185,18 +185,66 @@ pub struct QueryPart {
     pub with: Option<WithClause>,
 }
 
+/// `UNWIND <source> AS <var> [WHERE ...] [WITH ...]` — fans a list out into
+/// one row per element, cross-joined against whatever rows already exist
+/// (same "row-vector-in, row-vector-out, no graph traversal" shape as a
+/// `WithClause`, not a graph-traversal `LogicalPlan` node — see
+/// `executor::eval_unwind`). Its own `where_clause` (rather than requiring
+/// a `WITH` right after it just to filter) is what makes `UNWIND [1,2,3]
+/// AS x WHERE x > 2` — or `WITH ... collect(m) AS ms UNWIND ms AS m2
+/// WHERE m2.x > 1` — work within the one-`WITH`-per-statement cap (see
+/// `QueryClause`'s docs). Deliberately typed as `WithExpr`, not the
+/// pattern-level `Expr`: an unwound variable is very often a bare scalar
+/// (`x > 2`), which `Expr::Compare`'s always-`PropAccess` LHS structurally
+/// cannot express (only `x.prop > 2` is) — `WithExpr::Compare`'s
+/// `ReturnExpr` LHS covers both.
+#[derive(Debug, Clone)]
+pub struct UnwindClause {
+    pub source: UnwindSource,
+    pub var: String,
+    pub where_clause: Option<WithExpr>,
+    pub with: Option<WithClause>,
+}
+
+/// Where an `UNWIND`'s list comes from. `Var` restores graph identity per
+/// element when the list came from `collect()`-ing nodes/edges (see
+/// `executor::value_to_binding_restore`) — there's no `PropertyValue::List`
+/// yet, so a `$param`-supplied list isn't reachable here; only a
+/// previously-bound `collect()` result or an inline Cypher-text list.
+#[derive(Debug, Clone)]
+pub enum UnwindSource {
+    Var(String),
+    List(Vec<Literal>),
+}
+
+/// One reading clause in a `MATCH`/`UNWIND` sequence. `Match` is today's
+/// `MATCH`/`OPTIONAL MATCH ... [WHERE] [WITH]` segment; `Unwind` fans out a
+/// list. Both can optionally end in a `WITH` — see `Statement::Match`'s
+/// docs for the WITH-separation/one-WITH-total rules this enum's variants
+/// are validated against.
+#[derive(Debug, Clone)]
+pub enum QueryClause {
+    Match(QueryPart),
+    Unwind(UnwindClause),
+}
+
 #[derive(Debug, Clone)]
 pub enum Statement {
     Create(Vec<Pattern>),
     Match {
-        /// One or more `MATCH ... [WITH ...]` segments. The parser enforces
-        /// every part except the last has a `with` (matching real Cypher's
-        /// rule that multiple reading clauses must be separated by WITH)
-        /// and that at most one part has a `with` at all (v1 doesn't
-        /// support chaining past one WITH boundary — nothing in the target
-        /// query set needs it, and it keeps a hand-rolled parser's
-        /// untested-path surface smaller).
-        parts: Vec<QueryPart>,
+        /// One or more `MATCH`/`UNWIND ... [WITH ...]` clauses. The parser
+        /// enforces every `Match` clause except the statement's last has a
+        /// `with` before the next `Match` clause (matching real Cypher's
+        /// rule that multiple reading clauses must be separated by WITH) —
+        /// `Unwind` clauses are exempt from this specific check (they
+        /// share one binding scope the same way `OPTIONAL MATCH` already
+        /// does, real Cypher needs no WITH around a bare UNWIND either) —
+        /// and that at most one clause (of any kind) has a `with` at all
+        /// across the whole statement (v1 doesn't support chaining past
+        /// one WITH boundary — nothing in the target query set needs it,
+        /// and it keeps a hand-rolled parser's untested-path surface
+        /// smaller).
+        clauses: Vec<QueryClause>,
         tail: Tail,
         /// Only meaningful for `Tail::Return`; evaluated against the
         /// projected/aliased output row, not the raw pattern bindings —
