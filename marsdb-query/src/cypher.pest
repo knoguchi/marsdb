@@ -19,8 +19,16 @@ create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 // still enforces for MATCH/UNWIND-only statements).
 match_stmt    = { clause+ ~ tail_clause? ~ order_by_clause? ~ limit_clause? }
 clause        = { unwind_clause | merge_clause | match_part }
-match_part    = { match_keyword ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
+match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
+
+// `p = (a)-->(b)` (named-path capture) or `p = shortestPath((a)-[:T*..N]-(b))`
+// -- only the match_part's *first* pattern token can carry a name; any
+// comma-continuation after it (spliced by parser::splice_patterns) is a
+// plain `pattern`, same as today, since naming/shortestPath only make
+// sense for the whole matched shape, not a fragment of it.
+path_pattern          = { (identifier ~ "=")? ~ (shortest_path_wrapper | pattern) }
+shortest_path_wrapper = { ^"shortestPath" ~ "(" ~ pattern ~ ")" }
 with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ limit_clause? }
 
 // Not a general `Literal::List` usable anywhere a `literal` is (a prop

@@ -38,15 +38,24 @@ pub(crate) enum HashKey {
     List(Vec<HashKey>),
 }
 
-pub(crate) fn value_hash_key(v: &Value) -> HashKey {
-    match v {
+pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
+    Ok(match v {
         Value::Null => HashKey::Null,
         Value::Node(n) => HashKey::Node(n.id),
         Value::Edge(e) => HashKey::Edge(e.id),
         Value::Property(pv) => property_value_hash_key(pv),
         Value::Literal(lit) => literal_hash_key(lit),
-        Value::List(items) => HashKey::List(items.iter().map(value_hash_key).collect()),
-    }
+        Value::List(items) => HashKey::List(items.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?),
+        // Same explicit-error stance as executor::binding_hash_key's
+        // Binding::Path arm — grouping/DISTINCT/collect(DISTINCT) by a
+        // path isn't a case any real usage needs.
+        Value::Path(_) => {
+            return Err(QueryError::Parse(
+                "grouping or using DISTINCT with a path (e.g. a named-path/shortestPath() variable) isn't supported"
+                    .into(),
+            ))
+        }
+    })
 }
 
 pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
@@ -103,6 +112,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Node(_) => "a node",
         Value::Edge(_) => "an edge",
         Value::List(_) => "a list",
+        Value::Path(_) => "a path",
         Value::Property(_) | Value::Literal(_) => "a scalar",
         Value::Null => "null",
     }
@@ -111,11 +121,11 @@ fn value_type_name(v: &Value) -> &'static str {
 /// True iff `v` hasn't been seen before in this accumulator's DISTINCT set
 /// (and records it if so) — `HashKey` is what makes this an O(1) average
 /// hash-set insert instead of a linear rescan-and-compare per value.
-fn dedup_seen(distinct: &mut Option<HashSet<HashKey>>, v: &Value) -> bool {
-    match distinct {
+fn dedup_seen(distinct: &mut Option<HashSet<HashKey>>, v: &Value) -> Result<bool, QueryError> {
+    Ok(match distinct {
         None => true,
-        Some(seen) => seen.insert(value_hash_key(v)),
-    }
+        Some(seen) => seen.insert(value_hash_key(v)?),
+    })
 }
 
 impl AggAcc {
@@ -152,7 +162,7 @@ impl AggAcc {
         debug_assert!(!matches!(v, Value::Null), "callers must skip Value::Null before calling fold");
         match self {
             AggAcc::Count { distinct, n } => {
-                if dedup_seen(distinct, v) {
+                if dedup_seen(distinct, v)? {
                     *n += 1;
                 }
             }
@@ -162,7 +172,7 @@ impl AggAcc {
                 total_float,
                 saw_float,
             } => {
-                if !dedup_seen(distinct, v) {
+                if !dedup_seen(distinct, v)? {
                     return Ok(());
                 }
                 match numeric_value(v) {
@@ -180,7 +190,7 @@ impl AggAcc {
                 }
             }
             AggAcc::Avg { distinct, total, n } => {
-                if !dedup_seen(distinct, v) {
+                if !dedup_seen(distinct, v)? {
                     return Ok(());
                 }
                 let f = match numeric_value(v) {
@@ -197,7 +207,7 @@ impl AggAcc {
                 *n += 1;
             }
             AggAcc::Min { distinct, best } => {
-                if !dedup_seen(distinct, v) {
+                if !dedup_seen(distinct, v)? {
                     return Ok(());
                 }
                 if comparable_ordering(v, v).is_none() {
@@ -215,7 +225,7 @@ impl AggAcc {
                 }
             }
             AggAcc::Max { distinct, best } => {
-                if !dedup_seen(distinct, v) {
+                if !dedup_seen(distinct, v)? {
                     return Ok(());
                 }
                 if comparable_ordering(v, v).is_none() {
@@ -233,7 +243,7 @@ impl AggAcc {
                 }
             }
             AggAcc::Collect { distinct, items } => {
-                if dedup_seen(distinct, v) {
+                if dedup_seen(distinct, v)? {
                     items.push(v.clone());
                 }
             }

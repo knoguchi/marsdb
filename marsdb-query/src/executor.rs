@@ -5,13 +5,14 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess, QueryClause,
-    RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    QueryPart, RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
+    WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
 use crate::planner::{build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::result::QueryResult;
-use crate::value::Value;
+use crate::value::{PathElem, Value};
 
 /// Hidden key used to correlate `OPTIONAL MATCH` results back to the outer
 /// row that seeded them — never visible to user Cypher (not a valid
@@ -36,9 +37,29 @@ enum Binding {
     /// list variant — lists are a query-layer-only concept, never
     /// persisted — so a materialized `collect()` has nowhere else to live
     /// between one `QueryPart` and the next. Elements are already-resolved
-    /// `Value`s, not `Binding`s: there's no `UNWIND` yet to pull one back
-    /// out with restored graph identity.
+    /// `Value`s, not `Binding`s — `UNWIND` restores graph identity on the
+    /// way back out via `value_to_binding_restore`, a separate step from
+    /// how this is stored here.
     List(Vec<Value>),
+    /// A named path (`p = (a)-->(b)`) or `shortestPath()` result — see
+    /// `assemble_path`/`eval_shortest_path`. `PathBinding` (not `Binding`
+    /// again) because a path element only ever needs graph identity
+    /// (`NodeId`/`EdgeId`), never any of `Binding`'s other cases — using
+    /// `Binding` itself here would make "a path containing a path" a type
+    /// state nothing ever produces or handles.
+    Path(Vec<PathBinding>),
+}
+
+/// One element of a `Binding::Path`, alternating node/edge/node/.../node
+/// — the row-carried counterpart to `Value::Path`'s `PathElem` (which
+/// carries full `Node`/`Edge` records instead of just their ids, the same
+/// "keep identity in the row, resolve to a full record only when
+/// materializing for display" split every other `Binding`/`Value` pair
+/// already uses).
+#[derive(Debug, Clone)]
+enum PathBinding {
+    Node(NodeId),
+    Edge(EdgeId),
 }
 
 type BindingRow = HashMap<String, Binding>;
@@ -323,7 +344,7 @@ impl<'a> Executor<'a> {
                     Binding::Edge(id) => {
                         GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                     }
-                    Binding::Value(_) | Binding::List(_) => {
+                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
                             pa.var
@@ -353,20 +374,41 @@ impl<'a> Executor<'a> {
         for clause in clauses {
             match clause {
                 QueryClause::Match(part) => {
-                    let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
-                    current_rows = if part.optional {
-                        let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                        self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                    current_rows = if part.shortest_path {
+                        // Not a LogicalPlan/eval_plan traversal at all —
+                        // see eval_shortest_path's docs.
+                        self.eval_shortest_path(txn, part, &current_rows)?
+                    } else if let Some(path_var) = &part.path_var {
+                        let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
+                        let plan = build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?;
+                        let mut rows = if part.optional {
+                            let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
+                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                        } else {
+                            self.eval_plan(txn, &plan, &current_rows)?
+                        };
+                        for row in &mut rows {
+                            let path_binding = assemble_path(&named_pattern, row);
+                            for key in &synthesized {
+                                row.remove(key);
+                            }
+                            row.insert(path_var.clone(), path_binding);
+                        }
+                        rows
                     } else {
-                        self.eval_plan(txn, &plan, &current_rows)?
+                        let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+                        if part.optional {
+                            let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
+                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                        } else {
+                            self.eval_plan(txn, &plan, &current_rows)?
+                        }
                     };
-                    current_rows = self.apply_with_or_carry(
-                        txn,
-                        &part.with,
-                        current_rows,
-                        pattern_all_vars(&part.pattern),
-                        &mut carried_vars,
-                    )?;
+                    let mut new_vars = pattern_all_vars(&part.pattern);
+                    if let Some(path_var) = &part.path_var {
+                        new_vars.insert(path_var.clone());
+                    }
+                    current_rows = self.apply_with_or_carry(txn, &part.with, current_rows, new_vars, &mut carried_vars)?;
                 }
                 QueryClause::Unwind(u) => {
                     current_rows = self.eval_unwind(txn, u, &current_rows)?;
@@ -510,6 +552,138 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
+    /// `shortestPath((a)-[:TYPE*..N]-(b))` — a real parent-pointer BFS
+    /// between two already-bound endpoints, not a `LogicalPlan`/
+    /// `VarExpand` traversal (which only tracks final position plus a
+    /// visited set, not the hop-by-hop chain a path needs to reconstruct).
+    /// BFS visits in non-decreasing depth order, so the first time `b` is
+    /// reached is *a* shortest path — stop there and reconstruct via
+    /// parent pointers, rather than enumerating every path up to some
+    /// bound the way `VarExpand` does.
+    ///
+    /// Both endpoints must already be bound by a preceding clause (e.g.
+    /// `MATCH (a:Person{name:'Alice'}), (b:Person{name:'Bob'}) MATCH p =
+    /// shortestPath((a)-[:KNOWS*]-(b)) RETURN p` — parser-enforced, see
+    /// `parser::validate_shortest_path_pattern`) — v1 doesn't attempt to
+    /// resolve a fresh/scanned endpoint here the way ordinary MATCH does,
+    /// since "shortest path to *any* node matching these constraints" is a
+    /// different, more ambiguous question than "shortest path between
+    /// these two specific nodes."
+    ///
+    /// Every input row always survives (unlike an ordinary pattern match,
+    /// which can produce zero rows for a non-match) — an unreachable pair
+    /// binds the path variable to `Null`, same as `OPTIONAL MATCH`'s
+    /// null-padding, rather than dropping the row. `part.optional` is
+    /// therefore a no-op here, not separately handled. Exceeding the
+    /// safety depth cap on an unbounded (`*..`) search also resolves to
+    /// `Null`, not an error — unlike `VarExpand`'s cap (which errors,
+    /// because truncating there would silently produce an *incomplete
+    /// set* of paths, a wrong-answer risk), `shortestPath()` is only ever
+    /// answering "is there a path within the searched horizon," which is
+    /// a well-defined answer either way.
+    fn eval_shortest_path(
+        &self,
+        txn: Txn,
+        part: &QueryPart,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let Some(path_var) = &part.path_var else {
+            // Nothing names the result, so there's nothing to bind and no
+            // filtering effect (see this function's docs) — pure no-op.
+            return Ok(rows.to_vec());
+        };
+        let start_var = part.pattern.start.var.as_deref().expect(
+            "shortestPath()'s start node always has a var — validated at parse time by \
+             validate_shortest_path_pattern",
+        );
+        let (rel, end_node) = &part.pattern.hops[0];
+        let end_var = end_node.var.as_deref().expect(
+            "shortestPath()'s end node always has a var — validated at parse time by \
+             validate_shortest_path_pattern",
+        );
+        let (min_hops, max_hops) = rel.hop_range.expect(
+            "shortestPath()'s relationship is always variable-length — validated at parse time by \
+             validate_shortest_path_pattern",
+        );
+        let direction = match rel.direction {
+            RelDirection::Right => ExpandDirection::Out,
+            RelDirection::Left => ExpandDirection::In,
+            RelDirection::Either => ExpandDirection::Either,
+        };
+        let rel_label = rel.rel_type.as_deref();
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let start_id = require_bound_node(row, start_var)?;
+            let end_id = require_bound_node(row, end_var)?;
+            let path = self.shortest_path_between(txn, start_id, end_id, direction, rel_label, min_hops, max_hops)?;
+            let mut new_row = row.clone();
+            let binding = match path {
+                Some(elems) => Binding::Path(elems),
+                None => Binding::Value(PropertyValue::Null),
+            };
+            new_row.insert(path_var.clone(), binding);
+            out.push(new_row);
+        }
+        if let Some(where_clause) = &part.where_clause {
+            let mut filtered = Vec::with_capacity(out.len());
+            for row in out {
+                if self.eval_expr(txn, where_clause, &row)? {
+                    filtered.push(row);
+                }
+            }
+            out = filtered;
+        }
+        Ok(out)
+    }
+
+    /// The BFS itself. `min_hops` is only ever 0 or 1 (`validate_shortest_
+    /// path_pattern` rejects anything higher) — deliberately: a plain
+    /// visited-set BFS can't correctly answer "shortest path of at least N
+    /// hops" for N > 1 (a node first reached at a too-early depth would
+    /// need to stay revisitable for a later, longer route to it, which a
+    /// visited-set structurally can't represent) without a different
+    /// (node, depth)-keyed algorithm. Rejecting the case outright at parse
+    /// time is safer than silently answering it wrong.
+    fn shortest_path_between(
+        &self,
+        txn: Txn,
+        start: NodeId,
+        end: NodeId,
+        direction: ExpandDirection,
+        rel_label: Option<&str>,
+        min_hops: u32,
+        max_hops: Option<u32>,
+    ) -> Result<Option<Vec<PathBinding>>, QueryError> {
+        if start == end && min_hops == 0 {
+            return Ok(Some(vec![PathBinding::Node(start)]));
+        }
+        let cap = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
+        let mut parent: HashMap<NodeId, (NodeId, EdgeId)> = HashMap::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        visited.insert(start);
+        let mut frontier = vec![start];
+        let mut depth = 0u32;
+        while depth < cap && !frontier.is_empty() {
+            depth += 1;
+            let mut next_frontier = Vec::new();
+            for node in frontier {
+                for entry in neighbors_for_direction(txn, node, direction, rel_label)? {
+                    if entry.other == end {
+                        parent.insert(entry.other, (node, entry.edge_id));
+                        return Ok(Some(reconstruct_path(&parent, start, end)));
+                    }
+                    if visited.insert(entry.other) {
+                        parent.insert(entry.other, (node, entry.edge_id));
+                        next_frontier.push(entry.other);
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        Ok(None)
+    }
+
     /// Projects `rows` through a `WITH` clause. Unlike `materialize_return`
     /// (which resolves everything down to display `Value`s), a bare
     /// variable reference (`WITH message`) must keep its graph identity
@@ -636,7 +810,30 @@ impl<'a> Executor<'a> {
             Binding::Value(PropertyValue::Null) => Value::Null,
             Binding::Value(pv) => Value::Property(pv.clone()),
             Binding::List(items) => Value::List(items.clone()),
+            Binding::Path(elems) => Value::Path(self.resolve_path_elems(txn, elems)?),
         })
+    }
+
+    /// `binding_to_value`'s per-element helper for `Binding::Path` — fetches
+    /// each element's full current record, same "keep just the id in the
+    /// row, resolve to a full record only when materializing for display"
+    /// split `Binding::Node`/`Edge` already use above.
+    fn resolve_path_elems(&self, txn: Txn, elems: &[PathBinding]) -> Result<Vec<PathElem>, QueryError> {
+        elems
+            .iter()
+            .map(|e| {
+                Ok(match e {
+                    PathBinding::Node(id) => PathElem::Node(
+                        GraphStore::get_node_in_txn(txn, *id)?
+                            .expect("bound node exists within this statement's transaction"),
+                    ),
+                    PathBinding::Edge(id) => PathElem::Edge(
+                        GraphStore::get_edge_in_txn(txn, *id)?
+                            .expect("bound edge exists within this statement's transaction"),
+                    ),
+                })
+            })
+            .collect()
     }
 
     /// Folds `rows` into groups keyed by every non-aggregate item's per-row
@@ -705,8 +902,10 @@ impl<'a> Executor<'a> {
                     Some(self.item_binding(txn, &item.expr, row)?)
                 });
             }
-            let hash_key: Vec<Option<HashKey>> =
-                key_bindings.iter().map(|b| b.as_ref().map(binding_hash_key)).collect();
+            let hash_key: Vec<Option<HashKey>> = key_bindings
+                .iter()
+                .map(|b| b.as_ref().map(binding_hash_key).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
             let group_idx = *group_index.entry(hash_key).or_insert_with(|| {
                 groups.push(Group {
                     key_bindings: key_bindings.clone(),
@@ -1041,11 +1240,12 @@ impl<'a> Executor<'a> {
                 let edge = GraphStore::get_edge_in_txn(txn, *id)?;
                 Ok(edge.and_then(|e| e.props.get(&pa.prop).cloned()))
             }
-            // A WITH-projected scalar (or list) has no `.prop` to access —
-            // e.g. `WITH message.id AS messageId` then `messageId.foo`
-            // isn't meaningful. Treat as absent rather than erroring,
-            // consistent with how a missing property already behaves.
-            Binding::Value(_) | Binding::List(_) => Ok(None),
+            // A WITH-projected scalar (or list/path) has no `.prop` to
+            // access — e.g. `WITH message.id AS messageId` then
+            // `messageId.foo` isn't meaningful. Treat as absent rather
+            // than erroring, consistent with how a missing property
+            // already behaves.
+            Binding::Value(_) | Binding::List(_) | Binding::Path(_) => Ok(None),
         }
     }
 
@@ -1186,7 +1386,7 @@ impl<'a> Executor<'a> {
                             GraphStore::delete_edge_in_txn(write_txn, *id)?;
                         }
                     }
-                    Binding::Value(_) | Binding::List(_) => {
+                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
                         )))
@@ -1217,7 +1417,7 @@ impl<'a> Executor<'a> {
                     Binding::Edge(id) => {
                         GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                     }
-                    Binding::Value(_) | Binding::List(_) => {
+                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
                             pa.var
@@ -1372,13 +1572,23 @@ fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
 /// the same group iff the same node **identity**, not equal-by-struct-
 /// contents). `Binding::List`'s elements are `Value`s already, so those
 /// delegate to `value_hash_key` directly.
-fn binding_hash_key(b: &Binding) -> HashKey {
-    match b {
+fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
+    Ok(match b {
         Binding::Node(id) => HashKey::Node(*id),
         Binding::Edge(id) => HashKey::Edge(*id),
         Binding::Value(pv) => property_value_hash_key(pv),
-        Binding::List(items) => HashKey::List(items.iter().map(value_hash_key).collect()),
-    }
+        Binding::List(items) => HashKey::List(items.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?),
+        // Explicit error, not a silent hash-by-something-arbitrary —
+        // grouping/collecting by a captured path isn't a case any real
+        // usage needs, and this codebase's stance is to reject an
+        // untested shape rather than guess at its semantics.
+        Binding::Path(_) => {
+            return Err(QueryError::Parse(
+                "grouping or collecting by a path (e.g. a named-path/shortestPath() variable) isn't supported"
+                    .into(),
+            ))
+        }
+    })
 }
 
 /// Converts a finished `AggAcc::finish()` result to the `Binding` it's
@@ -1407,8 +1617,132 @@ fn value_to_binding_restore(v: &Value) -> Binding {
         Value::Property(pv) => Binding::Value(pv.clone()),
         Value::Literal(lit) => Binding::Value(literal_to_value(lit)),
         Value::List(items) => Binding::List(items.clone()),
+        Value::Path(elems) => Binding::Path(elems.iter().map(path_elem_to_binding).collect()),
         Value::Null => Binding::Value(PropertyValue::Null),
     }
+}
+
+fn path_elem_to_binding(elem: &PathElem) -> PathBinding {
+    match elem {
+        PathElem::Node(n) => PathBinding::Node(n.id),
+        PathElem::Edge(e) => PathBinding::Edge(e.id),
+    }
+}
+
+/// When a path is being captured, every hop's rel/node needs a trackable
+/// binding even if the user left it anonymous — `Expand` only inserts a
+/// `rel_var` into the row `if let Some(rv) = rel_var`, silently dropping
+/// anonymous rels, which is fine for ordinary matching but loses exactly
+/// the information path assembly needs. Returns a clone of `pattern` with
+/// every position named (synthesizing `__path_elemN` for anything
+/// anonymous), plus the set of names that were synthesized so
+/// `execute_match` can strip them from the row again after `assemble_path`
+/// runs — they were never something the user could reference. Only this
+/// renamed clone is used for plan-building/OPTIONAL-MATCH null-padding
+/// bookkeeping *within this one clause*; `carried_vars` (what's exposed to
+/// later clauses) is still computed from the original `part.pattern`
+/// elsewhere, so synthesized names never leak past this function's caller.
+fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
+    fn fresh(counter: &mut usize, synthesized: &mut HashSet<String>) -> String {
+        *counter += 1;
+        let name = format!("__path_elem{counter}");
+        synthesized.insert(name.clone());
+        name
+    }
+    let mut counter = 0usize;
+    let mut synthesized = HashSet::new();
+    let mut start = pattern.start.clone();
+    if start.var.is_none() {
+        start.var = Some(fresh(&mut counter, &mut synthesized));
+    }
+    let hops = pattern
+        .hops
+        .iter()
+        .map(|(rel, node)| {
+            let mut rel = rel.clone();
+            if rel.var.is_none() {
+                rel.var = Some(fresh(&mut counter, &mut synthesized));
+            }
+            let mut node = node.clone();
+            if node.var.is_none() {
+                node.var = Some(fresh(&mut counter, &mut synthesized));
+            }
+            (rel, node)
+        })
+        .collect();
+    (Pattern { start, hops }, synthesized)
+}
+
+/// Assembles a `Binding::Path` from `pattern`'s (fully-named, via
+/// `name_pattern_for_path`) start/hop variables, in pattern order. Falls
+/// back to `Binding::Value(Null)` — never errors — if any position isn't a
+/// real node/edge binding, which only happens when this row came from
+/// `OPTIONAL MATCH` null-padding (every position `name_pattern_for_path`
+/// named is guaranteed present in the row either way, as a real binding or
+/// as `Binding::Value(Null)`, so "missing key" isn't a case this needs to
+/// handle) — same "no match survives as Null, not a dropped row" outcome
+/// `OPTIONAL MATCH` already gives every other variable.
+fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
+    let Some(start_id) = path_node_id(pattern.start.var.as_deref(), row) else {
+        return Binding::Value(PropertyValue::Null);
+    };
+    let mut elems = vec![PathBinding::Node(start_id)];
+    for (rel, node) in &pattern.hops {
+        let Some(edge_id) = path_edge_id(rel.var.as_deref(), row) else {
+            return Binding::Value(PropertyValue::Null);
+        };
+        let Some(node_id) = path_node_id(node.var.as_deref(), row) else {
+            return Binding::Value(PropertyValue::Null);
+        };
+        elems.push(PathBinding::Edge(edge_id));
+        elems.push(PathBinding::Node(node_id));
+    }
+    Binding::Path(elems)
+}
+
+fn path_node_id(var: Option<&str>, row: &BindingRow) -> Option<NodeId> {
+    match var.and_then(|v| row.get(v)) {
+        Some(Binding::Node(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+fn path_edge_id(var: Option<&str>, row: &BindingRow) -> Option<EdgeId> {
+    match var.and_then(|v| row.get(v)) {
+        Some(Binding::Edge(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+fn require_bound_node(row: &BindingRow, var: &str) -> Result<NodeId, QueryError> {
+    match row.get(var) {
+        Some(Binding::Node(id)) => Ok(*id),
+        _ => Err(QueryError::UnboundVariable(format!(
+            "'{var}' must already be bound to a node before shortestPath() — match it in a preceding MATCH"
+        ))),
+    }
+}
+
+/// Walks `parent` (populated by `shortest_path_between`'s BFS) backward
+/// from `end` to `start`, then reverses — `parent` only ever needs to
+/// answer "how did BFS first reach this node," not support any other
+/// traversal, so a plain `HashMap` (not a `LogicalPlan`/adjacency
+/// structure) is enough.
+fn reconstruct_path(parent: &HashMap<NodeId, (NodeId, EdgeId)>, start: NodeId, end: NodeId) -> Vec<PathBinding> {
+    let mut hops = Vec::new();
+    let mut current = end;
+    while current != start {
+        let (prev, edge_id) = parent[&current];
+        hops.push((edge_id, current));
+        current = prev;
+    }
+    hops.reverse();
+    let mut elems = vec![PathBinding::Node(start)];
+    for (edge_id, node) in hops {
+        elems.push(PathBinding::Edge(edge_id));
+        elems.push(PathBinding::Node(node));
+    }
+    elems
 }
 
 /// `WithExpr::Compare`'s value-vs-literal comparison — reuses `compare()`
@@ -1420,7 +1754,7 @@ fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> bool {
         Value::Null => None,
         Value::Property(pv) => Some(pv.clone()),
         Value::Literal(l) => Some(literal_to_value(l)),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) => None,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => None,
     };
     compare(&prop, op, lit)
 }
@@ -1439,7 +1773,7 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
         Value::Null => PropertyValue::Null,
         Value::Property(pv) => pv.clone(),
         Value::Literal(lit) => literal_to_value(lit),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) => PropertyValue::Null,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => PropertyValue::Null,
     }
 }
 
@@ -1585,6 +1919,17 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             .cloned()
             .unwrap_or(Value::Null)),
         "tointeger" => Ok(args.first().map(to_integer).unwrap_or(Value::Null)),
+        // The dominant real-world use of shortestPath() is measuring it
+        // (degrees-of-separation queries), not returning/rendering the
+        // raw path object — path elements alternate node/edge/.../node,
+        // so edge count is (elements.len() - 1) / 2.
+        "length" => Ok(match args.first() {
+            Some(Value::Path(elems)) => Value::Property(PropertyValue::Int(((elems.len().max(1) - 1) / 2) as i64)),
+            Some(Value::Null) | None => Value::Null,
+            Some(other) => {
+                return Err(QueryError::Parse(format!("length() expects a path, got {other:?}")))
+            }
+        }),
         other => Err(QueryError::Parse(format!("unknown function: {other}"))),
     }
 }

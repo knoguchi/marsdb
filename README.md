@@ -130,19 +130,27 @@ first, creates exactly one new instance if nothing matched) — capped at
 one relationship hop (`MERGE (n:Label {props})` or `MERGE (a)-[:TYPE]->
 (b)`); an unconstrained node pattern that isn't already bound (`MERGE
 (n)`, no label or property) is rejected rather than matching/creating
-arbitrarily.
+arbitrarily. Named-path capture (`MATCH p = (a)-[:KNOWS]->(b) RETURN p`,
+fixed-hop patterns only) and `shortestPath((a)-[:TYPE*..N]-(b))` (real
+shortest-path search via BFS, not just the first path found — both
+endpoints must already be matched by a preceding clause), plus
+`length(p)` to measure one.
 
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
-verified: LDBC's complex queries (IC1-14: named paths/`shortestPath()`,
-and the full query set beyond one hand-crafted
-grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` checkpoint —
-see `marsdb-query/tests/smoke.rs`), comma-separated patterns *within one*
-`MATCH`/`CREATE` clause beyond a single linear chain (general
+verified: LDBC's complex queries (IC1-14: the full query set beyond one
+hand-crafted grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()`
+checkpoint — see `marsdb-query/tests/smoke.rs`), comma-separated patterns
+*within one* `MATCH`/`CREATE` clause beyond a single linear chain (general
 cross-joins — different from the cross-join WITH-chaining above, which
-works), chaining past one `WITH` boundary, or `MERGE` patterns with more
-than one relationship hop (whole-pattern atomicity across multiple
-simultaneously-unbound hops isn't attempted).
+works), chaining past one `WITH` boundary, `MERGE` patterns with more than
+one relationship hop (whole-pattern atomicity across multiple
+simultaneously-unbound hops isn't attempted), named-path capture over a
+variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain
+needed to reconstruct a path over `*`-traversal), or `shortestPath()` with
+a minimum hop count greater than 1 (a plain visited-set BFS can't
+correctly answer "shortest path of at least N hops" for N > 1 without a
+different algorithm).
 
 ## Roadmap
 
@@ -150,7 +158,6 @@ simultaneously-unbound hops isn't attempted).
 - `RETURN DISTINCT` (result-set-level dedup; `DISTINCT` inside an
   aggregate call already works)
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
-- Named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
