@@ -20,6 +20,7 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
             pattern,
             where_clause,
             tail,
+            order_by,
             limit: _,
         } => {
             substitute_pattern(pattern, params)?;
@@ -27,6 +28,11 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
                 substitute_expr(expr, params)?;
             }
             substitute_tail(tail, params)?;
+            if let Some(items) = order_by {
+                for (expr, _) in items {
+                    substitute_return_expr(expr, params)?;
+                }
+            }
         }
     }
     Ok(())

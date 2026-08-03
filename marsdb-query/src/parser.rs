@@ -42,6 +42,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let mut pattern = None;
     let mut where_clause = None;
     let mut tail = None;
+    let mut order_by = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -51,6 +52,14 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
                 where_clause = Some(parse_expr(expr_pair)?);
             }
             Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
+            Rule::order_by_clause => {
+                let items = p
+                    .into_inner()
+                    .filter(|c| c.as_rule() == Rule::sort_item)
+                    .map(parse_sort_item)
+                    .collect::<Result<Vec<_>, _>>()?;
+                order_by = Some(items);
+            }
             Rule::limit_clause => {
                 let n_pair = p.into_inner().next().expect("LIMIT has an int_literal");
                 let n = n_pair
@@ -67,8 +76,19 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         where_clause,
         tail: tail
             .ok_or_else(|| QueryError::Parse("MATCH requires RETURN/DELETE/SET".into()))?,
+        order_by,
         limit,
     })
+}
+
+fn parse_sort_item(pair: Pair<Rule>) -> Result<(ReturnExpr, SortDir), QueryError> {
+    let mut inner = pair.into_inner();
+    let expr = parse_return_expr(inner.next().expect("sort_item has a return_expr"))?;
+    let dir = match inner.next() {
+        Some(d) if d.as_str().eq_ignore_ascii_case("desc") => SortDir::Desc,
+        _ => SortDir::Asc,
+    };
+    Ok((expr, dir))
 }
 
 fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {

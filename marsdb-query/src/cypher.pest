@@ -6,7 +6,7 @@ statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
-match_stmt  = { ^"MATCH" ~ pattern ~ where_clause? ~ tail_clause ~ limit_clause? }
+match_stmt  = { ^"MATCH" ~ pattern ~ where_clause? ~ tail_clause ~ order_by_clause? ~ limit_clause? }
 
 tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause }
 
@@ -27,8 +27,11 @@ delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 set_clause            = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
 set_item               = { prop_access ~ "=" ~ literal }
 
-where_clause = { ^"WHERE" ~ expr }
-limit_clause = { ^"LIMIT" ~ int_literal }
+where_clause    = { ^"WHERE" ~ expr }
+limit_clause    = { ^"LIMIT" ~ int_literal }
+order_by_clause = { ^"ORDER" ~ ^"BY" ~ sort_item ~ ("," ~ sort_item)* }
+sort_item       = { return_expr ~ sort_dir? }
+sort_dir        = { ^"ASC" | ^"DESC" }
 
 pattern = { node_pattern ~ (rel_pattern ~ node_pattern)* }
 

@@ -195,3 +195,68 @@ fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
         other => panic!("unexpected value {other:?}"),
     }
 }
+
+#[test]
+fn order_by_multi_key_against_aliases_not_raw_bindings() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Charlie', age: 30})");
+    run(&store, "CREATE (b:Person {name: 'Alice', age: 30})");
+    run(&store, "CREATE (c:Person {name: 'Bob', age: 25})");
+
+    // Sort keys are aliases (personAge/personName), not raw pattern vars —
+    // this is the shape every IS-query ORDER BY actually uses.
+    let result = run(
+        &store,
+        "MATCH (n:Person) RETURN n.age AS personAge, n.name AS personName ORDER BY personAge DESC, personName ASC",
+    );
+    let names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice".to_string(), "Charlie".to_string(), "Bob".to_string()]);
+}
+
+#[test]
+fn order_by_then_limit_sorts_before_truncating() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x ORDER BY x DESC LIMIT 2");
+    let values: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    // Must be the top 2 by DESC order (4, 3), not an arbitrary 2 rows
+    // taken before sorting.
+    assert_eq!(values, vec![4, 3]);
+}
+
+#[test]
+fn order_by_with_function_call_key() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {code: '20'})");
+    run(&store, "CREATE (b:Person {code: '3'})");
+    // toInteger(personId) as an ORDER BY key, matching IS3's shape.
+    let result = run(
+        &store,
+        "MATCH (n:Person) RETURN n.code AS personId ORDER BY toInteger(personId) ASC",
+    );
+    let values: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec!["3".to_string(), "20".to_string()]);
+}

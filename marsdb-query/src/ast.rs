@@ -64,6 +64,12 @@ pub struct ReturnItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelDirection {
     /// (a)-[..]->(b)
     Right,
@@ -109,6 +115,11 @@ pub enum Statement {
         pattern: Pattern,
         where_clause: Option<Expr>,
         tail: Tail,
+        /// Only meaningful for `Tail::Return`; evaluated against the
+        /// projected/aliased output row, not the raw pattern bindings —
+        /// every ORDER BY key in practice is a RETURN alias, not a bare
+        /// pattern variable.
+        order_by: Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     },
 }

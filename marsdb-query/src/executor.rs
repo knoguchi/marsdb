@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use marsdb_graph::{EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
 
-use crate::ast::{CompareOp, Expr, Literal, Pattern, PropAccess, RelDirection, ReturnExpr, ReturnItem, Statement, Tail};
+use crate::ast::{
+    CompareOp, Expr, Literal, Pattern, PropAccess, RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail,
+};
 use crate::error::QueryError;
 use crate::ir::LogicalPlan;
 use crate::planner::build_match_plan;
@@ -40,8 +42,9 @@ impl<'a> Executor<'a> {
                 pattern,
                 where_clause,
                 tail,
+                order_by,
                 limit,
-            } => self.execute_match(&write_txn, pattern, where_clause, tail, *limit),
+            } => self.execute_match(&write_txn, pattern, where_clause, tail, order_by, *limit),
         };
         match outcome {
             Ok(result) => {
@@ -89,22 +92,38 @@ impl<'a> Executor<'a> {
         pattern: &Pattern,
         where_clause: &Option<Expr>,
         tail: &Tail,
+        order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
         let mut plan = build_match_plan(pattern, where_clause);
-        if let Some(count) = limit {
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                count,
-            };
+        // ORDER BY must see every matching row before LIMIT truncates —
+        // sort, then take N, not the other way around. Only skip the
+        // pre-materialization limit (the v1 "doesn't short-circuit" path)
+        // when there's no ORDER BY to invalidate it; DELETE/SET+LIMIT keep
+        // their existing "stop after N bindings" behavior since they have
+        // no ORDER BY position in the grammar.
+        if order_by.is_none() {
+            if let Some(count) = limit {
+                plan = LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    count,
+                };
+            }
         }
         let rows = self.eval_plan(write_txn, &plan)?;
-        match tail {
-            Tail::Return(items) => self.materialize_return(write_txn, items, &rows),
-            Tail::Delete(vars) => self.materialize_delete(write_txn, vars, &rows, false),
-            Tail::DetachDelete(vars) => self.materialize_delete(write_txn, vars, &rows, true),
-            Tail::Set(items) => self.materialize_set(write_txn, items, &rows),
+        let mut result = match tail {
+            Tail::Return(items) => self.materialize_return(write_txn, items, &rows)?,
+            Tail::Delete(vars) => self.materialize_delete(write_txn, vars, &rows, false)?,
+            Tail::DetachDelete(vars) => self.materialize_delete(write_txn, vars, &rows, true)?,
+            Tail::Set(items) => self.materialize_set(write_txn, items, &rows)?,
+        };
+        if let Some(order_by) = order_by {
+            result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
+            if let Some(count) = limit {
+                result.rows.truncate(count.max(0) as usize);
+            }
         }
+        Ok(result)
     }
 
     fn eval_plan(&self, write_txn: &WriteTransaction, plan: &LogicalPlan) -> Result<Vec<BindingRow>, QueryError> {
@@ -478,5 +497,141 @@ fn to_integer(v: &Value) -> Value {
         Value::Literal(Literal::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
         Value::Literal(Literal::String(s)) => as_str_parse(s),
         _ => Value::Null,
+    }
+}
+
+/// Sorts `rows` (already-projected `RETURN`/`WITH` output, `columns`
+/// aligned by index) by `order_by`, which evaluates against the projected
+/// column names — never the raw pattern `BindingRow` — since every ORDER BY
+/// key in practice is a RETURN/WITH alias, not a bare pattern variable.
+fn apply_order_by(
+    rows: Vec<Vec<Value>>,
+    columns: &[String],
+    order_by: &[(ReturnExpr, SortDir)],
+) -> Result<Vec<Vec<Value>>, QueryError> {
+    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row_map: HashMap<String, Value> = columns.iter().cloned().zip(row.iter().cloned()).collect();
+        let keys = order_by
+            .iter()
+            .map(|(expr, _)| eval_projected_expr(expr, &row_map))
+            .collect::<Result<Vec<_>, _>>()?;
+        keyed.push((keys, row));
+    }
+    keyed.sort_by(|(ka, _), (kb, _)| {
+        for (i, (_, dir)) in order_by.iter().enumerate() {
+            let ord = compare_with_dir(&ka[i], &kb[i], *dir);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(keyed.into_iter().map(|(_, row)| row).collect())
+}
+
+/// Same expression shape as `eval_return_expr`, but resolves `Var`/`Prop`
+/// against already-projected output columns instead of the graph-bound
+/// `BindingRow` — no `WriteTransaction`/`GraphStore` access needed, since a
+/// projected `Value::Node`/`Value::Edge` already carries its full record
+/// (including props) from when it was first materialized.
+fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Result<Value, QueryError> {
+    match expr {
+        ReturnExpr::Var(name) => row
+            .get(name)
+            .cloned()
+            .ok_or_else(|| QueryError::UnboundVariable(name.clone())),
+        ReturnExpr::Prop(pa) => {
+            let base = row
+                .get(&pa.var)
+                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            let pv = match base {
+                Value::Node(n) => n.props.get(&pa.prop).cloned(),
+                Value::Edge(e) => e.props.get(&pa.prop).cloned(),
+                _ => None,
+            };
+            Ok(match pv {
+                Some(PropertyValue::Null) | None => Value::Null,
+                Some(v) => Value::Property(v),
+            })
+        }
+        ReturnExpr::Lit(lit) => Ok(match lit {
+            Literal::Null => Value::Null,
+            other => Value::Literal(other.clone()),
+        }),
+        ReturnExpr::Call(name, args) => {
+            let arg_values = args
+                .iter()
+                .map(|a| eval_projected_expr(a, row))
+                .collect::<Result<Vec<_>, _>>()?;
+            call_builtin(name, &arg_values)
+        }
+        ReturnExpr::Case { test, whens, else_ } => {
+            let test_value = match test {
+                Some(t) => Some(eval_projected_expr(t, row)?),
+                None => None,
+            };
+            for (when, then) in whens {
+                let when_value = eval_projected_expr(when, row)?;
+                let matched = match &test_value {
+                    Some(tv) => value_eq(tv, &when_value),
+                    None => matches!(when_value, Value::Literal(Literal::Bool(true))),
+                };
+                if matched {
+                    return eval_projected_expr(then, row);
+                }
+            }
+            match else_ {
+                Some(e) => eval_projected_expr(e, row),
+                None => Ok(Value::Null),
+            }
+        }
+    }
+}
+
+/// NULLs sort last regardless of ASC/DESC (matches Neo4j's documented
+/// behavior) — only non-null comparisons get reversed for DESC.
+fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = matches!(a, Value::Null);
+    let b_null = matches!(b, Value::Null);
+    match (a_null, b_null) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    let ord = compare_non_null(a, b);
+    if dir == SortDir::Desc {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let pa = value_to_comparable(a);
+    let pb = value_to_comparable(b);
+    match (pa, pb) {
+        (Some(PropertyValue::Int(x)), Some(PropertyValue::Int(y))) => x.cmp(&y),
+        (Some(PropertyValue::Int(x)), Some(PropertyValue::Float(y))) => {
+            (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
+        (Some(PropertyValue::Float(x)), Some(PropertyValue::Int(y))) => {
+            x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal)
+        }
+        (Some(PropertyValue::Float(x)), Some(PropertyValue::Float(y))) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
+        (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
+        _ => Ordering::Equal,
+    }
+}
+
+fn value_to_comparable(v: &Value) -> Option<PropertyValue> {
+    match v {
+        Value::Property(pv) => Some(pv.clone()),
+        Value::Literal(lit) => Some(literal_to_value(lit)),
+        _ => None,
     }
 }
