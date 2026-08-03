@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use marsdb_graph::PropertyValue;
 
-use crate::ast::{Expr, Literal, NodePattern, Pattern, ReturnExpr, Statement, Tail};
+use crate::ast::{Expr, Literal, NodePattern, Pattern, QueryPart, ReturnExpr, Statement, Tail, WithClause};
 use crate::error::QueryError;
 
 /// Resolves every `$name` placeholder in `stmt` to a concrete `Literal`
@@ -17,15 +17,13 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
             }
         }
         Statement::Match {
-            pattern,
-            where_clause,
+            parts,
             tail,
             order_by,
             limit: _,
         } => {
-            substitute_pattern(pattern, params)?;
-            if let Some(expr) = where_clause {
-                substitute_expr(expr, params)?;
+            for part in parts {
+                substitute_query_part(part, params)?;
             }
             substitute_tail(tail, params)?;
             if let Some(items) = order_by {
@@ -33,6 +31,29 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
                     substitute_return_expr(expr, params)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn substitute_query_part(part: &mut QueryPart, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    substitute_pattern(&mut part.pattern, params)?;
+    if let Some(expr) = &mut part.where_clause {
+        substitute_expr(expr, params)?;
+    }
+    if let Some(with) = &mut part.with {
+        substitute_with_clause(with, params)?;
+    }
+    Ok(())
+}
+
+fn substitute_with_clause(with: &mut WithClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    for item in &mut with.items {
+        substitute_return_expr(&mut item.expr, params)?;
+    }
+    if let Some(items) = &mut with.order_by {
+        for (expr, _) in items {
+            substitute_return_expr(expr, params)?;
         }
     }
     Ok(())

@@ -39,46 +39,140 @@ fn parse_create_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
 }
 
 fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
-    let mut pattern = None;
-    let mut where_clause = None;
+    let mut parts = Vec::new();
     let mut tail = None;
     let mut order_by = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::pattern => pattern = Some(parse_pattern(p)?),
+            Rule::match_part => parts.push(parse_match_part(p)?),
+            Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
+            Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
+            Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
+            r => unreachable!("unexpected match_stmt child rule {r:?}"),
+        }
+    }
+
+    // Mirrors real Cypher's rule that multiple reading clauses need a WITH
+    // between them, and additionally caps chaining at one WITH boundary
+    // total — nothing IS1-7 needs requires more, and a hand-rolled parser
+    // is safer erroring on untested shapes than silently mishandling them.
+    let with_count = parts.iter().filter(|p| p.with.is_some()).count();
+    if with_count > 1 {
+        return Err(QueryError::Parse(
+            "chaining past one WITH boundary in a single MATCH isn't supported yet".into(),
+        ));
+    }
+    for (i, part) in parts.iter().enumerate() {
+        if i + 1 < parts.len() && part.with.is_none() {
+            return Err(QueryError::Parse(
+                "multiple MATCH clauses must be separated by WITH".into(),
+            ));
+        }
+    }
+
+    Ok(Statement::Match {
+        parts,
+        tail: tail.ok_or_else(|| QueryError::Parse("MATCH requires RETURN/DELETE/SET".into()))?,
+        order_by,
+        limit,
+    })
+}
+
+fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
+    let mut patterns = Vec::new();
+    let mut where_clause = None;
+    let mut with = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::pattern => patterns.push(parse_pattern(p)?),
             Rule::where_clause => {
                 let expr_pair = p.into_inner().next().expect("WHERE has an expr");
                 where_clause = Some(parse_expr(expr_pair)?);
             }
-            Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
-            Rule::order_by_clause => {
-                let items = p
-                    .into_inner()
-                    .filter(|c| c.as_rule() == Rule::sort_item)
-                    .map(parse_sort_item)
-                    .collect::<Result<Vec<_>, _>>()?;
-                order_by = Some(items);
-            }
-            Rule::limit_clause => {
-                let n_pair = p.into_inner().next().expect("LIMIT has an int_literal");
-                let n = n_pair
-                    .as_str()
-                    .parse::<i64>()
-                    .map_err(|_| QueryError::Parse("invalid LIMIT value".into()))?;
-                limit = Some(n);
-            }
-            r => unreachable!("unexpected match_stmt child rule {r:?}"),
+            Rule::with_clause => with = Some(parse_with_clause(p)?),
+            r => unreachable!("unexpected match_part child rule {r:?}"),
         }
     }
-    Ok(Statement::Match {
-        pattern: pattern.ok_or_else(|| QueryError::Parse("MATCH requires a pattern".into()))?,
+    let pattern = splice_patterns(patterns)?;
+    Ok(QueryPart {
+        pattern,
         where_clause,
-        tail: tail
-            .ok_or_else(|| QueryError::Parse("MATCH requires RETURN/DELETE/SET".into()))?,
-        order_by,
-        limit,
+        with,
     })
+}
+
+fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
+    let mut items = Vec::new();
+    let mut order_by = None;
+    let mut limit = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::return_item => items.push(parse_return_item(p)?),
+            Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
+            Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
+            r => unreachable!("unexpected with_clause child rule {r:?}"),
+        }
+    }
+    Ok(WithClause { items, order_by, limit })
+}
+
+fn parse_order_by_clause(pair: Pair<Rule>) -> Result<Vec<(ReturnExpr, SortDir)>, QueryError> {
+    pair.into_inner()
+        .filter(|c| c.as_rule() == Rule::sort_item)
+        .map(parse_sort_item)
+        .collect()
+}
+
+fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
+    let n_pair = pair.into_inner().next().expect("LIMIT has an int_literal");
+    n_pair
+        .as_str()
+        .parse::<i64>()
+        .map_err(|_| QueryError::Parse("invalid LIMIT value".into()))
+}
+
+/// Merges comma-separated patterns within one `MATCH` into a single linear
+/// `Pattern`. Not a general cross-join — each subsequent pattern's start
+/// variable must be exactly the previous pattern's last-introduced
+/// variable (e.g. IS2's `MATCH (message)-[...]->(post:Post), (post)-[...]->
+/// (person)`, where `post` is both the first pattern's end and the second's
+/// start). Any labels/props the continuing pattern restates on that shared
+/// variable are merged in as additional filters. Non-linear/branching
+/// comma patterns (sharing a variable that isn't this exact splice point)
+/// are rejected rather than silently mishandled.
+fn splice_patterns(mut patterns: Vec<Pattern>) -> Result<Pattern, QueryError> {
+    if patterns.is_empty() {
+        return Err(QueryError::Parse("MATCH requires a pattern".into()));
+    }
+    let mut combined = patterns.remove(0);
+    for next in patterns {
+        let Some(start_var) = next.start.var.clone() else {
+            return Err(QueryError::Parse(
+                "a comma-separated MATCH pattern must start from a named variable".into(),
+            ));
+        };
+        let last_var = combined
+            .hops
+            .last()
+            .map(|(_, n)| n.var.clone())
+            .unwrap_or_else(|| combined.start.var.clone());
+        if last_var.as_deref() != Some(start_var.as_str()) {
+            return Err(QueryError::Parse(format!(
+                "comma-separated MATCH pattern must continue from the previous pattern's last \
+                 variable ('{}'), not '{start_var}' — general cross-joins aren't supported",
+                last_var.unwrap_or_default()
+            )));
+        }
+        let target = match combined.hops.last_mut() {
+            Some((_, node)) => node,
+            None => &mut combined.start,
+        };
+        target.labels.extend(next.start.labels);
+        target.props.extend(next.start.props);
+        combined.hops.extend(next.hops);
+    }
+    Ok(combined)
 }
 
 fn parse_sort_item(pair: Pair<Rule>) -> Result<(ReturnExpr, SortDir), QueryError> {

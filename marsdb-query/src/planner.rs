@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::ast::{CompareOp, Expr, NodePattern, Pattern, PropAccess, RelDirection};
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -26,10 +28,21 @@ impl VarNamer {
     }
 }
 
-pub fn build_match_plan(pattern: &Pattern, where_clause: &Option<Expr>) -> Result<LogicalPlan, QueryError> {
+pub fn build_match_plan(
+    pattern: &Pattern,
+    where_clause: &Option<Expr>,
+    carried_vars: &HashSet<String>,
+) -> Result<LogicalPlan, QueryError> {
     let mut namer = VarNamer::new();
     let start_var = namer.name(&pattern.start.var);
-    let mut plan = scan_for(&start_var, &pattern.start);
+    let mut plan = if carried_vars.contains(&start_var) {
+        // Already bound by a prior QueryPart's WITH output — continue from
+        // it instead of re-scanning, same Filter treatment as a hop node
+        // (no preceding scan narrowed it, so check every listed label).
+        wrap_labels_and_props(LogicalPlan::Seed { var: start_var.clone() }, &start_var, &pattern.start, 0)
+    } else {
+        scan_for(&start_var, &pattern.start)
+    };
     let mut from_var = start_var;
     for (rel, node) in &pattern.hops {
         let to_var = namer.name(&node.var);

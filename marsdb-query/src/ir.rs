@@ -2,13 +2,15 @@
 //!
 //! Deliberately close to Neo4j's Cypher runtime operator shape, and maps
 //! ~1:1 onto TinkerPop Gremlin traversal steps (`g.V().hasLabel(X)` ->
-//! NodeByLabelScan+Filter, `.out('REL')` -> Expand, `.limit(n)` -> Limit) so
-//! a future Gremlin frontend can compile into this same IR without
-//! redesigning the executor.
+//! NodeByLabelScan+Filter, `.out('REL')` -> Expand) so a future Gremlin
+//! frontend can compile into this same IR without redesigning the
+//! executor.
 //!
 //! CREATE has no traversal/filtering semantics (it only ever produces new
 //! rows), so it's executed directly from the AST rather than through this
-//! IR — see `executor::execute_create`.
+//! IR — see `executor::execute_create`. `LIMIT`/`ORDER BY` aren't IR nodes
+//! either — they're executor-level post-processing over the materialized
+//! row set (see `execute_match`), not something the plan tree represents.
 
 use crate::ast::Expr;
 
@@ -32,6 +34,15 @@ pub enum LogicalPlan {
     NodeByLabelScan {
         var: String,
         label: String,
+    },
+    /// "Start from the rows already bound coming into this statement" —
+    /// used when a `QueryPart`'s pattern start-variable was already bound
+    /// by a prior part's `WITH` output, instead of a fresh
+    /// `AllNodesScan`/`NodeByLabelScan`. A leaf like the scans above, but
+    /// reads externally-supplied rows (the executor's `seed` parameter)
+    /// rather than the graph.
+    Seed {
+        var: String,
     },
     Expand {
         input: Box<LogicalPlan>,
@@ -59,9 +70,5 @@ pub enum LogicalPlan {
     Filter {
         input: Box<LogicalPlan>,
         predicate: Expr,
-    },
-    Limit {
-        input: Box<LogicalPlan>,
-        count: i64,
     },
 }

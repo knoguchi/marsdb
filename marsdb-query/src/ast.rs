@@ -114,12 +114,39 @@ pub enum Tail {
     Set(Vec<(PropAccess, Literal)>),
 }
 
+/// A `WITH` clause: projects/renames the current bindings, optionally
+/// filtered/sorted/limited at that boundary, and becomes the binding scope
+/// for whatever follows (the next `QueryPart`, or the final `Tail`).
+#[derive(Debug, Clone)]
+pub struct WithClause {
+    pub items: Vec<ReturnItem>,
+    pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
+    pub limit: Option<i64>,
+}
+
+/// One `MATCH <pattern>[, <pattern>...] [WHERE ...] [WITH ...]` segment.
+/// Comma-separated patterns within one part are spliced into a single
+/// linear `Pattern` at parse time (see `parser::splice_patterns`) — this
+/// only ever holds one already-combined `Pattern`, not several.
+#[derive(Debug, Clone)]
+pub struct QueryPart {
+    pub pattern: Pattern,
+    pub where_clause: Option<Expr>,
+    pub with: Option<WithClause>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Statement {
     Create(Vec<Pattern>),
     Match {
-        pattern: Pattern,
-        where_clause: Option<Expr>,
+        /// One or more `MATCH ... [WITH ...]` segments. The parser enforces
+        /// every part except the last has a `with` (matching real Cypher's
+        /// rule that multiple reading clauses must be separated by WITH)
+        /// and that at most one part has a `with` at all (v1 doesn't
+        /// support chaining past one WITH boundary — nothing in the target
+        /// query set needs it, and it keeps a hand-rolled parser's
+        /// untested-path surface smaller).
+        parts: Vec<QueryPart>,
         tail: Tail,
         /// Only meaningful for `Tail::Return`; evaluated against the
         /// projected/aliased output row, not the raw pattern bindings —

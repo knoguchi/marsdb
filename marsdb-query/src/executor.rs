@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
 
 use crate::ast::{
-    CompareOp, Expr, Literal, Pattern, PropAccess, RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail,
+    CompareOp, Expr, Literal, Pattern, PropAccess, QueryPart, RelDirection, ReturnExpr, ReturnItem, SortDir,
+    Statement, Tail, WithClause,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -11,10 +12,14 @@ use crate::planner::build_match_plan;
 use crate::result::QueryResult;
 use crate::value::Value;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Binding {
     Node(NodeId),
     Edge(EdgeId),
+    /// A scalar carried through a `WITH` projection (e.g. `WITH message.id
+    /// AS messageId`) — no graph identity, just a value along for the ride
+    /// to the next `QueryPart`/the final `Tail`.
+    Value(PropertyValue),
 }
 
 type BindingRow = HashMap<String, Binding>;
@@ -48,12 +53,11 @@ impl<'a> Executor<'a> {
         let outcome = match stmt {
             Statement::Create(patterns) => self.execute_create(&write_txn, patterns),
             Statement::Match {
-                pattern,
-                where_clause,
+                parts,
                 tail,
                 order_by,
                 limit,
-            } => self.execute_match(&write_txn, pattern, where_clause, tail, order_by, *limit),
+            } => self.execute_match(&write_txn, parts, tail, order_by, *limit),
         };
         match outcome {
             Ok(result) => {
@@ -108,33 +112,48 @@ impl<'a> Executor<'a> {
     fn execute_match(
         &self,
         write_txn: &WriteTransaction,
-        pattern: &Pattern,
-        where_clause: &Option<Expr>,
+        parts: &[QueryPart],
         tail: &Tail,
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
-        let mut plan = build_match_plan(pattern, where_clause)?;
-        // ORDER BY must see every matching row before LIMIT truncates —
-        // sort, then take N, not the other way around. Only skip the
-        // pre-materialization limit (the v1 "doesn't short-circuit" path)
-        // when there's no ORDER BY to invalidate it; DELETE/SET+LIMIT keep
-        // their existing "stop after N bindings" behavior since they have
-        // no ORDER BY position in the grammar.
-        if order_by.is_none() {
-            if let Some(count) = limit {
-                plan = LogicalPlan::Limit {
-                    input: Box::new(plan),
-                    count,
-                };
+        // Threads bindings through each MATCH/WITH segment. `carried_vars`
+        // tells the planner which of the next part's pattern variables are
+        // already bound (-> LogicalPlan::Seed) rather than fresh
+        // (-> a scan). Starts empty: the first part never has anything
+        // carried into it.
+        let mut carried_vars: HashSet<String> = HashSet::new();
+        let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
+        for part in parts {
+            let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+            current_rows = self.eval_plan(write_txn, &plan, &current_rows)?;
+            if let Some(with) = &part.with {
+                current_rows = self.materialize_with(write_txn, with, &current_rows)?;
+                if let Some(with_order_by) = &with.order_by {
+                    current_rows = self.apply_order_by_bindings(write_txn, current_rows, with_order_by)?;
+                }
+                if let Some(with_limit) = with.limit {
+                    current_rows.truncate(with_limit.max(0) as usize);
+                }
+                carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
             }
         }
-        let rows = self.eval_plan(write_txn, &plan)?;
+        // ORDER BY must see every matching row before LIMIT truncates —
+        // sort, then take N, not the other way around. Only pre-truncate
+        // (the v1 "doesn't short-circuit" path) when there's no ORDER BY to
+        // invalidate it; DELETE/SET+LIMIT keep their "stop after N
+        // bindings" behavior since they have no ORDER BY position in the
+        // grammar.
+        if order_by.is_none() {
+            if let Some(count) = limit {
+                current_rows.truncate(count.max(0) as usize);
+            }
+        }
         let mut result = match tail {
-            Tail::Return(items) => self.materialize_return(write_txn, items, &rows)?,
-            Tail::Delete(vars) => self.materialize_delete(write_txn, vars, &rows, false)?,
-            Tail::DetachDelete(vars) => self.materialize_delete(write_txn, vars, &rows, true)?,
-            Tail::Set(items) => self.materialize_set(write_txn, items, &rows)?,
+            Tail::Return(items) => self.materialize_return(write_txn, items, &current_rows)?,
+            Tail::Delete(vars) => self.materialize_delete(write_txn, vars, &current_rows, false)?,
+            Tail::DetachDelete(vars) => self.materialize_delete(write_txn, vars, &current_rows, true)?,
+            Tail::Set(items) => self.materialize_set(write_txn, items, &current_rows)?,
         };
         if let Some(order_by) = order_by {
             result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
@@ -145,8 +164,109 @@ impl<'a> Executor<'a> {
         Ok(result)
     }
 
-    fn eval_plan(&self, write_txn: &WriteTransaction, plan: &LogicalPlan) -> Result<Vec<BindingRow>, QueryError> {
+    /// Projects `rows` through a `WITH` clause. Unlike `materialize_return`
+    /// (which resolves everything down to display `Value`s), a bare
+    /// variable reference (`WITH message`) must keep its graph identity
+    /// (`Binding::Node`/`Edge`) so the next `QueryPart` can keep
+    /// traversing from it — only computed expressions collapse to a
+    /// scalar `Binding::Value`.
+    fn materialize_with(
+        &self,
+        write_txn: &WriteTransaction,
+        with: &WithClause,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut new_row = BindingRow::new();
+            for (i, item) in with.items.iter().enumerate() {
+                let name = with_item_output_name((i, item));
+                let binding = match &item.expr {
+                    ReturnExpr::Var(v) => row
+                        .get(v)
+                        .cloned()
+                        .ok_or_else(|| QueryError::UnboundVariable(v.clone()))?,
+                    other => {
+                        let value = self.eval_return_expr(write_txn, other, row)?;
+                        Binding::Value(value_to_property_value(&value))
+                    }
+                };
+                new_row.insert(name, binding);
+            }
+            out.push(new_row);
+        }
+        Ok(out)
+    }
+
+    /// Same sort as `apply_order_by`, but over `BindingRow`s (a `WITH`
+    /// clause's own ORDER BY, which must run before that row set becomes
+    /// the seed for the next `QueryPart` — sorting/limiting a WITH changes
+    /// *which* rows continue, not just their presentation order).
+    fn apply_order_by_bindings(
+        &self,
+        write_txn: &WriteTransaction,
+        rows: Vec<BindingRow>,
+        order_by: &[(ReturnExpr, SortDir)],
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value_map = self.binding_row_to_value_map(write_txn, &row)?;
+            let keys = order_by
+                .iter()
+                .map(|(expr, _)| eval_projected_expr(expr, &value_map))
+                .collect::<Result<Vec<_>, _>>()?;
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|(ka, _), (kb, _)| {
+            for (i, (_, dir)) in order_by.iter().enumerate() {
+                let ord = compare_with_dir(&ka[i], &kb[i], *dir);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        Ok(keyed.into_iter().map(|(_, row)| row).collect())
+    }
+
+    fn binding_row_to_value_map(
+        &self,
+        write_txn: &WriteTransaction,
+        row: &BindingRow,
+    ) -> Result<HashMap<String, Value>, QueryError> {
+        let mut map = HashMap::with_capacity(row.len());
+        for (k, binding) in row {
+            let value = match binding {
+                Binding::Node(id) => Value::Node(
+                    GraphStore::get_node_in_txn(write_txn, *id)?
+                        .expect("bound node exists within this statement's transaction"),
+                ),
+                Binding::Edge(id) => Value::Edge(
+                    GraphStore::get_edge_in_txn(write_txn, *id)?
+                        .expect("bound edge exists within this statement's transaction"),
+                ),
+                Binding::Value(PropertyValue::Null) => Value::Null,
+                Binding::Value(pv) => Value::Property(pv.clone()),
+            };
+            map.insert(k.clone(), value);
+        }
+        Ok(map)
+    }
+
+    fn eval_plan(
+        &self,
+        write_txn: &WriteTransaction,
+        plan: &LogicalPlan,
+        seed: &[BindingRow],
+    ) -> Result<Vec<BindingRow>, QueryError> {
         match plan {
+            LogicalPlan::Seed { var } => {
+                debug_assert!(
+                    seed.first().is_none_or(|row| row.contains_key(var)),
+                    "Seed{{var: {var:?}}} planned for a var not present in the carried-forward rows"
+                );
+                Ok(seed.to_vec())
+            }
             LogicalPlan::AllNodesScan { var } => self.scan(write_txn, var, None),
             LogicalPlan::NodeByLabelScan { var, label } => self.scan(write_txn, var, Some(label)),
             LogicalPlan::Expand {
@@ -157,10 +277,10 @@ impl<'a> Executor<'a> {
                 rel_label,
                 direction,
             } => {
-                let base_rows = self.eval_plan(write_txn, input)?;
+                let base_rows = self.eval_plan(write_txn, input, seed)?;
                 let mut out = Vec::new();
                 for row in base_rows {
-                    let Some(Binding::Node(from_id)) = row.get(from_var).copied() else {
+                    let Some(Binding::Node(from_id)) = row.get(from_var).cloned() else {
                         return Err(QueryError::UnboundVariable(from_var.clone()));
                     };
                     let entries = neighbors_for_direction(write_txn, from_id, *direction, rel_label.as_deref())?;
@@ -184,12 +304,12 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
             } => {
-                let base_rows = self.eval_plan(write_txn, input)?;
+                let base_rows = self.eval_plan(write_txn, input, seed)?;
                 let mut out = Vec::new();
                 let unbounded = max_hops.is_none();
                 let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
                 for row in base_rows {
-                    let Some(Binding::Node(start_id)) = row.get(from_var).copied() else {
+                    let Some(Binding::Node(start_id)) = row.get(from_var).cloned() else {
                         return Err(QueryError::UnboundVariable(from_var.clone()));
                     };
                     let mut visited = HashSet::new();
@@ -235,7 +355,7 @@ impl<'a> Executor<'a> {
                 Ok(out)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let rows = self.eval_plan(write_txn, input)?;
+                let rows = self.eval_plan(write_txn, input, seed)?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     if self.eval_expr(write_txn, predicate, &row)? {
@@ -243,11 +363,6 @@ impl<'a> Executor<'a> {
                     }
                 }
                 Ok(out)
-            }
-            LogicalPlan::Limit { input, count } => {
-                let mut rows = self.eval_plan(write_txn, input)?;
-                rows.truncate((*count).max(0) as usize);
-                Ok(rows)
             }
         }
     }
@@ -302,6 +417,11 @@ impl<'a> Executor<'a> {
                 let edge = GraphStore::get_edge_in_txn(write_txn, *id)?;
                 Ok(edge.and_then(|e| e.props.get(&pa.prop).cloned()))
             }
+            // A WITH-projected scalar has no `.prop` to access — e.g.
+            // `WITH message.id AS messageId` then `messageId.foo` isn't
+            // meaningful. Treat as absent rather than erroring, consistent
+            // with how a missing property already behaves.
+            Binding::Value(_) => Ok(None),
         }
     }
 
@@ -350,6 +470,8 @@ impl<'a> Executor<'a> {
                             .expect("bound edge exists within this statement's transaction");
                         Ok(Value::Edge(edge))
                     }
+                    Binding::Value(PropertyValue::Null) => Ok(Value::Null),
+                    Binding::Value(pv) => Ok(Value::Property(pv.clone())),
                 }
             }
             ReturnExpr::Prop(pa) => {
@@ -423,6 +545,11 @@ impl<'a> Executor<'a> {
                             GraphStore::delete_edge_in_txn(write_txn, *id)?;
                         }
                     }
+                    Binding::Value(_) => {
+                        return Err(QueryError::UnboundVariable(format!(
+                            "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
+                        )))
+                    }
                 }
             }
         }
@@ -449,6 +576,12 @@ impl<'a> Executor<'a> {
                     Binding::Edge(id) => {
                         GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                     }
+                    Binding::Value(_) => {
+                        return Err(QueryError::UnboundVariable(format!(
+                            "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
+                            pa.var
+                        )))
+                    }
                 }
             }
         }
@@ -466,6 +599,28 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Lit(_) => format!("col{idx}"),
         ReturnExpr::Call(name, _) => format!("{name}(...)"),
         ReturnExpr::Case { .. } => format!("case{idx}"),
+    }
+}
+
+/// The name a `WITH`/`RETURN` item is known by afterward — its alias, or
+/// a name derived from the expression (its bare var name, `col{i}`, etc).
+fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
+    item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i))
+}
+
+/// Coerces a materialized `Value` down to a `PropertyValue` for storing in
+/// `Binding::Value` — used when a `WITH` item is a computed expression
+/// (not a bare variable, which instead keeps its `Binding::Node`/`Edge`
+/// identity — see `materialize_with`). `Value::Node`/`Edge` can't occur
+/// here in practice (no `ReturnExpr` form produces one except `Var`, which
+/// takes the bare-variable path instead), so they fall back to `Null`
+/// rather than needing a fallible signature for an unreachable case.
+fn value_to_property_value(v: &Value) -> PropertyValue {
+    match v {
+        Value::Null => PropertyValue::Null,
+        Value::Property(pv) => pv.clone(),
+        Value::Literal(lit) => literal_to_value(lit),
+        Value::Node(_) | Value::Edge(_) => PropertyValue::Null,
     }
 }
 

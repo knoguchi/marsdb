@@ -203,11 +203,11 @@ fn order_by_multi_key_against_aliases_not_raw_bindings() {
     run(&store, "CREATE (b:Person {name: 'Alice', age: 30})");
     run(&store, "CREATE (c:Person {name: 'Bob', age: 25})");
 
-    // Sort keys are aliases (personAge/personName), not raw pattern vars —
+    // Sort keys are aliases (personAge/person_name), not raw pattern vars —
     // this is the shape every IS-query ORDER BY actually uses.
     let result = run(
         &store,
-        "MATCH (n:Person) RETURN n.age AS personAge, n.name AS personName ORDER BY personAge DESC, personName ASC",
+        "MATCH (n:Person) RETURN n.age AS personAge, n.name AS person_name ORDER BY personAge DESC, person_name ASC",
     );
     let names: Vec<String> = result
         .rows
@@ -426,4 +426,126 @@ fn create_rejects_variable_length_pattern() {
     let stmt = parse("CREATE (a:Item)-[:NEXT*1..3]->(b:Item)").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("variable-length"));
+}
+
+#[test]
+fn with_chaining_mirrors_is2_shape() {
+    use std::collections::BTreeMap;
+
+    // Mirrors IS2: MATCH ... WITH ... ORDER BY ... LIMIT ... MATCH
+    // (comma-pattern) ... RETURN ... ORDER BY.
+    //
+    // m1 is its own Post, authored by Alice (REPLY_OF*0.. reaches itself).
+    // m2 is a Comment authored by Alice, replying to p1 (a Post authored by
+    // Bob) -- REPLY_OF*0.. must walk one hop to reach it.
+    let store = GraphStore::open_memory().unwrap();
+    let mut alice_props = BTreeMap::new();
+    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
+    let mut bob_props = BTreeMap::new();
+    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    let bob = store.create_node(&["Person"], bob_props).unwrap();
+
+    let mut m1_props = BTreeMap::new();
+    m1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
+    let m1 = store.create_node(&["Post"], m1_props).unwrap();
+    store.create_edge("HAS_CREATOR", m1, alice, BTreeMap::new()).unwrap();
+
+    let mut m2_props = BTreeMap::new();
+    m2_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(2));
+    let m2 = store.create_node(&["Comment"], m2_props).unwrap();
+    store.create_edge("HAS_CREATOR", m2, alice, BTreeMap::new()).unwrap();
+
+    let mut p1_props = BTreeMap::new();
+    p1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(3));
+    let p1 = store.create_node(&["Post"], p1_props).unwrap();
+    store.create_edge("HAS_CREATOR", p1, bob, BTreeMap::new()).unwrap();
+    store.create_edge("REPLY_OF", m2, p1, BTreeMap::new()).unwrap();
+
+    let result = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'})<-[:HAS_CREATOR]-(message) \
+         WITH message, message.id AS message_id \
+         ORDER BY message_id ASC \
+         LIMIT 10 \
+         MATCH (message)-[:REPLY_OF*0..]->(post:Post), (post)-[:HAS_CREATOR]->(person) \
+         RETURN message_id, post.id AS post_id, person.name AS person_name \
+         ORDER BY message_id ASC",
+    );
+
+    assert_eq!(result.columns, vec!["message_id", "post_id", "person_name"]);
+    assert_eq!(result.rows.len(), 2, "both of Alice's messages must resolve to a post+author");
+
+    let extract = |row: &Vec<Value>| -> (i64, i64, String) {
+        let message_id = match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected message_id {other:?}"),
+        };
+        let post_id = match &row[1] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected post_id {other:?}"),
+        };
+        let person_name = match &row[2] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected person_name {other:?}"),
+        };
+        (message_id, post_id, person_name)
+    };
+
+    assert_eq!(extract(&result.rows[0]), (1, 1, "Alice".to_string()));
+    assert_eq!(extract(&result.rows[1]), (2, 3, "Bob".to_string()));
+
+    let _ = (m1, m2, p1); // silence unused warnings if any
+}
+
+#[test]
+fn with_boundary_limit_restricts_what_flows_into_next_match() {
+    use std::collections::BTreeMap;
+
+    // WITH's own LIMIT must reduce which rows continue to the next MATCH,
+    // not just presentation -- confirms apply_order_by_bindings + truncate
+    // run before the second MATCH, not after.
+    let store = GraphStore::open_memory().unwrap();
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
+        let n = store.create_node(&["Item"], props).unwrap();
+        ids.push(n);
+    }
+    for &n in &ids {
+        store.create_edge("SELF", n, n, BTreeMap::new()).unwrap();
+    }
+
+    let result = run(
+        &store,
+        "MATCH (n:Item) \
+         WITH n, n.idx AS idx ORDER BY idx DESC LIMIT 2 \
+         MATCH (n)-[:SELF]->(m) \
+         RETURN idx",
+    );
+    let mut values: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    values.sort();
+    assert_eq!(values, vec![3, 4], "only the top-2-by-idx rows from WITH should reach the second MATCH");
+}
+
+#[test]
+fn multiple_match_without_with_is_rejected() {
+    let err = parse("MATCH (a:Item) MATCH (b:Item) RETURN a").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("with"));
+}
+
+#[test]
+fn two_with_boundaries_is_rejected() {
+    // Grammar-valid (two match_parts, each with its own WITH) but rejected
+    // at the AST level -- v1 only supports chaining past one WITH boundary.
+    let err = parse("MATCH (a:Item) WITH a MATCH (b:Item) WITH b RETURN a").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("with"));
 }

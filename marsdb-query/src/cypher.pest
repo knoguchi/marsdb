@@ -6,7 +6,9 @@ statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
-match_stmt  = { ^"MATCH" ~ pattern ~ where_clause? ~ tail_clause ~ order_by_clause? ~ limit_clause? }
+match_stmt  = { match_part+ ~ tail_clause ~ order_by_clause? ~ limit_clause? }
+match_part  = { ^"MATCH" ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
+with_clause = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ order_by_clause? ~ limit_clause? }
 
 tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause }
 
