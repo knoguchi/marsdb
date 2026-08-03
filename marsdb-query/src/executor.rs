@@ -4,8 +4,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, QueryPart, RelDirection,
-    ReturnExpr, ReturnItem, SortDir, Statement, Tail, WithClause, WithExpr,
+    is_aggregate_name, CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, QueryClause, RelDirection,
+    ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -71,7 +71,7 @@ impl<'a> Executor<'a> {
         if is_read_only(stmt) {
             let read_txn = self.store.begin_read()?;
             let Statement::Match {
-                parts,
+                clauses,
                 tail,
                 order_by,
                 limit,
@@ -81,17 +81,17 @@ impl<'a> Executor<'a> {
             };
             // No explicit commit/abort — a ReadTransaction is a pure
             // snapshot view with nothing to roll back; it releases on drop.
-            return self.execute_match(Txn::Read(&read_txn), parts, tail, order_by, *limit);
+            return self.execute_match(Txn::Read(&read_txn), clauses, tail, order_by, *limit);
         }
         let write_txn = self.store.begin_write()?;
         let outcome = match stmt {
             Statement::Create(patterns) => self.execute_create(&write_txn, patterns),
             Statement::Match {
-                parts,
+                clauses,
                 tail,
                 order_by,
                 limit,
-            } => self.execute_match(Txn::Write(&write_txn), parts, tail, order_by, *limit),
+            } => self.execute_match(Txn::Write(&write_txn), clauses, tail, order_by, *limit),
         };
         match outcome {
             Ok(result) => {
@@ -198,41 +198,46 @@ impl<'a> Executor<'a> {
     fn execute_match(
         &self,
         txn: Txn,
-        parts: &[QueryPart],
+        clauses: &[QueryClause],
         tail: &Tail,
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
-        // Threads bindings through each MATCH/WITH segment. `carried_vars`
-        // tells the planner which of the next part's pattern variables are
-        // already bound (-> LogicalPlan::Seed) rather than fresh
-        // (-> a scan). Starts empty: the first part never has anything
-        // carried into it.
+        // Threads bindings through each MATCH/UNWIND/WITH clause.
+        // `carried_vars` tells the planner which of the next MATCH clause's
+        // pattern variables are already bound (-> LogicalPlan::Seed) rather
+        // than fresh (-> a scan). Starts empty: the first clause never has
+        // anything carried into it.
         let mut carried_vars: HashSet<String> = HashSet::new();
         let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
-        for part in parts {
-            let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
-            current_rows = if part.optional {
-                let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
-            } else {
-                self.eval_plan(txn, &plan, &current_rows)?
-            };
-            if let Some(with) = &part.with {
-                current_rows = self.materialize_with(txn, with, &current_rows)?;
-                if let Some(with_order_by) = &with.order_by {
-                    current_rows = self.apply_order_by_bindings(txn, current_rows, with_order_by)?;
+        for clause in clauses {
+            match clause {
+                QueryClause::Match(part) => {
+                    let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+                    current_rows = if part.optional {
+                        let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
+                        self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                    } else {
+                        self.eval_plan(txn, &plan, &current_rows)?
+                    };
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &part.with,
+                        current_rows,
+                        pattern_all_vars(&part.pattern),
+                        &mut carried_vars,
+                    )?;
                 }
-                if let Some(with_limit) = with.limit {
-                    current_rows.truncate(with_limit.max(0) as usize);
+                QueryClause::Unwind(u) => {
+                    current_rows = self.eval_unwind(txn, u, &current_rows)?;
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &u.with,
+                        current_rows,
+                        HashSet::from([u.var.clone()]),
+                        &mut carried_vars,
+                    )?;
                 }
-                carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
-            } else {
-                // No WITH: real Cypher shares one binding scope across
-                // MATCH/OPTIONAL MATCH clauses that aren't WITH-separated
-                // — every var this part bound stays in scope for whatever
-                // comes next, on top of what was already carried in.
-                carried_vars.extend(pattern_all_vars(&part.pattern));
             }
         }
         // ORDER BY must see every matching row before LIMIT truncates —
@@ -269,6 +274,75 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(result)
+    }
+
+    /// Applies a clause's optional trailing `WITH` (shared by both
+    /// `QueryClause::Match` and `QueryClause::Unwind`, which can each end
+    /// in one — see `QueryClause`'s docs), or, with no `WITH`, grows
+    /// `carried_vars` by `new_vars` so the next clause shares this one's
+    /// binding scope — same "no WITH means stay in scope" rule `OPTIONAL
+    /// MATCH` already gets, now uniform across clause kinds.
+    fn apply_with_or_carry(
+        &self,
+        txn: Txn,
+        with: &Option<WithClause>,
+        rows: Vec<BindingRow>,
+        new_vars: HashSet<String>,
+        carried_vars: &mut HashSet<String>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let Some(with) = with else {
+            carried_vars.extend(new_vars);
+            return Ok(rows);
+        };
+        let mut rows = self.materialize_with(txn, with, &rows)?;
+        if let Some(with_order_by) = &with.order_by {
+            rows = self.apply_order_by_bindings(txn, rows, with_order_by)?;
+        }
+        if let Some(with_limit) = with.limit {
+            rows.truncate(with_limit.max(0) as usize);
+        }
+        *carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
+        Ok(rows)
+    }
+
+    /// `UNWIND`'s fan-out. Not a graph traversal — like `WITH`, handled
+    /// directly here rather than through a `LogicalPlan`/`eval_plan` (see
+    /// `UnwindClause`'s docs). Cross-joins each input row against every
+    /// element of that row's resolved list, then applies the clause's own
+    /// `WHERE`.
+    fn eval_unwind(&self, txn: Txn, clause: &UnwindClause, rows: &[BindingRow]) -> Result<Vec<BindingRow>, QueryError> {
+        let mut out = Vec::new();
+        for row in rows {
+            let elements: Vec<Binding> = match &clause.source {
+                UnwindSource::Var(name) => {
+                    let binding = row.get(name).ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                    let Binding::List(items) = binding else {
+                        return Err(QueryError::Parse(format!(
+                            "'{name}' isn't a list — UNWIND needs a list (e.g. from collect())"
+                        )));
+                    };
+                    items.iter().map(value_to_binding_restore).collect()
+                }
+                UnwindSource::List(literals) => {
+                    literals.iter().map(|lit| Binding::Value(literal_to_value(lit))).collect()
+                }
+            };
+            for element in elements {
+                let mut new_row = row.clone();
+                new_row.insert(clause.var.clone(), element);
+                out.push(new_row);
+            }
+        }
+        if let Some(where_clause) = &clause.where_clause {
+            let mut filtered = Vec::with_capacity(out.len());
+            for row in out {
+                if self.eval_with_expr(txn, where_clause, &row)? {
+                    filtered.push(row);
+                }
+            }
+            out = filtered;
+        }
+        Ok(out)
     }
 
     /// Projects `rows` through a `WITH` clause. Unlike `materialize_return`
@@ -1144,6 +1218,24 @@ fn value_to_binding(v: Value) -> Binding {
     match v {
         Value::List(items) => Binding::List(items),
         other => Binding::Value(value_to_property_value(&other)),
+    }
+}
+
+/// `UNWIND`'s counterpart to `value_to_binding` — restores graph identity
+/// from a `collect()`'d element instead of collapsing it. `Value::Node`/
+/// `Edge` carry their full `id`, so this isn't lossy the way carrying only
+/// a display value would be: a `MATCH` after the `UNWIND` can keep
+/// traversing from the restored `Binding::Node`/`Edge`, exactly as if it
+/// had been bound by a fresh scan/expand. See `Binding::List`'s docs,
+/// which anticipated this exact restoration.
+fn value_to_binding_restore(v: &Value) -> Binding {
+    match v {
+        Value::Node(n) => Binding::Node(n.id),
+        Value::Edge(e) => Binding::Edge(e.id),
+        Value::Property(pv) => Binding::Value(pv.clone()),
+        Value::Literal(lit) => Binding::Value(literal_to_value(lit)),
+        Value::List(items) => Binding::List(items.clone()),
+        Value::Null => Binding::Value(PropertyValue::Null),
     }
 }
 

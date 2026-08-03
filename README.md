@@ -118,12 +118,18 @@ one), multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 result-set modifier doesn't exist yet). Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`
-alongside every row `b` produces.
+alongside every row `b` produces. `UNWIND <list> AS x` (fans a list out
+into one row per element, cross-joined against existing rows; its own
+`WHERE` works without needing a second `WITH`) — `<list>` is an inline
+Cypher-text list literal (`[1, 2, 'a', $p]`) or a variable bound by a
+preceding `WITH ... collect(...)`; `UNWIND $param` where `$param` itself
+names a list isn't supported yet (no list-valued parameters — every
+`$param` is a single scalar).
 
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
-verified: LDBC's complex queries (IC1-14: `UNWIND`, named
-paths/`shortestPath()`, and the full query set beyond one hand-crafted
+verified: LDBC's complex queries (IC1-14: named paths/`shortestPath()`,
+and the full query set beyond one hand-crafted
 grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` checkpoint —
 see `marsdb-query/tests/smoke.rs`), comma-separated patterns *within one*
 `MATCH`/`CREATE` clause beyond a single linear chain (general
@@ -138,7 +144,8 @@ works), or chaining past one `WITH` boundary.
 - `MERGE` (match-or-create in one clause — `MATCH ... CREATE` covers
   "create an edge between nodes I already matched," not "create this
   node if it doesn't already exist")
-- `UNWIND`, named paths/`shortestPath()`
+- List-valued `$parameters`, to unblock `UNWIND $items AS x`
+- Named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR

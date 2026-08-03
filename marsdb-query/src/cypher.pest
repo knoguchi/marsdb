@@ -13,10 +13,25 @@ statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
-match_stmt    = { match_part+ ~ tail_clause ~ order_by_clause? ~ limit_clause? }
+match_stmt    = { clause+ ~ tail_clause ~ order_by_clause? ~ limit_clause? }
+clause        = { unwind_clause | match_part }
 match_part    = { match_keyword ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ limit_clause? }
+
+// Not a general `Literal::List` usable anywhere a `literal` is (a prop
+// value, a comparison RHS, ...) — deliberately scoped to only appear right
+// after UNWIND, same reasoning as `with_comparison`'s deliberately-separate
+// mirror of `comparison` elsewhere in this grammar.
+// Its filter reuses `with_where_clause` (a `with_expr`, LHS is a
+// `return_expr`), not the pattern-level `where_clause`/`expr`
+// (`comparison`'s LHS is always a `prop_access`) -- an UNWIND-bound
+// variable is very often a bare scalar (`UNWIND [1,2,3] AS x WHERE x >
+// 2`), which `comparison` structurally cannot express at all (only
+// `x.prop > 2` is representable there).
+unwind_clause = { ^"UNWIND" ~ unwind_source ~ ^"AS" ~ identifier ~ with_where_clause? ~ with_clause? }
+unwind_source = { list_literal | identifier }
+list_literal  = { "[" ~ (literal ~ ("," ~ literal)*)? ~ "]" }
 
 // Reuses `create_stmt` itself (not a duplicate rule) — a `MATCH ... CREATE`
 // tail has the exact same pattern syntax as a standalone `CREATE`

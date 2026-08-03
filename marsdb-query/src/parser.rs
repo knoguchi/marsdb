@@ -59,13 +59,13 @@ fn parse_create_patterns(pair: Pair<Rule>) -> Result<Vec<Pattern>, QueryError> {
 }
 
 fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
-    let mut parts = Vec::new();
+    let mut clauses = Vec::new();
     let mut tail = None;
     let mut order_by = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::match_part => parts.push(parse_match_part(p)?),
+            Rule::clause => clauses.push(parse_clause(p)?),
             Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
             Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
             Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
@@ -77,18 +77,23 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     // between them, and additionally caps chaining at one WITH boundary
     // total — nothing IS1-7 needs requires more, and a hand-rolled parser
     // is safer erroring on untested shapes than silently mishandling them.
-    // OPTIONAL MATCH is exempt from the WITH requirement (matching real
-    // Cypher: `MATCH (a) OPTIONAL MATCH (b) RETURN a, b` is valid without a
-    // WITH between them — OPTIONAL MATCH continues in the same scope
-    // rather than starting a fresh reading context).
-    let with_count = parts.iter().filter(|p| p.with.is_some()).count();
+    // OPTIONAL MATCH and UNWIND are both exempt from the WITH-separation
+    // requirement (matching real Cypher: `MATCH (a) OPTIONAL MATCH (b) ...`
+    // and `MATCH (a) UNWIND [1,2] AS x ...` are both valid without a WITH
+    // between them — they continue in the same scope rather than starting
+    // a fresh reading context). The one-WITH-total cap still counts every
+    // clause kind's `with` uniformly.
+    let with_count = clauses.iter().filter(|c| clause_with(c).is_some()).count();
     if with_count > 1 {
         return Err(QueryError::Parse(
             "chaining past one WITH boundary in a single MATCH isn't supported yet".into(),
         ));
     }
-    for (i, part) in parts.iter().enumerate() {
-        if i + 1 < parts.len() && part.with.is_none() && !parts[i + 1].optional {
+    for i in 0..clauses.len() {
+        let (QueryClause::Match(part), Some(QueryClause::Match(next))) = (&clauses[i], clauses.get(i + 1)) else {
+            continue;
+        };
+        if part.with.is_none() && !next.optional {
             return Err(QueryError::Parse(
                 "multiple MATCH clauses must be separated by WITH".into(),
             ));
@@ -96,11 +101,66 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     }
 
     Ok(Statement::Match {
-        parts,
+        clauses,
         tail: tail.ok_or_else(|| QueryError::Parse("MATCH requires RETURN/DELETE/SET".into()))?,
         order_by,
         limit,
     })
+}
+
+fn clause_with(clause: &QueryClause) -> Option<&WithClause> {
+    match clause {
+        QueryClause::Match(part) => part.with.as_ref(),
+        QueryClause::Unwind(u) => u.with.as_ref(),
+    }
+}
+
+fn parse_clause(pair: Pair<Rule>) -> Result<QueryClause, QueryError> {
+    let inner = pair.into_inner().next().expect("clause has one child");
+    match inner.as_rule() {
+        Rule::match_part => Ok(QueryClause::Match(parse_match_part(inner)?)),
+        Rule::unwind_clause => Ok(QueryClause::Unwind(parse_unwind_clause(inner)?)),
+        r => unreachable!("unexpected clause child rule {r:?}"),
+    }
+}
+
+fn parse_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause, QueryError> {
+    let mut inner = pair.into_inner();
+    let source = parse_unwind_source(inner.next().expect("unwind_clause has an unwind_source"))?;
+    let var = inner.next().expect("unwind_clause has an AS identifier").as_str().to_string();
+    let mut where_clause = None;
+    let mut with = None;
+    for p in inner {
+        match p.as_rule() {
+            Rule::with_where_clause => {
+                let expr_pair = p.into_inner().next().expect("WHERE has a with_expr");
+                where_clause = Some(parse_with_expr(expr_pair)?);
+            }
+            Rule::with_clause => with = Some(parse_with_clause(p)?),
+            r => unreachable!("unexpected unwind_clause child rule {r:?}"),
+        }
+    }
+    Ok(UnwindClause {
+        source,
+        var,
+        where_clause,
+        with,
+    })
+}
+
+fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
+    let inner = pair.into_inner().next().expect("unwind_source has one child");
+    match inner.as_rule() {
+        Rule::list_literal => Ok(UnwindSource::List(
+            inner
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::literal)
+                .map(parse_literal)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Rule::identifier => Ok(UnwindSource::Var(inner.as_str().to_string())),
+        r => unreachable!("unexpected unwind_source child rule {r:?}"),
+    }
 }
 
 fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {

@@ -1207,3 +1207,67 @@ fn string_literal_without_backslash_unaffected() {
     let result = run(&store, "MATCH (n:Person) RETURN n.name");
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
 }
+
+#[test]
+fn unwind_inline_list_fans_out_one_row_per_element() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "UNWIND [10, 20, 30] AS x RETURN x");
+    let values: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
+    assert_eq!(values, vec![10, 20, 30]);
+}
+
+#[test]
+fn unwind_cross_joins_against_existing_rows() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    let result = run(&store, "MATCH (p:Person) UNWIND [1, 2] AS n RETURN p.name AS name, n ORDER BY name, n");
+    let pairs: Vec<(String, i64)> = result.rows.iter().map(|r| (str_value(&r[0]), int_value(&r[1]))).collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), 1),
+            ("Alice".to_string(), 2),
+            ("Bob".to_string(), 1),
+            ("Bob".to_string(), 2),
+        ]
+    );
+}
+
+#[test]
+fn unwind_collected_nodes_restores_graph_identity() {
+    // The whole point of value_to_binding_restore: a node that went into
+    // collect() as a Value::Node must come back out of UNWIND as a real
+    // Binding::Node, not just a display value -- provable by traversing
+    // further (m.name) after the UNWIND, which only works with real graph
+    // identity, not a frozen snapshot value.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(c:Person {name: 'Carol'})");
+    let result = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(f:Person) WITH collect(f) AS friends \
+         UNWIND friends AS m RETURN m.name AS name ORDER BY name",
+    );
+    let names: Vec<String> = result.rows.iter().map(|r| str_value(&r[0])).collect();
+    assert_eq!(names, vec!["Bob".to_string(), "Carol".to_string()]);
+}
+
+#[test]
+fn unwind_own_where_filters_without_needing_a_second_with() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "UNWIND [1, 2, 3, 4, 5] AS x WHERE x > 2 RETURN x ORDER BY x");
+    let values: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
+    assert_eq!(values, vec![3, 4, 5]);
+}
+
+#[test]
+fn unwind_non_list_var_errors_clearly() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    // `p` is bound to a node, not a list -- UNWIND needs a real list
+    // (e.g. from collect()), not any bound variable.
+    let stmt = parse("MATCH (p:Person) UNWIND p AS x RETURN x").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("list"));
+}

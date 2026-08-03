@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use marsdb_graph::PropertyValue;
 
-use crate::ast::{Expr, Literal, NodePattern, Pattern, QueryPart, ReturnExpr, Statement, Tail, WithClause, WithExpr};
+use crate::ast::{
+    Expr, Literal, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, Statement, Tail, UnwindClause,
+    UnwindSource, WithClause, WithExpr,
+};
 use crate::error::QueryError;
 
 /// Resolves every `$name` placeholder in `stmt` to a concrete `Literal`
@@ -17,13 +20,13 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
             }
         }
         Statement::Match {
-            parts,
+            clauses,
             tail,
             order_by,
             limit: _,
         } => {
-            for part in parts {
-                substitute_query_part(part, params)?;
+            for clause in clauses {
+                substitute_query_clause(clause, params)?;
             }
             substitute_tail(tail, params)?;
             if let Some(items) = order_by {
@@ -36,12 +39,34 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
     Ok(())
 }
 
+fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    match clause {
+        QueryClause::Match(part) => substitute_query_part(part, params),
+        QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
+    }
+}
+
 fn substitute_query_part(part: &mut QueryPart, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
     substitute_pattern(&mut part.pattern, params)?;
     if let Some(expr) = &mut part.where_clause {
         substitute_expr(expr, params)?;
     }
     if let Some(with) = &mut part.with {
+        substitute_with_clause(with, params)?;
+    }
+    Ok(())
+}
+
+fn substitute_unwind_clause(u: &mut UnwindClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    if let UnwindSource::List(literals) = &mut u.source {
+        for lit in literals {
+            substitute_literal(lit, params)?;
+        }
+    }
+    if let Some(expr) = &mut u.where_clause {
+        substitute_with_expr(expr, params)?;
+    }
+    if let Some(with) = &mut u.with {
         substitute_with_clause(with, params)?;
     }
     Ok(())
