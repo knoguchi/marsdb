@@ -481,16 +481,48 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Tail::Set(items))
         }
+        Rule::remove_clause => {
+            let items = inner.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
+            Ok(Tail::Remove(items))
+        }
         Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(inner)?)),
         r => unreachable!("unexpected tail_clause child rule {r:?}"),
     }
 }
 
-fn parse_set_item(pair: Pair<Rule>) -> Result<(PropAccess, Literal), QueryError> {
+fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
     let mut inner = pair.into_inner();
-    let prop_access_pair = inner.next().expect("set_item has a prop_access");
-    let literal_pair = inner.next().expect("set_item has a literal");
-    Ok((parse_prop_access(prop_access_pair), parse_literal(literal_pair)?))
+    let first = inner.next().expect("set_item has at least one child");
+    match first.as_rule() {
+        Rule::prop_access => {
+            let literal_pair = inner.next().expect("set_item's prop_access form has a literal");
+            Ok(SetItem::Prop(parse_prop_access(first), parse_literal(literal_pair)?))
+        }
+        Rule::set_label_item => {
+            let (var, labels) = parse_set_label_item(first);
+            Ok(SetItem::Labels(var, labels))
+        }
+        r => unreachable!("unexpected set_item child rule {r:?}"),
+    }
+}
+
+fn parse_set_label_item(pair: Pair<Rule>) -> (String, Vec<String>) {
+    let mut inner = pair.into_inner();
+    let var = inner.next().expect("set_label_item has a var identifier").as_str().to_string();
+    let labels = inner.map(|p| p.as_str().to_string()).collect();
+    (var, labels)
+}
+
+fn parse_remove_item(pair: Pair<Rule>) -> RemoveItem {
+    let inner = pair.into_inner().next().expect("remove_item has one child");
+    match inner.as_rule() {
+        Rule::prop_access => RemoveItem::Prop(parse_prop_access(inner)),
+        Rule::set_label_item => {
+            let (var, labels) = parse_set_label_item(inner);
+            RemoveItem::Labels(var, labels)
+        }
+        r => unreachable!("unexpected remove_item child rule {r:?}"),
+    }
 }
 
 fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
@@ -793,13 +825,21 @@ fn parse_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
 }
 
 fn parse_compare_op(pair: Pair<Rule>) -> CompareOp {
-    match pair.as_str() {
+    // `STARTS WITH`/`ENDS WITH` are two separate keyword tokens in the
+    // grammar (so any amount of whitespace between them matches, same as
+    // `DETACH DELETE`) -- normalize before matching so the exact source
+    // spacing/casing doesn't matter.
+    let normalized = pair.as_str().split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase();
+    match normalized.as_str() {
         "=" => CompareOp::Eq,
         "<>" => CompareOp::Ne,
         "<" => CompareOp::Lt,
         "<=" => CompareOp::Le,
         ">" => CompareOp::Gt,
         ">=" => CompareOp::Ge,
+        "STARTS WITH" => CompareOp::StartsWith,
+        "ENDS WITH" => CompareOp::EndsWith,
+        "CONTAINS" => CompareOp::Contains,
         other => unreachable!("unexpected compare_op {other:?}"),
     }
 }

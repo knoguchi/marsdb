@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use marsdb_graph::PropertyValue;
 
 use crate::ast::{
-    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, Statement, Tail,
+    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, SetItem, Statement, Tail,
     UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
@@ -51,8 +51,10 @@ fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, Pr
 
 fn substitute_merge_clause(m: &mut MergeClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
     substitute_pattern(&mut m.pattern, params)?;
-    for (_, lit) in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
-        substitute_literal(lit, params)?;
+    for item in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
+        if let SetItem::Prop(_, lit) = item {
+            substitute_literal(lit, params)?;
+        }
     }
     if let Some(with) = &mut m.with {
         substitute_with_clause(with, params)?;
@@ -155,10 +157,12 @@ fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> 
                 substitute_return_expr(&mut item.expr, params)?;
             }
         }
-        Tail::Delete(_) | Tail::DetachDelete(_) => {}
+        Tail::Delete(_) | Tail::DetachDelete(_) | Tail::Remove(_) => {}
         Tail::Set(items) => {
-            for (_, lit) in items {
-                substitute_literal(lit, params)?;
+            for item in items {
+                if let SetItem::Prop(_, lit) = item {
+                    substitute_literal(lit, params)?;
+                }
             }
         }
         Tail::Create(patterns) => {

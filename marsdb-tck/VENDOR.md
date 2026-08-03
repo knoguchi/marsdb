@@ -4,9 +4,11 @@
 [opencypher/openCypher](https://github.com/opencypher/openCypher), pinned at
 commit `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23` (2026-03-20). The runner
 reads `.feature` files from `openCypher/tck/features/` directly — 220 files,
-1615 `Scenario:`/`Scenario Outline:` headers (per this crate's own Gherkin
-parser, the authoritative count — a plain `grep -c '^\s*Scenario:'`
-undercounts by 276, since it doesn't match `Scenario Outline:` at all).
+3880 real scenarios once every `Scenario Outline:` + `Examples:` table is
+expanded (see below) — 1615 raw `Scenario:`/`Scenario Outline:` headers
+(a plain `grep -c '^\s*Scenario:'` undercounts even that by 276, since it
+doesn't match `Scenario Outline:` at all), 276 of which are outlines
+expanding to 2541 real instances via their `Examples:` tables.
 
 A submodule (not a vendored copy) so the build has no bearing on Apache-2.0
 attribution bookkeeping — the checked-out submodule *is* the real upstream
@@ -22,16 +24,15 @@ git submodule update --init marsdb-tck/openCypher
 `marsdb-tck` fails fast with that same instruction if the submodule isn't
 checked out, rather than silently reporting zero scenarios.
 
-Each `Scenario Outline:` is parsed and run as exactly one scenario, using
-the literal, unsubstituted `<placeholder>` text still in its query (e.g.
-`ORDER BY <sort>`) — the `Examples:` table that real Cucumber execution
-would use to expand one outline into N instantiated scenarios isn't read
-at all; the table is silently skipped as an unrecognized block. This means
-outline-based scenarios almost always end up `ParseRejected` (the
-placeholder text isn't valid Cypher) rather than exercising the N real
-variants upstream defines. A known v1 simplification, not a bug — full
-`Examples:` expansion would be the natural follow-up if outline coverage
-ever needs to be real.
+`Scenario Outline:` + `Examples:` (Cucumber's scenario templating) is
+expanded for real: `gherkin.rs` parses the outline as a template (`query`/
+`setup_cypher`/`expected` still containing literal `<placeholder>` tokens)
+paired with its `Examples:` table, then emits one real `Scenario` per data
+row with every `<col>` token replaced by that row's value — in the query
+text, `having executed` setup, parameter values, and expected-result cells
+alike (substitution isn't scoped to just the query, matching real Cucumber
+semantics; most vendored outlines only use `<col>` in the query, but
+nothing about the format guarantees that).
 
 To move to a newer upstream commit:
 

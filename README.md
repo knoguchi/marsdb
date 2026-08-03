@@ -146,12 +146,18 @@ Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
-(`[:TYPE*min..max]`) relationship patterns, `WHERE`, one `WITH` boundary
-per statement (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER
-BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/`SET`/`MATCH ... CREATE`
-(adds an edge between two already-matched nodes — a node token whose
-variable is already bound reuses that node instead of creating a new
-one), multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
+(`[:TYPE*min..max]`) relationship patterns, `WHERE` (including the
+string predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`), one `WITH`
+boundary per statement (projection/rename, its own `WHERE`/
+`WITH...WHERE`/`ORDER BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/
+`SET`/`REMOVE`/`MATCH ... CREATE` (adds an edge between two
+already-matched nodes — a node token whose variable is already bound
+reuses that node instead of creating a new one). `SET`/`REMOVE` cover
+both properties (`SET n.prop = 'x'`/`REMOVE n.prop`) and labels
+(`SET n:Label`/`REMOVE n:Label`) — but, like `DELETE`, can't be
+followed by anything else in the same statement (no `SET ... RETURN`
+in one query yet — each is a terminal tail, not a chainable clause).
+Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 `coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
 `DISTINCT` — inside an aggregate call only; a standalone `RETURN DISTINCT`
@@ -190,7 +196,14 @@ variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain
 needed to reconstruct a path over `*`-traversal), or `shortestPath()` with
 a minimum hop count greater than 1 (a plain visited-set BFS can't
 correctly answer "shortest path of at least N hops" for N > 1 without a
-different algorithm).
+different algorithm). Two more gaps the TCK surfaced directly: no
+three-valued NULL logic in `WHERE` (a comparison against a missing/null
+property or a literal `null` evaluates to plain `false`, not "unknown" —
+so `NOT (x STARTS WITH null)` is `true` instead of also unknown/excluded,
+same simplification `value_eq`'s docs already call out for equality); and
+no compile-time semantic validation (an undefined variable/function, or a
+wrong-type function argument, is only caught while evaluating an actual
+row — a query whose `MATCH` matches zero rows never gets checked at all).
 
 ## Roadmap
 
@@ -238,7 +251,7 @@ seeded corpus doesn't hit it.
 `marsdb-tck` runs a real subset of the
 [openCypher TCK](https://github.com/opencypher/openCypher) (pulled in as a
 git submodule pinned to a fixed commit — see `marsdb-tck/VENDOR.md`; 220
-`.feature` files, 1615 scenarios) against MarsDB, via a purpose-built
+`.feature` files, 3880 scenarios) against MarsDB, via a purpose-built
 Gherkin-subset parser and structural result comparison (not string
 matching):
 

@@ -25,6 +25,12 @@ pub enum CompareOp {
     Le,
     Gt,
     Ge,
+    /// String-only predicates (`a.name STARTS WITH 'x'`, etc.) — anything
+    /// but a `String`/`String` operand pair compares `false`, same as every
+    /// other type-mismatched `CompareOp` already does in `compare()`.
+    StartsWith,
+    EndsWith,
+    Contains,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +140,8 @@ pub enum Tail {
     Return(Vec<ReturnItem>),
     Delete(Vec<String>),
     DetachDelete(Vec<String>),
-    Set(Vec<(PropAccess, Literal)>),
+    Set(Vec<SetItem>),
+    Remove(Vec<RemoveItem>),
     /// `MATCH ... CREATE ...` — same pattern syntax as `Statement::Create`,
     /// but runs once per row already bound by the preceding MATCH/WITH: a
     /// node pattern token whose variable is already bound in that row
@@ -143,6 +150,22 @@ pub enum Tail {
     /// `Statement::Create` alone can't (every node token it sees is
     /// always fresh).
     Create(Vec<Pattern>),
+}
+
+#[derive(Debug, Clone)]
+pub enum SetItem {
+    Prop(PropAccess, Literal),
+    /// `SET n:A:B` — adds each label to the node's label set (idempotent,
+    /// not an error if already present).
+    Labels(String, Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub enum RemoveItem {
+    Prop(PropAccess),
+    /// `REMOVE n:A:B` — removes each label from the node's label set (not
+    /// an error if it wasn't there).
+    Labels(String, Vec<String>),
 }
 
 /// WITH's HAVING-equivalent: filters on the already-projected/aggregated
@@ -245,8 +268,8 @@ pub enum UnwindSource {
 #[derive(Debug, Clone)]
 pub struct MergeClause {
     pub pattern: Pattern,
-    pub on_create: Vec<(PropAccess, Literal)>,
-    pub on_match: Vec<(PropAccess, Literal)>,
+    pub on_create: Vec<SetItem>,
+    pub on_match: Vec<SetItem>,
     pub with: Option<WithClause>,
 }
 

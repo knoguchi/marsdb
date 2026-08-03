@@ -59,7 +59,7 @@ on_match_clause   = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 // statement; only the AST/executor treat a node token whose variable is
 // already bound differently (reuse the existing node instead of making a
 // new one — see `Tail::Create`'s docs).
-tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause | create_stmt }
+tail_clause = { return_clause | detach_delete_clause | delete_clause | remove_clause | set_clause | create_stmt }
 
 return_clause = { ^"RETURN" ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }
@@ -97,8 +97,15 @@ with_comparison   = { return_expr ~ compare_op ~ literal }
 
 detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
-set_clause            = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
-set_item               = { prop_access ~ "=" ~ literal }
+// Order matters: `prop_access` (`n.prop`) is tried first -- both start with
+// an `identifier`, and only backtrack to `set_label_item` (`n:Label`) if
+// the "." doesn't match.
+set_clause     = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
+set_item       = { (prop_access ~ "=" ~ literal) | set_label_item }
+set_label_item = { identifier ~ (":" ~ identifier)+ }
+
+remove_clause   = { ^"REMOVE" ~ remove_item ~ ("," ~ remove_item)* }
+remove_item     = { prop_access | set_label_item }
 
 where_clause    = { ^"WHERE" ~ expr }
 limit_clause    = { ^"LIMIT" ~ int_literal }
@@ -135,7 +142,7 @@ or_expr    = { and_expr ~ (^"OR" ~ and_expr)* }
 and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
 unary_expr = { (^"NOT" ~ unary_expr) | comparison | ("(" ~ expr ~ ")") }
 comparison = { prop_access ~ compare_op ~ literal }
-compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" }
+compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" | (^"STARTS" ~ ^"WITH") | (^"ENDS" ~ ^"WITH") | ^"CONTAINS" }
 
 prop_access = { identifier ~ "." ~ identifier }
 

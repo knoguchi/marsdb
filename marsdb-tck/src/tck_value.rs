@@ -178,7 +178,21 @@ impl CellParser {
                 Some('\\') => {
                     self.pos += 1;
                     let escaped = self.peek().ok_or("dangling escape in string")?;
-                    s.push(escaped);
+                    // Real escape decoding, matching MarsDB's own Cypher
+                    // string-literal parser (\' \" \\ \n \r \t \b \f) --
+                    // TCK expected-result cells use the same escapes (e.g.
+                    // `'\nFoo\n'`), and a real query result's actual
+                    // newline/tab won't structurally equal the two-
+                    // character sequence backslash+n otherwise.
+                    let decoded = match escaped {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        'b' => '\u{8}',
+                        'f' => '\u{c}',
+                        other => other,
+                    };
+                    s.push(decoded);
                     self.pos += 1;
                 }
                 Some(c) => {
