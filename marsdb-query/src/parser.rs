@@ -215,6 +215,8 @@ fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
 
 fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
     let mut optional = false;
+    let mut path_var = None;
+    let mut shortest_path = false;
     let mut patterns = Vec::new();
     let mut where_clause = None;
     let mut with = None;
@@ -222,6 +224,12 @@ fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
         match p.as_rule() {
             Rule::match_keyword => {
                 optional = p.as_str().to_ascii_uppercase().starts_with("OPTIONAL");
+            }
+            Rule::path_pattern => {
+                let (var, is_shortest, pattern) = parse_path_pattern(p)?;
+                path_var = var;
+                shortest_path = is_shortest;
+                patterns.push(pattern);
             }
             Rule::pattern => patterns.push(parse_pattern(p)?),
             Rule::where_clause => {
@@ -233,12 +241,67 @@ fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
         }
     }
     let pattern = splice_patterns(patterns)?;
+    if shortest_path {
+        validate_shortest_path_pattern(&pattern)?;
+    } else if path_var.is_some() {
+        validate_named_path_pattern(&pattern)?;
+    }
     Ok(QueryPart {
         optional,
+        path_var,
+        shortest_path,
         pattern,
         where_clause,
         with,
     })
+}
+
+fn parse_path_pattern(pair: Pair<Rule>) -> Result<(Option<String>, bool, Pattern), QueryError> {
+    let mut var = None;
+    let mut shortest_path = false;
+    let mut pattern = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => var = Some(p.as_str().to_string()),
+            Rule::shortest_path_wrapper => {
+                shortest_path = true;
+                let inner_pattern = p.into_inner().next().expect("shortest_path_wrapper has a pattern");
+                pattern = Some(parse_pattern(inner_pattern)?);
+            }
+            Rule::pattern => pattern = Some(parse_pattern(p)?),
+            r => unreachable!("unexpected path_pattern child rule {r:?}"),
+        }
+    }
+    Ok((var, shortest_path, pattern.expect("path_pattern always has a pattern or shortest_path_wrapper")))
+}
+
+/// `shortestPath()`'s inner pattern must be exactly the shape it's built
+/// for: one variable-length hop between two nodes — not fixed-hop (nothing
+/// to search shortest-among), not multi-hop (which hop would even be the
+/// variable-length one is ambiguous), not hopless (no relationship to
+/// traverse at all).
+fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
+    if pattern.hops.len() != 1 || pattern.hops[0].0.hop_range.is_none() {
+        return Err(QueryError::Parse(
+            "shortestPath() requires exactly one variable-length relationship pattern (e.g. (a)-[:TYPE*..5]-(b))"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`) is
+/// limited to fixed-hop patterns — see `QueryPart::path_var`'s docs for
+/// why a variable-length hop isn't supported there.
+fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
+    if pattern.hops.iter().any(|(rel, _)| rel.hop_range.is_some()) {
+        return Err(QueryError::Parse(
+            "named-path capture (`p = ...`) over a variable-length relationship pattern isn't supported yet \
+             — use shortestPath() instead, or drop the path variable"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {

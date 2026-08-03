@@ -1,4 +1,4 @@
-use marsdb::{Literal, Value};
+use marsdb::{Literal, PathElem, Value};
 use marsdb_graph::PropertyValue;
 
 pub fn print_table(result: &marsdb::QueryResult) {
@@ -24,6 +24,16 @@ fn format_value(value: &Value) -> String {
         Value::List(items) => {
             let cells: Vec<String> = items.iter().map(format_value).collect();
             format!("[{}]", cells.join(", "))
+        }
+        Value::Path(elems) => {
+            let parts: Vec<String> = elems
+                .iter()
+                .map(|e| match e {
+                    PathElem::Node(n) => format!("(:{})", n.labels.join(":")),
+                    PathElem::Edge(e) => format!("-[:{}]->", e.label),
+                })
+                .collect();
+            parts.join("")
         }
         Value::Null => "null".to_string(),
     }

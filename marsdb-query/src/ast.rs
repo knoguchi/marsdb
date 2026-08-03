@@ -177,9 +177,23 @@ pub struct WithClause {
 /// Comma-separated patterns within one part are spliced into a single
 /// linear `Pattern` at parse time (see `parser::splice_patterns`) — this
 /// only ever holds one already-combined `Pattern`, not several.
+///
+/// `path_var` is `Some` for `p = (a)-->(b)` / `p = shortestPath(...)` —
+/// capturing the whole matched path, not just its endpoints. General
+/// named-path capture (`shortest_path: false`) is limited to fixed-hop
+/// patterns — `pattern` must contain no variable-length (`*`) hop, parser-
+/// enforced, since reconstructing a path over `VarExpand`'s BFS would need
+/// the same parent-pointer tracking `shortestPath()` already has, but
+/// generalized, which isn't worth it for the narrow payoff. `shortest_path
+/// : true` is the opposite: `pattern` must be exactly one variable-length
+/// hop (`shortestPath((a)-[:TYPE*..N]-(b))`), and both endpoints must
+/// already be bound by a preceding clause (see `executor::eval_shortest_
+/// path`'s docs for why unbound endpoints aren't supported in v1).
 #[derive(Debug, Clone)]
 pub struct QueryPart {
     pub optional: bool,
+    pub path_var: Option<String>,
+    pub shortest_path: bool,
     pub pattern: Pattern,
     pub where_clause: Option<Expr>,
     pub with: Option<WithClause>,

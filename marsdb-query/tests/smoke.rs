@@ -1,5 +1,5 @@
 use marsdb_graph::GraphStore;
-use marsdb_query::{parse, Executor, Value};
+use marsdb_query::{parse, Executor, PathElem, Value};
 
 fn run(store: &GraphStore, cypher: &str) -> marsdb_query::QueryResult {
     let stmt = parse(cypher).unwrap_or_else(|e| panic!("parse failed for {cypher:?}: {e}"));
@@ -1373,4 +1373,115 @@ fn merge_can_be_followed_by_return() {
     let store = GraphStore::open_memory().unwrap();
     let result = run(&store, "MERGE (n:Person {name: 'Alice'}) RETURN n.name");
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
+}
+
+fn path_elems(v: &Value) -> &[PathElem] {
+    match v {
+        Value::Path(elems) => elems,
+        other => panic!("expected a path, got {other:?}"),
+    }
+}
+
+fn node_name(elem: &PathElem) -> &str {
+    match elem {
+        PathElem::Node(n) => match n.props.get("name") {
+            Some(marsdb_graph::PropertyValue::String(s)) => s.as_str(),
+            other => panic!("expected node to have a string 'name' prop, got {other:?}"),
+        },
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn named_path_capture_returns_alternating_node_edge_elements() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})-[:LIKES]->(:Person {name: 'Carol'})",
+    );
+    let result = run(
+        &store,
+        "MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person)-[:LIKES]->(c:Person) RETURN p",
+    );
+    let elems = path_elems(&result.rows[0][0]);
+    assert_eq!(elems.len(), 5, "node,edge,node,edge,node");
+    assert_eq!(node_name(&elems[0]), "Alice");
+    assert!(matches!(&elems[1], PathElem::Edge(e) if e.label == "KNOWS"));
+    assert_eq!(node_name(&elems[2]), "Bob");
+    assert!(matches!(&elems[3], PathElem::Edge(e) if e.label == "LIKES"));
+    assert_eq!(node_name(&elems[4]), "Carol");
+}
+
+#[test]
+fn named_path_capture_with_anonymous_relationships() {
+    // Neither hop's relationship is named -- name_pattern_for_path must
+    // still track them internally (synthesized names), and they must not
+    // leak into the output row (only `p` should be bound/returned here).
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})");
+    let result = run(&store, "MATCH p = (a:Person {name: 'Alice'})-[]->(b:Person) RETURN p");
+    let elems = path_elems(&result.rows[0][0]);
+    assert_eq!(elems.len(), 3);
+    assert_eq!(node_name(&elems[0]), "Alice");
+    assert_eq!(node_name(&elems[2]), "Bob");
+}
+
+#[test]
+fn shortest_path_finds_the_actual_shortest_not_just_a_path() {
+    let store = GraphStore::open_memory().unwrap();
+    // Direct 1-hop route.
+    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Dave'})");
+    // Longer 3-hop route between the *same* two people -- MATCH...CREATE,
+    // not a chained plain CREATE, so the trailing (:Person{name:'Dave'})
+    // token reuses the existing Dave instead of silently creating a 2nd
+    // one (a chained CREATE never reuses an unbound token, even one that
+    // matches an existing node by props -- exactly the gap MATCH...CREATE
+    // exists to work around).
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (d:Person {name: 'Dave'}) \
+         CREATE (a)-[:KNOWS]->(:Person {name: 'Bob'})-[:KNOWS]->(:Person {name: 'Carol'})-[:KNOWS]->(d)",
+    );
+    let result = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) OPTIONAL MATCH (d:Person {name: 'Dave'}) \
+         OPTIONAL MATCH p = shortestPath((a)-[:KNOWS*]-(d)) RETURN length(p)",
+    );
+    assert_eq!(result.rows.len(), 1, "only one Dave -- must not have duplicated it");
+    assert_eq!(int_value(&result.rows[0][0]), 1, "must pick the 1-hop route, not the 3-hop one");
+}
+
+#[test]
+fn shortest_path_returns_null_when_unreachable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Zed'})");
+    let result = run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) OPTIONAL MATCH (z:Person {name: 'Zed'}) \
+         OPTIONAL MATCH p = shortestPath((a)-[:KNOWS*]-(z)) RETURN p",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn shortest_path_requires_both_endpoints_already_bound() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    let stmt = parse("MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]-(z:Person)) RETURN p").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("shortestpath"));
+}
+
+#[test]
+fn named_path_over_variable_length_pattern_errors_at_parse_time() {
+    let err = parse("MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN p").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("variable-length"));
+}
+
+#[test]
+fn shortest_path_requires_a_variable_length_hop() {
+    let err = parse("MATCH p = shortestPath((a)-[:KNOWS]->(b)) RETURN p").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("variable-length"));
 }

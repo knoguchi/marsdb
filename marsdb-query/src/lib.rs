@@ -15,4 +15,4 @@ pub use executor::Executor;
 pub use params::substitute_params;
 pub use parser::{parse, parse_many};
 pub use result::QueryResult;
-pub use value::Value;
+pub use value::{PathElem, Value};

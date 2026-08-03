@@ -82,6 +82,21 @@ fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<
             }
             list.into_any()
         }
+        // A path is a list of node/edge dicts, alternating -- the same
+        // dict shape Value::Node/Edge above already produce, so a caller
+        // walking a path sees exactly what they'd see walking `RETURN`ed
+        // nodes/edges individually.
+        ::marsdb::Value::Path(elems) => {
+            let list = PyList::empty(py);
+            for elem in elems {
+                let value = match elem {
+                    ::marsdb::PathElem::Node(n) => ::marsdb::Value::Node(n.clone()),
+                    ::marsdb::PathElem::Edge(e) => ::marsdb::Value::Edge(e.clone()),
+                };
+                list.append(value_to_py(py, &value)?)?;
+            }
+            list.into_any()
+        }
     })
 }
 
