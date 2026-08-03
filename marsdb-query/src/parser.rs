@@ -44,12 +44,18 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
 }
 
 fn parse_create_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
-    let patterns = pair
-        .into_inner()
+    Ok(Statement::Create(parse_create_patterns(pair)?))
+}
+
+/// Shared by standalone `CREATE` (`parse_create_stmt`) and a `MATCH ...
+/// CREATE` tail (`parse_tail_clause`'s `create_stmt` arm) — both reuse the
+/// `create_stmt` grammar rule (`^"CREATE" ~ pattern ~ ("," ~ pattern)*`),
+/// only what the executor does with the resulting patterns differs.
+fn parse_create_patterns(pair: Pair<Rule>) -> Result<Vec<Pattern>, QueryError> {
+    pair.into_inner()
         .filter(|p| p.as_rule() == Rule::pattern)
         .map(parse_pattern)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Statement::Create(patterns))
+        .collect()
 }
 
 fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
@@ -295,6 +301,7 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Tail::Set(items))
         }
+        Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(inner)?)),
         r => unreachable!("unexpected tail_clause child rule {r:?}"),
     }
 }

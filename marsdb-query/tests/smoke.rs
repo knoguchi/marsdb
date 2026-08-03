@@ -1047,3 +1047,129 @@ fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
     assert_eq!(str_value(&result.rows[1][0]), "Bob");
     assert_eq!(int_value(&result.rows[1][1]), 2);
 }
+
+#[test]
+fn match_create_connects_two_already_existing_nodes() {
+    // Standalone CREATE can never do this -- every node token it sees is
+    // always fresh. WITH-chaining is what lets two independently matched
+    // *existing* nodes both stay bound in the same row for the CREATE tail.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})");
+    run(&store, "CREATE (b:Person {name: 'Bob'})");
+
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    );
+
+    // No new Person nodes were created -- still exactly 2.
+    let people = run(&store, "MATCH (n:Person) RETURN n.name");
+    assert_eq!(people.rows.len(), 2);
+
+    let result = run(&store, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(str_value(&result.rows[0][1]), "Bob");
+}
+
+#[test]
+fn match_create_adds_new_node_to_bound_node() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})");
+
+    run(&store, "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:OWNS]->(i:Item {name: 'Widget'})");
+
+    let result = run(&store, "MATCH (a:Person)-[:OWNS]->(i:Item) RETURN a.name, i.name");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(str_value(&result.rows[0][1]), "Widget");
+}
+
+#[test]
+fn match_create_runs_once_per_matched_row() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (p:Person {{idx: {i}}})"));
+    }
+
+    run(&store, "MATCH (p:Person) CREATE (p)-[:HAS_LOG]->(l:Log)");
+
+    let result = run(&store, "MATCH (p:Person)-[:HAS_LOG]->(l:Log) RETURN count(*)");
+    assert_eq!(int_value(&result.rows[0][0]), 3, "one new Log node per matched Person row");
+}
+
+#[test]
+fn match_create_rejects_relabeling_bound_node() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})");
+    let stmt = parse("MATCH (a:Person {name: 'Alice'}) CREATE (a:Employee)-[:X]->(b:Item)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("already bound"), "expected an already-bound error, got: {err}");
+}
+
+#[test]
+fn match_create_rejects_variable_length_pattern() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Item)");
+    let stmt = parse("MATCH (a:Item) CREATE (a)-[:NEXT*1..3]->(b:Item)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("variable-length"));
+}
+
+#[test]
+fn match_create_rejects_undirected_pattern() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Item)");
+    let stmt = parse("MATCH (a:Item) CREATE (a)-[:X]-(b:Item)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("undirected"));
+}
+
+#[test]
+fn with_chaining_disjoint_second_match_cross_joins_carried_var() {
+    // `b`'s pattern doesn't chain from `a` at all -- before the scan/seed
+    // cross-join fix, this silently dropped `a` instead of producing the
+    // 2x2 cross join real Cypher semantics require here.
+    let store = GraphStore::open_memory().unwrap();
+    for name in ["Alice", "Bob"] {
+        run(&store, &format!("CREATE (:Left {{name: '{name}'}})"));
+    }
+    for name in ["X", "Y"] {
+        run(&store, &format!("CREATE (:Right {{name: '{name}'}})"));
+    }
+
+    let result = run(
+        &store,
+        "MATCH (a:Left) WITH a MATCH (b:Right) RETURN a.name AS leftName, b.name AS rightName \
+         ORDER BY leftName, rightName",
+    );
+    assert_eq!(result.rows.len(), 4, "2 Left x 2 Right must cross-join to 4 rows, not drop `a`");
+    let pairs: Vec<(String, String)> =
+        result.rows.iter().map(|r| (str_value(&r[0]), str_value(&r[1]))).collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("Alice".to_string(), "X".to_string()),
+            ("Alice".to_string(), "Y".to_string()),
+            ("Bob".to_string(), "X".to_string()),
+            ("Bob".to_string(), "Y".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn optional_match_disjoint_pattern_does_not_panic() {
+    // The OPTIONAL pattern doesn't chain from the outer `a` either -- same
+    // root cause as the cross-join test above, but through
+    // eval_optional_part's __seed_idx tagging instead of a plain MATCH.
+    // Before the fix, scan() silently dropped that tag and
+    // eval_optional_part's `unreachable!` fired.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Left {name: 'Alice'})");
+    run(&store, "CREATE (:Right {name: 'X'})");
+
+    let result = run(&store, "MATCH (a:Left) OPTIONAL MATCH (c:Right) RETURN a.name, c.name");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(str_value(&result.rows[0][1]), "X");
+}

@@ -18,7 +18,12 @@ match_part    = { match_keyword ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ w
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ limit_clause? }
 
-tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause }
+// Reuses `create_stmt` itself (not a duplicate rule) — a `MATCH ... CREATE`
+// tail has the exact same pattern syntax as a standalone `CREATE`
+// statement; only the AST/executor treat a node token whose variable is
+// already bound differently (reuse the existing node instead of making a
+// new one — see `Tail::Create`'s docs).
+tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause | create_stmt }
 
 return_clause = { ^"RETURN" ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }

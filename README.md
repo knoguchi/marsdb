@@ -100,23 +100,36 @@ Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
 (`[:TYPE*min..max]`) relationship patterns, `WHERE`, one `WITH` boundary
 per statement (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER
-BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/`SET`, multi-key `ORDER
-BY`, `LIMIT`, `CASE`, the built-in functions `coalesce()`/`toInteger()`,
-and implicit-GROUP-BY aggregation (`count()`/`count(*)`/`sum()`/`avg()`/
-`min()`/`max()`/`collect()`, with `DISTINCT`).
+BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/`SET`/`MATCH ... CREATE`
+(adds an edge between two already-matched nodes — a node token whose
+variable is already bound reuses that node instead of creating a new
+one), multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
+`coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
+(`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
+`DISTINCT` — inside an aggregate call only; a standalone `RETURN DISTINCT`
+result-set modifier doesn't exist yet). Two independent `MATCH` parts
+across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
+pattern doesn't chain from `a`) correctly cross-join, carrying `a`
+alongside every row `b` produces.
 
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
 verified: LDBC's complex queries (IC1-14: `UNWIND`, named
 paths/`shortestPath()`, and the full query set beyond one hand-crafted
 grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` checkpoint —
-see `marsdb-query/tests/smoke.rs`), comma-separated `MATCH` patterns
-beyond a single linear chain (general cross-joins), or chaining past one
-`WITH` boundary.
+see `marsdb-query/tests/smoke.rs`), comma-separated patterns *within one*
+`MATCH`/`CREATE` clause beyond a single linear chain (general
+cross-joins — different from the cross-join WITH-chaining above, which
+works), or chaining past one `WITH` boundary.
 
 ## Roadmap
 
 - `LIMIT` short-circuiting
+- `RETURN DISTINCT` (result-set-level dedup; `DISTINCT` inside an
+  aggregate call already works)
+- `MERGE` (match-or-create in one clause — `MATCH ... CREATE` covers
+  "create an edge between nodes I already matched," not "create this
+  node if it doesn't already exist")
 - `UNWIND`, named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb

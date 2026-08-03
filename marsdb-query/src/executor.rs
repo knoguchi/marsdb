@@ -4,8 +4,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, CompareOp, Expr, Literal, Pattern, PropAccess, QueryPart, RelDirection, ReturnExpr,
-    ReturnItem, SortDir, Statement, Tail, WithClause, WithExpr,
+    is_aggregate_name, CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, QueryPart, RelDirection,
+    ReturnExpr, ReturnItem, SortDir, Statement, Tail, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -107,40 +107,92 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_create(&self, write_txn: &WriteTransaction, patterns: &[Pattern]) -> Result<QueryResult, QueryError> {
-        for pattern in patterns {
-            let start_labels = pattern_labels(&pattern.start.labels);
-            let start_props = literal_props_to_values(&pattern.start.props);
-            let mut prev_id = GraphStore::create_node_in_txn(write_txn, &start_labels, start_props)?;
+        // A standalone CREATE is a MATCH...CREATE tail run against a
+        // single empty row -- `resolve_or_create_node` below never finds
+        // any variable already bound in an empty `BindingRow`, so every
+        // node token is fresh, exactly like standalone CREATE always was.
+        self.materialize_create(write_txn, patterns, &[BindingRow::new()])
+    }
 
-            for (rel, node) in &pattern.hops {
-                if rel.hop_range.is_some() {
-                    return Err(QueryError::Parse(
-                        "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
-                    ));
-                }
-                let labels = pattern_labels(&node.labels);
-                let props = literal_props_to_values(&node.props);
-                let node_id = GraphStore::create_node_in_txn(write_txn, &labels, props)?;
-
-                let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
-                let rel_props = literal_props_to_values(&rel.props);
-                let (src, dst) = match rel.direction {
-                    RelDirection::Right => (prev_id, node_id),
-                    RelDirection::Left => (node_id, prev_id),
-                    RelDirection::Either => {
+    /// Runs CREATE patterns once per row in `rows`. Shared by a
+    /// standalone `CREATE` statement (`execute_create`, a single empty
+    /// row) and a `MATCH ... CREATE` tail (`execute_match`, rows carry
+    /// bindings from the preceding MATCH/WITH). The only real difference
+    /// between the two is what `resolve_or_create_node` finds already
+    /// bound in a row -- nothing for standalone CREATE, real nodes for a
+    /// MATCH...CREATE tail, which is what lets the tail form add an edge
+    /// between two nodes that already exist.
+    fn materialize_create(
+        &self,
+        write_txn: &WriteTransaction,
+        patterns: &[Pattern],
+        rows: &[BindingRow],
+    ) -> Result<QueryResult, QueryError> {
+        for row in rows {
+            for pattern in patterns {
+                let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, row)?;
+                for (rel, node) in &pattern.hops {
+                    if rel.hop_range.is_some() {
                         return Err(QueryError::Parse(
-                            "CREATE requires a directed relationship (-> or <-), not an undirected pattern".into(),
-                        ))
+                            "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
+                        ));
                     }
-                };
-                GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
-                prev_id = node_id;
+                    let node_id = self.resolve_or_create_node(write_txn, node, row)?;
+
+                    let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
+                    let rel_props = literal_props_to_values(&rel.props);
+                    let (src, dst) = match rel.direction {
+                        RelDirection::Right => (prev_id, node_id),
+                        RelDirection::Left => (node_id, prev_id),
+                        RelDirection::Either => {
+                            return Err(QueryError::Parse(
+                                "CREATE requires a directed relationship (-> or <-), not an undirected pattern".into(),
+                            ))
+                        }
+                    };
+                    GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+                    prev_id = node_id;
+                }
             }
         }
         Ok(QueryResult {
             columns: vec![],
             rows: vec![],
         })
+    }
+
+    /// A node pattern token reuses an existing binding iff it names a
+    /// variable already bound in `row` (from a preceding MATCH/WITH) --
+    /// restating labels/props on that token is rejected with a clear
+    /// error rather than silently ignored, since silently dropping
+    /// user-written labels/props would be a correctness trap. Anything
+    /// else (no variable, or a variable not yet bound in this row)
+    /// creates a brand-new node, exactly like standalone CREATE always
+    /// has for every node token.
+    fn resolve_or_create_node(
+        &self,
+        write_txn: &WriteTransaction,
+        node: &NodePattern,
+        row: &BindingRow,
+    ) -> Result<NodeId, QueryError> {
+        if let Some(var) = &node.var {
+            if let Some(binding) = row.get(var) {
+                let Binding::Node(id) = binding else {
+                    return Err(QueryError::Parse(format!(
+                        "'{var}' is not a node — can't use it as a CREATE pattern endpoint"
+                    )));
+                };
+                if !node.labels.is_empty() || !node.props.is_empty() {
+                    return Err(QueryError::Parse(format!(
+                        "'{var}' is already bound — CREATE can't add labels/properties to an existing node"
+                    )));
+                }
+                return Ok(*id);
+            }
+        }
+        let labels = pattern_labels(&node.labels);
+        let props = literal_props_to_values(&node.props);
+        Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
     }
 
     fn execute_match(
@@ -208,6 +260,7 @@ impl<'a> Executor<'a> {
                 self.materialize_delete(require_write_txn(txn), vars, &current_rows, true)?
             }
             Tail::Set(items) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
+            Tail::Create(patterns) => self.materialize_create(require_write_txn(txn), patterns, &current_rows)?,
         };
         if let Some(order_by) = order_by {
             result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
@@ -570,8 +623,8 @@ impl<'a> Executor<'a> {
                 );
                 Ok(seed.to_vec())
             }
-            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None),
-            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label)),
+            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed),
+            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label), seed),
             LogicalPlan::Expand {
                 input,
                 from_var,
@@ -670,16 +723,29 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn scan(&self, txn: Txn, var: &str, label: Option<&str>) -> Result<Vec<BindingRow>, QueryError> {
+    /// Cross-joins the scan against `seed` — for the first `QueryPart` in a
+    /// statement, `seed` is always exactly one empty row (see
+    /// `execute_match`), so this reduces to "one row per scanned node,"
+    /// the same as before this scan ever needed a `seed` parameter at
+    /// all. It matters for a later `QueryPart` (after a `WITH` boundary)
+    /// whose pattern doesn't chain from an already-bound variable — e.g.
+    /// `MATCH (a) WITH a MATCH (b) ...` — real Cypher's cross-join
+    /// semantics require every carried-forward binding (`a`) to survive
+    /// alongside every row this scan produces (`b`), not get silently
+    /// dropped. This is a real cost, not just a correctness fix: a scan
+    /// against N carried rows does N × (scanned rows) work, same as any
+    /// cross join.
+    fn scan(&self, txn: Txn, var: &str, label: Option<&str>, seed: &[BindingRow]) -> Result<Vec<BindingRow>, QueryError> {
         let nodes = GraphStore::all_nodes_in_txn(txn, label)?;
-        Ok(nodes
-            .into_iter()
-            .map(|n| {
-                let mut row = BindingRow::new();
+        let mut out = Vec::with_capacity(seed.len() * nodes.len());
+        for base_row in seed {
+            for n in &nodes {
+                let mut row = base_row.clone();
                 row.insert(var.to_string(), Binding::Node(n.id));
-                row
-            })
-            .collect())
+                out.push(row);
+            }
+        }
+        Ok(out)
     }
 
     fn eval_expr(&self, txn: Txn, expr: &Expr, row: &BindingRow) -> Result<bool, QueryError> {

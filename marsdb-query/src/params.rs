@@ -122,6 +122,11 @@ fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> 
                 substitute_literal(lit, params)?;
             }
         }
+        Tail::Create(patterns) => {
+            for pattern in patterns {
+                substitute_pattern(pattern, params)?;
+            }
+        }
     }
     Ok(())
 }
