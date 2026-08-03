@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Renders the commit/file graph built by `commit_graph.py` (see DEMO.md)
-as a PNG — a bipartite layout, Commit nodes on the left, File nodes on
-the right (only the highest-churn ones, or the graph is an unreadable
-hairball — 50+ files touched more than once turns out to be too many to
-read individual edges from, even though it renders fine), sized by how
-many commits touched them.
+"""Renders the commit/file graph built by `commit_graph.py` as a PNG — a
+bipartite layout, Commit nodes on the left, File nodes on the right (only
+the highest-churn ones, or the graph is an unreadable hairball — 50+ files
+touched more than once turns out to be too many to read individual edges
+from, even though it renders fine), sized by how many commits touched
+them.
 
 Uses the `marsdb` package directly (the actual Python bindings, not the
 CLI) -- `pip install marsdb networkx matplotlib`.
 
-Usage:
-    python3 examples/commit_graph.py > commit_graph.cypher
+Usage (run from the repo root):
+    python3 marsdb-python/examples/commit_graph.py > commit_graph.cypher
     marsdb commit_graph.db "$(cat commit_graph.cypher)"
-    python3 examples/visualize_commit_graph.py commit_graph.db commit_graph.png [min-touches]
+    python3 marsdb-python/examples/visualize_commit_graph.py commit_graph.db commit_graph.png [min-touches]
 """
 
 import sys
