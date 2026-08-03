@@ -4,6 +4,6 @@ marsdb-python/.venv
 __pycache__/
 *.pyc
 *.db
-/task_tracker.png
-/social_graph.png
-/params_and_batch.png
+/task_tracker.svg
+/social_graph.svg
+/params_and_batch.svg

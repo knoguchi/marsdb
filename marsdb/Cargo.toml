@@ -21,7 +21,7 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile = "3"
 criterion.workspace = true
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "histogram", "ab_glyph"] }
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series", "histogram"] }
 
 [[bench]]
 name = "cypher_ops"

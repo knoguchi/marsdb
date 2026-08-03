@@ -4,7 +4,7 @@
 //!
 //!     cargo run -p marsdb --example social_graph
 //!
-//! Writes social_graph.png -- the full KNOWS network.
+//! Writes social_graph.svg -- the full KNOWS network.
 
 use marsdb::Database;
 
@@ -73,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         nodes.iter().position(|n| *n == name).expect("known node")
     };
     let edges: Vec<(usize, usize)> = all_edges.rows.iter().map(|row| (idx(&row[0]), idx(&row[1]))).collect();
-    viz::graph_viz("social_graph.png", "Alice's social network", &nodes, &edges)?;
-    println!("\nwrote social_graph.png");
+    viz::graph_viz("social_graph.svg", "Alice's social network", &nodes, &edges)?;
+    println!("\nwrote social_graph.svg");
 
     Ok(())
 }

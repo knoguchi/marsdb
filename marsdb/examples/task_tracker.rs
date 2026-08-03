@@ -4,7 +4,7 @@
 //!
 //!     cargo run -p marsdb --example task_tracker
 //!
-//! Writes task_tracker.png -- a bar chart of open vs. done tasks.
+//! Writes task_tracker.svg -- a bar chart of open vs. done tasks.
 
 use marsdb::Database;
 
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0.0)
     };
     viz::bar_chart(
-        "task_tracker.png",
+        "task_tracker.svg",
         "Tasks by status",
         "count",
         &[
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("Done", count_for(true), plotters::style::RGBColor(85, 168, 104)),
         ],
     )?;
-    println!("\nwrote task_tracker.png");
+    println!("\nwrote task_tracker.svg");
 
     Ok(())
 }

@@ -5,7 +5,7 @@
 //!
 //!     cargo run -p marsdb --example params_and_batch
 //!
-//! Writes params_and_batch.png -- all products, priced items above
+//! Writes params_and_batch.svg -- all products, priced items above
 //! $minPrice highlighted.
 
 use std::collections::HashMap;
@@ -71,8 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|(name, price)| (name.as_str(), *price, if *price >= min_price { above } else { below }))
         .collect();
-    viz::bar_chart("params_and_batch.png", "Product prices (green >= $minPrice)", "price ($)", &colored)?;
-    println!("\nwrote params_and_batch.png");
+    viz::bar_chart("params_and_batch.svg", "Product prices (green >= $minPrice)", "price ($)", &colored)?;
+    println!("\nwrote params_and_batch.svg");
 
     Ok(())
 }
