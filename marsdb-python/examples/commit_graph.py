@@ -6,10 +6,6 @@ modified. Run from the repo root, so `git log` sees the right history:
 
     python3 marsdb-python/examples/commit_graph.py > commit_graph.cypher
     marsdb commit_graph.db "$(cat commit_graph.cypher)"
-
-MarsDB's string literals have no escape mechanism (no `\\'`), so this
-strips single quotes out of commit subjects/author names rather than
-escaping them.
 """
 
 import subprocess
@@ -17,7 +13,7 @@ import sys
 
 
 def esc(s: str) -> str:
-    return s.replace("'", "")
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def main() -> None:

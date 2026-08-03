@@ -104,6 +104,7 @@ Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 ### Cypher coverage
 
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
+backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
 (`[:TYPE*min..max]`) relationship patterns, `WHERE`, one `WITH` boundary
 per statement (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER
