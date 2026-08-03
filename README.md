@@ -165,11 +165,20 @@ different algorithm).
 ## Testing
 
 ```
-cargo test --workspace                                             # ~1s
+cargo test --workspace                                             # ~8s
 cargo test -p marsdb-graph --test stress -- --ignored --nocapture  # ~15s, large-scale
+cargo test -p marsdb-crash-harness -- --ignored --nocapture        # ~7s/30 runs, SIGKILL-and-verify
 cargo bench -p marsdb-graph
 cargo bench -p marsdb
 ```
+
+`marsdb-crash-harness` is a process-crash durability check, not a full power-loss
+test (OS stays up, page cache intact — a real power-loss test needs fault
+injection like `dm-flakey`, not just `SIGKILL`): it spawns a child process
+committing one transaction at a time, `SIGKILL`s it at an unpredictable point,
+reopens the file fresh, and asserts every acknowledged commit survived intact
+with no gaps or duplicates. `CRASH_TEST_RUNS=200` (default 30) for more
+confidence at the cost of runtime.
 
 ## License
 

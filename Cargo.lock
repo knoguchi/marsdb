@@ -523,6 +523,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "marsdb-crash-harness"
+version = "0.0.0"
+dependencies = [
+ "marsdb",
+ "tempfile",
+]
+
+[[package]]
 name = "marsdb-graph"
 version = "0.4.0"
 dependencies = [
