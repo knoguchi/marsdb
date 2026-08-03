@@ -63,6 +63,28 @@ fn bench_all_nodes_scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// `bench_all_nodes_scan` above is 100% selectivity (every node is `Item`)
+/// — the worst case for an index, since it still pays a per-row point
+/// lookup instead of one sequential scan. This is the case the index is
+/// actually for: 1 in 100 nodes carries the target label, so most of the
+/// table is irrelevant to the query.
+fn bench_all_nodes_scan_low_selectivity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("all_nodes_scan_1pct_selectivity_by_table_size");
+    for n in [100i64, 1_000, 10_000, 100_000] {
+        let store = GraphStore::open_memory().unwrap();
+        for i in 0..n {
+            let mut props = BTreeMap::new();
+            props.insert("idx".to_string(), PropertyValue::Int(i));
+            let label = if i % 100 == 0 { "Target" } else { "Other" };
+            store.create_node(&[label], props).unwrap();
+        }
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(store.all_nodes(Some("Target")).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 /// Follow-up on an earlier open question: does batching many writes into
 /// one transaction (via the `*_in_txn` API the query executor uses) matter
 /// versus one transaction per node? Answers it directly instead of guessing.
@@ -104,6 +126,7 @@ criterion_group!(
     bench_get_node,
     bench_neighbors_1hop,
     bench_all_nodes_scan,
+    bench_all_nodes_scan_low_selectivity,
     bench_bulk_create_txn_strategy,
 );
 criterion_main!(benches);

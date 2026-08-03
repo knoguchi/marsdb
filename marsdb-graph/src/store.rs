@@ -79,10 +79,18 @@ impl GraphStore {
             .map(|l| intern_label(write_txn, l))
             .collect::<Result<Vec<_>, _>>()?;
         let id = next_id(write_txn, "next_node_id")?;
-        let record = NodeRecord { label_ids, props };
+        let record = NodeRecord {
+            label_ids: label_ids.clone(),
+            props,
+        };
         let bytes = encode(&record)?;
         let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
         nodes.insert(id, bytes.as_slice())?;
+        drop(nodes);
+        let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        for label_id in label_ids {
+            label_index.insert(label_id, id)?;
+        }
         Ok(NodeId(id))
     }
 
@@ -302,9 +310,20 @@ impl GraphStore {
         for edge_id in incident {
             Self::delete_edge_in_txn(write_txn, edge_id)?;
         }
-        let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
-        let existed = nodes.remove(id.0)?.is_some();
-        Ok(existed)
+        let removed_bytes: Option<Vec<u8>> = {
+            let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let removed = nodes.remove(id.0)?.map(|guard| guard.value().to_vec());
+            removed
+        };
+        let Some(removed_bytes) = removed_bytes else {
+            return Ok(false);
+        };
+        let record: NodeRecord = decode(&removed_bytes)?;
+        let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        for label_id in record.label_ids {
+            label_index.remove(label_id, id.0)?;
+        }
+        Ok(true)
     }
 
     pub fn set_node_prop(&self, id: NodeId, key: &str, value: PropertyValue) -> Result<bool, GraphError> {
@@ -379,19 +398,17 @@ impl GraphStore {
     }
 
     pub fn all_nodes_in_txn(write_txn: &WriteTransaction, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
-        let label_id_filter = match label_filter {
-            Some(l) => match lookup_label_id(write_txn, l)? {
-                Some(id) => Some(id),
-                None => return Ok(Vec::new()),
-            },
-            None => None,
-        };
-        let mut result = Vec::new();
-        let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
-        for item in nodes.iter()? {
-            let (key, value) = item?;
-            let record: NodeRecord = decode(value.value())?;
-            if label_id_filter.is_none_or(|lid| record.label_ids.contains(&lid)) {
+        // A label filter goes through NODE_LABEL_INDEX (label_id -> node_ids)
+        // plus a point lookup per match, instead of scanning every row in
+        // NODES — cost scales with the number of matching rows, not the
+        // table size. No filter means every row is wanted anyway, so a full
+        // scan is already optimal; the index wouldn't help.
+        let Some(label_filter) = label_filter else {
+            let mut result = Vec::new();
+            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            for item in nodes.iter()? {
+                let (key, value) = item?;
+                let record: NodeRecord = decode(value.value())?;
                 let labels = record
                     .label_ids
                     .iter()
@@ -403,6 +420,37 @@ impl GraphStore {
                     props: record.props,
                 });
             }
+            return Ok(result);
+        };
+        let Some(label_id) = lookup_label_id(write_txn, label_filter)? else {
+            return Ok(Vec::new());
+        };
+        let node_ids: Vec<u64> = {
+            let label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            let ids: Vec<u64> = label_index
+                .get(label_id)?
+                .map(|item| item.map(|g| g.value()))
+                .collect::<Result<_, _>>()?;
+            ids
+        };
+        let mut result = Vec::with_capacity(node_ids.len());
+        let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+        for id in node_ids {
+            let guard = nodes
+                .get(id)?
+                .expect("node_label_index entry must reference a live node");
+            let record: NodeRecord = decode(guard.value())?;
+            drop(guard);
+            let labels = record
+                .label_ids
+                .iter()
+                .map(|&lid| resolve_label(write_txn, lid))
+                .collect::<Result<Vec<_>, _>>()?;
+            result.push(Node {
+                id: NodeId(id),
+                labels,
+                props: record.props,
+            });
         }
         Ok(result)
     }
