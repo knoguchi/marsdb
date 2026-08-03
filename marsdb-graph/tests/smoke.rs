@@ -63,3 +63,35 @@ fn delete_node_detach() {
     assert!(store.get_node(a).unwrap().is_none());
     assert_eq!(store.neighbors(b, Direction::In, None).unwrap().len(), 0);
 }
+
+/// Regression test for the label index (`NODE_LABEL_INDEX`): a deleted
+/// multi-label node must disappear from every label bucket it was in, not
+/// just the `nodes` table, and a label-filtered scan must never return a
+/// stale/dangling node id.
+#[test]
+fn label_index_tracks_multi_label_create_and_delete() {
+    let store = GraphStore::open_memory().unwrap();
+    let post = store.create_node(&["Post", "Message"], BTreeMap::new()).unwrap();
+    let comment = store.create_node(&["Comment", "Message"], BTreeMap::new()).unwrap();
+    let _person = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+
+    let messages = store.all_nodes(Some("Message")).unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|n| n.id == post));
+    assert!(messages.iter().any(|n| n.id == comment));
+
+    assert_eq!(store.all_nodes(Some("Post")).unwrap().len(), 1);
+    assert_eq!(store.all_nodes(Some("Person")).unwrap().len(), 1);
+    assert_eq!(store.all_nodes(Some("NoSuchLabel")).unwrap().len(), 0);
+
+    assert!(store.delete_node(post, false).unwrap());
+
+    // `post` carried both `Post` and `Message` — deleting it must clear both
+    // buckets, not just the one a naive single-label implementation would
+    // remember.
+    let messages_after = store.all_nodes(Some("Message")).unwrap();
+    assert_eq!(messages_after.len(), 1);
+    assert_eq!(messages_after[0].id, comment);
+    assert_eq!(store.all_nodes(Some("Post")).unwrap().len(), 0);
+    assert_eq!(store.all_nodes(Some("Person")).unwrap().len(), 1);
+}

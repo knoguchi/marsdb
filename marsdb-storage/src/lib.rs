@@ -50,6 +50,7 @@ impl StorageEngine {
             write_txn.open_table(tables::EDGES)?;
             write_txn.open_multimap_table(tables::ADJ_OUT)?;
             write_txn.open_multimap_table(tables::ADJ_IN)?;
+            write_txn.open_multimap_table(tables::NODE_LABEL_INDEX)?;
         }
         write_txn.commit()?;
         Ok(Self { db })

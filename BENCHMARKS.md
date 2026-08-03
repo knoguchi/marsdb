@@ -13,21 +13,36 @@ both `cypher_ops` and `ldbc_ops`).
 
 | Operation | Result |
 |---|---|
-| `create_node` | 22.3 µs |
+| `create_node` | 36.7 µs |
 | `create_edge` | 48.7 µs |
-| `get_node` (point lookup by id) | 1.6 µs |
+| `get_node` (point lookup by id) | 1.7 µs |
 | `neighbors`, 1-hop, fanout 1 | 1.2 µs |
 | `neighbors`, 1-hop, fanout 10 | 1.7 µs |
-| `neighbors`, 1-hop, fanout 100 | 7.1 µs |
-| `neighbors`, 1-hop, fanout 1,000 | 55.6 µs |
-| `all_nodes` scan, 100 rows | 62.6 µs |
-| `all_nodes` scan, 1,000 rows | 619.5 µs |
-| `all_nodes` scan, 10,000 rows | 6.22 ms |
+| `neighbors`, 1-hop, fanout 100 | 7.0 µs |
+| `neighbors`, 1-hop, fanout 1,000 | 55.3 µs |
+| `all_nodes` scan, label matches 100% of rows, 100 rows | 81.6 µs |
+| Same query, 1,000 rows | 877.8 µs |
+| Same query, 10,000 rows | 9.08 ms |
+| `all_nodes` scan, label matches 1% of rows, 100 rows | 2.9 µs |
+| Same query, 1,000 rows | 10.9 µs |
+| Same query, 10,000 rows | 91.5 µs |
+| Same query, 100,000 rows | 1.03 ms |
 
-`all_nodes` is a linear scan of the whole node table filtered by label —
-there's no secondary index on label, so cost scales with total table size,
-not with the number of matching rows. At 10M rows this would be roughly
-6 seconds, not milliseconds. A label index is on the roadmap (see README).
+`NODE_LABEL_INDEX` (label_id -> node_ids) backs label-filtered scans: a
+lookup in that index plus one point-`get` per matching node, instead of
+decoding every row in the table. This is a genuine trade, not a strict
+win, and both sides show up above. On a query that only wants 1% of the
+table, it's roughly 60-100x faster than the old full scan (91.5 µs vs. the
+~6-9 ms a linear scan takes at the same table size) and stays close to flat
+per matching row as the table grows to 100,000. But `create_node` got
+~65% slower (22.3 µs -> 36.7 µs, extra index writes on every insert), and a
+query where every row matches the label got ~30-45% slower (62.6 µs -> 81.6
+µs at 100 rows, 6.22 ms -> 9.08 ms at 10,000) — the index still does N
+random point-`get`s where the old code did one sequential pass, and there's
+no matching-row count cheap enough to skip the index and fall back to a
+plain scan when selectivity is high. `AllNodesScan` (no label filter, e.g.
+`MATCH (n) RETURN n`) is untouched — it never had a filter to index against,
+so it still does the one sequential pass and isn't affected either way.
 
 ### Transaction batching
 

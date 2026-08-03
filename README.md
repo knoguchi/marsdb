@@ -102,7 +102,6 @@ linear chain (general cross-joins), or chaining past one `WITH` boundary.
 
 ## Roadmap
 
-- Secondary index on node label (label scans are currently linear)
 - Concurrent reads (split the executor's read path onto `ReadTransaction`)
 - `LIMIT` short-circuiting
 - Aggregation (`count`, `sum`, `collect`), `UNWIND`, named paths/`shortestPath()`
