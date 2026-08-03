@@ -86,6 +86,7 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, PropertyValue>) -> 
         Expr::Not(e) => substitute_expr(e, params)?,
         Expr::Compare(_, _, lit) => substitute_literal(lit, params)?,
         Expr::HasLabel(_, _) => {}
+        Expr::VarEq(_, _) => {}
     }
     Ok(())
 }

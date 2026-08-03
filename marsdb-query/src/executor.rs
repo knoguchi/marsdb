@@ -8,9 +8,14 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
-use crate::planner::build_match_plan;
+use crate::planner::{build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::result::QueryResult;
 use crate::value::Value;
+
+/// Hidden key used to correlate `OPTIONAL MATCH` results back to the outer
+/// row that seeded them — never visible to user Cypher (not a valid
+/// identifier prefix a parsed pattern could ever produce).
+const OPTIONAL_SEED_IDX_KEY: &str = "__seed_idx";
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -126,7 +131,12 @@ impl<'a> Executor<'a> {
         let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
         for part in parts {
             let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
-            current_rows = self.eval_plan(write_txn, &plan, &current_rows)?;
+            current_rows = if part.optional {
+                let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
+                self.eval_optional_part(write_txn, &plan, &current_rows, &new_vars)?
+            } else {
+                self.eval_plan(write_txn, &plan, &current_rows)?
+            };
             if let Some(with) = &part.with {
                 current_rows = self.materialize_with(write_txn, with, &current_rows)?;
                 if let Some(with_order_by) = &with.order_by {
@@ -136,6 +146,12 @@ impl<'a> Executor<'a> {
                     current_rows.truncate(with_limit.max(0) as usize);
                 }
                 carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
+            } else {
+                // No WITH: real Cypher shares one binding scope across
+                // MATCH/OPTIONAL MATCH clauses that aren't WITH-separated
+                // — every var this part bound stays in scope for whatever
+                // comes next, on top of what was already carried in.
+                carried_vars.extend(pattern_all_vars(&part.pattern));
             }
         }
         // ORDER BY must see every matching row before LIMIT truncates —
@@ -251,6 +267,65 @@ impl<'a> Executor<'a> {
             map.insert(k.clone(), value);
         }
         Ok(map)
+    }
+
+    /// Evaluates an `OPTIONAL MATCH` part with left-outer-join semantics:
+    /// every outer row survives, whether or not the optional pattern
+    /// matched anything for it. Must wrap the *whole* subplan rather than
+    /// null-padding inside `Expand`/`VarExpand` themselves — baking it in
+    /// there would turn every default (non-optional) `Expand` into a
+    /// left-outer-join too (breaking existing inner-join semantics), and
+    /// would mis-handle multi-hop optional patterns: IS7's optional
+    /// pattern is 2 hops, and per-hop null-padding would emit one
+    /// null-padded row per *hop-1* match even when hop 2 also matched,
+    /// instead of collapsing to exactly one row per outer row that had
+    /// zero end-to-end matches.
+    ///
+    /// Implementation: tag each outer row with its index, evaluate the
+    /// subplan once over the whole tagged batch (a single seed, not one
+    /// call per row), group results back by that index, then for any
+    /// outer index with zero results, emit the outer row unchanged plus
+    /// `Null` for every variable the optional pattern would have newly
+    /// introduced.
+    fn eval_optional_part(
+        &self,
+        write_txn: &WriteTransaction,
+        plan: &LogicalPlan,
+        outer_rows: &[BindingRow],
+        new_vars: &HashSet<String>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let tagged: Vec<BindingRow> = outer_rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut r = row.clone();
+                r.insert(OPTIONAL_SEED_IDX_KEY.to_string(), Binding::Value(PropertyValue::Int(i as i64)));
+                r
+            })
+            .collect();
+        let results = self.eval_plan(write_txn, plan, &tagged)?;
+        let mut by_idx: HashMap<i64, Vec<BindingRow>> = HashMap::new();
+        for mut row in results {
+            let idx = match row.remove(OPTIONAL_SEED_IDX_KEY) {
+                Some(Binding::Value(PropertyValue::Int(i))) => i,
+                other => unreachable!("__seed_idx tagged internally as Binding::Value(Int), got {other:?}"),
+            };
+            by_idx.entry(idx).or_default().push(row);
+        }
+        let mut out = Vec::with_capacity(outer_rows.len());
+        for (i, outer_row) in outer_rows.iter().enumerate() {
+            match by_idx.remove(&(i as i64)) {
+                Some(matches) => out.extend(matches),
+                None => {
+                    let mut padded = outer_row.clone();
+                    for var in new_vars {
+                        padded.insert(var.clone(), Binding::Value(PropertyValue::Null));
+                    }
+                    out.push(padded);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn eval_plan(
@@ -395,6 +470,22 @@ impl<'a> Executor<'a> {
                 };
                 let node = GraphStore::get_node_in_txn(write_txn, *id)?;
                 node.is_some_and(|n| n.labels.iter().any(|l| l == label))
+            }
+            Expr::VarEq(a, b) => {
+                let ba = row.get(a).ok_or_else(|| QueryError::UnboundVariable(a.clone()))?;
+                let bb = row.get(b).ok_or_else(|| QueryError::UnboundVariable(b.clone()))?;
+                match (ba, bb) {
+                    (Binding::Node(x), Binding::Node(y)) => x == y,
+                    (Binding::Edge(x), Binding::Edge(y)) => x == y,
+                    // A null-padded `Binding::Value` (from an earlier
+                    // OPTIONAL MATCH that didn't match) can't equal a
+                    // real node/edge, and comparing across binding kinds
+                    // (a node vs an edge) is never meaningful here — the
+                    // planner only ever synthesizes VarEq between two
+                    // occurrences of the same pattern variable, which are
+                    // always the same kind when both are real.
+                    _ => false,
+                }
             }
         })
     }

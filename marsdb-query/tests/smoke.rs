@@ -549,3 +549,110 @@ fn two_with_boundaries_is_rejected() {
     let err = parse("MATCH (a:Item) WITH a MATCH (b:Item) WITH b RETURN a").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("with"));
 }
+
+#[test]
+fn optional_match_with_var_eq_mirrors_is7_shape() {
+    use std::collections::BTreeMap;
+
+    // Mirrors IS7: MATCH (m)<-[:REPLY_OF]-(c)-[:HAS_CREATOR]->(p)
+    //              OPTIONAL MATCH (m)-[:HAS_CREATOR]->(a)-[r:KNOWS]-(p)
+    //              RETURN ... CASE r WHEN null THEN false ELSE true END
+    //
+    // p is bound by the first MATCH (comment author) then reappears as the
+    // endpoint of the OPTIONAL pattern -- must mean "KNOWS THIS p", not
+    // "KNOWS anyone" (Expr::VarEq). c1's author knows the original
+    // message's author; c2's author doesn't -- so the two rows must get
+    // different CASE results, not both true/both false.
+    let store = GraphStore::open_memory().unwrap();
+
+    let mut m_props = BTreeMap::new();
+    m_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
+    let m = store.create_node(&["Post", "Message"], m_props).unwrap();
+    let original_author = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    store.create_edge("HAS_CREATOR", m, original_author, BTreeMap::new()).unwrap();
+
+    let mut p1_props = BTreeMap::new();
+    p1_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("KnowsAuthor".into()));
+    let p1 = store.create_node(&["Person"], p1_props).unwrap();
+    let mut c1_props = BTreeMap::new();
+    c1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(10));
+    let c1 = store.create_node(&["Comment", "Message"], c1_props).unwrap();
+    store.create_edge("REPLY_OF", c1, m, BTreeMap::new()).unwrap();
+    store.create_edge("HAS_CREATOR", c1, p1, BTreeMap::new()).unwrap();
+    store.create_edge("KNOWS", p1, original_author, BTreeMap::new()).unwrap();
+
+    let mut p2_props = BTreeMap::new();
+    p2_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("StrangerAuthor".into()));
+    let p2 = store.create_node(&["Person"], p2_props).unwrap();
+    let mut c2_props = BTreeMap::new();
+    c2_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(20));
+    let c2 = store.create_node(&["Comment", "Message"], c2_props).unwrap();
+    store.create_edge("REPLY_OF", c2, m, BTreeMap::new()).unwrap();
+    store.create_edge("HAS_CREATOR", c2, p2, BTreeMap::new()).unwrap();
+    // No KNOWS edge between p2 and original_author.
+
+    let result = run(
+        &store,
+        "MATCH (m:Message {id: 1})<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(p:Person) \
+         OPTIONAL MATCH (m)-[:HAS_CREATOR]->(a:Person)-[r:KNOWS]-(p) \
+         RETURN c.id AS commentId, p.name AS replyAuthorName, \
+                CASE r WHEN null THEN false ELSE true END AS knowsFlag \
+         ORDER BY commentId ASC",
+    );
+
+    assert_eq!(result.rows.len(), 2);
+
+    let extract = |row: &Vec<Value>| -> (i64, String, bool) {
+        let comment_id = match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected commentId {other:?}"),
+        };
+        let name = match &row[1] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected replyAuthorName {other:?}"),
+        };
+        let knows = match &row[2] {
+            Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+            other => panic!("unexpected knowsFlag {other:?}"),
+        };
+        (comment_id, name, knows)
+    };
+
+    assert_eq!(extract(&result.rows[0]), (10, "KnowsAuthor".to_string(), true));
+    assert_eq!(extract(&result.rows[1]), (20, "StrangerAuthor".to_string(), false));
+
+    let _ = (m, c1, c2, p1, p2, original_author);
+}
+
+#[test]
+fn optional_match_null_pads_when_nothing_matches() {
+    use std::collections::BTreeMap;
+
+    // No KNOWS edge exists at all -- the OPTIONAL MATCH must still return
+    // one row per outer row (not zero), with `a`/`r` null-padded.
+    let store = GraphStore::open_memory().unwrap();
+    let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+
+    let result = run(
+        &store,
+        "MATCH (p:Person) \
+         OPTIONAL MATCH (p)-[r:KNOWS]-(friend) \
+         RETURN CASE r WHEN null THEN false ELSE true END AS knowsFlag",
+    );
+    assert_eq!(result.rows.len(), 1, "the outer MATCH row must survive even with zero optional matches");
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::Bool(b)) => assert!(!b),
+        other => panic!("unexpected value {other:?}"),
+    }
+    let _ = alice;
+}
+
+#[test]
+fn optional_match_without_with_shares_scope() {
+    // MATCH ... OPTIONAL MATCH ... (no WITH between them) must be valid --
+    // unlike two plain MATCHes, which require a WITH separator.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Item {name: 'a'})");
+    let result = run(&store, "MATCH (n:Item) OPTIONAL MATCH (n)-[:X]->(m) RETURN n.name");
+    assert_eq!(result.rows.len(), 1);
+}

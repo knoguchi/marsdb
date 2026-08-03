@@ -37,6 +37,13 @@ pub enum Expr {
     /// multiple) labels? Synthesized by the planner for the 2nd+ label in a
     /// multi-label pattern like `(n:Post:Message)` — never user-typed.
     HasLabel(String, String),
+    /// Do these two row bindings refer to the same node/edge? Synthesized
+    /// by the planner when a pattern's hop variable is a "bound-node
+    /// repetition" — the same variable already bound earlier reappearing
+    /// mid-pattern (e.g. IS7's `p`, bound by an earlier MATCH, reappearing
+    /// as the endpoint of an OPTIONAL MATCH pattern: `(a)-[r:KNOWS]-(p)`
+    /// must mean "KNOWS *this* `p`", not "KNOWS anyone"). Never user-typed.
+    VarEq(String, String),
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +137,7 @@ pub struct WithClause {
 /// only ever holds one already-combined `Pattern`, not several.
 #[derive(Debug, Clone)]
 pub struct QueryPart {
+    pub optional: bool,
     pub pattern: Pattern,
     pub where_clause: Option<Expr>,
     pub with: Option<WithClause>,

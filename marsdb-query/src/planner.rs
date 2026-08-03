@@ -45,7 +45,15 @@ pub fn build_match_plan(
     };
     let mut from_var = start_var;
     for (rel, node) in &pattern.hops {
-        let to_var = namer.name(&node.var);
+        // "Bound-node repetition": this hop's variable was already bound
+        // before this pattern started (e.g. IS7's `p`, bound by an earlier
+        // MATCH, reappearing as the endpoint of an OPTIONAL MATCH pattern).
+        // Must synthesize a FRESH name for the Expand to bind — reusing the
+        // original name here would let Expand's `new_row.insert` overwrite
+        // the existing carried-forward binding before it can be compared
+        // against, defeating the whole check.
+        let is_repeat = node.var.as_ref().is_some_and(|v| carried_vars.contains(v));
+        let to_var = if is_repeat { namer.name(&None) } else { namer.name(&node.var) };
         let direction = match rel.direction {
             RelDirection::Right => ExpandDirection::Out,
             RelDirection::Left => ExpandDirection::In,
@@ -88,6 +96,13 @@ pub fn build_match_plan(
         // NodeByLabelScan) — every listed label must be Filter-checked
         // here, not just the extras beyond the first.
         plan = wrap_labels_and_props(plan, &to_var, node, 0);
+        if is_repeat {
+            let original = node.var.clone().expect("is_repeat implies node.var is Some");
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: Expr::VarEq(to_var.clone(), original),
+            };
+        }
         from_var = to_var;
     }
     if let Some(expr) = where_clause {
@@ -141,4 +156,38 @@ fn wrap_labels_and_props(plan: LogicalPlan, var: &str, node: &NodePattern, skip:
         };
     }
     plan
+}
+
+/// All variable names (node + relationship) a pattern binds, regardless of
+/// whether they're a fresh binding or a bound-node repetition. Used by the
+/// executor to grow `carried_vars` across `QueryPart`s that aren't
+/// separated by a `WITH` — real Cypher shares one binding scope across
+/// `MATCH`/`OPTIONAL MATCH` clauses that aren't WITH-separated.
+pub fn pattern_all_vars(pattern: &Pattern) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    if let Some(v) = &pattern.start.var {
+        vars.insert(v.clone());
+    }
+    for (rel, node) in &pattern.hops {
+        if let Some(v) = &rel.var {
+            vars.insert(v.clone());
+        }
+        if let Some(v) = &node.var {
+            vars.insert(v.clone());
+        }
+    }
+    vars
+}
+
+/// Variables this pattern introduces newly — excludes anything already in
+/// `carried_vars` (those are Seed/`VarEq` repetitions, not fresh
+/// bindings). Used by `OPTIONAL MATCH` null-padding to know exactly which
+/// keys need `Null` when the whole pattern fails to match for an outer
+/// row — a repeated variable keeps whatever it already was, only genuinely
+/// new ones need padding.
+pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> HashSet<String> {
+    pattern_all_vars(pattern)
+        .into_iter()
+        .filter(|v| !carried_vars.contains(v))
+        .collect()
 }

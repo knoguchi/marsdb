@@ -57,6 +57,10 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     // between them, and additionally caps chaining at one WITH boundary
     // total — nothing IS1-7 needs requires more, and a hand-rolled parser
     // is safer erroring on untested shapes than silently mishandling them.
+    // OPTIONAL MATCH is exempt from the WITH requirement (matching real
+    // Cypher: `MATCH (a) OPTIONAL MATCH (b) RETURN a, b` is valid without a
+    // WITH between them — OPTIONAL MATCH continues in the same scope
+    // rather than starting a fresh reading context).
     let with_count = parts.iter().filter(|p| p.with.is_some()).count();
     if with_count > 1 {
         return Err(QueryError::Parse(
@@ -64,7 +68,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         ));
     }
     for (i, part) in parts.iter().enumerate() {
-        if i + 1 < parts.len() && part.with.is_none() {
+        if i + 1 < parts.len() && part.with.is_none() && !parts[i + 1].optional {
             return Err(QueryError::Parse(
                 "multiple MATCH clauses must be separated by WITH".into(),
             ));
@@ -80,11 +84,15 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
 }
 
 fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
+    let mut optional = false;
     let mut patterns = Vec::new();
     let mut where_clause = None;
     let mut with = None;
     for p in pair.into_inner() {
         match p.as_rule() {
+            Rule::match_keyword => {
+                optional = p.as_str().to_ascii_uppercase().starts_with("OPTIONAL");
+            }
             Rule::pattern => patterns.push(parse_pattern(p)?),
             Rule::where_clause => {
                 let expr_pair = p.into_inner().next().expect("WHERE has an expr");
@@ -96,6 +104,7 @@ fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
     }
     let pattern = splice_patterns(patterns)?;
     Ok(QueryPart {
+        optional,
         pattern,
         where_clause,
         with,
