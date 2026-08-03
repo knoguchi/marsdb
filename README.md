@@ -236,12 +236,14 @@ in MarsDB) take upwards of an hour instead of seconds on this target; a
 seeded corpus doesn't hit it.
 
 `marsdb-tck` runs a real subset of the
-[openCypher TCK](https://github.com/opencypher/openCypher) (220 vendored
-`.feature` files, 1615 scenarios, pinned commit — see
-`marsdb-tck/VENDOR.md`) against MarsDB, via a purpose-built Gherkin-subset
-parser and structural result comparison (not string matching):
+[openCypher TCK](https://github.com/opencypher/openCypher) (pulled in as a
+git submodule pinned to a fixed commit — see `marsdb-tck/VENDOR.md`; 220
+`.feature` files, 1615 scenarios) against MarsDB, via a purpose-built
+Gherkin-subset parser and structural result comparison (not string
+matching):
 
 ```
+git submodule update --init marsdb-tck/openCypher
 cargo run --release -p marsdb-tck
 ```
 

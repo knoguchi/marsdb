@@ -1,0 +1,3 @@
+[submodule "marsdb-tck/openCypher"]
+	path = marsdb-tck/openCypher
+	url = https://github.com/opencypher/openCypher.git

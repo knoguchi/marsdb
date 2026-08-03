@@ -1,18 +1,26 @@
-# Vendoring the openCypher TCK
+# The openCypher TCK submodule
 
-`TCK-LICENSE`/`TCK-NOTICE` are copied from upstream's repo root, alongside
-this vendored content, per the Apache-2.0 attribution requirement — separate
-from MarsDB's own `LICENSE-MIT`/`LICENSE-APACHE` at the repo root, which
-apply to MarsDB's own code, not this vendored third-party test suite.
-
-`features/` is a copy of `tck/features/` from
+`openCypher/` is a git submodule pointing at
 [opencypher/openCypher](https://github.com/opencypher/openCypher), pinned at
-commit `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23` (2026-03-20). 220
-`.feature` files, 1615 `Scenario:`/`Scenario Outline:` headers (per this
-crate's own Gherkin parser, the authoritative count — a plain
-`grep -c '^\s*Scenario:'` undercounts by 276, since it doesn't match
-`Scenario Outline:` at all), license headers (Apache-2.0 + the openCypher
-attribution notice) kept intact in every file, as copied.
+commit `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23` (2026-03-20). The runner
+reads `.feature` files from `openCypher/tck/features/` directly — 220 files,
+1615 `Scenario:`/`Scenario Outline:` headers (per this crate's own Gherkin
+parser, the authoritative count — a plain `grep -c '^\s*Scenario:'`
+undercounts by 276, since it doesn't match `Scenario Outline:` at all).
+
+A submodule (not a vendored copy) so the build has no bearing on Apache-2.0
+attribution bookkeeping — the checked-out submodule *is* the real upstream
+repo, `LICENSE`/`NOTICE` included, not a partial copy needing its own
+attribution files. It also means no drift risk from hand-copying and no
+repo-size cost from tracking 220 files directly. The tradeoff: cloning this
+repo needs an extra step to pull the TCK content in:
+
+```
+git submodule update --init marsdb-tck/openCypher
+```
+
+`marsdb-tck` fails fast with that same instruction if the submodule isn't
+checked out, rather than silently reporting zero scenarios.
 
 Each `Scenario Outline:` is parsed and run as exactly one scenario, using
 the literal, unsubstituted `<placeholder>` text still in its query (e.g.
@@ -25,12 +33,14 @@ variants upstream defines. A known v1 simplification, not a bug — full
 `Examples:` expansion would be the natural follow-up if outline coverage
 ever needs to be real.
 
-To re-vendor against a newer upstream commit:
+To move to a newer upstream commit:
 
 ```
-git clone --depth 1 https://github.com/opencypher/openCypher.git /tmp/oc
-rm -rf features
-cp -r /tmp/oc/tck/features features
+cd marsdb-tck/openCypher
+git fetch
+git checkout <new-commit>
+cd ../..
+git add marsdb-tck/openCypher
 ```
 
 ## `graphs/*.cypher` — rewritten, not verbatim

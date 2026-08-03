@@ -30,7 +30,13 @@ struct ScenarioReport {
 }
 
 fn main() {
-    let features_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("features");
+    let features_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("openCypher/tck/features");
+    if !features_dir.is_dir() {
+        eprintln!(
+            "{features_dir:?} doesn't exist -- the openCypher submodule isn't checked out.\nRun: git submodule update --init marsdb-tck/openCypher"
+        );
+        std::process::exit(1);
+    }
     let mut reports = Vec::new();
 
     for entry in walk_feature_files(&features_dir) {
