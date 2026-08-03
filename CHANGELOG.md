@@ -3,6 +3,14 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-08-03
+
+### Fixed
+- Every crate's `Cargo.toml` and `marsdb-python`'s `pyproject.toml` was
+  missing a `readme` field, so crates.io/PyPI showed "no README" for
+  0.3.0 despite one existing at the repo root. Package metadata only —
+  no code changes.
+
 ## [0.3.0] - 2026-08-03
 
 ### Added

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 description = "Thin embedded-KV storage trait boundary used internally by MarsDB."
 
 [dependencies]
