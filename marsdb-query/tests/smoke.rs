@@ -134,3 +134,64 @@ fn multi_label_create_and_match() {
         other => panic!("unexpected value {other:?}"),
     }
 }
+
+#[test]
+fn coalesce_returns_first_non_null() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Post {content: 'hello', imageFile: 'ignored.png'})");
+    run(&store, "CREATE (b:Post {imageFile: 'pic.png'})"); // no content prop
+
+    let result = run(&store, "MATCH (n:Post) RETURN coalesce(n.content, n.imageFile) AS x");
+    let mut values: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    values.sort();
+    assert_eq!(values, vec!["hello".to_string(), "pic.png".to_string()]);
+}
+
+#[test]
+fn to_integer_parses_string_and_passes_through_int() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {code: '42'})");
+    let result = run(&store, "MATCH (n:Person) RETURN toInteger(n.code) AS x");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(v)) => assert_eq!(*v, 42),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn case_when_then_else() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {age: 30})");
+    run(&store, "CREATE (b:Person {age: 17})");
+    let result = run(&store, "MATCH (n:Person) RETURN CASE n.age WHEN 30 THEN 'thirty' ELSE 'other' END AS x");
+    let mut values: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Literal(marsdb_query::Literal::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    values.sort();
+    assert_eq!(values, vec!["other".to_string(), "thirty".to_string()]);
+}
+
+#[test]
+fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
+    // Documents the deliberate convention CASE relies on for IS7: a missing
+    // property compared against `null` in a WHEN arm matches.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})"); // no `age` prop
+    let result = run(&store, "MATCH (n:Person) RETURN CASE n.age WHEN null THEN 'yes' ELSE 'no' END AS x");
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "yes"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}

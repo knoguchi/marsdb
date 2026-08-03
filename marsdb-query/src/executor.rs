@@ -259,11 +259,48 @@ impl<'a> Executor<'a> {
             ReturnExpr::Prop(pa) => {
                 let value = self.lookup_prop(write_txn, pa, row)?;
                 Ok(match value {
+                    // Collapse "prop missing" and "prop stored as null" into
+                    // one null representation — see Value::Null docs.
+                    Some(PropertyValue::Null) | None => Value::Null,
                     Some(pv) => Value::Property(pv),
-                    None => Value::Null,
                 })
             }
-            ReturnExpr::Lit(lit) => Ok(Value::Literal(lit.clone())),
+            ReturnExpr::Lit(lit) => Ok(match lit {
+                Literal::Null => Value::Null,
+                other => Value::Literal(other.clone()),
+            }),
+            ReturnExpr::Call(name, args) => {
+                let arg_values = args
+                    .iter()
+                    .map(|a| self.eval_return_expr(write_txn, a, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                call_builtin(name, &arg_values)
+            }
+            ReturnExpr::Case { test, whens, else_ } => {
+                let test_value = match test {
+                    Some(t) => Some(self.eval_return_expr(write_txn, t, row)?),
+                    None => None,
+                };
+                for (when, then) in whens {
+                    let when_value = self.eval_return_expr(write_txn, when, row)?;
+                    // Deliberately reuses the same Null == Null -> true
+                    // convention as `compare()` below, not standard
+                    // three-valued NULL logic — IS7's `CASE r WHEN null
+                    // THEN false ELSE true END` depends on this exact
+                    // semantics to detect an OPTIONAL MATCH non-match.
+                    let matched = match &test_value {
+                        Some(tv) => value_eq(tv, &when_value),
+                        None => matches!(when_value, Value::Literal(Literal::Bool(true))),
+                    };
+                    if matched {
+                        return self.eval_return_expr(write_txn, then, row);
+                    }
+                }
+                match else_ {
+                    Some(e) => self.eval_return_expr(write_txn, e, row),
+                    None => Ok(Value::Null),
+                }
+            }
         }
     }
 
@@ -331,6 +368,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Var(v) => v.clone(),
         ReturnExpr::Prop(pa) => format!("{}.{}", pa.var, pa.prop),
         ReturnExpr::Lit(_) => format!("col{idx}"),
+        ReturnExpr::Call(name, _) => format!("{name}(...)"),
+        ReturnExpr::Case { .. } => format!("case{idx}"),
     }
 }
 
@@ -396,5 +435,48 @@ fn cmp_ord<T: PartialOrd>(op: CompareOp, a: T, b: T) -> bool {
         CompareOp::Le => a <= b,
         CompareOp::Gt => a > b,
         CompareOp::Ge => a >= b,
+    }
+}
+
+/// Value equality for CASE's WHEN-comparison. Null == Null -> true here
+/// deliberately, matching `compare()`'s convention above, not standard
+/// three-valued NULL logic.
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Property(pa), Value::Property(pb)) => pa == pb,
+        (Value::Literal(la), Value::Literal(lb)) => la == lb,
+        (Value::Property(pa), Value::Literal(lb)) => *pa == literal_to_value(lb),
+        (Value::Literal(la), Value::Property(pb)) => literal_to_value(la) == *pb,
+        _ => false,
+    }
+}
+
+fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
+    match name.to_ascii_lowercase().as_str() {
+        "coalesce" => Ok(args
+            .iter()
+            .find(|v| !matches!(v, Value::Null))
+            .cloned()
+            .unwrap_or(Value::Null)),
+        "tointeger" => Ok(args.first().map(to_integer).unwrap_or(Value::Null)),
+        other => Err(QueryError::Parse(format!("unknown function: {other}"))),
+    }
+}
+
+fn to_integer(v: &Value) -> Value {
+    let as_str_parse = |s: &str| match s.trim().parse::<i64>() {
+        Ok(i) => Value::Property(PropertyValue::Int(i)),
+        Err(_) => Value::Null,
+    };
+    match v {
+        Value::Property(PropertyValue::Int(i)) => Value::Property(PropertyValue::Int(*i)),
+        Value::Property(PropertyValue::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
+        Value::Property(PropertyValue::String(s)) => as_str_parse(s),
+        Value::Literal(Literal::Int(i)) => Value::Property(PropertyValue::Int(*i)),
+        Value::Literal(Literal::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
+        Value::Literal(Literal::String(s)) => as_str_parse(s),
+        _ => Value::Null,
     }
 }

@@ -128,11 +128,44 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let inner = pair.into_inner().next().expect("return_expr has one child");
     match inner.as_rule() {
+        Rule::case_expr => parse_case_expr(inner),
+        Rule::function_call => parse_function_call(inner),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
-        Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
+        Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
         r => unreachable!("unexpected return_expr child rule {r:?}"),
     }
+}
+
+fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let test = parse_return_expr(inner.next().expect("case_expr has a test expr"))?;
+    let mut whens = Vec::new();
+    let mut else_ = None;
+    for p in inner {
+        match p.as_rule() {
+            Rule::case_when => {
+                let mut when_inner = p.into_inner();
+                let when = parse_return_expr(when_inner.next().expect("case_when has a WHEN expr"))?;
+                let then = parse_return_expr(when_inner.next().expect("case_when has a THEN expr"))?;
+                whens.push((when, then));
+            }
+            // The only other possible child is the trailing ELSE return_expr.
+            _ => else_ = Some(Box::new(parse_return_expr(p)?)),
+        }
+    }
+    Ok(ReturnExpr::Case {
+        test: Some(Box::new(test)),
+        whens,
+        else_,
+    })
+}
+
+fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let name = inner.next().expect("function_call has a name").as_str().to_string();
+    let args = inner.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?;
+    Ok(ReturnExpr::Call(name, args))
 }
 
 fn parse_prop_access(pair: Pair<Rule>) -> PropAccess {

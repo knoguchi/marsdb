@@ -84,6 +84,23 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) => {}
         ReturnExpr::Lit(lit) => substitute_literal(lit, params)?,
+        ReturnExpr::Call(_, args) => {
+            for arg in args {
+                substitute_return_expr(arg, params)?;
+            }
+        }
+        ReturnExpr::Case { test, whens, else_ } => {
+            if let Some(t) = test {
+                substitute_return_expr(t, params)?;
+            }
+            for (when, then) in whens {
+                substitute_return_expr(when, params)?;
+                substitute_return_expr(then, params)?;
+            }
+            if let Some(e) = else_ {
+                substitute_return_expr(e, params)?;
+            }
+        }
     }
     Ok(())
 }

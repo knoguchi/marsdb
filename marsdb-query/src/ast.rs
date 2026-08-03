@@ -44,6 +44,17 @@ pub enum ReturnExpr {
     Var(String),
     Prop(PropAccess),
     Lit(Literal),
+    Call(String, Vec<ReturnExpr>),
+    /// Simple/value `CASE`: `CASE <test> WHEN <value> THEN <result> ... [ELSE
+    /// <else>] END`. `test` is `Some` for every form the parser currently
+    /// produces; kept `Option` so a future searched-`CASE` (`CASE WHEN
+    /// <bool_expr> THEN ...`) can reuse this variant without another type
+    /// change.
+    Case {
+        test: Option<Box<ReturnExpr>>,
+        whens: Vec<(ReturnExpr, ReturnExpr)>,
+        else_: Option<Box<ReturnExpr>>,
+    },
 }
 
 #[derive(Debug, Clone)]

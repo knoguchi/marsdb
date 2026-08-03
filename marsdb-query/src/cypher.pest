@@ -12,7 +12,15 @@ tail_clause = { return_clause | detach_delete_clause | delete_clause | set_claus
 
 return_clause = { ^"RETURN" ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }
-return_expr   = { prop_access | identifier | literal }
+// Order matters: case_expr/function_call/prop_access need their extra
+// syntax tried before the bare `identifier` fallback, and `literal` must
+// come before `identifier` too — otherwise the keywords true/false/null
+// would parse as plain variable references instead of literals.
+return_expr   = { case_expr | function_call | prop_access | literal | identifier }
+
+case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
+case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }
+function_call = { identifier ~ "(" ~ (return_expr ~ ("," ~ return_expr)*)? ~ ")" }
 
 detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
