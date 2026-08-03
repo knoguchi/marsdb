@@ -86,7 +86,11 @@ single-file MVCC embedded KV engine. Query execution compiles Cypher to a
 small Gremlin-shaped logical IR (`AllNodesScan`, `NodeByLabelScan`,
 `Seed`, `Expand`, `VarExpand`, `Filter`) so a future Gremlin frontend can
 target the same executor. Every Cypher statement runs inside one
-transaction, committed or aborted as a whole.
+transaction — a read-only `MATCH ... RETURN` opens a `ReadTransaction`
+(a consistent snapshot that runs alongside other concurrent readers or a
+concurrent writer without contending for redb's single-writer lock),
+everything else opens a `WriteTransaction`, committed or aborted as a
+whole.
 
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 
@@ -112,7 +116,6 @@ beyond a single linear chain (general cross-joins), or chaining past one
 
 ## Roadmap
 
-- Concurrent reads (split the executor's read path onto `ReadTransaction`)
 - `LIMIT` short-circuiting
 - Hash-based grouping key for aggregation (currently a linear scan over
   groups — correct, but O(rows × groups); see `resolve_grouped_rows`)

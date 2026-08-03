@@ -7,6 +7,9 @@ pub mod tables;
 mod error;
 pub use error::StorageError;
 
+mod txn;
+pub use txn::{MultimapTableHandle, TableHandle, Txn};
+
 // Re-exported so callers can open transactions/tables without a direct redb
 // dependency of their own.
 pub use redb::{

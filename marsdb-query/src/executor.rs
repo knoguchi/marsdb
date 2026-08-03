@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
+use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction};
 
 use crate::aggregate::AggAcc;
 use crate::ast::{
@@ -56,13 +56,33 @@ impl<'a> Executor<'a> {
         Self { store }
     }
 
-    /// Runs the whole statement inside a single write transaction — the
+    /// Dispatches on whether `stmt` ever mutates anything. A read-only
+    /// statement (`MATCH ... RETURN`, `is_read_only` below) runs inside a
+    /// `ReadTransaction` — a consistent snapshot that doesn't contend for
+    /// redb's single-writer lock, so concurrent readers run in parallel
+    /// instead of queueing behind each other. Everything else runs inside
+    /// a `WriteTransaction`, committed or aborted as a whole — the
     /// crash-safety boundary from the plan (one statement = one commit).
-    /// Every graph access below this point must go through `write_txn` and
-    /// the `*_in_txn` GraphStore methods, never the standalone
-    /// `self.store.*` methods, which open (and would deadlock trying to
-    /// re-open) their own transaction.
+    /// Every graph access below this point must go through the `*_in_txn`
+    /// GraphStore methods, never the standalone `self.store.*` methods,
+    /// which open (and would deadlock trying to re-open) their own
+    /// transaction.
     pub fn execute(&self, stmt: &Statement) -> Result<QueryResult, QueryError> {
+        if is_read_only(stmt) {
+            let read_txn = self.store.begin_read()?;
+            let Statement::Match {
+                parts,
+                tail,
+                order_by,
+                limit,
+            } = stmt
+            else {
+                unreachable!("is_read_only only returns true for Statement::Match")
+            };
+            // No explicit commit/abort — a ReadTransaction is a pure
+            // snapshot view with nothing to roll back; it releases on drop.
+            return self.execute_match(Txn::Read(&read_txn), parts, tail, order_by, *limit);
+        }
         let write_txn = self.store.begin_write()?;
         let outcome = match stmt {
             Statement::Create(patterns) => self.execute_create(&write_txn, patterns),
@@ -71,7 +91,7 @@ impl<'a> Executor<'a> {
                 tail,
                 order_by,
                 limit,
-            } => self.execute_match(&write_txn, parts, tail, order_by, *limit),
+            } => self.execute_match(Txn::Write(&write_txn), parts, tail, order_by, *limit),
         };
         match outcome {
             Ok(result) => {
@@ -125,7 +145,7 @@ impl<'a> Executor<'a> {
 
     fn execute_match(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         parts: &[QueryPart],
         tail: &Tail,
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
@@ -142,14 +162,14 @@ impl<'a> Executor<'a> {
             let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
             current_rows = if part.optional {
                 let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                self.eval_optional_part(write_txn, &plan, &current_rows, &new_vars)?
+                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
             } else {
-                self.eval_plan(write_txn, &plan, &current_rows)?
+                self.eval_plan(txn, &plan, &current_rows)?
             };
             if let Some(with) = &part.with {
-                current_rows = self.materialize_with(write_txn, with, &current_rows)?;
+                current_rows = self.materialize_with(txn, with, &current_rows)?;
                 if let Some(with_order_by) = &with.order_by {
-                    current_rows = self.apply_order_by_bindings(write_txn, current_rows, with_order_by)?;
+                    current_rows = self.apply_order_by_bindings(txn, current_rows, with_order_by)?;
                 }
                 if let Some(with_limit) = with.limit {
                     current_rows.truncate(with_limit.max(0) as usize);
@@ -174,11 +194,20 @@ impl<'a> Executor<'a> {
                 current_rows.truncate(count.max(0) as usize);
             }
         }
+        // Delete/Set need real `.insert`/`.remove`-capable write access,
+        // not just `Txn`'s read-only `get`/`iter` — but they're only ever
+        // reached via `Executor::execute`'s write-dispatch path (see
+        // `is_read_only`), which always opens a `WriteTransaction`, so
+        // `txn` is guaranteed to be `Txn::Write` here.
         let mut result = match tail {
-            Tail::Return(items) => self.materialize_return(write_txn, items, &current_rows)?,
-            Tail::Delete(vars) => self.materialize_delete(write_txn, vars, &current_rows, false)?,
-            Tail::DetachDelete(vars) => self.materialize_delete(write_txn, vars, &current_rows, true)?,
-            Tail::Set(items) => self.materialize_set(write_txn, items, &current_rows)?,
+            Tail::Return(items) => self.materialize_return(txn, items, &current_rows)?,
+            Tail::Delete(vars) => {
+                self.materialize_delete(require_write_txn(txn), vars, &current_rows, false)?
+            }
+            Tail::DetachDelete(vars) => {
+                self.materialize_delete(require_write_txn(txn), vars, &current_rows, true)?
+            }
+            Tail::Set(items) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
         };
         if let Some(order_by) = order_by {
             result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
@@ -197,7 +226,7 @@ impl<'a> Executor<'a> {
     /// scalar `Binding::Value`.
     fn materialize_with(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         with: &WithClause,
         rows: &[BindingRow],
     ) -> Result<Vec<BindingRow>, QueryError> {
@@ -207,7 +236,7 @@ impl<'a> Executor<'a> {
                 let mut new_row = BindingRow::new();
                 for (i, item) in with.items.iter().enumerate() {
                     let name = with_item_output_name((i, item));
-                    let binding = self.item_binding(write_txn, &item.expr, row)?;
+                    let binding = self.item_binding(txn, &item.expr, row)?;
                     new_row.insert(name, binding);
                 }
                 out.push(new_row);
@@ -215,7 +244,7 @@ impl<'a> Executor<'a> {
             out
         } else {
             validate_return_items(&with.items)?;
-            let grouped = self.resolve_grouped_rows(write_txn, &with.items, rows)?;
+            let grouped = self.resolve_grouped_rows(txn, &with.items, rows)?;
             grouped
                 .into_iter()
                 .map(|bindings| {
@@ -231,7 +260,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &with.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_with_expr(write_txn, where_clause, &row)? {
+                if self.eval_with_expr(txn, where_clause, &row)? {
                     filtered.push(row);
                 }
             }
@@ -245,11 +274,11 @@ impl<'a> Executor<'a> {
     /// later `QueryPart` can keep traversing from it; anything else
     /// (computed expressions) collapses to `Binding::Value`. Shared by the
     /// non-aggregating `materialize_with` path and grouping-key evaluation.
-    fn item_binding(&self, write_txn: &WriteTransaction, expr: &ReturnExpr, row: &BindingRow) -> Result<Binding, QueryError> {
+    fn item_binding(&self, txn: Txn, expr: &ReturnExpr, row: &BindingRow) -> Result<Binding, QueryError> {
         match expr {
             ReturnExpr::Var(v) => row.get(v).cloned().ok_or_else(|| QueryError::UnboundVariable(v.clone())),
             other => {
-                let value = self.eval_return_expr(write_txn, other, row)?;
+                let value = self.eval_return_expr(txn, other, row)?;
                 Ok(Binding::Value(value_to_property_value(&value)))
             }
         }
@@ -261,13 +290,13 @@ impl<'a> Executor<'a> {
     /// *which* rows continue, not just their presentation order).
     fn apply_order_by_bindings(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         rows: Vec<BindingRow>,
         order_by: &[(ReturnExpr, SortDir)],
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
         for row in rows {
-            let value_map = self.binding_row_to_value_map(write_txn, &row)?;
+            let value_map = self.binding_row_to_value_map(txn, &row)?;
             let keys = order_by
                 .iter()
                 .map(|(expr, _)| eval_projected_expr(expr, &value_map))
@@ -288,12 +317,12 @@ impl<'a> Executor<'a> {
 
     fn binding_row_to_value_map(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         row: &BindingRow,
     ) -> Result<HashMap<String, Value>, QueryError> {
         let mut map = HashMap::with_capacity(row.len());
         for (k, binding) in row {
-            map.insert(k.clone(), self.binding_to_value(write_txn, binding)?);
+            map.insert(k.clone(), self.binding_to_value(txn, binding)?);
         }
         Ok(map)
     }
@@ -302,14 +331,14 @@ impl<'a> Executor<'a> {
     /// binding fetches the full current record, a scalar `Value` binding
     /// passes through (collapsing a stored `PropertyValue::Null` to
     /// `Value::Null`, same as everywhere else null is represented).
-    fn binding_to_value(&self, write_txn: &WriteTransaction, b: &Binding) -> Result<Value, QueryError> {
+    fn binding_to_value(&self, txn: Txn, b: &Binding) -> Result<Value, QueryError> {
         Ok(match b {
             Binding::Node(id) => Value::Node(
-                GraphStore::get_node_in_txn(write_txn, *id)?
+                GraphStore::get_node_in_txn(txn, *id)?
                     .expect("bound node exists within this statement's transaction"),
             ),
             Binding::Edge(id) => Value::Edge(
-                GraphStore::get_edge_in_txn(write_txn, *id)?
+                GraphStore::get_edge_in_txn(txn, *id)?
                     .expect("bound edge exists within this statement's transaction"),
             ),
             Binding::Value(PropertyValue::Null) => Value::Null,
@@ -342,7 +371,7 @@ impl<'a> Executor<'a> {
     /// have exactly one argument.
     fn resolve_grouped_rows(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         items: &[ReturnItem],
         rows: &[BindingRow],
     ) -> Result<Vec<Vec<Binding>>, QueryError> {
@@ -382,7 +411,7 @@ impl<'a> Executor<'a> {
                 key_bindings.push(if is_top_level_aggregate(&item.expr) {
                     None
                 } else {
-                    Some(self.item_binding(write_txn, &item.expr, row)?)
+                    Some(self.item_binding(txn, &item.expr, row)?)
                 });
             }
             let group_idx = match groups.iter().position(|g| key_bindings_eq(&g.key_bindings, &key_bindings)) {
@@ -409,7 +438,7 @@ impl<'a> Executor<'a> {
                 // this is what makes `count(x)` exclude a null-padded row
                 // while `count(*)` (tracked via `row_count`, not an
                 // accumulator at all) includes it.
-                let value = self.eval_return_expr(write_txn, &args[0], row)?;
+                let value = self.eval_return_expr(txn, &args[0], row)?;
                 if !matches!(value, Value::Null) {
                     if let Some(acc) = &mut group.accs[i] {
                         acc.fold(&value)?;
@@ -458,13 +487,13 @@ impl<'a> Executor<'a> {
     /// WITH's HAVING-equivalent — evaluated against the already-projected/
     /// grouped row, same as ORDER BY. Never pushed into the planner (see
     /// `WithExpr`'s docs).
-    fn eval_with_expr(&self, write_txn: &WriteTransaction, expr: &WithExpr, row: &BindingRow) -> Result<bool, QueryError> {
+    fn eval_with_expr(&self, txn: Txn, expr: &WithExpr, row: &BindingRow) -> Result<bool, QueryError> {
         Ok(match expr {
-            WithExpr::And(l, r) => self.eval_with_expr(write_txn, l, row)? && self.eval_with_expr(write_txn, r, row)?,
-            WithExpr::Or(l, r) => self.eval_with_expr(write_txn, l, row)? || self.eval_with_expr(write_txn, r, row)?,
-            WithExpr::Not(e) => !self.eval_with_expr(write_txn, e, row)?,
+            WithExpr::And(l, r) => self.eval_with_expr(txn, l, row)? && self.eval_with_expr(txn, r, row)?,
+            WithExpr::Or(l, r) => self.eval_with_expr(txn, l, row)? || self.eval_with_expr(txn, r, row)?,
+            WithExpr::Not(e) => !self.eval_with_expr(txn, e, row)?,
             WithExpr::Compare(lhs, op, lit) => {
-                let value = self.eval_return_expr(write_txn, lhs, row)?;
+                let value = self.eval_return_expr(txn, lhs, row)?;
                 compare_value(&value, *op, lit)
             }
         })
@@ -490,7 +519,7 @@ impl<'a> Executor<'a> {
     /// introduced.
     fn eval_optional_part(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         plan: &LogicalPlan,
         outer_rows: &[BindingRow],
         new_vars: &HashSet<String>,
@@ -504,7 +533,7 @@ impl<'a> Executor<'a> {
                 r
             })
             .collect();
-        let results = self.eval_plan(write_txn, plan, &tagged)?;
+        let results = self.eval_plan(txn, plan, &tagged)?;
         let mut by_idx: HashMap<i64, Vec<BindingRow>> = HashMap::new();
         for mut row in results {
             let idx = match row.remove(OPTIONAL_SEED_IDX_KEY) {
@@ -531,7 +560,7 @@ impl<'a> Executor<'a> {
 
     fn eval_plan(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         plan: &LogicalPlan,
         seed: &[BindingRow],
     ) -> Result<Vec<BindingRow>, QueryError> {
@@ -543,8 +572,8 @@ impl<'a> Executor<'a> {
                 );
                 Ok(seed.to_vec())
             }
-            LogicalPlan::AllNodesScan { var } => self.scan(write_txn, var, None),
-            LogicalPlan::NodeByLabelScan { var, label } => self.scan(write_txn, var, Some(label)),
+            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None),
+            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label)),
             LogicalPlan::Expand {
                 input,
                 from_var,
@@ -553,13 +582,13 @@ impl<'a> Executor<'a> {
                 rel_label,
                 direction,
             } => {
-                let base_rows = self.eval_plan(write_txn, input, seed)?;
+                let base_rows = self.eval_plan(txn, input, seed)?;
                 let mut out = Vec::new();
                 for row in base_rows {
                     let Some(Binding::Node(from_id)) = row.get(from_var).cloned() else {
                         return Err(QueryError::UnboundVariable(from_var.clone()));
                     };
-                    let entries = neighbors_for_direction(write_txn, from_id, *direction, rel_label.as_deref())?;
+                    let entries = neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
                     for entry in entries {
                         let mut new_row = row.clone();
                         new_row.insert(to_var.clone(), Binding::Node(entry.other));
@@ -580,7 +609,7 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
             } => {
-                let base_rows = self.eval_plan(write_txn, input, seed)?;
+                let base_rows = self.eval_plan(txn, input, seed)?;
                 let mut out = Vec::new();
                 let unbounded = max_hops.is_none();
                 let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
@@ -601,7 +630,7 @@ impl<'a> Executor<'a> {
                         depth += 1;
                         let mut next_frontier = Vec::new();
                         for node in frontier {
-                            let entries = neighbors_for_direction(write_txn, node, *direction, rel_label.as_deref())?;
+                            let entries = neighbors_for_direction(txn, node, *direction, rel_label.as_deref())?;
                             for entry in entries {
                                 if visited.insert(entry.other) {
                                     next_frontier.push(entry.other);
@@ -631,10 +660,10 @@ impl<'a> Executor<'a> {
                 Ok(out)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let rows = self.eval_plan(write_txn, input, seed)?;
+                let rows = self.eval_plan(txn, input, seed)?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    if self.eval_expr(write_txn, predicate, &row)? {
+                    if self.eval_expr(txn, predicate, &row)? {
                         out.push(row);
                     }
                 }
@@ -643,8 +672,8 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn scan(&self, write_txn: &WriteTransaction, var: &str, label: Option<&str>) -> Result<Vec<BindingRow>, QueryError> {
-        let nodes = GraphStore::all_nodes_in_txn(write_txn, label)?;
+    fn scan(&self, txn: Txn, var: &str, label: Option<&str>) -> Result<Vec<BindingRow>, QueryError> {
+        let nodes = GraphStore::all_nodes_in_txn(txn, label)?;
         Ok(nodes
             .into_iter()
             .map(|n| {
@@ -655,13 +684,13 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
-    fn eval_expr(&self, write_txn: &WriteTransaction, expr: &Expr, row: &BindingRow) -> Result<bool, QueryError> {
+    fn eval_expr(&self, txn: Txn, expr: &Expr, row: &BindingRow) -> Result<bool, QueryError> {
         Ok(match expr {
-            Expr::And(l, r) => self.eval_expr(write_txn, l, row)? && self.eval_expr(write_txn, r, row)?,
-            Expr::Or(l, r) => self.eval_expr(write_txn, l, row)? || self.eval_expr(write_txn, r, row)?,
-            Expr::Not(e) => !self.eval_expr(write_txn, e, row)?,
+            Expr::And(l, r) => self.eval_expr(txn, l, row)? && self.eval_expr(txn, r, row)?,
+            Expr::Or(l, r) => self.eval_expr(txn, l, row)? || self.eval_expr(txn, r, row)?,
+            Expr::Not(e) => !self.eval_expr(txn, e, row)?,
             Expr::Compare(pa, op, lit) => {
-                let prop_value = self.lookup_prop(write_txn, pa, row)?;
+                let prop_value = self.lookup_prop(txn, pa, row)?;
                 compare(&prop_value, *op, lit)
             }
             Expr::HasLabel(var, label) => {
@@ -669,7 +698,7 @@ impl<'a> Executor<'a> {
                 let Binding::Node(id) = binding else {
                     return Err(QueryError::UnboundVariable(var.clone()));
                 };
-                let node = GraphStore::get_node_in_txn(write_txn, *id)?;
+                let node = GraphStore::get_node_in_txn(txn, *id)?;
                 node.is_some_and(|n| n.labels.iter().any(|l| l == label))
             }
             Expr::VarEq(a, b) => {
@@ -693,7 +722,7 @@ impl<'a> Executor<'a> {
 
     fn lookup_prop(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         pa: &PropAccess,
         row: &BindingRow,
     ) -> Result<Option<PropertyValue>, QueryError> {
@@ -702,11 +731,11 @@ impl<'a> Executor<'a> {
             .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
         match binding {
             Binding::Node(id) => {
-                let node = GraphStore::get_node_in_txn(write_txn, *id)?;
+                let node = GraphStore::get_node_in_txn(txn, *id)?;
                 Ok(node.and_then(|n| n.props.get(&pa.prop).cloned()))
             }
             Binding::Edge(id) => {
-                let edge = GraphStore::get_edge_in_txn(write_txn, *id)?;
+                let edge = GraphStore::get_edge_in_txn(txn, *id)?;
                 Ok(edge.and_then(|e| e.props.get(&pa.prop).cloned()))
             }
             // A WITH-projected scalar (or list) has no `.prop` to access —
@@ -719,7 +748,7 @@ impl<'a> Executor<'a> {
 
     fn materialize_return(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         items: &[ReturnItem],
         rows: &[BindingRow],
     ) -> Result<QueryResult, QueryError> {
@@ -733,20 +762,20 @@ impl<'a> Executor<'a> {
             for row in rows {
                 let mut out_row = Vec::with_capacity(items.len());
                 for item in items {
-                    out_row.push(self.eval_return_expr(write_txn, &item.expr, row)?);
+                    out_row.push(self.eval_return_expr(txn, &item.expr, row)?);
                 }
                 out_rows.push(out_row);
             }
             out_rows
         } else {
             validate_return_items(items)?;
-            let grouped = self.resolve_grouped_rows(write_txn, items, rows)?;
+            let grouped = self.resolve_grouped_rows(txn, items, rows)?;
             grouped
                 .into_iter()
                 .map(|bindings| {
                     bindings
                         .iter()
-                        .map(|b| self.binding_to_value(write_txn, b))
+                        .map(|b| self.binding_to_value(txn, b))
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -759,17 +788,17 @@ impl<'a> Executor<'a> {
 
     fn eval_return_expr(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         expr: &ReturnExpr,
         row: &BindingRow,
     ) -> Result<Value, QueryError> {
         match expr {
             ReturnExpr::Var(var) => {
                 let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-                self.binding_to_value(write_txn, binding)
+                self.binding_to_value(txn, binding)
             }
             ReturnExpr::Prop(pa) => {
-                let value = self.lookup_prop(write_txn, pa, row)?;
+                let value = self.lookup_prop(txn, pa, row)?;
                 Ok(match value {
                     // Collapse "prop missing" and "prop stored as null" into
                     // one null representation — see Value::Null docs.
@@ -796,7 +825,7 @@ impl<'a> Executor<'a> {
                 }
                 let arg_values = args
                     .iter()
-                    .map(|a| self.eval_return_expr(write_txn, a, row))
+                    .map(|a| self.eval_return_expr(txn, a, row))
                     .collect::<Result<Vec<_>, _>>()?;
                 call_builtin(name, &arg_values)
             }
@@ -805,11 +834,11 @@ impl<'a> Executor<'a> {
             )),
             ReturnExpr::Case { test, whens, else_ } => {
                 let test_value = match test {
-                    Some(t) => Some(self.eval_return_expr(write_txn, t, row)?),
+                    Some(t) => Some(self.eval_return_expr(txn, t, row)?),
                     None => None,
                 };
                 for (when, then) in whens {
-                    let when_value = self.eval_return_expr(write_txn, when, row)?;
+                    let when_value = self.eval_return_expr(txn, when, row)?;
                     // Deliberately reuses the same Null == Null -> true
                     // convention as `compare()` below, not standard
                     // three-valued NULL logic — IS7's `CASE r WHEN null
@@ -820,11 +849,11 @@ impl<'a> Executor<'a> {
                         None => matches!(when_value, Value::Literal(Literal::Bool(true))),
                     };
                     if matched {
-                        return self.eval_return_expr(write_txn, then, row);
+                        return self.eval_return_expr(txn, then, row);
                     }
                 }
                 match else_ {
-                    Some(e) => self.eval_return_expr(write_txn, e, row),
+                    Some(e) => self.eval_return_expr(txn, e, row),
                     None => Ok(Value::Null),
                 }
             }
@@ -899,6 +928,37 @@ impl<'a> Executor<'a> {
             rows: vec![],
         })
     }
+}
+
+/// A statement never mutates anything iff it's a `MATCH ... RETURN` with no
+/// `DELETE`/`DETACH DELETE`/`SET` tail — `Statement::Create` and every
+/// other `Tail` variant always write. Confirmed by tracing every function
+/// reachable from pattern/WHERE/WITH evaluation: none of them ever call a
+/// table-mutating `*_in_txn` method for a `Tail::Return` statement (a
+/// label-filtered scan looks up an existing label id, it never allocates
+/// one — allocation only happens in `create_node_in_txn`/
+/// `create_edge_in_txn`). `Executor::execute` uses this to decide whether
+/// to open a `ReadTransaction` (no contention with concurrent readers or a
+/// concurrent writer) or a `WriteTransaction`.
+fn is_read_only(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Match { tail: Tail::Return(_), .. })
+}
+
+/// Recovers the real `&WriteTransaction` from a `Txn` for the two
+/// `execute_match` tail arms (`DELETE`/`SET`) that need `.insert`/
+/// `.remove`, not just `Txn`'s read-only `get`/`iter`. Panics if given
+/// `Txn::Read` — which can't happen: `Tail::Delete`/`DetachDelete`/`Set`
+/// make `is_read_only` return `false`, so `Executor::execute` always opens
+/// a `WriteTransaction` (and thus `Txn::Write`) before reaching this path.
+fn require_write_txn(txn: Txn<'_>) -> &WriteTransaction {
+    let Txn::Write(write_txn) = txn else {
+        unreachable!(
+            "materialize_delete/materialize_set only reached via the write-dispatch path in \
+             Executor::execute — is_read_only(stmt) is false for any statement with a Delete/ \
+             DetachDelete/Set tail, so execute always opens a WriteTransaction for these"
+        )
+    };
+    write_txn
 }
 
 fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
@@ -1084,17 +1144,17 @@ fn pattern_labels(labels: &[String]) -> Vec<&str> {
 /// query both directions and dedupe by `edge_id` (a self-loop would
 /// otherwise appear twice, once from each direction's adjacency table).
 fn neighbors_for_direction(
-    write_txn: &WriteTransaction,
+    txn: Txn,
     node: NodeId,
     direction: ExpandDirection,
     rel_label: Option<&str>,
 ) -> Result<Vec<AdjEntry>, QueryError> {
     Ok(match direction {
-        ExpandDirection::Out => GraphStore::neighbors_in_txn(write_txn, node, Direction::Out, rel_label)?,
-        ExpandDirection::In => GraphStore::neighbors_in_txn(write_txn, node, Direction::In, rel_label)?,
+        ExpandDirection::Out => GraphStore::neighbors_in_txn(txn, node, Direction::Out, rel_label)?,
+        ExpandDirection::In => GraphStore::neighbors_in_txn(txn, node, Direction::In, rel_label)?,
         ExpandDirection::Either => {
-            let mut out = GraphStore::neighbors_in_txn(write_txn, node, Direction::Out, rel_label)?;
-            let inbound = GraphStore::neighbors_in_txn(write_txn, node, Direction::In, rel_label)?;
+            let mut out = GraphStore::neighbors_in_txn(txn, node, Direction::Out, rel_label)?;
+            let inbound = GraphStore::neighbors_in_txn(txn, node, Direction::In, rel_label)?;
             let seen: HashSet<EdgeId> = out.iter().map(|e| e.edge_id).collect();
             out.extend(inbound.into_iter().filter(|e| !seen.contains(&e.edge_id)));
             out

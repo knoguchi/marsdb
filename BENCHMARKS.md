@@ -7,7 +7,7 @@ numbers aren't a competitive comparison, they're here to track regressions
 and show where the current architecture's cost is.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
-`cypher_ops`, `ldbc_ops`, and `aggregate_ops`).
+`cypher_ops`, `ldbc_ops`, `aggregate_ops`, and `concurrency_ops`).
 
 ## Storage layer (`marsdb-graph/benches/graph_ops.rs`)
 
@@ -170,11 +170,35 @@ the filter pass itself is cheap; the group-scan it runs after is not.
 
 Reproduce: `cargo bench -p marsdb --bench aggregate_ops`.
 
+## Concurrent reads (`marsdb/benches/concurrency_ops.rs`)
+
+A `MATCH ... RETURN` opens a `ReadTransaction`, not a `WriteTransaction` —
+concurrent readers run in parallel instead of queueing behind redb's
+single-writer lock (see README). 200 `MATCH (n:Item) RETURN n.idx` queries
+against a 1,000-node dataset, done on a single thread vs. split evenly
+across `N` threads sharing one `Arc<Database>`:
+
+| Threads | Result | Speedup vs. 1 thread |
+|---|---|---|
+| 1 (sequential) | 326.0 ms | — |
+| 2 | 231.8 ms | 1.41x |
+| 4 | 175.0 ms | 1.86x |
+| 8 | 172.0 ms | 1.90x |
+
+Real, but sub-linear, and it plateaus at 4 threads on the 14-core (10P+4E)
+machine this was measured on — nowhere near "N threads = N times faster."
+Two things this benchmark doesn't isolate: each `b.iter()` call spawns
+fresh OS threads via `std::thread::scope` rather than reusing a pool, and
+this hasn't been checked against a profiler for lock contention inside
+redb's own read-transaction bookkeeping — either could be inflating the
+per-thread overhead that caps the speedup here. The number that matters
+regardless: 2+ threads reading concurrently are reliably faster than 1,
+confirming the feature does what it's for, not just that it compiles.
+
+Reproduce: `cargo bench -p marsdb --bench concurrency_ops`.
+
 ## Scope of these numbers
 
-- No concurrent-access benchmarks — every statement currently runs through a
-  single-writer transaction (see README), so this doesn't measure
-  concurrent-reader throughput.
 - No disk-backed sustained-write benchmarks — everything above ran against
   `Database::in_memory()`; file-backed throughput under real fsync pressure
   hasn't been measured separately.
