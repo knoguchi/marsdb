@@ -1,0 +1,56 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+query = { SOI ~ statement ~ ";"? ~ EOI }
+
+statement = { create_stmt | match_stmt }
+
+create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
+
+match_stmt  = { ^"MATCH" ~ pattern ~ where_clause? ~ tail_clause ~ limit_clause? }
+
+tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause }
+
+return_clause = { ^"RETURN" ~ return_item ~ ("," ~ return_item)* }
+return_item   = { return_expr ~ (^"AS" ~ identifier)? }
+return_expr   = { prop_access | identifier | literal }
+
+detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
+delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
+set_clause            = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
+set_item               = { prop_access ~ "=" ~ literal }
+
+where_clause = { ^"WHERE" ~ expr }
+limit_clause = { ^"LIMIT" ~ int_literal }
+
+pattern = { node_pattern ~ (rel_pattern ~ node_pattern)* }
+
+node_pattern = { "(" ~ node_var? ~ node_label? ~ prop_map? ~ ")" }
+node_var     = { identifier }
+node_label   = { ":" ~ identifier }
+
+rel_pattern = { rel_right | rel_left }
+rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]->" }
+rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]-" }
+rel_var     = { identifier }
+rel_type    = { ":" ~ identifier }
+
+prop_map = { "{" ~ (prop_kv ~ ("," ~ prop_kv)*)? ~ "}" }
+prop_kv  = { identifier ~ ":" ~ literal }
+
+expr       = { or_expr }
+or_expr    = { and_expr ~ (^"OR" ~ and_expr)* }
+and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
+unary_expr = { (^"NOT" ~ unary_expr) | comparison | ("(" ~ expr ~ ")") }
+comparison = { prop_access ~ compare_op ~ literal }
+compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" }
+
+prop_access = { identifier ~ "." ~ identifier }
+
+literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal }
+int_literal    = @{ "-"? ~ ASCII_DIGIT+ }
+float_literal  = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+string_literal = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+bool_literal   = @{ ^"true" | ^"false" }
+null_literal   = @{ ^"null" }
+
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

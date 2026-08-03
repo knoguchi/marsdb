@@ -1,0 +1,16 @@
+[package]
+name = "marsdb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Mars, an embeddable property-graph database styled like SQLite."
+
+[[bin]]
+name = "mars"
+path = "src/main.rs"
+
+[dependencies]
+marsdb = { path = "../marsdb", version = "0.1.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.1.0" }
+clap.workspace = true
+rustyline.workspace = true

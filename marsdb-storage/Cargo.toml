@@ -1,0 +1,10 @@
+[package]
+name = "marsdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin embedded-KV storage trait boundary used internally by Mars."
+
+[dependencies]
+redb.workspace = true
+thiserror.workspace = true

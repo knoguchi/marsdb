@@ -1,0 +1,12 @@
+[package]
+name = "marsdb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "openCypher query subset parser, planner, and executor used internally by Mars."
+
+[dependencies]
+marsdb-graph = { path = "../marsdb-graph", version = "0.1.0" }
+pest.workspace = true
+pest_derive.workspace = true
+thiserror.workspace = true

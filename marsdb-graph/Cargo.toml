@@ -1,0 +1,16 @@
+[package]
+name = "marsdb-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Property graph model and CRUD storage layer used internally by Mars."
+
+[dependencies]
+marsdb-storage = { path = "../marsdb-storage", version = "0.1.0" }
+redb.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

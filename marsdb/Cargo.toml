@@ -1,0 +1,19 @@
+[package]
+name = "marsdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable property-graph database with an openCypher query subset, styled like SQLite: single binary, single file, optional in-memory mode."
+
+[lib]
+name = "marsdb"
+path = "src/lib.rs"
+
+[dependencies]
+marsdb-storage = { path = "../marsdb-storage", version = "0.1.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.1.0" }
+marsdb-query = { path = "../marsdb-query", version = "0.1.0" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
