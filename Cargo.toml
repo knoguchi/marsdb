@@ -6,6 +6,7 @@ members = [
     "marsdb-query",
     "marsdb",
     "marsdb-cli",
+    "marsdb-crash-harness",
 ]
 # marsdb-python builds as a PyO3 extension-module (no libpython link, no
 # runnable test binary) via maturin, not plain `cargo build`/`cargo test` —
