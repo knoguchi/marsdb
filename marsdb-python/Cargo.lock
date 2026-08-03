@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "marsdb-graph",
  "marsdb-query",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-graph"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "marsdb-storage",
  "postcard",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-python"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "marsdb",
  "marsdb-graph",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "marsdb-graph",
  "pest",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "redb",
  "thiserror 1.0.69",

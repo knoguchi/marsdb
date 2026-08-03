@@ -501,7 +501,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "marsdb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "marsdb-graph",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "marsdb",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-graph"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "marsdb-storage",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "marsdb-graph",
  "pest",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "redb",
  "thiserror 1.0.69",
