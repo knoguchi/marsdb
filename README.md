@@ -20,6 +20,12 @@ Alice | Bob
 cargo install marsdb-cli
 ```
 
+Or on macOS/Linux via Homebrew ([tap](https://github.com/knoguchi/homebrew-marsdb)):
+
+```
+brew install knoguchi/marsdb/marsdb
+```
+
 **Rust library**:
 
 ```
