@@ -21,6 +21,10 @@ fn format_value(value: &Value) -> String {
         Value::Edge(e) => format!("[:{}]", e.label),
         Value::Property(p) => format_property(p),
         Value::Literal(l) => format_literal(l),
+        Value::List(items) => {
+            let cells: Vec<String> = items.iter().map(format_value).collect();
+            format!("[{}]", cells.join(", "))
+        }
         Value::Null => "null".to_string(),
     }
 }

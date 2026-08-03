@@ -90,21 +90,28 @@ Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
 (`[:TYPE*min..max]`) relationship patterns, `WHERE`, one `WITH` boundary
-per statement (projection/rename, its own `WHERE`/`ORDER BY`/`LIMIT`),
-`RETURN`/`DELETE`/`DETACH DELETE`/`SET`, multi-key `ORDER BY`, `LIMIT`,
-`CASE`, and the built-in functions `coalesce()`/`toInteger()`.
+per statement (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER
+BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/`SET`, multi-key `ORDER
+BY`, `LIMIT`, `CASE`, the built-in functions `coalesce()`/`toInteger()`,
+and implicit-GROUP-BY aggregation (`count()`/`count(*)`/`sum()`/`avg()`/
+`min()`/`max()`/`collect()`, with `DISTINCT`).
 
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
-verified: LDBC's complex queries (IC1-14: aggregation, `UNWIND`, named
-paths/`shortestPath()`), comma-separated `MATCH` patterns beyond a single
-linear chain (general cross-joins), or chaining past one `WITH` boundary.
+verified: LDBC's complex queries (IC1-14: `UNWIND`, named
+paths/`shortestPath()`, and the full query set beyond one hand-crafted
+grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` checkpoint —
+see `marsdb-query/tests/smoke.rs`), comma-separated `MATCH` patterns
+beyond a single linear chain (general cross-joins), or chaining past one
+`WITH` boundary.
 
 ## Roadmap
 
 - Concurrent reads (split the executor's read path onto `ReadTransaction`)
 - `LIMIT` short-circuiting
-- Aggregation (`count`, `sum`, `collect`), `UNWIND`, named paths/`shortestPath()`
+- Hash-based grouping key for aggregation (currently a linear scan over
+  groups — correct, but O(rows × groups); see `resolve_grouped_rows`)
+- `UNWIND`, named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR

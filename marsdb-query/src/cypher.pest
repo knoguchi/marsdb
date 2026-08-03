@@ -9,7 +9,7 @@ create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 match_stmt    = { match_part+ ~ tail_clause ~ order_by_clause? ~ limit_clause? }
 match_part    = { match_keyword ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
-with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ order_by_clause? ~ limit_clause? }
+with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ limit_clause? }
 
 tail_clause = { return_clause | detach_delete_clause | delete_clause | set_clause }
 
@@ -23,7 +23,29 @@ return_expr   = { case_expr | function_call | prop_access | literal | identifier
 
 case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }
-function_call = { identifier ~ "(" ~ (return_expr ~ ("," ~ return_expr)*)? ~ ")" }
+function_call = { identifier ~ "(" ~ call_args ~ ")" }
+// `"*"` (bare, only meaningful for `count(*)`) is tried first — no
+// `return_expr` production can ever start with a bare `*`, so there's no
+// backtracking ambiguity with the general-args branch. Which functions
+// accept `"*"` or `DISTINCT` is a semantic check in parser.rs, not a
+// grammar-level restriction — see cypher.pest's other permissive-grammar
+// precedents (comma-pattern splicing, WITH-boundary counting).
+call_args     = { "*" | (distinct_kw? ~ (return_expr ~ ("," ~ return_expr)*)?) }
+distinct_kw   = { ^"DISTINCT" }
+
+// WITH's HAVING-equivalent: filters on the already-projected/aggregated
+// row, so its comparison LHS is a `return_expr` (a WITH alias or raw
+// expression), not `prop_access` like pattern-level `comparison` below —
+// structurally a separate mirror of expr/and_expr/or_expr, not a reuse of
+// them, since widening pattern-`Expr`'s LHS type would ripple into the
+// planner's pre-projection filter-pushdown logic for a WHERE that
+// fundamentally belongs post-projection instead.
+with_where_clause = { ^"WHERE" ~ with_expr }
+with_expr         = { with_or_expr }
+with_or_expr      = { with_and_expr ~ (^"OR" ~ with_and_expr)* }
+with_and_expr     = { with_unary_expr ~ (^"AND" ~ with_unary_expr)* }
+with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_comparison | ("(" ~ with_expr ~ ")") }
+with_comparison   = { return_expr ~ compare_op ~ literal }
 
 detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }

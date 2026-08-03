@@ -136,3 +136,9 @@ Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
 - No benchmarks yet for `CASE`/function calls (`coalesce()`/`toInteger()`)
   in isolation — they're cheap scalar operations exercised inside the
   `WITH`-chaining query above, but not measured standalone.
+- No benchmarks yet for aggregation (`count`/`sum`/`avg`/`min`/`max`/
+  `collect`, `DISTINCT`, `WITH...WHERE`). Grouping-key lookup is a linear
+  scan over the groups formed so far, not a hash lookup (see
+  `resolve_grouped_rows` in `marsdb-query/src/executor.rs`) — expected to
+  scale roughly like the unindexed `all_nodes` scan above, worse as the
+  number of distinct groups grows, but not yet measured.

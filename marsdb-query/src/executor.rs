@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
 
+use crate::aggregate::AggAcc;
 use crate::ast::{
-    CompareOp, Expr, Literal, Pattern, PropAccess, QueryPart, RelDirection, ReturnExpr, ReturnItem, SortDir,
-    Statement, Tail, WithClause,
+    is_aggregate_name, CompareOp, Expr, Literal, Pattern, PropAccess, QueryPart, RelDirection, ReturnExpr,
+    ReturnItem, SortDir, Statement, Tail, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -25,6 +26,14 @@ enum Binding {
     /// AS messageId`) — no graph identity, just a value along for the ride
     /// to the next `QueryPart`/the final `Tail`.
     Value(PropertyValue),
+    /// A `collect()` result carried through a `WITH` projection. Separate
+    /// from `Binding::Value` because `PropertyValue` (storage-layer) has no
+    /// list variant — lists are a query-layer-only concept, never
+    /// persisted — so a materialized `collect()` has nowhere else to live
+    /// between one `QueryPart` and the next. Elements are already-resolved
+    /// `Value`s, not `Binding`s: there's no `UNWIND` yet to pull one back
+    /// out with restored graph identity.
+    List(Vec<Value>),
 }
 
 type BindingRow = HashMap<String, Binding>;
@@ -192,26 +201,58 @@ impl<'a> Executor<'a> {
         with: &WithClause,
         rows: &[BindingRow],
     ) -> Result<Vec<BindingRow>, QueryError> {
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut new_row = BindingRow::new();
-            for (i, item) in with.items.iter().enumerate() {
-                let name = with_item_output_name((i, item));
-                let binding = match &item.expr {
-                    ReturnExpr::Var(v) => row
-                        .get(v)
-                        .cloned()
-                        .ok_or_else(|| QueryError::UnboundVariable(v.clone()))?,
-                    other => {
-                        let value = self.eval_return_expr(write_txn, other, row)?;
-                        Binding::Value(value_to_property_value(&value))
-                    }
-                };
-                new_row.insert(name, binding);
+        let mut out = if !has_aggregate(&with.items) {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut new_row = BindingRow::new();
+                for (i, item) in with.items.iter().enumerate() {
+                    let name = with_item_output_name((i, item));
+                    let binding = self.item_binding(write_txn, &item.expr, row)?;
+                    new_row.insert(name, binding);
+                }
+                out.push(new_row);
             }
-            out.push(new_row);
+            out
+        } else {
+            validate_return_items(&with.items)?;
+            let grouped = self.resolve_grouped_rows(write_txn, &with.items, rows)?;
+            grouped
+                .into_iter()
+                .map(|bindings| {
+                    with.items
+                        .iter()
+                        .enumerate()
+                        .zip(bindings)
+                        .map(|((i, item), b)| (with_item_output_name((i, item)), b))
+                        .collect()
+                })
+                .collect()
+        };
+        if let Some(where_clause) = &with.where_clause {
+            let mut filtered = Vec::with_capacity(out.len());
+            for row in out {
+                if self.eval_with_expr(write_txn, where_clause, &row)? {
+                    filtered.push(row);
+                }
+            }
+            out = filtered;
         }
         Ok(out)
+    }
+
+    /// The `Binding` one WITH/RETURN item evaluates to for one input row. A
+    /// bare `Var` keeps its graph identity (`Binding::Node`/`Edge`) so a
+    /// later `QueryPart` can keep traversing from it; anything else
+    /// (computed expressions) collapses to `Binding::Value`. Shared by the
+    /// non-aggregating `materialize_with` path and grouping-key evaluation.
+    fn item_binding(&self, write_txn: &WriteTransaction, expr: &ReturnExpr, row: &BindingRow) -> Result<Binding, QueryError> {
+        match expr {
+            ReturnExpr::Var(v) => row.get(v).cloned().ok_or_else(|| QueryError::UnboundVariable(v.clone())),
+            other => {
+                let value = self.eval_return_expr(write_txn, other, row)?;
+                Ok(Binding::Value(value_to_property_value(&value)))
+            }
+        }
     }
 
     /// Same sort as `apply_order_by`, but over `BindingRow`s (a `WITH`
@@ -252,21 +293,181 @@ impl<'a> Executor<'a> {
     ) -> Result<HashMap<String, Value>, QueryError> {
         let mut map = HashMap::with_capacity(row.len());
         for (k, binding) in row {
-            let value = match binding {
-                Binding::Node(id) => Value::Node(
-                    GraphStore::get_node_in_txn(write_txn, *id)?
-                        .expect("bound node exists within this statement's transaction"),
-                ),
-                Binding::Edge(id) => Value::Edge(
-                    GraphStore::get_edge_in_txn(write_txn, *id)?
-                        .expect("bound edge exists within this statement's transaction"),
-                ),
-                Binding::Value(PropertyValue::Null) => Value::Null,
-                Binding::Value(pv) => Value::Property(pv.clone()),
-            };
-            map.insert(k.clone(), value);
+            map.insert(k.clone(), self.binding_to_value(write_txn, binding)?);
         }
         Ok(map)
+    }
+
+    /// Resolves a `Binding` to its display `Value` — a `Node`/`Edge`
+    /// binding fetches the full current record, a scalar `Value` binding
+    /// passes through (collapsing a stored `PropertyValue::Null` to
+    /// `Value::Null`, same as everywhere else null is represented).
+    fn binding_to_value(&self, write_txn: &WriteTransaction, b: &Binding) -> Result<Value, QueryError> {
+        Ok(match b {
+            Binding::Node(id) => Value::Node(
+                GraphStore::get_node_in_txn(write_txn, *id)?
+                    .expect("bound node exists within this statement's transaction"),
+            ),
+            Binding::Edge(id) => Value::Edge(
+                GraphStore::get_edge_in_txn(write_txn, *id)?
+                    .expect("bound edge exists within this statement's transaction"),
+            ),
+            Binding::Value(PropertyValue::Null) => Value::Null,
+            Binding::Value(pv) => Value::Property(pv.clone()),
+            Binding::List(items) => Value::List(items.clone()),
+        })
+    }
+
+    /// Folds `rows` into groups keyed by every non-aggregate item's per-row
+    /// `Binding` (via `item_binding`), then finishes each aggregate item's
+    /// accumulator per group. Returns one `Vec<Binding>` per output group,
+    /// column-aligned with `items`. Shared by `materialize_with` and
+    /// `materialize_return` — both already take the same `rows: &[BindingRow]`
+    /// input type, so the grouping core stays in `Binding`-space (preserving
+    /// graph identity for bare-var grouping keys) and each caller does its
+    /// own thin final conversion.
+    ///
+    /// Grouping-key lookup is a **linear scan** (walk existing groups
+    /// comparing key `Binding`s via `binding_eq`, append a new group on no
+    /// match) — O(rows × groups), not a hash-based grouping. Deliberate:
+    /// neither `PropertyValue` nor `Node`/`Edge` derive `Eq`/`Hash`
+    /// (`PropertyValue::Float` has no natural bit-exact hash without a
+    /// wrapper type), and this follows the same "correctness first,
+    /// document Big-O honestly, optimize later with benchmarks" precedent
+    /// already established for the unindexed `all_nodes` scan and the
+    /// label-index trade-off (see `BENCHMARKS.md`).
+    ///
+    /// Callers must call `validate_return_items` first — this function
+    /// assumes every aggregate `Call` item has already been checked to
+    /// have exactly one argument.
+    fn resolve_grouped_rows(
+        &self,
+        write_txn: &WriteTransaction,
+        items: &[ReturnItem],
+        rows: &[BindingRow],
+    ) -> Result<Vec<Vec<Binding>>, QueryError> {
+        struct Group {
+            // Aligned to `items`: `Some` at a non-aggregate item's index,
+            // `None` at an aggregate item's index (both vecs below are
+            // index-aligned to `items` the same way, so exactly one of
+            // `key_bindings[i]`/`accs[i]` is populated per `i`).
+            key_bindings: Vec<Option<Binding>>,
+            accs: Vec<Option<AggAcc>>,
+            row_count: i64,
+        }
+        fn fresh_accs(items: &[ReturnItem]) -> Vec<Option<AggAcc>> {
+            items
+                .iter()
+                .map(|item| match &item.expr {
+                    ReturnExpr::Call { name, distinct, .. } if is_aggregate_name(name) => {
+                        Some(AggAcc::identity(name, *distinct))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        fn key_bindings_eq(a: &[Option<Binding>], b: &[Option<Binding>]) -> bool {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|pair| match pair {
+                    (Some(x), Some(y)) => binding_eq(x, y),
+                    (None, None) => true,
+                    _ => false,
+                })
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        for row in rows {
+            let mut key_bindings = Vec::with_capacity(items.len());
+            for item in items {
+                key_bindings.push(if is_top_level_aggregate(&item.expr) {
+                    None
+                } else {
+                    Some(self.item_binding(write_txn, &item.expr, row)?)
+                });
+            }
+            let group_idx = match groups.iter().position(|g| key_bindings_eq(&g.key_bindings, &key_bindings)) {
+                Some(idx) => idx,
+                None => {
+                    groups.push(Group {
+                        key_bindings: key_bindings.clone(),
+                        accs: fresh_accs(items),
+                        row_count: 0,
+                    });
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[group_idx];
+            group.row_count += 1;
+            for (i, item) in items.iter().enumerate() {
+                let ReturnExpr::Call { args, .. } = &item.expr else { continue };
+                if !is_top_level_aggregate(&item.expr) {
+                    continue;
+                }
+                // Standard Cypher null-skipping: a null argument (e.g. an
+                // unmatched OPTIONAL MATCH variable) contributes to
+                // neither the accumulator nor its DISTINCT dedup set —
+                // this is what makes `count(x)` exclude a null-padded row
+                // while `count(*)` (tracked via `row_count`, not an
+                // accumulator at all) includes it.
+                let value = self.eval_return_expr(write_txn, &args[0], row)?;
+                if !matches!(value, Value::Null) {
+                    if let Some(acc) = &mut group.accs[i] {
+                        acc.fold(&value)?;
+                    }
+                }
+            }
+        }
+
+        // Global aggregate over an empty result set (no grouping-key items
+        // at all, and no rows to seed a group from) still produces exactly
+        // one output row — `count`/`count(*)` -> 0, `sum` -> 0,
+        // `avg`/`min`/`max` -> Null, `collect` -> [] — via the same
+        // fresh-accumulator `finish()` path a normal empty-contribution
+        // group already uses below, not a separate code path.
+        let no_key_items = items.iter().all(|item| is_top_level_aggregate(&item.expr));
+        if groups.is_empty() && no_key_items {
+            groups.push(Group {
+                key_bindings: vec![None; items.len()],
+                accs: fresh_accs(items),
+                row_count: 0,
+            });
+        }
+
+        let mut out = Vec::with_capacity(groups.len());
+        for mut group in groups {
+            let mut row_out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let binding = if matches!(item.expr, ReturnExpr::CountStar) {
+                    Binding::Value(PropertyValue::Int(group.row_count))
+                } else if is_top_level_aggregate(&item.expr) {
+                    let value = group.accs[i]
+                        .take()
+                        .expect("aggregate item must have an accumulator")
+                        .finish();
+                    value_to_binding(value)
+                } else {
+                    group.key_bindings[i].clone().expect("non-aggregate item must have a key binding")
+                };
+                row_out.push(binding);
+            }
+            out.push(row_out);
+        }
+        Ok(out)
+    }
+
+    /// WITH's HAVING-equivalent — evaluated against the already-projected/
+    /// grouped row, same as ORDER BY. Never pushed into the planner (see
+    /// `WithExpr`'s docs).
+    fn eval_with_expr(&self, write_txn: &WriteTransaction, expr: &WithExpr, row: &BindingRow) -> Result<bool, QueryError> {
+        Ok(match expr {
+            WithExpr::And(l, r) => self.eval_with_expr(write_txn, l, row)? && self.eval_with_expr(write_txn, r, row)?,
+            WithExpr::Or(l, r) => self.eval_with_expr(write_txn, l, row)? || self.eval_with_expr(write_txn, r, row)?,
+            WithExpr::Not(e) => !self.eval_with_expr(write_txn, e, row)?,
+            WithExpr::Compare(lhs, op, lit) => {
+                let value = self.eval_return_expr(write_txn, lhs, row)?;
+                compare_value(&value, *op, lit)
+            }
+        })
     }
 
     /// Evaluates an `OPTIONAL MATCH` part with left-outer-join semantics:
@@ -508,11 +709,11 @@ impl<'a> Executor<'a> {
                 let edge = GraphStore::get_edge_in_txn(write_txn, *id)?;
                 Ok(edge.and_then(|e| e.props.get(&pa.prop).cloned()))
             }
-            // A WITH-projected scalar has no `.prop` to access — e.g.
-            // `WITH message.id AS messageId` then `messageId.foo` isn't
-            // meaningful. Treat as absent rather than erroring, consistent
-            // with how a missing property already behaves.
-            Binding::Value(_) => Ok(None),
+            // A WITH-projected scalar (or list) has no `.prop` to access —
+            // e.g. `WITH message.id AS messageId` then `messageId.foo`
+            // isn't meaningful. Treat as absent rather than erroring,
+            // consistent with how a missing property already behaves.
+            Binding::Value(_) | Binding::List(_) => Ok(None),
         }
     }
 
@@ -527,14 +728,29 @@ impl<'a> Executor<'a> {
             .enumerate()
             .map(|(i, item)| item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i)))
             .collect();
-        let mut out_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out_row = Vec::with_capacity(items.len());
-            for item in items {
-                out_row.push(self.eval_return_expr(write_txn, &item.expr, row)?);
+        let out_rows = if !has_aggregate(items) {
+            let mut out_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut out_row = Vec::with_capacity(items.len());
+                for item in items {
+                    out_row.push(self.eval_return_expr(write_txn, &item.expr, row)?);
+                }
+                out_rows.push(out_row);
             }
-            out_rows.push(out_row);
-        }
+            out_rows
+        } else {
+            validate_return_items(items)?;
+            let grouped = self.resolve_grouped_rows(write_txn, items, rows)?;
+            grouped
+                .into_iter()
+                .map(|bindings| {
+                    bindings
+                        .iter()
+                        .map(|b| self.binding_to_value(write_txn, b))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(QueryResult {
             columns,
             rows: out_rows,
@@ -550,20 +766,7 @@ impl<'a> Executor<'a> {
         match expr {
             ReturnExpr::Var(var) => {
                 let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-                match binding {
-                    Binding::Node(id) => {
-                        let node = GraphStore::get_node_in_txn(write_txn, *id)?
-                            .expect("bound node exists within this statement's transaction");
-                        Ok(Value::Node(node))
-                    }
-                    Binding::Edge(id) => {
-                        let edge = GraphStore::get_edge_in_txn(write_txn, *id)?
-                            .expect("bound edge exists within this statement's transaction");
-                        Ok(Value::Edge(edge))
-                    }
-                    Binding::Value(PropertyValue::Null) => Ok(Value::Null),
-                    Binding::Value(pv) => Ok(Value::Property(pv.clone())),
-                }
+                self.binding_to_value(write_txn, binding)
             }
             ReturnExpr::Prop(pa) => {
                 let value = self.lookup_prop(write_txn, pa, row)?;
@@ -578,13 +781,28 @@ impl<'a> Executor<'a> {
                 Literal::Null => Value::Null,
                 other => Value::Literal(other.clone()),
             }),
-            ReturnExpr::Call(name, args) => {
+            ReturnExpr::Call { name, args, .. } => {
+                // Reaching here with an aggregate name means an aggregate
+                // call slipped past `validate_return_items` (which only
+                // allows one at a return item's top level) — grouping
+                // itself never calls `eval_return_expr` on the aggregate
+                // wrapper, only on each aggregate's own argument
+                // subexpression (see `resolve_grouped_rows`), so this is
+                // an internal-consistency error, not a normal user path.
+                if is_aggregate_name(name) {
+                    return Err(QueryError::Parse(format!(
+                        "aggregate function '{name}' can only be used as a return item's top-level expression"
+                    )));
+                }
                 let arg_values = args
                     .iter()
                     .map(|a| self.eval_return_expr(write_txn, a, row))
                     .collect::<Result<Vec<_>, _>>()?;
                 call_builtin(name, &arg_values)
             }
+            ReturnExpr::CountStar => Err(QueryError::Parse(
+                "count(*) can only be used as a return item's top-level expression".into(),
+            )),
             ReturnExpr::Case { test, whens, else_ } => {
                 let test_value = match test {
                     Some(t) => Some(self.eval_return_expr(write_txn, t, row)?),
@@ -636,7 +854,7 @@ impl<'a> Executor<'a> {
                             GraphStore::delete_edge_in_txn(write_txn, *id)?;
                         }
                     }
-                    Binding::Value(_) => {
+                    Binding::Value(_) | Binding::List(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
                         )))
@@ -667,7 +885,7 @@ impl<'a> Executor<'a> {
                     Binding::Edge(id) => {
                         GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                     }
-                    Binding::Value(_) => {
+                    Binding::Value(_) | Binding::List(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
                             pa.var
@@ -688,7 +906,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Var(v) => v.clone(),
         ReturnExpr::Prop(pa) => format!("{}.{}", pa.var, pa.prop),
         ReturnExpr::Lit(_) => format!("col{idx}"),
-        ReturnExpr::Call(name, _) => format!("{name}(...)"),
+        ReturnExpr::Call { name, .. } => format!("{name}(...)"),
+        ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
     }
 }
@@ -699,19 +918,140 @@ fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
     item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i))
 }
 
+/// True iff `expr` is itself an aggregate call — `count(*)`, or a `Call`
+/// whose name is in `is_aggregate_name`'s fixed set. Does NOT look inside
+/// `expr` for a nested aggregate — see `contains_aggregate` for that.
+fn is_top_level_aggregate(expr: &ReturnExpr) -> bool {
+    match expr {
+        ReturnExpr::CountStar => true,
+        ReturnExpr::Call { name, .. } => is_aggregate_name(name),
+        _ => false,
+    }
+}
+
+/// True iff `expr` contains an aggregate call anywhere inside it, at any
+/// depth — used to reject an aggregate nested inside another aggregate's
+/// argument, or inside a non-aggregate expression's `CASE`/`Call`
+/// arguments (an aggregate must be a return item's *entire* top-level
+/// expression — see `validate_return_items`).
+fn contains_aggregate(expr: &ReturnExpr) -> bool {
+    match expr {
+        ReturnExpr::CountStar => true,
+        ReturnExpr::Call { name, args, .. } => is_aggregate_name(name) || args.iter().any(contains_aggregate),
+        ReturnExpr::Case { test, whens, else_ } => {
+            test.as_deref().is_some_and(contains_aggregate)
+                || whens.iter().any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || else_.as_deref().is_some_and(contains_aggregate)
+        }
+        ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
+    }
+}
+
+/// True iff any item's top-level expression is an aggregate call —
+/// `materialize_with`/`materialize_return` dispatch to the grouping path
+/// iff this is true, otherwise the existing row-at-a-time path runs
+/// completely unchanged (zero perf/behavior impact on non-aggregating
+/// queries).
+fn has_aggregate(items: &[ReturnItem]) -> bool {
+    items.iter().any(|item| is_top_level_aggregate(&item.expr))
+}
+
+/// Validates a RETURN/WITH item list before any row is processed: every
+/// aggregate call has exactly one argument (`count(*)`, the zero-argument
+/// form, is `CountStar`, a separate variant — never reaches the `Call`
+/// arm here), no aggregate's own argument contains a nested aggregate
+/// call, and no non-aggregate item's expression contains an aggregate
+/// call anywhere inside it (aggregates must be a return item's entire
+/// top-level expression — justified by there being no arithmetic
+/// operators anywhere in this engine yet, so `count(n) * 2`-style
+/// composition is already impossible, and nothing in the target query set
+/// needs an aggregate nested inside a `CASE` branch).
+fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
+    for item in items {
+        match &item.expr {
+            ReturnExpr::CountStar => {}
+            ReturnExpr::Call { name, args, .. } if is_aggregate_name(name) => {
+                if args.len() != 1 {
+                    return Err(QueryError::Parse(format!(
+                        "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
+                    )));
+                }
+                if contains_aggregate(&args[0]) {
+                    return Err(QueryError::Parse(format!(
+                        "aggregate function '{name}' can't take another aggregate as an argument"
+                    )));
+                }
+            }
+            other => {
+                if contains_aggregate(other) {
+                    return Err(QueryError::Parse(
+                        "an aggregate function must be a return item's entire expression, not nested inside \
+                         another expression"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Grouping-key equality — deliberately at the `Binding` level (`NodeId`/
+/// `EdgeId`/`PropertyValue`), not `Value`: cheaper (no `GraphStore` fetch
+/// just to compare) and the correct semantics (two `Binding::Node`s are
+/// the same group iff the same node **identity**, not equal-by-struct-
+/// contents).
+fn binding_eq(a: &Binding, b: &Binding) -> bool {
+    match (a, b) {
+        (Binding::Node(x), Binding::Node(y)) => x == y,
+        (Binding::Edge(x), Binding::Edge(y)) => x == y,
+        (Binding::Value(x), Binding::Value(y)) => x == y,
+        (Binding::List(x), Binding::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q)),
+        _ => false,
+    }
+}
+
+/// Converts a finished `AggAcc::finish()` result to the `Binding` it's
+/// carried as through a `WITH` boundary — `collect()`'s `Value::List`
+/// needs `Binding::List` (no list variant in `PropertyValue`, the
+/// storage-layer type `Binding::Value` wraps), everything else collapses
+/// to `Binding::Value` same as any other computed WITH item.
+fn value_to_binding(v: Value) -> Binding {
+    match v {
+        Value::List(items) => Binding::List(items),
+        other => Binding::Value(value_to_property_value(&other)),
+    }
+}
+
+/// `WithExpr::Compare`'s value-vs-literal comparison — reuses `compare()`
+/// (below) by reducing a `Value` down to the `Option<PropertyValue>` shape
+/// it expects; `Node`/`Edge`/`List` have no meaningful comparison against
+/// a `Literal` and fall back to "absent", same as a missing property does.
+fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> bool {
+    let prop = match value {
+        Value::Null => None,
+        Value::Property(pv) => Some(pv.clone()),
+        Value::Literal(l) => Some(literal_to_value(l)),
+        Value::Node(_) | Value::Edge(_) | Value::List(_) => None,
+    };
+    compare(&prop, op, lit)
+}
+
 /// Coerces a materialized `Value` down to a `PropertyValue` for storing in
-/// `Binding::Value` — used when a `WITH` item is a computed expression
-/// (not a bare variable, which instead keeps its `Binding::Node`/`Edge`
-/// identity — see `materialize_with`). `Value::Node`/`Edge` can't occur
-/// here in practice (no `ReturnExpr` form produces one except `Var`, which
-/// takes the bare-variable path instead), so they fall back to `Null`
+/// `Binding::Value` — used by `item_binding` for a computed (non-bare-var)
+/// WITH/RETURN item. `Value::Node`/`Edge` can't occur here in practice (no
+/// non-aggregate `ReturnExpr` form produces one except `Var`, which takes
+/// the bare-variable path instead). `Value::List` can't occur here either
+/// — `collect()` only ever appears in an aggregating item list, which
+/// `has_aggregate` routes to `resolve_grouped_rows`/`Binding::List`
+/// instead of through `item_binding` at all. Both fall back to `Null`
 /// rather than needing a fallible signature for an unreachable case.
 fn value_to_property_value(v: &Value) -> PropertyValue {
     match v {
         Value::Null => PropertyValue::Null,
         Value::Property(pv) => pv.clone(),
         Value::Literal(lit) => literal_to_value(lit),
-        Value::Node(_) | Value::Edge(_) => PropertyValue::Null,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) => PropertyValue::Null,
     }
 }
 
@@ -802,10 +1142,14 @@ fn cmp_ord<T: PartialOrd>(op: CompareOp, a: T, b: T) -> bool {
     }
 }
 
-/// Value equality for CASE's WHEN-comparison. Null == Null -> true here
-/// deliberately, matching `compare()`'s convention above, not standard
-/// three-valued NULL logic.
-fn value_eq(a: &Value, b: &Value) -> bool {
+/// Value equality for CASE's WHEN-comparison (and, elsewhere, DISTINCT
+/// dedup within an aggregate). Null == Null -> true here deliberately,
+/// matching `compare()`'s convention above, not standard three-valued NULL
+/// logic. `Node`/`Edge` compare by id (graph identity), not full-struct
+/// contents — cheaper, and the correct semantics regardless (two bindings
+/// are "the same node" iff the same node, not iff their label/prop
+/// snapshots happen to match).
+pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
@@ -813,6 +1157,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Literal(la), Value::Literal(lb)) => la == lb,
         (Value::Property(pa), Value::Literal(lb)) => *pa == literal_to_value(lb),
         (Value::Literal(la), Value::Property(pb)) => literal_to_value(la) == *pb,
+        (Value::Node(na), Value::Node(nb)) => na.id == nb.id,
+        (Value::Edge(ea), Value::Edge(eb)) => ea.id == eb.id,
+        (Value::List(la), Value::List(lb)) => la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y)),
         _ => false,
     }
 }
@@ -904,13 +1251,27 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             Literal::Null => Value::Null,
             other => Value::Literal(other.clone()),
         }),
-        ReturnExpr::Call(name, args) => {
+        ReturnExpr::Call { name, args, .. } => {
+            // Same internal-consistency stance as `eval_return_expr`'s
+            // `Call` arm: by the time ORDER BY runs, aggregation has
+            // already resolved into ordinary named output columns
+            // (referenced here via `Var`), so a raw aggregate `Call`
+            // reaching this point means it wasn't top-level as
+            // `validate_return_items` requires.
+            if is_aggregate_name(name) {
+                return Err(QueryError::Parse(format!(
+                    "aggregate function '{name}' can only be used as a return item's top-level expression"
+                )));
+            }
             let arg_values = args
                 .iter()
                 .map(|a| eval_projected_expr(a, row))
                 .collect::<Result<Vec<_>, _>>()?;
             call_builtin(name, &arg_values)
         }
+        ReturnExpr::CountStar => Err(QueryError::Parse(
+            "count(*) can only be used as a return item's top-level expression".into(),
+        )),
         ReturnExpr::Case { test, whens, else_ } => {
             let test_value = match test {
                 Some(t) => Some(eval_projected_expr(t, row)?),
@@ -979,4 +1340,28 @@ fn value_to_comparable(v: &Value) -> Option<PropertyValue> {
         Value::Literal(lit) => Some(literal_to_value(lit)),
         _ => None,
     }
+}
+
+/// Ordering for `min`/`max` aggregate folding — `None` for values with no
+/// natural order (`Node`/`Edge`/`List`, or a `Null`, which `AggAcc::fold`
+/// never passes here anyway since null contributions are skipped before
+/// folding). The caller turns `None` into a clear error rather than an
+/// arbitrary "always equal" fallback — unlike ORDER BY's
+/// `compare_non_null`, which tolerates that for presentation ordering
+/// (see its docs), silently treating two nodes as "equal" inside an
+/// aggregate would be a wrong-answer failure mode, not just an
+/// unhelpful sort order.
+pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let pa = value_to_comparable(a)?;
+    let pb = value_to_comparable(b)?;
+    Some(match (pa, pb) {
+        (PropertyValue::Int(x), PropertyValue::Int(y)) => x.cmp(&y),
+        (PropertyValue::Int(x), PropertyValue::Float(y)) => (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (PropertyValue::Float(x), PropertyValue::Int(y)) => x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal),
+        (PropertyValue::Float(x), PropertyValue::Float(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(&y),
+        (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(&y),
+        _ => return None,
+    })
 }

@@ -656,3 +656,394 @@ fn optional_match_without_with_shares_scope() {
     let result = run(&store, "MATCH (n:Item) OPTIONAL MATCH (n)-[:X]->(m) RETURN n.name");
     assert_eq!(result.rows.len(), 1);
 }
+
+fn int_value(v: &Value) -> i64 {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+        other => panic!("expected an int, got {other:?}"),
+    }
+}
+
+fn str_value(v: &Value) -> String {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+        other => panic!("expected a string, got {other:?}"),
+    }
+}
+
+#[test]
+fn count_star_over_all_rows() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN count(*) AS c");
+    assert_eq!(result.columns, vec!["c"]);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 5);
+}
+
+#[test]
+fn count_excludes_null_but_count_star_does_not() {
+    use std::collections::BTreeMap;
+
+    // p1/p2 each KNOWS one friend; p3 knows nobody -- its OPTIONAL MATCH
+    // row null-pads `f`. count(f) must skip that row; count(*) must not.
+    let store = GraphStore::open_memory().unwrap();
+    let p1 = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let p2 = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let p3 = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let f1 = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let f2 = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    store.create_edge("KNOWS", p1, f1, BTreeMap::new()).unwrap();
+    store.create_edge("KNOWS", p2, f2, BTreeMap::new()).unwrap();
+    let _ = p3;
+
+    let result = run(
+        &store,
+        "MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS cf, count(*) AS cs",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 2, "count(f) must exclude the null-padded row");
+    assert_eq!(int_value(&result.rows[0][1]), 5, "count(*) counts every row, including null-padded ones");
+}
+
+#[test]
+fn group_by_implicit_via_with() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut alice_props = BTreeMap::new();
+    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
+    let mut bob_props = BTreeMap::new();
+    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    let bob = store.create_node(&["Person"], bob_props).unwrap();
+    for _ in 0..2 {
+        let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    }
+    let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+    store.create_edge("OWNS", bob, item, BTreeMap::new()).unwrap();
+
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(i:Item) WITH p.name AS name, count(i) AS c RETURN name, c ORDER BY name",
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!((str_value(&result.rows[0][0]), int_value(&result.rows[0][1])), ("Alice".to_string(), 2));
+    assert_eq!((str_value(&result.rows[1][0]), int_value(&result.rows[1][1])), ("Bob".to_string(), 1));
+}
+
+#[test]
+fn group_by_implicit_via_return_no_with() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut alice_props = BTreeMap::new();
+    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
+    for _ in 0..3 {
+        let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    }
+
+    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN p.name AS name, count(i) AS c");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!((str_value(&result.rows[0][0]), int_value(&result.rows[0][1])), ("Alice".to_string(), 3));
+}
+
+#[test]
+fn count_distinct_dedupes() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    for cat in ["A", "A", "B"] {
+        let mut props = BTreeMap::new();
+        props.insert("category".to_string(), marsdb_graph::PropertyValue::String(cat.into()));
+        let item = store.create_node(&["Item"], props).unwrap();
+        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    }
+
+    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN count(DISTINCT i.category) AS c");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+}
+
+#[test]
+fn collect_distinct_dedupes_nodes() {
+    use std::collections::BTreeMap;
+
+    // Two separate OWNS edges to the *same* item -- MATCH produces 2 rows
+    // for it, but collect(DISTINCT i) must dedupe by node identity down to
+    // one entry, not two.
+    let store = GraphStore::open_memory().unwrap();
+    let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+    store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+
+    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN collect(DISTINCT i) AS items");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::List(items) => assert_eq!(items.len(), 1, "the same node reached via 2 edges must collect once"),
+        other => panic!("expected a list, got {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_over_empty_result_global() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "MATCH (n:NoSuchLabel) RETURN count(n) AS c, sum(n.x) AS s, avg(n.x) AS a, min(n.x) AS mn, max(n.x) AS mx, \
+         collect(n.x) AS coll",
+    );
+    assert_eq!(result.rows.len(), 1, "a global aggregate over zero rows must still emit one row");
+    let row = &result.rows[0];
+    assert_eq!(int_value(&row[0]), 0);
+    assert_eq!(int_value(&row[1]), 0);
+    assert!(matches!(row[2], Value::Null));
+    assert!(matches!(row[3], Value::Null));
+    assert!(matches!(row[4], Value::Null));
+    match &row[5] {
+        Value::List(items) => assert!(items.is_empty()),
+        other => panic!("expected an empty list, got {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_with_grouping_key_empty_result() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "MATCH (n:NoSuchLabel) RETURN n.type AS t, count(n) AS c");
+    assert_eq!(result.rows.len(), 0, "a grouping key present means zero groups over zero rows, not one");
+}
+
+#[test]
+fn collect_produces_list() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN collect(n.idx) AS idxs");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            let mut vals: Vec<i64> = items.iter().map(int_value).collect();
+            vals.sort();
+            assert_eq!(vals, vec![0, 1, 2]);
+        }
+        other => panic!("expected a list, got {other:?}"),
+    }
+}
+
+#[test]
+fn grouped_bare_var_stays_traversable_after_with() {
+    use std::collections::BTreeMap;
+
+    // The grouped `p` (a bare-var grouping key) must keep its graph
+    // identity through the WITH boundary so the second MATCH can keep
+    // traversing from it, not collapse to a value-only binding.
+    let store = GraphStore::open_memory().unwrap();
+    let mut alice_props = BTreeMap::new();
+    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
+    for _ in 0..2 {
+        let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    }
+    let mut co_props = BTreeMap::new();
+    co_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Acme".into()));
+    let acme = store.create_node(&["Company"], co_props).unwrap();
+    store.create_edge("WORKS_AT", alice, acme, BTreeMap::new()).unwrap();
+
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(f:Item) \
+         WITH p, count(f) AS c \
+         MATCH (p)-[:WORKS_AT]->(co:Company) \
+         RETURN p.name AS name, c, co.name AS company",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(int_value(&result.rows[0][1]), 2);
+    assert_eq!(str_value(&result.rows[0][2]), "Acme");
+}
+
+#[test]
+fn sum_avg_int_float_promotion() {
+    let store = GraphStore::open_memory().unwrap();
+    for v in [1, 2, 3] {
+        run(&store, &format!("CREATE (n:Item {{val: {v}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a");
+    assert_eq!(int_value(&result.rows[0][0]), 6, "sum of all-int inputs must stay Int");
+    match &result.rows[0][1] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => assert!((f - 2.0).abs() < 1e-9),
+        other => panic!("avg must always be a float, got {other:?}"),
+    }
+}
+
+#[test]
+fn sum_avg_promotes_to_float_when_any_input_is_float() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {val: 1})");
+    run(&store, "CREATE (n:Item {val: 2})");
+    run(&store, "CREATE (n:Item {val: 1.5})");
+    let result = run(&store, "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => assert!((f - 4.5).abs() < 1e-9),
+        other => panic!("expected a float sum, got {other:?}"),
+    }
+    match &result.rows[0][1] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => assert!((f - 1.5).abs() < 1e-9),
+        other => panic!("expected a float avg, got {other:?}"),
+    }
+}
+
+#[test]
+fn min_max_on_non_orderable_errors() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {idx: 1})");
+    let stmt = parse("MATCH (n:Item) RETURN min(n) AS m").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("comparable"), "expected a comparability error, got: {err}");
+}
+
+#[test]
+fn nested_aggregate_rejected() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {idx: 1})");
+    let stmt = parse("MATCH (n:Item) RETURN count(sum(n.idx)) AS c").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregate"), "expected an aggregate-nesting error, got: {err}");
+}
+
+#[test]
+fn aggregate_not_top_level_rejected() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {idx: 1})");
+    let stmt = parse("MATCH (n:Item) RETURN CASE n.idx WHEN 1 THEN count(n) ELSE 0 END AS x").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregate"), "expected a top-level-aggregate error, got: {err}");
+}
+
+#[test]
+fn var_expand_depth_cap_error_survives_aggregation() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut prev = {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(0));
+        store.create_node(&["Item"], props).unwrap()
+    };
+    for i in 1..40 {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
+        let next = store.create_node(&["Item"], props).unwrap();
+        store.create_edge("NEXT", prev, next, BTreeMap::new()).unwrap();
+        prev = next;
+    }
+
+    let stmt = parse("MATCH (n:Item {idx: 0})-[:NEXT*0..]->(m:Item) RETURN count(m) AS c").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("depth cap"), "expected a depth-cap error, got: {err}");
+}
+
+#[test]
+fn with_where_filters_on_aggregate_result() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut alice_props = BTreeMap::new();
+    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    let alice = store.create_node(&["Person"], alice_props).unwrap();
+    let mut bob_props = BTreeMap::new();
+    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    let bob = store.create_node(&["Person"], bob_props).unwrap();
+    for _ in 0..3 {
+        let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    }
+    let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+    store.create_edge("OWNS", bob, item, BTreeMap::new()).unwrap();
+
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(i:Item) WITH p, count(i) AS c WHERE c > 1 RETURN p.name AS name, c",
+    );
+    assert_eq!(result.rows.len(), 1, "only Alice's group (count 3) should survive c > 1");
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(int_value(&result.rows[0][1]), 3);
+}
+
+#[test]
+fn with_where_filters_without_aggregation() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in [5, 15, 25] {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y");
+    let vals: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
+    assert_eq!(vals, vec![15, 25]);
+}
+
+#[test]
+fn with_where_and_or_not() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in [5, 15, 25, 35] {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 AND NOT y > 30 RETURN y ORDER BY y");
+    let vals: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
+    assert_eq!(vals, vec![15, 25]);
+}
+
+#[test]
+fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
+    use std::collections::BTreeMap;
+
+    // Not literal IC1 text/fixtures (out of scope, same as the IS1-7 plan's
+    // deferral of IC fixtures) -- a hand-crafted shape combining grouping,
+    // WITH...WHERE, ORDER BY, LIMIT, and collect() together in one query,
+    // since no single mechanic test above exercises that combination.
+    let store = GraphStore::open_memory().unwrap();
+    let names = ["Alice", "Bob", "Carol", "Dave"];
+    let mut people = Vec::new();
+    for name in names {
+        let mut props = BTreeMap::new();
+        props.insert("name".to_string(), marsdb_graph::PropertyValue::String(name.into()));
+        people.push(store.create_node(&["Person"], props).unwrap());
+    }
+    // Alice: 3 posts, Bob: 2 posts, Carol: 1 post, Dave: 0 posts.
+    let post_counts = [3, 2, 1, 0];
+    for (person, &n) in people.iter().zip(&post_counts) {
+        for i in 0..n {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(i));
+            let post = store.create_node(&["Post"], props).unwrap();
+            store.create_edge("HAS_CREATOR", post, *person, BTreeMap::new()).unwrap();
+        }
+    }
+
+    let result = run(
+        &store,
+        "MATCH (p:Person)<-[:HAS_CREATOR]-(post:Post) \
+         WITH p, count(post) AS postCount, collect(post.id) AS postIds \
+         WHERE postCount > 0 \
+         RETURN p.name AS name, postCount, postIds \
+         ORDER BY postCount DESC \
+         LIMIT 2",
+    );
+    assert_eq!(result.rows.len(), 2, "Dave (0 posts) filtered by WHERE, then LIMIT 2 of the remaining 3");
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+    assert_eq!(int_value(&result.rows[0][1]), 3);
+    match &result.rows[0][2] {
+        Value::List(items) => assert_eq!(items.len(), 3),
+        other => panic!("expected a 3-item list, got {other:?}"),
+    }
+    assert_eq!(str_value(&result.rows[1][0]), "Bob");
+    assert_eq!(int_value(&result.rows[1][1]), 2);
+}
