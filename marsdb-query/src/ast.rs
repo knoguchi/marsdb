@@ -136,6 +136,14 @@ pub enum Tail {
     Delete(Vec<String>),
     DetachDelete(Vec<String>),
     Set(Vec<(PropAccess, Literal)>),
+    /// `MATCH ... CREATE ...` — same pattern syntax as `Statement::Create`,
+    /// but runs once per row already bound by the preceding MATCH/WITH: a
+    /// node pattern token whose variable is already bound in that row
+    /// reuses the existing node instead of creating a new one. This is
+    /// the only way to add an edge between two nodes that already exist —
+    /// `Statement::Create` alone can't (every node token it sees is
+    /// always fresh).
+    Create(Vec<Pattern>),
 }
 
 /// WITH's HAVING-equivalent: filters on the already-projected/aggregated
