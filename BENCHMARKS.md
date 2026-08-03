@@ -73,3 +73,8 @@ roadmap.
   hasn't been measured separately.
 - No comparison against Neo4j, JanusGraph, Neptune, or any other graph
   database.
+- No benchmarks yet for `WITH`-chaining, `OPTIONAL MATCH`, undirected or
+  variable-length (`*min..max`) patterns, or `CASE`/function calls
+  (`coalesce()`/`toInteger()`) — all added after these numbers were
+  measured. The queries above only exercise `CREATE` and a single-hop
+  `MATCH`.
