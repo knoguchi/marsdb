@@ -237,12 +237,14 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
     let mut var = None;
     let mut rel_type = None;
     let mut props = Vec::new();
+    let mut hop_range = None;
     for p in inner.into_inner() {
         match p.as_rule() {
             Rule::rel_var => var = Some(p.as_str().to_string()),
             Rule::rel_type => {
                 rel_type = Some(p.into_inner().next().expect("rel_type has an identifier").as_str().to_string())
             }
+            Rule::rel_range => hop_range = Some(parse_rel_range(p.as_str())?),
             Rule::prop_map => props = parse_prop_map(p)?,
             r => unreachable!("unexpected rel_right/rel_left/rel_either child rule {r:?}"),
         }
@@ -252,7 +254,45 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
         rel_type,
         props,
         direction,
+        hop_range,
     })
+}
+
+/// Parses the raw `rel_range` text (`*`, `*N`, `*N..`, `*N..M`, `*..M`)
+/// directly rather than via sub-rules, since the `..` literal produces no
+/// child `Pair` to structurally distinguish "*N" (exact) from "*N.." (N or
+/// more).
+fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
+    let rest = &text[1..]; // strip leading '*'
+    if rest.is_empty() {
+        return Ok((0, None));
+    }
+    if let Some(idx) = rest.find("..") {
+        let min_str = &rest[..idx];
+        let max_str = &rest[idx + 2..];
+        let min = if min_str.is_empty() {
+            0
+        } else {
+            min_str
+                .parse()
+                .map_err(|_| QueryError::Parse("invalid variable-length min hop count".into()))?
+        };
+        let max = if max_str.is_empty() {
+            None
+        } else {
+            Some(
+                max_str
+                    .parse()
+                    .map_err(|_| QueryError::Parse("invalid variable-length max hop count".into()))?,
+            )
+        };
+        Ok((min, max))
+    } else {
+        let n: u32 = rest
+            .parse()
+            .map_err(|_| QueryError::Parse("invalid variable-length hop count".into()))?;
+        Ok((n, Some(n)))
+    }
 }
 
 fn parse_prop_map(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>, QueryError> {

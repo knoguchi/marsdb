@@ -19,6 +19,15 @@ enum Binding {
 
 type BindingRow = HashMap<String, Binding>;
 
+/// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
+/// Hitting it errors rather than silently truncating — see `VarExpand`
+/// evaluation. Node-visited-set BFS (not relationship-uniqueness) is used
+/// throughout, which is only correct because the graphs this targets
+/// (LDBC's REPLY_OF-style reply chains) form a forest, not a general
+/// cyclic graph — not safe to reuse as-is for a variable-length pattern
+/// over a cyclic relationship type without revisiting that assumption.
+const VAR_EXPAND_DEPTH_CAP: u32 = 30;
+
 pub struct Executor<'a> {
     store: &'a GraphStore,
 }
@@ -66,6 +75,11 @@ impl<'a> Executor<'a> {
             let mut prev_id = GraphStore::create_node_in_txn(write_txn, &start_labels, start_props)?;
 
             for (rel, node) in &pattern.hops {
+                if rel.hop_range.is_some() {
+                    return Err(QueryError::Parse(
+                        "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
+                    ));
+                }
                 let labels = pattern_labels(&node.labels);
                 let props = literal_props_to_values(&node.props);
                 let node_id = GraphStore::create_node_in_txn(write_txn, &labels, props)?;
@@ -100,7 +114,7 @@ impl<'a> Executor<'a> {
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
-        let mut plan = build_match_plan(pattern, where_clause);
+        let mut plan = build_match_plan(pattern, where_clause)?;
         // ORDER BY must see every matching row before LIMIT truncates —
         // sort, then take N, not the other way around. Only skip the
         // pre-materialization limit (the v1 "doesn't short-circuit" path)
@@ -157,6 +171,65 @@ impl<'a> Executor<'a> {
                             new_row.insert(rv.clone(), Binding::Edge(entry.edge_id));
                         }
                         out.push(new_row);
+                    }
+                }
+                Ok(out)
+            }
+            LogicalPlan::VarExpand {
+                input,
+                from_var,
+                to_var,
+                rel_label,
+                direction,
+                min_hops,
+                max_hops,
+            } => {
+                let base_rows = self.eval_plan(write_txn, input)?;
+                let mut out = Vec::new();
+                let unbounded = max_hops.is_none();
+                let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
+                for row in base_rows {
+                    let Some(Binding::Node(start_id)) = row.get(from_var).copied() else {
+                        return Err(QueryError::UnboundVariable(from_var.clone()));
+                    };
+                    let mut visited = HashSet::new();
+                    visited.insert(start_id);
+                    if *min_hops == 0 {
+                        let mut new_row = row.clone();
+                        new_row.insert(to_var.clone(), Binding::Node(start_id));
+                        out.push(new_row);
+                    }
+                    let mut frontier = vec![start_id];
+                    let mut depth = 0u32;
+                    while depth < effective_max && !frontier.is_empty() {
+                        depth += 1;
+                        let mut next_frontier = Vec::new();
+                        for node in frontier {
+                            let entries = neighbors_for_direction(write_txn, node, *direction, rel_label.as_deref())?;
+                            for entry in entries {
+                                if visited.insert(entry.other) {
+                                    next_frontier.push(entry.other);
+                                    if depth >= *min_hops {
+                                        let mut new_row = row.clone();
+                                        new_row.insert(to_var.clone(), Binding::Node(entry.other));
+                                        out.push(new_row);
+                                    }
+                                }
+                            }
+                        }
+                        frontier = next_frontier;
+                        if depth == effective_max && unbounded && !frontier.is_empty() {
+                            // Unbounded (`*N..`) traversal hit the safety
+                            // cap with more still reachable — error rather
+                            // than silently truncate results, which would
+                            // be a wrong-answer failure mode for a
+                            // correctness-benchmark tool.
+                            return Err(QueryError::Parse(format!(
+                                "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
+                                 hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
+                                 add an explicit upper bound (e.g. *0..10)"
+                            )));
+                        }
                     }
                 }
                 Ok(out)

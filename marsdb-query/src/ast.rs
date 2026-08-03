@@ -93,6 +93,10 @@ pub struct RelPattern {
     #[allow(dead_code)] // property-map on relationships parsed but not filtered on in v1
     pub props: Vec<(String, Literal)>,
     pub direction: RelDirection,
+    /// `[:TYPE*min..max]` — `None` means a fixed single hop (existing
+    /// behavior). `max: None` means unbounded, capped at a safety depth by
+    /// the executor.
+    pub hop_range: Option<(u32, Option<u32>)>,
 }
 
 /// A linear chain: node, (rel, node)*.

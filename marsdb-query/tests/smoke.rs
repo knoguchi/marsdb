@@ -309,3 +309,121 @@ fn create_rejects_undirected_pattern_at_execute_time() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("direct"));
 }
+
+#[test]
+fn hop_node_first_label_is_actually_filtered() {
+    // Regression test: the planner used to unconditionally skip the FIRST
+    // label when filtering a node reached via Expand/VarExpand (only
+    // correct for the pattern's start node, where NodeByLabelScan already
+    // handles the first label) -- so `(a)-[:R]->(b:Post)` would match ANY
+    // labeled node at the far end of the hop, not just :Post ones.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Root {name: 'r'})-[:R]->(b:Post {name: 'post'})");
+    run(&store, "CREATE (a2:Root {name: 'r2'})-[:R]->(c:Comment {name: 'comment'})");
+
+    let result = run(&store, "MATCH (a:Root)-[:R]->(b:Post) RETURN b.name");
+    assert_eq!(result.rows.len(), 1, "hop node's label filter must exclude the :Comment target");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "post"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn variable_length_pattern_walks_reply_chain_to_root() {
+    use std::collections::BTreeMap;
+
+    // Mirrors IS6's shape: MATCH (m:Message {id})-[:REPLY_OF*0..]->(p:Post) ...
+    // Chain c2 -[:REPLY_OF]-> c1 -[:REPLY_OF]-> p. Cypher CREATE always
+    // makes fresh nodes per pattern position (no MATCH+CREATE combo in
+    // v1), so build this directly via GraphStore to get real shared node
+    // identity across the chain.
+    let store = GraphStore::open_memory().unwrap();
+    let mut props_p = BTreeMap::new();
+    props_p.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
+    let p = store.create_node(&["Post", "Message"], props_p).unwrap();
+    let mut props_c1 = BTreeMap::new();
+    props_c1.insert("id".to_string(), marsdb_graph::PropertyValue::Int(2));
+    let c1 = store.create_node(&["Comment", "Message"], props_c1).unwrap();
+    let mut props_c2 = BTreeMap::new();
+    props_c2.insert("id".to_string(), marsdb_graph::PropertyValue::Int(3));
+    let c2 = store.create_node(&["Comment", "Message"], props_c2).unwrap();
+    store.create_edge("REPLY_OF", c1, p, BTreeMap::new()).unwrap();
+    store.create_edge("REPLY_OF", c2, c1, BTreeMap::new()).unwrap();
+
+    let result = run(&store, "MATCH (m:Message {id: 3})-[:REPLY_OF*0..]->(p:Post) RETURN p.id");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(v)) => assert_eq!(*v, 1),
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    // min_hops = 0 also includes the start node itself if it happens to
+    // match the target label — not exercised by IS6 (a Comment never
+    // has :Post too) but worth confirming: starting FROM the post with
+    // *0.. must return the post itself at hop 0.
+    let from_post = run(&store, "MATCH (m:Message {id: 1})-[:REPLY_OF*0..]->(p:Post) RETURN p.id");
+    assert_eq!(from_post.rows.len(), 1);
+}
+
+#[test]
+fn variable_length_bounded_range_respects_max_hops() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
+        ids.push(store.create_node(&["Item"], props).unwrap());
+    }
+    for i in 0..4 {
+        store.create_edge("NEXT", ids[i], ids[i + 1], BTreeMap::new()).unwrap();
+    }
+
+    // From idx=0, *1..2 should reach idx=1 and idx=2 only (not 3, not 4;
+    // not 0 itself since min_hops=1).
+    let result = run(&store, "MATCH (n:Item {idx: 0})-[:NEXT*1..2]->(m:Item) RETURN m.idx");
+    let mut reached: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    reached.sort();
+    assert_eq!(reached, vec![1, 2]);
+}
+
+#[test]
+fn variable_length_unbounded_depth_cap_errors_not_truncates() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut prev = {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(0));
+        store.create_node(&["Item"], props).unwrap()
+    };
+    // 40 hops, past the 30-hop safety cap.
+    for i in 1..40 {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
+        let next = store.create_node(&["Item"], props).unwrap();
+        store.create_edge("NEXT", prev, next, BTreeMap::new()).unwrap();
+        prev = next;
+    }
+
+    let stmt = parse("MATCH (n:Item {idx: 0})-[:NEXT*0..]->(m:Item) RETURN m.idx").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("depth cap"), "expected a depth-cap error, got: {err}");
+}
+
+#[test]
+fn create_rejects_variable_length_pattern() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (a:Item)-[:NEXT*1..3]->(b:Item)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("variable-length"));
+}

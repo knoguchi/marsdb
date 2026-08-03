@@ -43,11 +43,16 @@ node_label   = { ":" ~ identifier }
 // bare "-", or "-[:KNOWS]->" would parse as rel_either and leave a dangling
 // ">" that fails the rest of the pattern instead of matching rel_right.
 rel_pattern = { rel_right | rel_left | rel_either }
-rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]->" }
-rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]-" }
-rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]-" }
+rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]->" }
+rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]-" }
+rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]-" }
 rel_var     = { identifier }
 rel_type    = { ":" ~ identifier }
+// Variable-length hop count: `*`, `*N`, `*N..`, `*N..M`, `*..M`. Captured
+// as raw text and parsed directly in parser.rs rather than broken into
+// sub-rules — simpler than distinguishing "*N" (exact) from "*N.." (N or
+// more) structurally, since the ".." literal itself produces no Pair.
+rel_range = @{ "*" ~ ASCII_DIGIT* ~ (".." ~ ASCII_DIGIT*)? }
 
 prop_map = { "{" ~ (prop_kv ~ ("," ~ prop_kv)*)? ~ "}" }
 prop_kv  = { identifier ~ ":" ~ literal }

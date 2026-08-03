@@ -41,6 +41,21 @@ pub enum LogicalPlan {
         rel_label: Option<String>,
         direction: ExpandDirection,
     },
+    /// `[:TYPE*min..max]` — BFS from each input row's bound node instead of
+    /// a single fixed hop. `rel_var` isn't meaningful here (a variable-
+    /// length pattern binds a *list* of relationships in real Cypher; v1
+    /// doesn't support that, so a `rel_var` on a variable-length pattern is
+    /// rejected by the planner rather than silently bound to just the last
+    /// hop's edge).
+    VarExpand {
+        input: Box<LogicalPlan>,
+        from_var: String,
+        to_var: String,
+        rel_label: Option<String>,
+        direction: ExpandDirection,
+        min_hops: u32,
+        max_hops: Option<u32>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: Expr,
