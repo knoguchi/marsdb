@@ -6,9 +6,9 @@ use marsdb::Database;
 mod format;
 mod repl;
 
-/// Mars: an embeddable property-graph database. Single binary, single file.
+/// MarsDB: an embeddable property-graph database. Single binary, single file.
 #[derive(Parser)]
-#[command(name = "mars")]
+#[command(name = "marsdb")]
 struct Cli {
     /// Database file path, or `:memory:` for a transient in-memory database.
     /// Omit entirely for an in-memory database.
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     let db = match db {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("mars: failed to open database: {e}");
+            eprintln!("marsdb: failed to open database: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("mars: {e}");
+                eprintln!("marsdb: {e}");
                 ExitCode::FAILURE
             }
         };

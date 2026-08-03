@@ -3,7 +3,7 @@ name = "marsdb-graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Property graph model and CRUD storage layer used internally by Mars."
+description = "Property graph model and CRUD storage layer used internally by MarsDB."
 
 [dependencies]
 marsdb-storage = { path = "../marsdb-storage", version = "0.1.0" }
