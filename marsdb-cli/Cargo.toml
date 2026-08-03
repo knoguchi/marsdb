@@ -12,7 +12,7 @@ name = "marsdb"
 path = "src/main.rs"
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.1.0" }
-marsdb-graph = { path = "../marsdb-graph", version = "0.1.0" }
+marsdb = { path = "../marsdb", version = "0.2.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.2.0" }
 clap.workspace = true
 rustyline.workspace = true
