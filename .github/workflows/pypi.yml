@@ -29,6 +29,23 @@ jobs:
           name: wheel-${{ matrix.target }}
           path: marsdb-python/dist
 
+  linux-wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: marsdb-python
+          command: build
+          args: --release --out dist
+          target: x86_64-unknown-linux-gnu
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-x86_64-unknown-linux-gnu
+          path: marsdb-python/dist
+
   sdist:
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +62,7 @@ jobs:
           path: marsdb-python/dist
 
   publish:
-    needs: [macos-wheels, sdist]
+    needs: [macos-wheels, linux-wheels, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

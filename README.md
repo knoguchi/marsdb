@@ -46,9 +46,9 @@ db.execute("MATCH (n:Person) RETURN n.name")
 # -> [{'n.name': 'Alice'}, {'n.name': 'Bob'}]
 ```
 
-Prebuilt wheel currently covers macOS arm64 / Python 3.14; other platforms
-install from the source distribution and need a Rust toolchain. To build
-from source directly:
+Prebuilt wheels cover macOS (arm64, x86_64) and Linux (x86_64, manylinux);
+other platforms install from the source distribution and need a Rust
+toolchain. To build from source directly:
 
 ```
 cd marsdb-python
