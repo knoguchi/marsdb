@@ -180,6 +180,21 @@ reopens the file fresh, and asserts every acknowledged commit survived intact
 with no gaps or duplicates. `CRASH_TEST_RUNS=200` (default 30) for more
 confidence at the cost of runtime.
 
+The Cypher parser (the one part of MarsDB that takes raw, untrusted string
+input directly) is fuzzed via `cargo-fuzz` — needs nightly:
+
+```
+cargo install cargo-fuzz
+cd marsdb-query && cargo +nightly fuzz run parse -- -max_total_time=120
+```
+
+Only claim: never panics. A parse error (`Result::Err`) is the expected,
+correct outcome for most fuzzer-generated input. Keep at least one real
+Cypher string in `fuzz/corpus/parse/` — running against a genuinely empty
+corpus made libFuzzer's own startup/seed-bootstrapping phase (not anything
+in MarsDB) take upwards of an hour instead of seconds on this target; a
+seeded corpus doesn't hit it.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or

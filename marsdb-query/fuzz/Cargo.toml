@@ -1,0 +1,26 @@
+[package]
+name = "marsdb-query-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately its own workspace, not a member of the root one -- cargo-fuzz
+# builds with nightly-only sanitizer flags that don't belong anywhere near
+# the normal `cargo build --workspace` path.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.marsdb-query]
+path = ".."
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
