@@ -4,8 +4,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, QueryClause, RelDirection,
-    ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    is_aggregate_name, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess, QueryClause,
+    RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -17,6 +17,11 @@ use crate::value::Value;
 /// row that seeded them — never visible to user Cypher (not a valid
 /// identifier prefix a parsed pattern could ever produce).
 const OPTIONAL_SEED_IDX_KEY: &str = "__seed_idx";
+
+/// Hidden key tagging whether a `MERGE`d row came from the create-path or
+/// the match-path, consumed (and stripped) by `apply_merge_set` before the
+/// row becomes visible to the rest of the query.
+const MERGE_CREATED_KEY: &str = "__merge_created";
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -195,11 +200,146 @@ impl<'a> Executor<'a> {
         Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
     }
 
+    /// Runs `MERGE` once per row in `rows` (`clause.pattern.hops.len() <=
+    /// 1`, enforced at parse time — whole-pattern atomicity across
+    /// multiple simultaneously-unbound hops isn't attempted in v1: which
+    /// hop's "not found" should trigger creation of what, in what order,
+    /// gets genuinely hard to reason about correctly for longer chains).
+    fn eval_merge(
+        &self,
+        write_txn: &WriteTransaction,
+        clause: &MergeClause,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let mut out = Vec::new();
+        for row in rows {
+            out.extend(self.merge_one_row(write_txn, clause, row)?);
+        }
+        self.apply_merge_set(write_txn, clause, &mut out)?;
+        Ok(out)
+    }
+
+    fn merge_one_row(
+        &self,
+        write_txn: &WriteTransaction,
+        clause: &MergeClause,
+        row: &BindingRow,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        // Validate every token before doing any graph work (search or
+        // create) — an unconstrained node pattern that isn't already bound
+        // would otherwise let the search below silently "match" every
+        // node in the graph (AllNodesScan, no Filter), which is a
+        // wrong-answer footgun, not a helpful default.
+        require_mergeable(&clause.pattern.start, row)?;
+        for (rel, node) in &clause.pattern.hops {
+            if rel.hop_range.is_some() {
+                return Err(QueryError::Parse(
+                    "MERGE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
+                ));
+            }
+            require_mergeable(node, row)?;
+        }
+
+        // Try the pattern as an ordinary MATCH first. Whatever's already
+        // bound in `row` (e.g. `a` from a preceding MATCH) becomes a Seed,
+        // not a fresh scan — build_match_plan already knows how to do
+        // this, the same mechanism every ordinary MATCH clause uses. For a
+        // one-hop pattern this already searches the *connected*
+        // sub-pattern (Expand from the resolved source, Filter by the
+        // target's own constraints), not each node independently — which
+        // is exactly the correctness property MERGE needs and gets for
+        // free by reusing this instead of inventing bespoke search logic.
+        let carried_vars: HashSet<String> = row.keys().cloned().collect();
+        let plan = build_match_plan(&clause.pattern, &None, &carried_vars)?;
+        let found = self.eval_plan(Txn::Write(write_txn), &plan, std::slice::from_ref(row))?;
+        if !found.is_empty() {
+            return Ok(found.into_iter().map(|r| tag_merge_created(r, false)).collect());
+        }
+
+        // Nothing found — create exactly one new instance. Reuses
+        // resolve_or_create_node, the same "reuse if the token's var is
+        // already bound in the row, else create fresh" logic
+        // Tail::Create/materialize_create already use.
+        let mut new_row = row.clone();
+        let start_id = self.resolve_or_create_node(write_txn, &clause.pattern.start, &new_row)?;
+        if let Some(var) = &clause.pattern.start.var {
+            new_row.insert(var.clone(), Binding::Node(start_id));
+        }
+        // At most one hop (enforced at parse time) -- a plain `if let`,
+        // not a loop, so there's no dangling "previous node" state to
+        // thread once a 2nd+ hop is ever supported.
+        if let Some((rel, node)) = clause.pattern.hops.first() {
+            let node_id = self.resolve_or_create_node(write_txn, node, &new_row)?;
+            if let Some(var) = &node.var {
+                new_row.insert(var.clone(), Binding::Node(node_id));
+            }
+            let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
+            let rel_props = literal_props_to_values(&rel.props);
+            let (src, dst) = match rel.direction {
+                RelDirection::Right => (start_id, node_id),
+                RelDirection::Left => (node_id, start_id),
+                RelDirection::Either => {
+                    return Err(QueryError::Parse(
+                        "MERGE requires a directed relationship (-> or <-), not an undirected pattern".into(),
+                    ))
+                }
+            };
+            let edge_id = GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+            if let Some(var) = &rel.var {
+                new_row.insert(var.clone(), Binding::Edge(edge_id));
+            }
+        }
+        Ok(vec![tag_merge_created(new_row, true)])
+    }
+
+    /// Applies `ON CREATE SET`/`ON MATCH SET` to the right rows (matching
+    /// real Cypher semantics exactly: `ON CREATE` fires whenever anything
+    /// in the pattern was newly created, `ON MATCH` only when the whole
+    /// pattern already existed as-is — the single per-row
+    /// `MERGE_CREATED_KEY` tag is the correct model for this, not a
+    /// simplification of it — see `eval_optional_part`'s
+    /// `OPTIONAL_SEED_IDX_KEY` for the same hidden-tag precedent), then
+    /// strips the tag before the rows become visible to the rest of the
+    /// query.
+    fn apply_merge_set(
+        &self,
+        write_txn: &WriteTransaction,
+        clause: &MergeClause,
+        rows: &mut Vec<BindingRow>,
+    ) -> Result<(), QueryError> {
+        for row in rows.iter_mut() {
+            let created = match row.remove(MERGE_CREATED_KEY) {
+                Some(Binding::Value(PropertyValue::Bool(b))) => b,
+                other => unreachable!("{MERGE_CREATED_KEY} tagged internally as Binding::Value(Bool), got {other:?}"),
+            };
+            let items = if created { &clause.on_create } else { &clause.on_match };
+            for (pa, lit) in items {
+                let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+                let value = literal_to_value(lit);
+                match binding {
+                    Binding::Node(id) => {
+                        GraphStore::set_node_prop_in_txn(write_txn, *id, &pa.prop, value)?;
+                    }
+                    Binding::Edge(id) => {
+                        GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
+                    }
+                    Binding::Value(_) | Binding::List(_) => {
+                        return Err(QueryError::UnboundVariable(format!(
+                            "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
+                            pa.var
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn execute_match(
         &self,
         txn: Txn,
         clauses: &[QueryClause],
-        tail: &Tail,
+        tail: &Option<Tail>,
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
@@ -238,6 +378,23 @@ impl<'a> Executor<'a> {
                         &mut carried_vars,
                     )?;
                 }
+                QueryClause::Merge(m) => {
+                    // MERGE always needs real `.insert`-capable write
+                    // access, whether or not the rest of the statement
+                    // would otherwise be read-only (e.g. `MERGE (n) RETURN
+                    // n`) — see `is_read_only`, which already accounts for
+                    // this by checking `clauses` too, so `txn` is
+                    // guaranteed to be `Txn::Write` here.
+                    let write_txn = require_write_txn(txn);
+                    current_rows = self.eval_merge(write_txn, m, &current_rows)?;
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &m.with,
+                        current_rows,
+                        pattern_all_vars(&m.pattern),
+                        &mut carried_vars,
+                    )?;
+                }
             }
         }
         // ORDER BY must see every matching row before LIMIT truncates —
@@ -257,15 +414,23 @@ impl<'a> Executor<'a> {
         // `is_read_only`), which always opens a `WriteTransaction`, so
         // `txn` is guaranteed to be `Txn::Write` here.
         let mut result = match tail {
-            Tail::Return(items) => self.materialize_return(txn, items, &current_rows)?,
-            Tail::Delete(vars) => {
+            // A missing tail only ever occurs with a MERGE clause and
+            // nothing after it — a pure write, same empty result shape
+            // standalone CREATE already returns (not one blank row per
+            // `current_rows`, which a synthetic `Tail::Return(vec![])`
+            // would produce instead).
+            None => QueryResult { columns: vec![], rows: vec![] },
+            Some(Tail::Return(items)) => self.materialize_return(txn, items, &current_rows)?,
+            Some(Tail::Delete(vars)) => {
                 self.materialize_delete(require_write_txn(txn), vars, &current_rows, false)?
             }
-            Tail::DetachDelete(vars) => {
+            Some(Tail::DetachDelete(vars)) => {
                 self.materialize_delete(require_write_txn(txn), vars, &current_rows, true)?
             }
-            Tail::Set(items) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
-            Tail::Create(patterns) => self.materialize_create(require_write_txn(txn), patterns, &current_rows)?,
+            Some(Tail::Set(items)) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
+            Some(Tail::Create(patterns)) => {
+                self.materialize_create(require_write_txn(txn), patterns, &current_rows)?
+            }
         };
         if let Some(order_by) = order_by {
             result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
@@ -1069,17 +1234,24 @@ impl<'a> Executor<'a> {
 }
 
 /// A statement never mutates anything iff it's a `MATCH ... RETURN` with no
-/// `DELETE`/`DETACH DELETE`/`SET` tail — `Statement::Create` and every
-/// other `Tail` variant always write. Confirmed by tracing every function
-/// reachable from pattern/WHERE/WITH evaluation: none of them ever call a
-/// table-mutating `*_in_txn` method for a `Tail::Return` statement (a
-/// label-filtered scan looks up an existing label id, it never allocates
-/// one — allocation only happens in `create_node_in_txn`/
-/// `create_edge_in_txn`). `Executor::execute` uses this to decide whether
-/// to open a `ReadTransaction` (no contention with concurrent readers or a
-/// concurrent writer) or a `WriteTransaction`.
+/// `DELETE`/`DETACH DELETE`/`SET` tail *and* no `MERGE` clause anywhere in
+/// it (`MERGE (n) RETURN n` has a `Tail::Return`, but still writes whenever
+/// it has to create — checking `tail` alone here would be a real bug, not
+/// just an incomplete check: it would send a MERGE-that-creates through a
+/// `ReadTransaction`, which has no `.insert`). `Statement::Create` and
+/// every other `Tail` variant always write. Confirmed by tracing every
+/// function reachable from pattern/WHERE/WITH evaluation: none of them
+/// ever call a table-mutating `*_in_txn` method for a `Tail::Return`
+/// statement with no `MERGE` clause (a label-filtered scan looks up an
+/// existing label id, it never allocates one — allocation only happens in
+/// `create_node_in_txn`/`create_edge_in_txn`). `Executor::execute` uses
+/// this to decide whether to open a `ReadTransaction` (no contention with
+/// concurrent readers or a concurrent writer) or a `WriteTransaction`.
 fn is_read_only(stmt: &Statement) -> bool {
-    matches!(stmt, Statement::Match { tail: Tail::Return(_), .. })
+    let Statement::Match { tail: Some(Tail::Return(_)), clauses, .. } = stmt else {
+        return false;
+    };
+    !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_)))
 }
 
 /// Recovers the real `&WriteTransaction` from a `Txn` for the two
@@ -1286,6 +1458,31 @@ fn literal_to_value(lit: &Literal) -> PropertyValue {
 
 fn literal_props_to_values(props: &[(String, Literal)]) -> BTreeMap<String, PropertyValue> {
     props.iter().map(|(k, v)| (k.clone(), literal_to_value(v))).collect()
+}
+
+fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
+    row.insert(MERGE_CREATED_KEY.to_string(), Binding::Value(PropertyValue::Bool(created)));
+    row
+}
+
+/// Rejects a `MERGE` pattern token that's neither already bound in `row`
+/// nor constrained by any label/property — matching or creating it would
+/// mean guessing at "any node," which this codebase's "error on an
+/// ambiguous shape" stance treats as a mistake to catch (not a silent
+/// "match/create arbitrarily" default). Called before any graph work, not
+/// just before the create-fallback branch — an unconstrained, unbound
+/// token would otherwise let `eval_merge`'s search phase silently "match"
+/// every node in the graph (`AllNodesScan`, no `Filter`) instead of
+/// erroring.
+fn require_mergeable(node: &NodePattern, row: &BindingRow) -> Result<(), QueryError> {
+    let already_bound = node.var.as_ref().is_some_and(|v| row.contains_key(v));
+    if !already_bound && node.labels.is_empty() && node.props.is_empty() {
+        return Err(QueryError::Parse(
+            "MERGE requires a label or property to match/create by — an unconstrained node pattern is ambiguous"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn pattern_labels(labels: &[String]) -> Vec<&str> {

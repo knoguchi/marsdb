@@ -13,8 +13,12 @@ statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
-match_stmt    = { clause+ ~ tail_clause ~ order_by_clause? ~ limit_clause? }
-clause        = { unwind_clause | match_part }
+// tail_clause is optional -- a bare `MERGE (...)` with nothing after it
+// is valid, same as standalone CREATE (see parser.rs::parse_match_stmt
+// for the "tail required unless a MERGE clause is present" check this
+// still enforces for MATCH/UNWIND-only statements).
+match_stmt    = { clause+ ~ tail_clause? ~ order_by_clause? ~ limit_clause? }
+clause        = { unwind_clause | merge_clause | match_part }
 match_part    = { match_keyword ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ limit_clause? }
@@ -32,6 +36,15 @@ with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clau
 unwind_clause = { ^"UNWIND" ~ unwind_source ~ ^"AS" ~ identifier ~ with_where_clause? ~ with_clause? }
 unwind_source = { list_literal | identifier }
 list_literal  = { "[" ~ (literal ~ ("," ~ literal)*)? ~ "]" }
+
+// No WHERE here -- real Cypher's MERGE has none either; the pattern's own
+// labels/props are the only match criteria. `pattern`'s hop count is
+// capped at 1 in parser.rs (whole-pattern atomicity across multiple
+// simultaneously-unbound hops isn't attempted in v1 -- see
+// executor::eval_merge's docs).
+merge_clause      = { ^"MERGE" ~ pattern ~ on_create_clause? ~ on_match_clause? ~ with_clause? }
+on_create_clause  = { ^"ON" ~ ^"CREATE" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
+on_match_clause   = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 
 // Reuses `create_stmt` itself (not a duplicate rule) — a `MATCH ... CREATE`
 // tail has the exact same pattern syntax as a standalone `CREATE`

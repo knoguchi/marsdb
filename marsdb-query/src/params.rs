@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use marsdb_graph::PropertyValue;
 
 use crate::ast::{
-    Expr, Literal, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, Statement, Tail, UnwindClause,
-    UnwindSource, WithClause, WithExpr,
+    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, Statement, Tail,
+    UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 
@@ -28,7 +28,9 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
             for clause in clauses {
                 substitute_query_clause(clause, params)?;
             }
-            substitute_tail(tail, params)?;
+            if let Some(tail) = tail {
+                substitute_tail(tail, params)?;
+            }
             if let Some(items) = order_by {
                 for (expr, _) in items {
                     substitute_return_expr(expr, params)?;
@@ -43,7 +45,19 @@ fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, Pr
     match clause {
         QueryClause::Match(part) => substitute_query_part(part, params),
         QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
+        QueryClause::Merge(m) => substitute_merge_clause(m, params),
     }
+}
+
+fn substitute_merge_clause(m: &mut MergeClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    substitute_pattern(&mut m.pattern, params)?;
+    for (_, lit) in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
+        substitute_literal(lit, params)?;
+    }
+    if let Some(with) = &mut m.with {
+        substitute_with_clause(with, params)?;
+    }
+    Ok(())
 }
 
 fn substitute_query_part(part: &mut QueryPart, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
