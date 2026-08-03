@@ -95,6 +95,9 @@ fn literal_to_py<'py>(py: Python<'py>, l: &::marsdb::Literal) -> PyResult<Bound<
         ::marsdb::Literal::Int(i) => i.into_pyobject(py)?.into_any(),
         ::marsdb::Literal::Float(f) => f.into_pyobject(py)?.into_any(),
         ::marsdb::Literal::String(s) => s.into_pyobject(py)?.into_any(),
+        ::marsdb::Literal::Param(name) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
     })
 }
 
