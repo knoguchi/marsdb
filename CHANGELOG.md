@@ -3,6 +3,27 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-08-03
+
+### Added
+- `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...]` — match-or-
+  create, capped at one relationship hop. The search phase reuses the
+  same planner/executor path an ordinary `MATCH` uses, so a one-hop
+  pattern correctly searches the *connected* sub-pattern rather than
+  each node independently.
+- `UNWIND <list> AS x [WHERE ...]` — fans a list out into one row per
+  element. `<list>` is an inline Cypher-text list literal or a variable
+  bound by a preceding `WITH ... collect(...)`; collected nodes/edges
+  restore real graph identity on the way back out, so a `MATCH` after
+  the `UNWIND` can keep traversing.
+- Named-path capture (`MATCH p = (a)-[:KNOWS]->(b) RETURN p`, fixed-hop
+  patterns only) and `shortestPath((a)-[:TYPE*..N]-(b))` (a real
+  shortest-path BFS between two already-matched endpoints, not just the
+  first path found), plus `length(p)`.
+- Backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`) — fixes
+  a real bug, not just a missing feature: an unescaped `'` inside a
+  string used to silently mis-terminate the literal instead of erroring.
+
 ## [0.3.1] - 2026-08-03
 
 ### Fixed
