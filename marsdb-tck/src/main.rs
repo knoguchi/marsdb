@@ -282,4 +282,15 @@ fn report(reports: &[ScenarioReport]) {
             }
         }
     }
+
+    let unexpected: Vec<&ScenarioReport> = reports.iter().filter(|r| r.outcome == Outcome::UnexpectedOutcome).collect();
+    if !unexpected.is_empty() {
+        println!("\n--- UnexpectedOutcome scenarios (errored/succeeded when the opposite was expected) ---");
+        for r in &unexpected {
+            println!("[{}] {} :: {}", r.category, r.feature_name, r.name);
+            if let Some(d) = &r.detail {
+                println!("    {d}");
+            }
+        }
+    }
 }

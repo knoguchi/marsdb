@@ -155,15 +155,27 @@ impl<'a> Executor<'a> {
         rows: &[BindingRow],
     ) -> Result<QueryResult, QueryError> {
         for row in rows {
+            // A variable bound earlier in this same CREATE (an earlier hop,
+            // or an earlier comma-separated pattern) must be visible to
+            // later tokens naming it again -- e.g. a self-loop `(a)-[:R]->(a)`
+            // -- so track newly-created bindings in a local, per-row copy
+            // instead of just consulting the original incoming `row`.
+            let mut row = row.clone();
             for pattern in patterns {
-                let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, row)?;
+                let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, &row)?;
+                if let Some(var) = &pattern.start.var {
+                    row.insert(var.clone(), Binding::Node(prev_id));
+                }
                 for (rel, node) in &pattern.hops {
                     if rel.hop_range.is_some() {
                         return Err(QueryError::Parse(
                             "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                         ));
                     }
-                    let node_id = self.resolve_or_create_node(write_txn, node, row)?;
+                    let node_id = self.resolve_or_create_node(write_txn, node, &row)?;
+                    if let Some(var) = &node.var {
+                        row.insert(var.clone(), Binding::Node(node_id));
+                    }
 
                     let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
                     let rel_props = literal_props_to_values(&rel.props);
@@ -216,7 +228,7 @@ impl<'a> Executor<'a> {
                 return Ok(*id);
             }
         }
-        let labels = pattern_labels(&node.labels);
+        let labels: Vec<&str> = node.labels.iter().map(String::as_str).collect();
         let props = literal_props_to_values(&node.props);
         Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
     }
@@ -455,6 +467,20 @@ impl<'a> Executor<'a> {
         // reached via `Executor::execute`'s write-dispatch path (see
         // `is_read_only`), which always opens a `WriteTransaction`, so
         // `txn` is guaranteed to be `Txn::Write` here.
+        // A non-aggregating RETURN's ORDER BY can reference either a
+        // RETURN-introduced alias (`RETURN friend.id AS friendId ORDER BY
+        // friendId`) or a variable still in scope that isn't returned at
+        // all (`RETURN n.num AS prop ORDER BY n.num` — `n` itself never
+        // appears in the RETURN list) — real Cypher allows both. Sorting
+        // needs both the pre-projection bindings *and* the post-projection
+        // output columns available at once, so it happens after
+        // `materialize_return`, against a combined view of the two (see
+        // `apply_order_by_with_scope`) rather than either alone. The
+        // aggregating case can't use pre-projection bindings at all
+        // (grouping has already collapsed the per-row bindings by then), so
+        // it keeps sorting the post-projection output alone via
+        // `apply_order_by`, further down.
+        let mut order_by_pre_applied = false;
         let mut result = match tail {
             // A missing tail only ever occurs with a MERGE clause and
             // nothing after it — a pure write, same empty result shape
@@ -462,7 +488,19 @@ impl<'a> Executor<'a> {
             // `current_rows`, which a synthetic `Tail::Return(vec![])`
             // would produce instead).
             None => QueryResult { columns: vec![], rows: vec![] },
-            Some(Tail::Return(items)) => self.materialize_return(txn, items, &current_rows)?,
+            Some(Tail::Return(items)) => {
+                let projected = self.materialize_return(txn, items, &current_rows)?;
+                if let Some(ob) = order_by {
+                    if !has_aggregate(items) {
+                        order_by_pre_applied = true;
+                        self.apply_order_by_with_scope(txn, &current_rows, projected, ob)?
+                    } else {
+                        projected
+                    }
+                } else {
+                    projected
+                }
+            }
             Some(Tail::Delete(vars)) => {
                 self.materialize_delete(require_write_txn(txn), vars, &current_rows, false)?
             }
@@ -475,7 +513,9 @@ impl<'a> Executor<'a> {
             }
         };
         if let Some(order_by) = order_by {
-            result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
+            if !order_by_pre_applied {
+                result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
+            }
             if let Some(count) = limit {
                 result.rows.truncate(count.max(0) as usize);
             }
@@ -781,6 +821,47 @@ impl<'a> Executor<'a> {
         Ok(keyed.into_iter().map(|(_, row)| row).collect())
     }
 
+    /// Sorts an already-`materialize_return`d result for a non-aggregating
+    /// `RETURN`, evaluating each ORDER BY expression against *both* the
+    /// pre-projection `BindingRow` it came from and its own projected
+    /// output columns overlaid on top — real Cypher allows ORDER BY to
+    /// reference either a RETURN alias or a still-in-scope variable that
+    /// wasn't returned at all, so neither view alone is enough (see the
+    /// call site in `execute_match`). `binding_rows` and `result.rows` are
+    /// the same length and pairwise correspond — `materialize_return`'s
+    /// non-aggregating path preserves row order 1:1 with its input.
+    fn apply_order_by_with_scope(
+        &self,
+        txn: Txn,
+        binding_rows: &[BindingRow],
+        result: QueryResult,
+        order_by: &[(ReturnExpr, SortDir)],
+    ) -> Result<QueryResult, QueryError> {
+        let QueryResult { columns, rows } = result;
+        let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+        for (binding_row, row) in binding_rows.iter().zip(rows) {
+            let mut value_map = self.binding_row_to_value_map(txn, binding_row)?;
+            for (col, val) in columns.iter().zip(&row) {
+                value_map.insert(col.clone(), val.clone());
+            }
+            let keys = order_by
+                .iter()
+                .map(|(expr, _)| eval_projected_expr(expr, &value_map))
+                .collect::<Result<Vec<_>, _>>()?;
+            keyed.push((keys, row));
+        }
+        keyed.sort_by(|(ka, _), (kb, _)| {
+            for (i, (_, dir)) in order_by.iter().enumerate() {
+                let ord = compare_with_dir(&ka[i], &kb[i], *dir);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        Ok(QueryResult { columns, rows: keyed.into_iter().map(|(_, row)| row).collect() })
+    }
+
     fn binding_row_to_value_map(
         &self,
         txn: Txn,
@@ -1074,8 +1155,15 @@ impl<'a> Executor<'a> {
                 let base_rows = self.eval_plan(txn, input, seed)?;
                 let mut out = Vec::new();
                 for row in base_rows {
-                    let Some(Binding::Node(from_id)) = row.get(from_var).cloned() else {
-                        return Err(QueryError::UnboundVariable(from_var.clone()));
+                    let from_id = match row.get(from_var) {
+                        Some(Binding::Node(id)) => *id,
+                        // A null `from_var` (padded by an outer, already-
+                        // resolved `OPTIONAL MATCH` that didn't match) has
+                        // no neighbors, same as any other traversal from
+                        // null -- contributes zero rows, not an error. A
+                        // truly missing/wrong-typed binding still is one.
+                        Some(Binding::Value(PropertyValue::Null)) => continue,
+                        _ => return Err(QueryError::UnboundVariable(from_var.clone())),
                     };
                     let entries = neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
                     for entry in entries {
@@ -1103,8 +1191,11 @@ impl<'a> Executor<'a> {
                 let unbounded = max_hops.is_none();
                 let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
                 for row in base_rows {
-                    let Some(Binding::Node(start_id)) = row.get(from_var).cloned() else {
-                        return Err(QueryError::UnboundVariable(from_var.clone()));
+                    let start_id = match row.get(from_var) {
+                        Some(Binding::Node(id)) => *id,
+                        // Same null-propagation as `Expand` above.
+                        Some(Binding::Value(PropertyValue::Null)) => continue,
+                        _ => return Err(QueryError::UnboundVariable(from_var.clone())),
                     };
                     let mut visited = HashSet::new();
                     visited.insert(start_id);
@@ -1386,6 +1477,12 @@ impl<'a> Executor<'a> {
                             GraphStore::delete_edge_in_txn(write_txn, *id)?;
                         }
                     }
+                    // A null binding is a real, legal DELETE target -- an
+                    // `OPTIONAL MATCH` that didn't match pads its variables
+                    // with null, and deleting that null is specified as a
+                    // silent no-op, not an error (real Cypher: "deleting
+                    // null does nothing").
+                    Binding::Value(PropertyValue::Null) => {}
                     Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
@@ -1819,14 +1916,6 @@ fn require_mergeable(node: &NodePattern, row: &BindingRow) -> Result<(), QueryEr
     Ok(())
 }
 
-fn pattern_labels(labels: &[String]) -> Vec<&str> {
-    if labels.is_empty() {
-        vec!["Node"]
-    } else {
-        labels.iter().map(|s| s.as_str()).collect()
-    }
-}
-
 /// `Either` (undirected `-[r:TYPE]-`) has no single storage-level call —
 /// query both directions and dedupe by `edge_id` (a self-loop would
 /// otherwise appear twice, once from each direction's adjacency table).
@@ -1852,7 +1941,7 @@ fn neighbors_for_direction(
 fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {
     let Some(prop) = prop else { return false };
     match (prop, lit) {
-        (PropertyValue::Int(a), Literal::Int(b)) => cmp_f64(op, *a as f64, *b as f64),
+        (PropertyValue::Int(a), Literal::Int(b)) => cmp_ord(op, *a, *b),
         (PropertyValue::Int(a), Literal::Float(b)) => cmp_f64(op, *a as f64, *b),
         (PropertyValue::Float(a), Literal::Float(b)) => cmp_f64(op, *a, *b),
         (PropertyValue::Float(a), Literal::Int(b)) => cmp_f64(op, *a, *b as f64),
@@ -1959,12 +2048,26 @@ fn apply_order_by(
     columns: &[String],
     order_by: &[(ReturnExpr, SortDir)],
 ) -> Result<Vec<Vec<Value>>, QueryError> {
+    // An ORDER BY expression that repeats a returned expression verbatim
+    // (`RETURN n.name, count(*) AS foo ORDER BY n.name`) names a real
+    // output column by its default name -- match it directly by position
+    // rather than re-evaluating the expression, which would need bindings
+    // (e.g. `n`) that only the pre-aggregation rows had and are gone by
+    // this post-projection point.
+    let order_by_col: Vec<Option<usize>> = order_by
+        .iter()
+        .map(|(expr, _)| columns.iter().position(|c| *c == default_column_name(expr, 0)))
+        .collect();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for row in rows {
         let row_map: HashMap<String, Value> = columns.iter().cloned().zip(row.iter().cloned()).collect();
         let keys = order_by
             .iter()
-            .map(|(expr, _)| eval_projected_expr(expr, &row_map))
+            .zip(&order_by_col)
+            .map(|((expr, _), col)| match col {
+                Some(i) => Ok(row[*i].clone()),
+                None => eval_projected_expr(expr, &row_map),
+            })
             .collect::<Result<Vec<_>, _>>()?;
         keyed.push((keys, row));
     }
