@@ -235,6 +235,26 @@ corpus made libFuzzer's own startup/seed-bootstrapping phase (not anything
 in MarsDB) take upwards of an hour instead of seconds on this target; a
 seeded corpus doesn't hit it.
 
+`marsdb-tck` runs a real subset of the
+[openCypher TCK](https://github.com/opencypher/openCypher) (220 vendored
+`.feature` files, 1615 scenarios, pinned commit — see
+`marsdb-tck/VENDOR.md`) against MarsDB, via a purpose-built Gherkin-subset
+parser and structural result comparison (not string matching):
+
+```
+cargo run --release -p marsdb-tck
+```
+
+Attempts every scenario, including the ~75% that use Cypher features MarsDB
+doesn't implement at all (temporal/spatial types, list comprehensions,
+`CALL`, arithmetic expressions, ...) — those report as a distinct
+"rejected at parse time" outcome, not lumped in with genuine wrong answers.
+Of the scenarios MarsDB's grammar accepts at all, it gets the *right*
+answer in the large majority — the real, checked-for-real signal this
+exists to produce, not the flat pass-rate over the whole suite. Side-effect
+assertions and the TCK's typed error taxonomy aren't checked (see the
+crate's doc comments for why).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or

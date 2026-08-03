@@ -1,0 +1,17 @@
+CREATE (:A {name: 'a'}), (:X {name: 'b1'}), (:X {name: 'b2'}), (:X {name: 'b3'}), (:X {name: 'b4'}), (:X {name: 'c11'}), (:Y {name: 'c12'}), (:X {name: 'c21'}), (:Y {name: 'c22'}), (:X {name: 'c31'}), (:Y {name: 'c32'}), (:X {name: 'c41'}), (:Y {name: 'c42'});
+MATCH (x {name: 'a'}) WITH x MATCH (y {name: 'b1'}) CREATE (x)-[:KNOWS]->(y);
+MATCH (x {name: 'a'}) WITH x MATCH (y {name: 'b2'}) CREATE (x)-[:KNOWS]->(y);
+MATCH (x {name: 'a'}) WITH x MATCH (y {name: 'b3'}) CREATE (x)-[:FOLLOWS]->(y);
+MATCH (x {name: 'a'}) WITH x MATCH (y {name: 'b4'}) CREATE (x)-[:FOLLOWS]->(y);
+MATCH (x {name: 'b1'}) WITH x MATCH (y {name: 'c11'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b1'}) WITH x MATCH (y {name: 'c12'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b2'}) WITH x MATCH (y {name: 'c21'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b2'}) WITH x MATCH (y {name: 'c22'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b3'}) WITH x MATCH (y {name: 'c31'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b3'}) WITH x MATCH (y {name: 'c32'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b4'}) WITH x MATCH (y {name: 'c41'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b4'}) WITH x MATCH (y {name: 'c42'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b1'}) WITH x MATCH (y {name: 'b2'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b2'}) WITH x MATCH (y {name: 'b3'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b3'}) WITH x MATCH (y {name: 'b4'}) CREATE (x)-[:FRIEND]->(y);
+MATCH (x {name: 'b4'}) WITH x MATCH (y {name: 'b1'}) CREATE (x)-[:FRIEND]->(y);
