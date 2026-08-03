@@ -1,0 +1,22 @@
+[package]
+name = "marsdb-nl2cypher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Natural-language-to-Cypher translation for MarsDB: schema introspection, prompt building, and validate-and-repair against a pluggable LLM client."
+
+[dependencies]
+marsdb = { path = "../marsdb", version = "0.4.0" }
+marsdb-query = { path = "../marsdb-query", version = "0.4.0" }
+
+[dev-dependencies]
+tempfile.workspace = true
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+
+[[example]]
+name = "ollama_demo"
+path = "examples/ollama_demo.rs"
