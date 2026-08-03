@@ -1,0 +1,33 @@
+name: Crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+env:
+  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          cargo build --workspace --verbose
+          cargo test --workspace --verbose
+      # Published in dependency order — cargo publish blocks until each
+      # crate is visible on the index before returning, so the next
+      # publish always sees its path dependency already there.
+      - name: Publish marsdb-storage
+        run: cargo publish -p marsdb-storage
+      - name: Publish marsdb-graph
+        run: cargo publish -p marsdb-graph
+      - name: Publish marsdb-query
+        run: cargo publish -p marsdb-query
+      - name: Publish marsdb
+        run: cargo publish -p marsdb
+      - name: Publish marsdb-cli
+        run: cargo publish -p marsdb-cli
