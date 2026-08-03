@@ -507,6 +507,7 @@ dependencies = [
  "marsdb-graph",
  "marsdb-query",
  "marsdb-storage",
+ "plotters",
  "tempfile",
  "thiserror 1.0.69",
 ]

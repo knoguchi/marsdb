@@ -36,6 +36,13 @@ let result = db.execute("MATCH (n:Person) RETURN n.name")?;
 let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
 ```
 
+More: `cargo run -p marsdb --example task_tracker` (CRUD + aggregation),
+`--example social_graph` (variable-length traversal, `MATCH...CREATE`), or
+`--example params_and_batch` (`$parameters`, `execute_batch`) — full
+source in [`marsdb/examples/`](./marsdb/examples). Each also writes an SVG
+chart of its query result (via [plotters](https://github.com/plotters-rs/plotters))
+to the current directory.
+
 **Python**:
 
 ```
