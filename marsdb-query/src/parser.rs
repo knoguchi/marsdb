@@ -231,6 +231,7 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
     let direction = match inner.as_rule() {
         Rule::rel_right => RelDirection::Right,
         Rule::rel_left => RelDirection::Left,
+        Rule::rel_either => RelDirection::Either,
         r => unreachable!("unexpected rel_pattern child rule {r:?}"),
     };
     let mut var = None;
@@ -243,7 +244,7 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
                 rel_type = Some(p.into_inner().next().expect("rel_type has an identifier").as_str().to_string())
             }
             Rule::prop_map => props = parse_prop_map(p)?,
-            r => unreachable!("unexpected rel_right/rel_left child rule {r:?}"),
+            r => unreachable!("unexpected rel_right/rel_left/rel_either child rule {r:?}"),
         }
     }
     Ok(RelPattern {

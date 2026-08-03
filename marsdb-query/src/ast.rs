@@ -75,6 +75,8 @@ pub enum RelDirection {
     Right,
     /// (a)<-[..]-(b)
     Left,
+    /// (a)-[..]-(b) — matches either direction.
+    Either,
 }
 
 #[derive(Debug, Clone)]

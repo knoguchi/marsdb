@@ -1,7 +1,5 @@
-use marsdb_graph::Direction;
-
 use crate::ast::{CompareOp, Expr, NodePattern, Pattern, PropAccess, RelDirection};
-use crate::ir::LogicalPlan;
+use crate::ir::{ExpandDirection, LogicalPlan};
 
 struct VarNamer {
     next: usize,
@@ -35,8 +33,9 @@ pub fn build_match_plan(pattern: &Pattern, where_clause: &Option<Expr>) -> Logic
     for (rel, node) in &pattern.hops {
         let to_var = namer.name(&node.var);
         let direction = match rel.direction {
-            RelDirection::Right => Direction::Out,
-            RelDirection::Left => Direction::In,
+            RelDirection::Right => ExpandDirection::Out,
+            RelDirection::Left => ExpandDirection::In,
+            RelDirection::Either => ExpandDirection::Either,
         };
         plan = LogicalPlan::Expand {
             input: Box::new(plan),

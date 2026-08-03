@@ -39,9 +39,13 @@ node_pattern = { "(" ~ node_var? ~ node_label* ~ prop_map? ~ ")" }
 node_var     = { identifier }
 node_label   = { ":" ~ identifier }
 
-rel_pattern = { rel_right | rel_left }
+// Order matters: rel_right's trailing "->" must be tried before rel_either's
+// bare "-", or "-[:KNOWS]->" would parse as rel_either and leave a dangling
+// ">" that fails the rest of the pattern instead of matching rel_right.
+rel_pattern = { rel_right | rel_left | rel_either }
 rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]->" }
 rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]-" }
+rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ prop_map? ~ "]-" }
 rel_var     = { identifier }
 rel_type    = { ":" ~ identifier }
 

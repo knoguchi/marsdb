@@ -260,3 +260,52 @@ fn order_by_with_function_call_key() {
         .collect();
     assert_eq!(values, vec!["3".to_string(), "20".to_string()]);
 }
+
+#[test]
+fn undirected_pattern_matches_either_direction() {
+    let store = GraphStore::open_memory().unwrap();
+    // a->b (created via Right direction), so from b's perspective it's an
+    // incoming edge — an undirected MATCH from b must still find a.
+    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+
+    let from_a = run(&store, "MATCH (n:Person {name: 'Alice'})-[:KNOWS]-(friend) RETURN friend.name");
+    assert_eq!(from_a.rows.len(), 1);
+
+    let from_b = run(&store, "MATCH (n:Person {name: 'Bob'})-[:KNOWS]-(friend) RETURN friend.name");
+    assert_eq!(from_b.rows.len(), 1);
+    match &from_b.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "Alice"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn undirected_pattern_dedupes_self_loop() {
+    use std::collections::BTreeMap;
+
+    // A true self-loop needs the same node bound as both src and dst, which
+    // Cypher CREATE can't express in v1 (each pattern position always
+    // creates a fresh node) — construct it directly via GraphStore instead.
+    let store = GraphStore::open_memory().unwrap();
+    let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    store.create_edge("KNOWS", alice, alice, BTreeMap::new()).unwrap();
+
+    let result = run(&store, "MATCH (n:Person)-[:KNOWS]-(friend) RETURN friend");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "a self-loop edge must be returned once via undirected dedup-by-edge_id, not twice"
+    );
+}
+
+#[test]
+fn create_rejects_undirected_pattern_at_execute_time() {
+    // The grammar allows `-[...]−` anywhere a rel_pattern appears (CREATE
+    // and MATCH share the same pattern rule), so this parses fine — the
+    // rejection happens in execute_create, since CREATE always needs a
+    // direction to know which node is src and which is dst.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (a:Person)-[:KNOWS]-(b:Person)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("direct"));
+}

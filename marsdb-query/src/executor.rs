@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use marsdb_graph::{EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
+use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, WriteTransaction};
 
 use crate::ast::{
     CompareOp, Expr, Literal, Pattern, PropAccess, RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail,
 };
 use crate::error::QueryError;
-use crate::ir::LogicalPlan;
+use crate::ir::{ExpandDirection, LogicalPlan};
 use crate::planner::build_match_plan;
 use crate::result::QueryResult;
 use crate::value::Value;
@@ -75,6 +75,11 @@ impl<'a> Executor<'a> {
                 let (src, dst) = match rel.direction {
                     RelDirection::Right => (prev_id, node_id),
                     RelDirection::Left => (node_id, prev_id),
+                    RelDirection::Either => {
+                        return Err(QueryError::Parse(
+                            "CREATE requires a directed relationship (-> or <-), not an undirected pattern".into(),
+                        ))
+                    }
                 };
                 GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
                 prev_id = node_id;
@@ -144,8 +149,7 @@ impl<'a> Executor<'a> {
                     let Some(Binding::Node(from_id)) = row.get(from_var).copied() else {
                         return Err(QueryError::UnboundVariable(from_var.clone()));
                     };
-                    let entries =
-                        GraphStore::neighbors_in_txn(write_txn, from_id, *direction, rel_label.as_deref())?;
+                    let entries = neighbors_for_direction(write_txn, from_id, *direction, rel_label.as_deref())?;
                     for entry in entries {
                         let mut new_row = row.clone();
                         new_row.insert(to_var.clone(), Binding::Node(entry.other));
@@ -415,6 +419,28 @@ fn pattern_labels(labels: &[String]) -> Vec<&str> {
     } else {
         labels.iter().map(|s| s.as_str()).collect()
     }
+}
+
+/// `Either` (undirected `-[r:TYPE]-`) has no single storage-level call —
+/// query both directions and dedupe by `edge_id` (a self-loop would
+/// otherwise appear twice, once from each direction's adjacency table).
+fn neighbors_for_direction(
+    write_txn: &WriteTransaction,
+    node: NodeId,
+    direction: ExpandDirection,
+    rel_label: Option<&str>,
+) -> Result<Vec<AdjEntry>, QueryError> {
+    Ok(match direction {
+        ExpandDirection::Out => GraphStore::neighbors_in_txn(write_txn, node, Direction::Out, rel_label)?,
+        ExpandDirection::In => GraphStore::neighbors_in_txn(write_txn, node, Direction::In, rel_label)?,
+        ExpandDirection::Either => {
+            let mut out = GraphStore::neighbors_in_txn(write_txn, node, Direction::Out, rel_label)?;
+            let inbound = GraphStore::neighbors_in_txn(write_txn, node, Direction::In, rel_label)?;
+            let seen: HashSet<EdgeId> = out.iter().map(|e| e.edge_id).collect();
+            out.extend(inbound.into_iter().filter(|e| !seen.contains(&e.edge_id)));
+            out
+        }
+    })
 }
 
 fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {
