@@ -28,3 +28,5 @@ pest = "2"
 pest_derive = "2"
 clap = { version = "4", features = ["derive"] }
 rustyline = "14"
+criterion = "0.5"
+tempfile = "3"
