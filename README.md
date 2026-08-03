@@ -79,18 +79,33 @@ marsdb-python    PyO3 bindings, builds via maturin
 Storage runs on [redb](https://github.com/cberner/redb), a pure-Rust
 single-file MVCC embedded KV engine. Query execution compiles Cypher to a
 small Gremlin-shaped logical IR (`AllNodesScan`, `NodeByLabelScan`,
-`Expand`, `Filter`, `Limit`) so a future Gremlin frontend can target the
-same executor. Every Cypher statement runs inside one transaction, committed
-or aborted as a whole.
+`Seed`, `Expand`, `VarExpand`, `Filter`) so a future Gremlin frontend can
+target the same executor. Every Cypher statement runs inside one
+transaction, committed or aborted as a whole.
 
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
+
+### Cypher coverage
+
+`CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
+`MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
+(`[:TYPE*min..max]`) relationship patterns, `WHERE`, one `WITH` boundary
+per statement (projection/rename, its own `WHERE`/`ORDER BY`/`LIMIT`),
+`RETURN`/`DELETE`/`DETACH DELETE`/`SET`, multi-key `ORDER BY`, `LIMIT`,
+`CASE`, and the built-in functions `coalesce()`/`toInteger()`.
+
+Verified against all 7 of LDBC SNB Interactive's short-read reference
+queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
+verified: LDBC's complex queries (IC1-14: aggregation, `UNWIND`, named
+paths/`shortestPath()`), comma-separated `MATCH` patterns beyond a single
+linear chain (general cross-joins), or chaining past one `WITH` boundary.
 
 ## Roadmap
 
 - Secondary index on node label (label scans are currently linear)
 - Concurrent reads (split the executor's read path onto `ReadTransaction`)
-- Multi-pattern `MATCH` (comma-separated joins)
 - `LIMIT` short-circuiting
+- Aggregation (`count`, `sum`, `collect`), `UNWIND`, named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
