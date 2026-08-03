@@ -1271,3 +1271,106 @@ fn unwind_non_list_var_errors_clearly() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("list"));
 }
+
+#[test]
+fn merge_single_node_creates_then_reuses() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "MERGE (n:Person {name: 'Alice'})");
+    run(&store, "MERGE (n:Person {name: 'Alice'})");
+    let result = run(&store, "MATCH (n:Person) RETURN count(*)");
+    assert_eq!(int_value(&result.rows[0][0]), 1, "second MERGE must reuse, not create a duplicate");
+}
+
+#[test]
+fn merge_one_hop_both_endpoints_bound_reuses_existing_edge() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (b:Person {name: 'Bob'}) MERGE (a)-[:KNOWS]->(b)",
+    );
+    let result = run(&store, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*)");
+    assert_eq!(int_value(&result.rows[0][0]), 1, "must reuse the existing edge, not create a 2nd one");
+}
+
+#[test]
+fn merge_one_hop_both_endpoints_bound_creates_missing_edge() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (b:Person {name: 'Bob'}) MERGE (a)-[:KNOWS]->(b)",
+    );
+    let result = run(&store, "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)");
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+    // No new nodes -- both endpoints already existed, only the edge is new.
+    let nodes = run(&store, "MATCH (n:Person) RETURN count(*)");
+    assert_eq!(int_value(&nodes.rows[0][0]), 2);
+}
+
+#[test]
+fn merge_one_fresh_endpoint_does_not_reuse_an_unconnected_matching_node() {
+    // The wrong-answer scenario the plan review flagged: an independent
+    // per-token scan would find this pre-existing, unconnected Bob and
+    // wrongly reuse it. The correct (composite) search must come up empty
+    // and create a brand-new, properly-connected Bob instead.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person {name: 'Bob'})"); // unconnected to Alice
+    run(&store, "MATCH (a:Person {name: 'Alice'}) MERGE (a)-[:KNOWS]->(b:Person {name: 'Bob'})");
+
+    let bobs = run(&store, "MATCH (n:Person {name: 'Bob'}) RETURN count(*)");
+    assert_eq!(int_value(&bobs.rows[0][0]), 2, "must create a 2nd Bob, not reuse the unconnected one");
+    let connected =
+        run(&store, "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)");
+    assert_eq!(int_value(&connected.rows[0][0]), 1);
+}
+
+#[test]
+fn merge_standalone_both_endpoints_fresh() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(&store, "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    let nodes = run(&store, "MATCH (n:Person) RETURN count(*)");
+    assert_eq!(int_value(&nodes.rows[0][0]), 2, "2nd MERGE must reuse both nodes and the edge, not duplicate");
+    let edges = run(&store, "MATCH (:Person)-[:KNOWS]->(:Person) RETURN count(*)");
+    assert_eq!(int_value(&edges.rows[0][0]), 1);
+}
+
+#[test]
+fn merge_on_create_and_on_match_fire_on_the_right_rows() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2");
+    let after_create = run(&store, "MATCH (n:Person) RETURN n.seen");
+    assert_eq!(int_value(&after_create.rows[0][0]), 1);
+
+    run(&store, "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2");
+    let after_match = run(&store, "MATCH (n:Person) RETURN n.seen");
+    assert_eq!(int_value(&after_match.rows[0][0]), 2);
+}
+
+#[test]
+fn merge_unconstrained_node_pattern_errors() {
+    let err = parse("MERGE (n) RETURN n").and_then(|stmt| {
+        let store = GraphStore::open_memory().unwrap();
+        Executor::new(&store).execute(&stmt)
+    });
+    let err = err.unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("ambiguous"));
+}
+
+#[test]
+fn merge_two_hop_pattern_errors_at_parse_time() {
+    let err = parse("MERGE (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("one relationship hop"));
+}
+
+#[test]
+fn merge_can_be_followed_by_return() {
+    // The whole reason MERGE is a QueryClause, not a Tail -- unlike
+    // MATCH...CREATE, MATCH...MERGE...RETURN must work.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "MERGE (n:Person {name: 'Alice'}) RETURN n.name");
+    assert_eq!(str_value(&result.rows[0][0]), "Alice");
+}

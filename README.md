@@ -124,7 +124,13 @@ into one row per element, cross-joined against existing rows; its own
 Cypher-text list literal (`[1, 2, 'a', $p]`) or a variable bound by a
 preceding `WITH ... collect(...)`; `UNWIND $param` where `$param` itself
 names a list isn't supported yet (no list-valued parameters — every
-`$param` is a single scalar).
+`$param` is a single scalar). `MERGE <pattern> [ON CREATE SET ...] [ON
+MATCH SET ...]` (match-or-create: tries the pattern as an ordinary MATCH
+first, creates exactly one new instance if nothing matched) — capped at
+one relationship hop (`MERGE (n:Label {props})` or `MERGE (a)-[:TYPE]->
+(b)`); an unconstrained node pattern that isn't already bound (`MERGE
+(n)`, no label or property) is rejected rather than matching/creating
+arbitrarily.
 
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
@@ -134,16 +140,15 @@ grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` checkpoint —
 see `marsdb-query/tests/smoke.rs`), comma-separated patterns *within one*
 `MATCH`/`CREATE` clause beyond a single linear chain (general
 cross-joins — different from the cross-join WITH-chaining above, which
-works), or chaining past one `WITH` boundary.
+works), chaining past one `WITH` boundary, or `MERGE` patterns with more
+than one relationship hop (whole-pattern atomicity across multiple
+simultaneously-unbound hops isn't attempted).
 
 ## Roadmap
 
 - `LIMIT` short-circuiting
 - `RETURN DISTINCT` (result-set-level dedup; `DISTINCT` inside an
   aggregate call already works)
-- `MERGE` (match-or-create in one clause — `MATCH ... CREATE` covers
-  "create an edge between nodes I already matched," not "create this
-  node if it doesn't already exist")
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
 - Named paths/`shortestPath()`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an

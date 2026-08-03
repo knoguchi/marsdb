@@ -100,9 +100,20 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         }
     }
 
+    // A missing tail is only valid when a MERGE clause is present (a bare
+    // `MERGE (n:Label)`, a pure write with nothing to return — same as
+    // standalone CREATE). Otherwise a missing tail is almost certainly a
+    // mistake (`MATCH (n)` alone does nothing at all), so it's still
+    // rejected.
+    if tail.is_none() && !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_))) {
+        return Err(QueryError::Parse(
+            "a query needs a RETURN/DELETE/SET tail, unless it has a MERGE clause with nothing after it".into(),
+        ));
+    }
+
     Ok(Statement::Match {
         clauses,
-        tail: tail.ok_or_else(|| QueryError::Parse("MATCH requires RETURN/DELETE/SET".into()))?,
+        tail,
         order_by,
         limit,
     })
@@ -112,6 +123,7 @@ fn clause_with(clause: &QueryClause) -> Option<&WithClause> {
     match clause {
         QueryClause::Match(part) => part.with.as_ref(),
         QueryClause::Unwind(u) => u.with.as_ref(),
+        QueryClause::Merge(m) => m.with.as_ref(),
     }
 }
 
@@ -120,8 +132,46 @@ fn parse_clause(pair: Pair<Rule>) -> Result<QueryClause, QueryError> {
     match inner.as_rule() {
         Rule::match_part => Ok(QueryClause::Match(parse_match_part(inner)?)),
         Rule::unwind_clause => Ok(QueryClause::Unwind(parse_unwind_clause(inner)?)),
+        Rule::merge_clause => Ok(QueryClause::Merge(parse_merge_clause(inner)?)),
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
+}
+
+/// `pattern.hops.len() > 1` is rejected here, not left to the executor —
+/// whole-pattern atomicity across multiple simultaneously-unbound hops
+/// isn't attempted in v1 (see `executor::eval_merge`'s docs), so a clear
+/// parse-time error is better than a confusing runtime one.
+fn parse_merge_clause(pair: Pair<Rule>) -> Result<MergeClause, QueryError> {
+    let mut inner = pair.into_inner();
+    let pattern = parse_pattern(inner.next().expect("merge_clause has a pattern"))?;
+    if pattern.hops.len() > 1 {
+        return Err(QueryError::Parse(
+            "MERGE with more than one relationship hop isn't supported yet — split it into a MATCH \
+             for the already-known part and a MERGE for one new hop"
+                .into(),
+        ));
+    }
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
+    let mut with = None;
+    for p in inner {
+        match p.as_rule() {
+            Rule::on_create_clause => {
+                on_create = p.into_inner().filter(|p| p.as_rule() == Rule::set_item).map(parse_set_item).collect::<Result<_, _>>()?;
+            }
+            Rule::on_match_clause => {
+                on_match = p.into_inner().filter(|p| p.as_rule() == Rule::set_item).map(parse_set_item).collect::<Result<_, _>>()?;
+            }
+            Rule::with_clause => with = Some(parse_with_clause(p)?),
+            r => unreachable!("unexpected merge_clause child rule {r:?}"),
+        }
+    }
+    Ok(MergeClause {
+        pattern,
+        on_create,
+        on_match,
+        with,
+    })
 }
 
 fn parse_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause, QueryError> {

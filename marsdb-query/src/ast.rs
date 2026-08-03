@@ -217,35 +217,62 @@ pub enum UnwindSource {
     List(Vec<Literal>),
 }
 
-/// One reading clause in a `MATCH`/`UNWIND` sequence. `Match` is today's
-/// `MATCH`/`OPTIONAL MATCH ... [WHERE] [WITH]` segment; `Unwind` fans out a
-/// list. Both can optionally end in a `WITH` — see `Statement::Match`'s
-/// docs for the WITH-separation/one-WITH-total rules this enum's variants
-/// are validated against.
+/// `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...] [WITH ...]` —
+/// match-or-create: try the pattern as an ordinary MATCH first (reusing
+/// `build_match_plan`/`eval_plan` — this already does the right "search
+/// the *connected* sub-pattern, not each node in isolation" thing for a
+/// hop pattern, since `Expand` only follows real edges and `Filter` only
+/// keeps matches against the target's own constraints); if that finds
+/// nothing, create exactly one new pattern instance (reusing
+/// `resolve_or_create_node`, the same "reuse if the token's var is
+/// already bound in the row" logic `Tail::Create` uses). `pattern.hops`
+/// is capped at one relationship by the parser — whole-pattern atomicity
+/// across multiple simultaneously-unbound hops isn't attempted in v1, see
+/// `executor::eval_merge`'s docs for why.
+#[derive(Debug, Clone)]
+pub struct MergeClause {
+    pub pattern: Pattern,
+    pub on_create: Vec<(PropAccess, Literal)>,
+    pub on_match: Vec<(PropAccess, Literal)>,
+    pub with: Option<WithClause>,
+}
+
+/// One reading clause in a `MATCH`/`UNWIND`/`MERGE` sequence. `Match` is
+/// today's `MATCH`/`OPTIONAL MATCH ... [WHERE] [WITH]` segment; `Unwind`
+/// fans out a list; `Merge` matches-or-creates. All three can optionally
+/// end in a `WITH` — see `Statement::Match`'s docs for the WITH-
+/// separation/one-WITH-total rules this enum's variants are validated
+/// against.
 #[derive(Debug, Clone)]
 pub enum QueryClause {
     Match(QueryPart),
     Unwind(UnwindClause),
+    Merge(MergeClause),
 }
 
 #[derive(Debug, Clone)]
 pub enum Statement {
     Create(Vec<Pattern>),
     Match {
-        /// One or more `MATCH`/`UNWIND ... [WITH ...]` clauses. The parser
-        /// enforces every `Match` clause except the statement's last has a
-        /// `with` before the next `Match` clause (matching real Cypher's
-        /// rule that multiple reading clauses must be separated by WITH) —
-        /// `Unwind` clauses are exempt from this specific check (they
-        /// share one binding scope the same way `OPTIONAL MATCH` already
-        /// does, real Cypher needs no WITH around a bare UNWIND either) —
-        /// and that at most one clause (of any kind) has a `with` at all
-        /// across the whole statement (v1 doesn't support chaining past
-        /// one WITH boundary — nothing in the target query set needs it,
-        /// and it keeps a hand-rolled parser's untested-path surface
-        /// smaller).
+        /// One or more `MATCH`/`UNWIND`/`MERGE ... [WITH ...]` clauses. The
+        /// parser enforces every `Match` clause except the statement's
+        /// last has a `with` before the next `Match` clause (matching real
+        /// Cypher's rule that multiple reading clauses must be separated
+        /// by WITH) — `Unwind`/`Merge` clauses are exempt from this
+        /// specific check (they share one binding scope the same way
+        /// `OPTIONAL MATCH` already does, real Cypher needs no WITH around
+        /// a bare UNWIND/MERGE either) — and that at most one clause (of
+        /// any kind) has a `with` at all across the whole statement (v1
+        /// doesn't support chaining past one WITH boundary — nothing in
+        /// the target query set needs it, and it keeps a hand-rolled
+        /// parser's untested-path surface smaller).
         clauses: Vec<QueryClause>,
-        tail: Tail,
+        /// `None` only when a `MERGE` clause is present with nothing after
+        /// it (`MERGE (n:Label)` alone, no `RETURN`/etc — a pure write,
+        /// same as standalone `CREATE`). The parser rejects a missing tail
+        /// otherwise (`MATCH (n)` alone is almost certainly a mistake, not
+        /// a deliberate no-op).
+        tail: Option<Tail>,
         /// Only meaningful for `Tail::Return`; evaluated against the
         /// projected/aliased output row, not the raw pattern bindings —
         /// every ORDER BY key in practice is a RETURN alias, not a bare
