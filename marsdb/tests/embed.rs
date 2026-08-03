@@ -100,3 +100,85 @@ fn execute_batch_stops_at_first_runtime_failure_but_keeps_earlier_commits() {
     let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
     assert_eq!(result.rows.len(), 1, "the first CREATE must stay committed even though a later statement failed");
 }
+
+/// `MATCH ... RETURN` opens a `ReadTransaction`, not a `WriteTransaction`
+/// (see `Executor::execute`/`is_read_only`) -- proves that path is actually
+/// thread-safe under real concurrent access, not just single-threaded.
+#[test]
+fn concurrent_reads_from_multiple_threads_all_see_correct_results() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let db = Arc::new(Database::in_memory().unwrap());
+    for i in 0..200 {
+        db.execute(&format!("CREATE (n:Item {{idx: {i}}})")).unwrap();
+    }
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                for _ in 0..50 {
+                    let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
+                    assert_eq!(result.rows.len(), 200, "every concurrent reader must see all 200 rows");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// A writer committing new nodes while readers are concurrently querying
+/// must never panic, deadlock, or hand a reader a torn/partial view --
+/// each reader's `ReadTransaction` snapshot is either fully before or
+/// fully after any given writer commit (redb's MVCC guarantee), so every
+/// observed row count must be one of the values the writer actually
+/// passed through, never something in between within one CREATE.
+#[test]
+fn concurrent_write_and_reads_never_panic_or_see_torn_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let db = Arc::new(Database::in_memory().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let writer = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            for i in 0..300 {
+                db.execute(&format!("CREATE (n:Item {{idx: {i}}})")).unwrap();
+            }
+            stop.store(true, Ordering::SeqCst);
+        })
+    };
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut last_count = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    let result = db.execute("MATCH (n:Item) RETURN n").unwrap();
+                    assert!(
+                        result.rows.len() >= last_count,
+                        "row count must never go backwards mid-write (would mean a torn/inconsistent read)"
+                    );
+                    last_count = result.rows.len();
+                }
+            })
+        })
+        .collect();
+
+    writer.join().unwrap();
+    for r in readers {
+        r.join().unwrap();
+    }
+
+    let result = db.execute("MATCH (n:Item) RETURN n").unwrap();
+    assert_eq!(result.rows.len(), 300);
+}

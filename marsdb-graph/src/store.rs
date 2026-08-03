@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use marsdb_storage::{ReadableMultimapTable, ReadableTable, StorageEngine, WriteTransaction};
+use marsdb_storage::{ReadTransaction, ReadableMultimapTable, ReadableTable, StorageEngine, Txn, WriteTransaction};
 
 use crate::encode::{decode, encode, EdgeRecord, NodeRecord};
 use crate::error::GraphError;
@@ -42,6 +42,16 @@ impl GraphStore {
     /// concurrency becomes a bottleneck.
     pub fn begin_write(&self) -> Result<WriteTransaction, GraphError> {
         Ok(self.storage.begin_write()?)
+    }
+
+    /// Open a read transaction for a statement that never mutates
+    /// anything (`MATCH ... RETURN`) — a consistent point-in-time
+    /// snapshot that runs alongside any concurrent readers or a
+    /// concurrent writer without contending for redb's single-writer
+    /// lock. No commit/abort: a read transaction has nothing to roll
+    /// back, it just releases on drop.
+    pub fn begin_read(&self) -> Result<ReadTransaction, GraphError> {
+        Ok(self.storage.begin_read()?)
     }
 
     /// Commit a transaction obtained from [`begin_write`](Self::begin_write).
@@ -95,15 +105,13 @@ impl GraphStore {
     }
 
     pub fn get_node(&self, id: NodeId) -> Result<Option<Node>, GraphError> {
-        let write_txn = self.begin_write()?;
-        let node = Self::get_node_in_txn(&write_txn, id)?;
-        write_txn.abort()?;
-        Ok(node)
+        let read_txn = self.begin_read()?;
+        Self::get_node_in_txn(Txn::Read(&read_txn), id)
     }
 
-    pub fn get_node_in_txn(write_txn: &WriteTransaction, id: NodeId) -> Result<Option<Node>, GraphError> {
+    pub fn get_node_in_txn(txn: Txn, id: NodeId) -> Result<Option<Node>, GraphError> {
         let record: Option<NodeRecord> = {
-            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
             let found = match nodes.get(id.0)? {
                 Some(guard) => Some(decode(guard.value())?),
                 None => None,
@@ -114,7 +122,7 @@ impl GraphStore {
         let labels = record
             .label_ids
             .iter()
-            .map(|&lid| resolve_label(write_txn, lid))
+            .map(|&lid| resolve_label(txn, lid))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Node {
             id,
@@ -175,15 +183,13 @@ impl GraphStore {
     }
 
     pub fn get_edge(&self, id: EdgeId) -> Result<Option<Edge>, GraphError> {
-        let write_txn = self.begin_write()?;
-        let edge = Self::get_edge_in_txn(&write_txn, id)?;
-        write_txn.abort()?;
-        Ok(edge)
+        let read_txn = self.begin_read()?;
+        Self::get_edge_in_txn(Txn::Read(&read_txn), id)
     }
 
-    pub fn get_edge_in_txn(write_txn: &WriteTransaction, id: EdgeId) -> Result<Option<Edge>, GraphError> {
+    pub fn get_edge_in_txn(txn: Txn, id: EdgeId) -> Result<Option<Edge>, GraphError> {
         let record: Option<EdgeRecord> = {
-            let edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
+            let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
             let found = match edges.get(id.0)? {
                 Some(guard) => Some(decode(guard.value())?),
                 None => None,
@@ -191,7 +197,7 @@ impl GraphStore {
             found
         };
         let Some(record) = record else { return Ok(None) };
-        let label = resolve_label(write_txn, record.label_id)?;
+        let label = resolve_label(txn, record.label_id)?;
         Ok(Some(Edge {
             id,
             label,
@@ -209,20 +215,18 @@ impl GraphStore {
         dir: Direction,
         label_filter: Option<&str>,
     ) -> Result<Vec<AdjEntry>, GraphError> {
-        let write_txn = self.begin_write()?;
-        let result = Self::neighbors_in_txn(&write_txn, node, dir, label_filter)?;
-        write_txn.abort()?;
-        Ok(result)
+        let read_txn = self.begin_read()?;
+        Self::neighbors_in_txn(Txn::Read(&read_txn), node, dir, label_filter)
     }
 
     pub fn neighbors_in_txn(
-        write_txn: &WriteTransaction,
+        txn: Txn,
         node: NodeId,
         dir: Direction,
         label_filter: Option<&str>,
     ) -> Result<Vec<AdjEntry>, GraphError> {
         let label_id_filter = match label_filter {
-            Some(l) => match lookup_label_id(write_txn, l)? {
+            Some(l) => match lookup_label_id(txn, l)? {
                 Some(id) => Some(id),
                 None => return Ok(Vec::new()),
             },
@@ -233,7 +237,7 @@ impl GraphStore {
             Direction::Out => marsdb_storage::tables::ADJ_OUT,
             Direction::In => marsdb_storage::tables::ADJ_IN,
         };
-        let table = write_txn.open_multimap_table(table_def)?;
+        let table = txn.open_multimap_table(table_def)?;
         for item in table.get(node.0)? {
             let entry = AdjEntry::decode(item?.value());
             if label_id_filter.is_none_or(|lid| lid == entry.label_id) {
@@ -391,13 +395,11 @@ impl GraphStore {
     /// Full scan of all nodes, optionally filtered by label. v1 has no
     /// secondary index on label, so this is a linear scan of the table.
     pub fn all_nodes(&self, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
-        let write_txn = self.begin_write()?;
-        let result = Self::all_nodes_in_txn(&write_txn, label_filter)?;
-        write_txn.abort()?;
-        Ok(result)
+        let read_txn = self.begin_read()?;
+        Self::all_nodes_in_txn(Txn::Read(&read_txn), label_filter)
     }
 
-    pub fn all_nodes_in_txn(write_txn: &WriteTransaction, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
+    pub fn all_nodes_in_txn(txn: Txn, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
         // A label filter goes through NODE_LABEL_INDEX (label_id -> node_ids)
         // plus a point lookup per match, instead of scanning every row in
         // NODES — cost scales with the number of matching rows, not the
@@ -405,14 +407,14 @@ impl GraphStore {
         // scan is already optimal; the index wouldn't help.
         let Some(label_filter) = label_filter else {
             let mut result = Vec::new();
-            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
             for item in nodes.iter()? {
                 let (key, value) = item?;
                 let record: NodeRecord = decode(value.value())?;
                 let labels = record
                     .label_ids
                     .iter()
-                    .map(|&lid| resolve_label(write_txn, lid))
+                    .map(|&lid| resolve_label(txn, lid))
                     .collect::<Result<Vec<_>, _>>()?;
                 result.push(Node {
                     id: NodeId(key.value()),
@@ -422,11 +424,11 @@ impl GraphStore {
             }
             return Ok(result);
         };
-        let Some(label_id) = lookup_label_id(write_txn, label_filter)? else {
+        let Some(label_id) = lookup_label_id(txn, label_filter)? else {
             return Ok(Vec::new());
         };
         let node_ids: Vec<u64> = {
-            let label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            let label_index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             let ids: Vec<u64> = label_index
                 .get(label_id)?
                 .map(|item| item.map(|g| g.value()))
@@ -434,7 +436,7 @@ impl GraphStore {
             ids
         };
         let mut result = Vec::with_capacity(node_ids.len());
-        let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
         for id in node_ids {
             let guard = nodes
                 .get(id)?
@@ -444,7 +446,7 @@ impl GraphStore {
             let labels = record
                 .label_ids
                 .iter()
-                .map(|&lid| resolve_label(write_txn, lid))
+                .map(|&lid| resolve_label(txn, lid))
                 .collect::<Result<Vec<_>, _>>()?;
             result.push(Node {
                 id: NodeId(id),
