@@ -7,7 +7,7 @@ numbers aren't a competitive comparison, they're here to track regressions
 and show where the current architecture's cost is.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
-both `cypher_ops` and `ldbc_ops`).
+`cypher_ops`, `ldbc_ops`, and `aggregate_ops`).
 
 ## Storage layer (`marsdb-graph/benches/graph_ops.rs`)
 
@@ -122,6 +122,53 @@ measured at the same dataset sizes as the rest of this table without
 tripping that guard.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
+
+## Aggregation (`marsdb/benches/aggregate_ops.rs`)
+
+`resolve_grouped_rows` (the grouping core behind `count`/`sum`/`avg`/`min`/
+`max`/`collect` and implicit `GROUP BY`) does a linear scan over the groups
+formed so far to find a row's group, not a hash lookup — see its doc comment
+in `executor.rs` for why (`PropertyValue`/`Node`/`Edge` don't derive `Eq`/
+`Hash`). These benchmarks exist specifically to show that cost, not just
+confirm aggregation works. All queries run against `n` `Item` nodes created
+in one `CREATE` (one transaction), `cat` = `idx % num_groups`.
+
+| Operation | Result |
+|---|---|
+| Global aggregate (`count(*)`/`sum`/`avg`/`min`/`max`, 1 group), 100 rows | 638 µs |
+| Same query, 1,000 rows | 6.53 ms |
+| Same query, 10,000 rows | 69.2 ms |
+| `GROUP BY cat` (10 groups), 100 rows | 371 µs |
+| Same query, 1,000 rows | 3.78 ms |
+| Same query, 10,000 rows | 39.9 ms |
+| `GROUP BY cat` (every row its own group), 100 rows | 406 µs |
+| Same query, 1,000 rows | 5.06 ms |
+| Same query, 10,000 rows | 141 ms |
+| `collect(n.idx)`, 100 rows | 237 µs |
+| Same query, 1,000 rows | 2.43 ms |
+| Same query, 10,000 rows | 25.9 ms |
+| `count(DISTINCT n.cat)` (every row a distinct value), 100 rows | 253 µs |
+| Same query, 1,000 rows | 4.02 ms |
+| Same query, 10,000 rows | 187 ms |
+| `WITH...WHERE` on an aggregate result (10 groups), 100 rows | 374 µs |
+| Same query, 1,000 rows | 3.76 ms |
+| Same query, 10,000 rows | 40.0 ms |
+
+The 10-groups case scales close to linearly with row count (10x rows is
+~10-11x time, both 100->1,000 and 1,000->10,000) — group lookup stays cheap
+because there are only ever 10 groups to scan. The all-distinct case (every
+row its own group, so the group list grows as long as the row count) doesn't:
+100->1,000 is ~12.5x, 1,000->10,000 is ~27.9x — visibly super-linear, and
+getting worse as the dataset grows, consistent with the linear-scan-per-row
+group lookup this is meant to expose. `count(DISTINCT n.cat)` under the same
+all-distinct condition is worse still (100->1,000 ~15.9x, 1,000->10,000
+~46.5x) — its DISTINCT "seen" list has the identical linear-rescan-per-row
+shape (see `aggregate.rs::dedup_seen`), and unlike grouping it doesn't get a
+match on the very first comparison for repeat values, since here there are
+none. `WITH...WHERE` costs about the same as the 10-groups case it filters —
+the filter pass itself is cheap; the group-scan it runs after is not.
+
+Reproduce: `cargo bench -p marsdb --bench aggregate_ops`.
 
 ## Scope of these numbers
 
