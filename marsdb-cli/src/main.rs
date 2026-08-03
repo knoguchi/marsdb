@@ -6,7 +6,7 @@ use marsdb::Database;
 mod format;
 mod repl;
 
-/// Mars: an embeddable property-graph database, styled like SQLite.
+/// Mars: an embeddable property-graph database. Single binary, single file.
 #[derive(Parser)]
 #[command(name = "mars")]
 struct Cli {

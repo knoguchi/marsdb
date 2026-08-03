@@ -3,7 +3,7 @@ name = "marsdb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embeddable property-graph database with an openCypher query subset, styled like SQLite: single binary, single file, optional in-memory mode."
+description = "Embeddable property-graph database with an openCypher query subset: single binary, single file, optional in-memory mode."
 
 [lib]
 name = "marsdb"

@@ -1,5 +1,5 @@
-//! Embeddable property-graph database with an openCypher query subset,
-//! styled like SQLite: single binary, single file, optional in-memory mode.
+//! Embeddable property-graph database with an openCypher query subset:
+//! single binary, single file, optional in-memory mode.
 //!
 //! ```
 //! let db = marsdb::Database::in_memory().unwrap();

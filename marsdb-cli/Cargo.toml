@@ -3,7 +3,7 @@ name = "marsdb-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for Mars, an embeddable property-graph database styled like SQLite."
+description = "CLI for Mars, an embeddable property-graph database: single binary, single file."
 
 [[bin]]
 name = "mars"
