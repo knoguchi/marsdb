@@ -77,6 +77,39 @@ marsdb :memory: "..."                   # explicit in-memory, one-shot
 marsdb mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
 ```
 
+## Natural language -> Cypher
+
+`marsdb-nl2cypher` translates an English question into Cypher against a
+database's actual schema (labels/relationship-types/properties in use,
+introspected automatically), validates the result by really parsing it, and
+retries once with the exact parse error fed back if the first attempt
+doesn't parse. No HTTP/LLM-SDK dependency in the core crate — bring your
+own `LlmClient`:
+
+```rust
+use marsdb::Database;
+use marsdb_nl2cypher::{translate_and_run, LlmClient};
+
+let db = Database::in_memory()?;
+db.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")?;
+
+let (cypher, result) = translate_and_run(&db, &my_llm_client, "who does Alice know?")?;
+```
+
+A real, runnable example against a local [Ollama](https://ollama.com) instance:
+
+```
+ollama serve &
+ollama pull llama3.2
+cargo run -p marsdb-nl2cypher --example ollama_demo
+```
+
+MarsDB's narrower Cypher subset (vs. full Neo4j Cypher) is a deliberate fit
+for this — a smaller grammar means fewer ways an LLM can generate something
+unparseable. The prompt tells the model what's supported *and* what to
+avoid (no bare `-->` shorthand, no `RETURN DISTINCT`, `MERGE` capped at one
+hop, etc.) — see `marsdb-nl2cypher/src/lib.rs`'s `CAPABILITIES` constant.
+
 ## Architecture
 
 ```
@@ -86,6 +119,7 @@ marsdb-query     openCypher subset: pest grammar -> AST -> IR -> executor
 marsdb           embeddable public Rust API (Database::open/in_memory/execute)
 marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
+marsdb-nl2cypher natural-language -> Cypher: schema introspection, prompt building, validate-and-repair
 ```
 
 Storage runs on [redb](https://github.com/cberner/redb), a pure-Rust
