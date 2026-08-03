@@ -3,8 +3,25 @@
 //! build it as its own example -- each example pulls it in with
 //! `#[path = "common/viz.rs"] mod viz;`.
 
+use std::sync::Once;
+
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
+
+// CI runners have no system fonts (and no fontconfig), so plotters' ab_glyph
+// backend needs a font registered explicitly -- ttf/DejaVuSans.ttf is
+// bundled for exactly that (Bitstream Vera license, see fonts/LICENSE.txt).
+static REGISTER_FONT: Once = Once::new();
+
+fn ensure_font() {
+    REGISTER_FONT.call_once(|| {
+        if plotters::style::register_font("sans-serif", FontStyle::Normal, include_bytes!("fonts/DejaVuSans.ttf"))
+            .is_err()
+        {
+            panic!("bundled font is not a valid TTF");
+        }
+    });
+}
 
 fn centered(size: u32, color: &'static RGBColor) -> TextStyle<'static> {
     TextStyle::from(("sans-serif", size).into_font()).color(color).pos(Pos::new(HPos::Center, VPos::Center))
@@ -18,6 +35,7 @@ pub fn bar_chart(
     y_desc: &str,
     bars: &[(&str, f64, RGBColor)],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_font();
     let root = BitMapBackend::new(path, (640, 480)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -65,6 +83,7 @@ pub fn graph_viz(
     nodes: &[&str],
     edges: &[(usize, usize)],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_font();
     let root = BitMapBackend::new(path, (640, 640)).into_drawing_area();
     root.fill(&WHITE)?;
     root.draw(&Text::new(title, (320, 20), centered(24, &BLACK)))?;
