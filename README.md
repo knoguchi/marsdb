@@ -219,7 +219,7 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 2097/3880 TCK scenarios pass (54.0%), 0 wrong-result
+Short version: 2168/3880 TCK scenarios pass (55.9%), 0 wrong-result
 scenarios (no known silent-correctness bugs in the supported surface).
 
 ## Roadmap
@@ -232,8 +232,10 @@ scenarios (no known silent-correctness bugs in the supported surface).
   `<temporal>.truncate(unit, ...)` — the TCK's two single largest
   remaining `expressions/temporal` gaps by scenario count
 - Week-date/ordinal-date/quarter temporal construction
-  (`date({year: 2015, week: 1})`, `date('2015-W30-2')`) and projecting one
-  temporal value from another (`date({date: d, day: 5})`)
+  (`date({year: 2015, week: 1})`, `date('2015-W30-2')`) — projecting one
+  temporal value's *calendar*/*year/month/day* fields from another
+  (`date({date: d, day: 5})`) is already supported, just not the
+  week/quarter/ordinal-day override forms
 - List/map-valued node/edge properties (`CREATE (n {tags: [1,2,3]})` now
   parses but errors at execution — `PropertyValue` has no list/map
   variant to store one in yet)

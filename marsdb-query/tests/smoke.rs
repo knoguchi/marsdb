@@ -3702,6 +3702,93 @@ fn date_time_component_access_uses_local_reading_except_epoch_fields() {
     assert_eq!(temporal_str(&result.rows[0][7]), "+01:00");
 }
 
+/// `date({date: other, ...overrides})` -- projects year/month/day from
+/// another temporal value, individual keys override on top. Temporal3
+/// [1].
+#[test]
+fn date_projects_from_another_temporal_value() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH date({year: 1984, month: 11, day: 11}) AS other \
+         RETURN toString(date({date: other})), toString(date({date: other, year: 28})), \
+                toString(date({date: other, day: 28}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-11-11");
+    assert_eq!(temporal_str(&result.rows[0][1]), "0028-11-11");
+    assert_eq!(temporal_str(&result.rows[0][2]), "1984-11-28");
+
+    // Projects from LocalDateTime/DateTime too, not just Date.
+    let result = run(
+        &store,
+        "WITH localdatetime({year: 1984, month: 11, day: 11, hour: 12}) AS other RETURN toString(date({date: other}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-11-11");
+}
+
+/// `localtime({time: other, ...overrides})` -- Temporal3 [2].
+#[test]
+fn local_time_projects_from_another_temporal_value() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS other \
+         RETURN toString(localtime({time: other})), toString(localtime({time: other, second: 42}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:31:14.645876123");
+    assert_eq!(temporal_str(&result.rows[0][1]), "12:31:42.645876123");
+}
+
+/// `time({time: other, timezone: ...})` -- when the override timezone
+/// differs from the base's own offset, the wall-clock shifts to
+/// preserve the same instant (real Cypher's rule, not just relabeling
+/// the offset) -- Temporal3 [3].
+#[test]
+fn time_projection_with_different_timezone_shifts_wall_clock_to_preserve_instant() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH time({hour: 12, minute: 31, second: 14, microsecond: 645876, timezone: '+01:00'}) AS other \
+         RETURN toString(time({time: other})), toString(time({time: other, timezone: '+05:00'}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:31:14.645876+01:00");
+    assert_eq!(temporal_str(&result.rows[0][1]), "16:31:14.645876+05:00");
+
+    // An explicit field override applies *after* the zone shift, not
+    // before -- Temporal3 [3]'s own compound example.
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: '+01:00'}) AS other \
+         RETURN toString(time({time: other, second: 42, timezone: '+05:00'}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "16:00:42+05:00");
+}
+
+/// `localdatetime({date: ..., time: ..., ...overrides})` -- combining a
+/// date projected from one value and a time from another (or literal
+/// fields), Temporal3 [4]/[5]/[6].
+#[test]
+fn local_date_time_projects_date_and_time_independently() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH date({year: 1984, month: 10, day: 11}) AS d, \
+              localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS t \
+         RETURN toString(localdatetime({date: d, time: t})), \
+                toString(localdatetime({date: d, time: t, day: 28, second: 42})), \
+                toString(localdatetime({date: d, hour: 10, minute: 10, second: 10}))",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-10-11T12:31:14.645876123"
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][1]),
+        "1984-10-28T12:31:42.645876123"
+    );
+    assert_eq!(temporal_str(&result.rows[0][2]), "1984-10-11T10:10:10");
+}
+
 /// `datetime(...) + duration(...)` -- real calendar month arithmetic on
 /// the *local* reading, seconds/nanos carrying across day boundaries
 /// (unlike `Date`, which has no time-of-day to carry into). Temporal8.

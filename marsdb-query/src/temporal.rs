@@ -786,7 +786,7 @@ pub fn format_time(nanos_of_day: i64, offset_seconds: i32) -> String {
 /// still gets a `nanos_of_day` in `0..NANOS_PER_DAY` (Rust's `%` on a
 /// negative dividend returns a negative remainder, which would put the
 /// "same calendar day" one day off).
-fn split_epoch_seconds(epoch_seconds: i64) -> (i32, i64) {
+pub fn split_epoch_seconds(epoch_seconds: i64) -> (i32, i64) {
     let epoch_day = epoch_seconds.div_euclid(SECONDS_PER_DAY) as i32;
     let secs_of_day = epoch_seconds.rem_euclid(SECONDS_PER_DAY);
     (epoch_day, secs_of_day * 1_000_000_000)

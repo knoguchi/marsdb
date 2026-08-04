@@ -49,11 +49,11 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 169 | 0 | 356 | 479 | 0 | 16.8% |
+| expressions/temporal | 1004 | 240 | 0 | 285 | 479 | 0 | 23.9% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2097** | **0** | **387** | **1327** | **69** | **54.0%** |
+| **TOTAL** | **3880** | **2168** | **0** | **316** | **1327** | **69** | **55.9%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -281,13 +281,25 @@ calendar-style breakdown — `duration({years: 1, months:
 `.nanosecondsOfSecond`, each unit's remainder within the next one up).
 `toString()` round-trips for every type (`date(toString(d)) = d`, ...).
 
+Projecting one temporal value's fields from another via a `date`/`time`/
+`datetime` map key (`date({date: d, day: 5})`, `localtime({time: t,
+second: 42})`, `localdatetime({date: d, time: t})`, `time({time: t,
+timezone: '+05:00'})`, ...): the named key's calendar and/or clock
+fields become the defaults, any other explicit key overrides just that
+field on top. Changing `timezone` on a projected `Time`/`DateTime` whose
+source already carried an offset shifts the wall-clock to preserve the
+same instant (real Cypher's rule — `{time: t, timezone: '+05:00'}` on a
+`+01:00` source advances the hour by 4), and any further explicit
+hour/minute/second override applies *after* that shift, not before.
+
 **Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
 `DateTime` — needs a real IANA timezone database (DST transition rules,
 zone-name lookup), deliberately out of scope, no dependency pulled in
 for it; week-date/ordinal-date/quarter construction (`date({year: 2015,
 week: 1})`, `date('2015-W30-2')`, `date('2015-202')` — only the calendar
-year/month/day forms, for the date half of every type); projecting one
-temporal value from another (`date({date: d, day: 5})`);
+year/month/day forms, for the date half of every type, including as a
+projection override key, e.g. `date({date: d, week: 1})` still isn't
+supported even though `date({date: d, day: 5})` is);
 `duration.between(...)`/`.inDays(...)`/etc, `.truncate(...)`, and the
 alternate ISO-8601 combined date-time duration syntax
 (`duration('P2012-02-02T14:37:21.545')`). See `marsdb-query/src/
