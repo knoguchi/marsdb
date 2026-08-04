@@ -296,25 +296,16 @@ fn parse_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause, QueryError> {
     })
 }
 
+/// `unwind_source = { return_expr }` -- one child, always `return_expr`
+/// (`UNWIND null AS x` behaving like an empty list, not a bound-variable
+/// lookup, is handled at evaluation time in `executor::eval_unwind`, not
+/// here — `null` parses as an ordinary `ReturnExpr::Lit(Literal::Null)`).
 fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
     let inner = pair
         .into_inner()
         .next()
         .expect("unwind_source has one child");
-    match inner.as_rule() {
-        Rule::list_literal => Ok(UnwindSource::List(
-            inner
-                .into_inner()
-                .filter(|p| p.as_rule() == Rule::literal)
-                .map(parse_literal)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        // `UNWIND null AS x` is real Cypher -- unwinding null behaves like
-        // unwinding an empty list (zero rows), not a bound variable lookup.
-        Rule::null_literal => Ok(UnwindSource::List(vec![])),
-        Rule::identifier => Ok(UnwindSource::Var(inner.as_str().to_string())),
-        r => unreachable!("unexpected unwind_source child rule {r:?}"),
-    }
+    Ok(UnwindSource(parse_return_expr(inner)?))
 }
 
 fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {

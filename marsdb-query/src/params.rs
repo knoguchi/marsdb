@@ -4,7 +4,7 @@ use marsdb_graph::PropertyValue;
 
 use crate::ast::{
     Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr,
-    ReturnTail, SetItem, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 
@@ -99,11 +99,7 @@ fn substitute_unwind_clause(
     u: &mut UnwindClause,
     params: &HashMap<String, PropertyValue>,
 ) -> Result<(), QueryError> {
-    if let UnwindSource::List(literals) = &mut u.source {
-        for lit in literals {
-            substitute_literal(lit, params)?;
-        }
-    }
+    substitute_return_expr(&mut u.source.0, params)?;
     if let Some(expr) = &mut u.where_clause {
         substitute_with_expr(expr, params)?;
     }

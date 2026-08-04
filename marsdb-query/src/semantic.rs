@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::ast::{
     is_aggregate_name, Expr, MergeClause, Pattern, QueryClause, RemoveItem, ReturnExpr, ReturnItem,
-    ReturnTail, SetItem, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::QueryError;
 
@@ -112,18 +112,23 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
 }
 
 fn bind_unwind(clause: &UnwindClause, scope: &mut Scope) -> Result<(), QueryError> {
-    let element_kind = match &clause.source {
-        UnwindSource::Var(name) => match lookup(scope, name, "UNWIND source")? {
-            Kind::List(element) => (**element).clone(),
-            Kind::Unknown => Kind::Unknown,
-            other => {
-                return Err(semantic(format!(
-                    "UNWIND source '{name}' is {}, not a list",
-                    kind_name(other)
-                )))
-            }
-        },
-        UnwindSource::List(_) => Kind::Scalar,
+    let source_kind = infer_expr(&clause.source.0, scope)?;
+    let element_kind = match source_kind {
+        Kind::List(element) => *element,
+        // `Scalar` is deliberately not rejected here -- most function
+        // calls (`infer_expr`'s own `Call` arm) type as `Scalar` even
+        // when they in fact return a list at runtime (this codebase's
+        // `Kind` system doesn't model every builtin's real return shape),
+        // so treating it as "unknown, defer to the real runtime
+        // Value::List check in eval_unwind" avoids rejecting legitimate
+        // queries the semantic layer just can't see through.
+        Kind::Unknown | Kind::Scalar => Kind::Unknown,
+        other => {
+            return Err(semantic(format!(
+                "UNWIND source is {}, not a list",
+                kind_name(&other)
+            )))
+        }
     };
     scope.insert(clause.var.clone(), element_kind);
     if let Some(expr) = &clause.where_clause {

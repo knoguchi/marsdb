@@ -89,9 +89,14 @@ with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clau
 // variable is very often a bare scalar (`UNWIND [1,2,3] AS x WHERE x >
 // 2`), which `comparison` structurally cannot express at all (only
 // `x.prop > 2` is representable there).
+// Any expression, not just a literal list/null/bound variable -- real
+// Cypher's UNWIND source can be `range(0, 2)`, `n.tags`, `[x IN y | x]`,
+// etc. `return_expr` already covers the old three forms as special cases
+// (a list literal is `list_expr`, `null` is part of `literal`, a bound
+// variable is `identifier` -- all reachable through `atom_expr`), so this
+// is a strict widening, not a new grammar shape.
 unwind_clause = { ^"UNWIND" ~ unwind_source ~ ^"AS" ~ identifier ~ with_where_clause? ~ with_clause? }
-unwind_source = { list_literal | null_literal | identifier }
-list_literal  = { "[" ~ (literal ~ ("," ~ literal)*)? ~ "]" }
+unwind_source = { return_expr }
 
 // No WHERE here -- real Cypher's MERGE has none either; the pattern's own
 // labels/props are the only match criteria. `pattern`'s hop count is
