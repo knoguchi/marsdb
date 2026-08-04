@@ -209,8 +209,24 @@ List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
 from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
 open-ended `list[2..]`/`list[..3]` — unlike indexing, out-of-range slice
 bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
+List comprehensions (`[x IN list WHERE cond | expr]`, both `WHERE` and
+`| expr` independently optional — `[x IN list]` is a legal no-op filter),
+whose `WHERE` reuses the same expression shape as `WITH ... WHERE`
+(comparisons + `AND`/`OR`/`NOT`, not yet arbitrary boolean expressions —
+a bare `WHERE x`/`WHERE true` isn't parseable yet, only `WHERE x > 2`
+shapes). Quantifiers `ALL(x IN list WHERE cond)`/`ANY(...)`/`NONE(...)`/
+`SINGLE(...)` (same `WHERE` shape as list comprehensions, no `WHERE` means
+"every element's own truthiness"), with real three-valued NULL logic — a
+definite `true`/`false` among the elements decides the answer even with
+other `null` elements present; only "no definite answer, but at least one
+`null`" actually yields `null` (e.g. `all(x IN [0, null] WHERE x = 2)` is
+`false`, not `null`, since `0 = 2` is a definite `false`).
 A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
 list[1]`) is also valid on its own.
+Map literals (`{a: 1, b: 2+1}`) in `RETURN`/`WITH`, and property-style
+access on a map-valued variable (`WITH {a: 1} AS m RETURN m.a`) — general
+postfix property access on an arbitrary non-identifier expression
+(`list[0].prop`) isn't supported yet, only `identifier.prop`.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`

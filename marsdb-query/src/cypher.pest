@@ -114,8 +114,33 @@ slice_range     = { return_expr? ~ ".." ~ return_expr? }
 // before `literal`/`identifier` -- unambiguous either way since it starts
 // with `[`, which nothing else here can, but keeping the ordering
 // consistent with this rule's own "more specific syntax first" pattern.
-atom_expr   = { case_expr | function_call | list_expr | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
-list_expr   = { "[" ~ (return_expr ~ ("," ~ return_expr)*)? ~ "]" }
+// `quantifier_expr` (`ALL(x IN list WHERE cond)`) is tried before
+// `function_call` -- both start with `identifier ~ "("`, but ordered
+// choice backtracks cleanly: `call_args` (a comma-separated return_expr
+// list) can never match `x IN list WHERE cond`'s shape (`IN`/`WHERE`
+// aren't valid `return_expr` continuations), so a real function call
+// falls through to `function_call` untouched.
+// `map_expr` (`{a: 1, b: 2+1}`) is unambiguous against everything else
+// here -- `{` starts nothing else `atom_expr` can produce.
+atom_expr   = { case_expr | quantifier_expr | function_call | list_expr | map_expr | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
+map_expr    = { "{" ~ (map_kv ~ ("," ~ map_kv)*)? ~ "}" }
+map_kv      = { identifier ~ ":" ~ return_expr }
+// `list_comprehension` (`[x IN list WHERE cond | expr]`) is tried before
+// the plain comma-separated form -- ordered choice backtracks cleanly:
+// a plain list's first element only looks like a comprehension's bound
+// variable if it's a bare identifier immediately followed by `IN`, which
+// a plain element list (`[a, b]`, `[a.name]`, `[f(x)]`, ...) never is.
+list_expr           = { "[" ~ (list_comprehension | (return_expr ~ ("," ~ return_expr)*)?) ~ "]" }
+list_comprehension  = { filter_expr ~ ("|" ~ return_expr)? }
+// Shared by `list_comprehension` and `quantifier_expr` -- both bind one
+// variable over a list, optionally filtered. WHERE reuses `with_expr`
+// (not the pattern-level `where_clause`/`expr`) for the same reason
+// `unwind_clause` does -- the bound variable is a bare scalar/node/edge,
+// not necessarily something `comparison`'s `prop_access`-only LHS can
+// express.
+filter_expr         = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~ with_expr)? }
+quantifier_expr      = { quantifier_kw ~ "(" ~ filter_expr ~ ")" }
+quantifier_kw        = { ^"ALL" | ^"ANY" | ^"NONE" | ^"SINGLE" }
 
 case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }

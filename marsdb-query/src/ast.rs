@@ -99,6 +99,43 @@ pub enum ReturnExpr {
     /// out-of-range bounds clamp instead of nulling out, and a start at or
     /// past the (clamped) end yields `[]` rather than erroring.
     Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
+    /// `[x IN <source> WHERE <cond> | <project>]` — `WHERE`/`| project` are
+    /// each independently optional (`[x IN list]` is a legal no-op
+    /// identity-filter comprehension). `where_clause` reuses `WithExpr`
+    /// (not pattern-level `Expr`) for the same reason `UnwindClause`'s own
+    /// filter does — `var` is very often a bare scalar/node/edge, not
+    /// something `Expr::Compare`'s `prop_access`-only LHS can express.
+    ListComp {
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<WithExpr>>,
+        project: Option<Box<ReturnExpr>>,
+    },
+    /// `ALL(x IN list WHERE cond)` / `ANY(...)` / `NONE(...)` / `SINGLE(...)`
+    /// — shares `ListComp`'s "one bound variable over a list, optionally
+    /// filtered" shape (no `project` half; a quantifier always yields a
+    /// `Bool`, never a projected list). `where_clause` absent means "every
+    /// element's own truthiness", same convention `CASE`'s subject-less
+    /// `WHEN` branch already uses (`matches!(v, Literal(Bool(true)))`).
+    Quantifier {
+        kind: QuantifierKind,
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<WithExpr>>,
+    },
+    /// `{a: 1, b: 2 + 1}` — a general expression map, the `RETURN`-level
+    /// counterpart to `prop_map`'s literal-only property-map syntax used
+    /// by `CREATE`/`MERGE`/`prop_kv` (which stays scoped to a
+    /// `Literal` value, since a stored property is always a scalar).
+    MapLit(Vec<(String, ReturnExpr)>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

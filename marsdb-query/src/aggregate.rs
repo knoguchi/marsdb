@@ -55,6 +55,14 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
                     .into(),
             ))
         }
+        // Same stance as `Path` above -- a map has no natural total order/
+        // hash convention this codebase has picked yet, and no real usage
+        // needs grouping/DISTINCT by a whole map value.
+        Value::Map(_) => {
+            return Err(QueryError::Parse(
+                "grouping or using DISTINCT with a map value isn't supported".into(),
+            ))
+        }
     })
 }
 
@@ -112,6 +120,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Node(_) => "a node",
         Value::Edge(_) => "an edge",
         Value::List(_) => "a list",
+        Value::Map(_) => "a map",
         Value::Path(_) => "a path",
         Value::Property(_) | Value::Literal(_) => "a scalar",
         Value::Null => "null",

@@ -5,8 +5,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir,
-    Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem,
+    SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -41,6 +41,11 @@ enum Binding {
     /// way back out via `value_to_binding_restore`, a separate step from
     /// how this is stored here.
     List(Vec<Value>),
+    /// A map literal (`{a: 1, b: 2}`) carried through a `WITH` projection
+    /// — same reasoning as `List`: `PropertyValue` has no map variant, so
+    /// this is the only place a materialized map has to live between one
+    /// `QueryPart` and the next.
+    Map(BTreeMap<String, Value>),
     /// A named path (`p = (a)-->(b)`) or `shortestPath()` result — see
     /// `assemble_path`/`eval_shortest_path`. `PathBinding` (not `Binding`
     /// again) because a path element only ever needs graph identity
@@ -861,6 +866,7 @@ impl<'a> Executor<'a> {
                     Value::Node(n) => Binding::Node(n.id),
                     Value::Edge(e) => Binding::Edge(e.id),
                     Value::List(items) => Binding::List(items),
+                    Value::Map(m) => Binding::Map(m),
                     other => Binding::Value(value_to_property_value(&other)),
                 })
             }
@@ -947,6 +953,7 @@ impl<'a> Executor<'a> {
             Binding::Value(PropertyValue::Null) => Value::Null,
             Binding::Value(pv) => Value::Property(pv.clone()),
             Binding::List(items) => Value::List(items.clone()),
+            Binding::Map(m) => Value::Map(m.clone()),
             Binding::Path(elems) => Value::Path(self.resolve_path_elems(txn, elems)?),
         })
     }
@@ -1416,12 +1423,32 @@ impl<'a> Executor<'a> {
                 let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
                 Ok(edge.props.get(&pa.prop).cloned())
             }
-            // A WITH-projected scalar (or list/path) has no `.prop` to
-            // access — e.g. `WITH message.id AS messageId` then
-            // `messageId.foo` isn't meaningful. Treat as absent rather
-            // than erroring, consistent with how a missing property
-            // already behaves.
-            Binding::Value(_) | Binding::List(_) | Binding::Path(_) => Ok(None),
+            // A WITH-projected scalar (or list/map/path) has no scalar
+            // `.prop` to access via this path — e.g. `WITH message.id AS
+            // messageId` then `messageId.foo` isn't meaningful. Treat as
+            // absent rather than erroring, consistent with how a missing
+            // property already behaves. `Binding::Map` specifically *does*
+            // have real `.prop` access, just not through this method (its
+            // values aren't always a scalar `PropertyValue`) — see
+            // `lookup_prop_value`, which `ReturnExpr::Prop` actually calls.
+            Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => Ok(None),
+        }
+    }
+
+    /// `ReturnExpr::Prop`'s own lookup -- unlike `lookup_prop` (used by
+    /// pattern-level `WHERE`, which only ever compares a real node/edge
+    /// property against a `Literal`), a map's value can be any `Value`
+    /// shape (nested list/map/node), not just a scalar `PropertyValue`,
+    /// so this returns the wider type and handles `Binding::Map` itself
+    /// rather than collapsing through `lookup_prop`.
+    fn lookup_prop_value(&self, txn: Txn, pa: &PropAccess, row: &BindingRow) -> Result<Value, QueryError> {
+        match row.get(&pa.var) {
+            Some(Binding::Map(m)) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
+            Some(_) => Ok(match self.lookup_prop(txn, pa, row)? {
+                Some(PropertyValue::Null) | None => Value::Null,
+                Some(pv) => Value::Property(pv),
+            }),
+            None => Err(QueryError::UnboundVariable(pa.var.clone())),
         }
     }
 
@@ -1480,15 +1507,7 @@ impl<'a> Executor<'a> {
                 let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 self.binding_to_value(txn, binding)
             }
-            ReturnExpr::Prop(pa) => {
-                let value = self.lookup_prop(txn, pa, row)?;
-                Ok(match value {
-                    // Collapse "prop missing" and "prop stored as null" into
-                    // one null representation — see Value::Null docs.
-                    Some(PropertyValue::Null) | None => Value::Null,
-                    Some(pv) => Value::Property(pv),
-                })
-            }
+            ReturnExpr::Prop(pa) => self.lookup_prop_value(txn, pa, row),
             ReturnExpr::Lit(lit) => Ok(match lit {
                 Literal::Null => Value::Null,
                 other => Value::Literal(other.clone()),
@@ -1559,6 +1578,78 @@ impl<'a> Executor<'a> {
                 let end_v = end.as_deref().map(|e| self.eval_return_expr(txn, e, row)).transpose()?;
                 apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
             }
+            ReturnExpr::ListComp {
+                var,
+                source,
+                where_clause,
+                project,
+            } => {
+                let source_v = self.eval_return_expr(txn, source, row)?;
+                let items = match source_v {
+                    Value::List(items) => items,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(QueryError::Parse(format!(
+                            "list comprehension source must be a list, got {other:?}"
+                        )))
+                    }
+                };
+                let mut result = Vec::with_capacity(items.len());
+                for item in items {
+                    // A fresh overlay per element -- `var` shadows any
+                    // outer binding of the same name for the duration of
+                    // this one element, same scoping UNWIND already uses.
+                    let mut scoped_row = row.clone();
+                    scoped_row.insert(var.clone(), value_to_binding_restore(&item));
+                    let keep = match where_clause {
+                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)? == Some(true),
+                        None => true,
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    result.push(match project {
+                        Some(p) => self.eval_return_expr(txn, p, &scoped_row)?,
+                        None => item,
+                    });
+                }
+                Ok(Value::List(result))
+            }
+            ReturnExpr::Quantifier {
+                kind,
+                var,
+                source,
+                where_clause,
+            } => {
+                let source_v = self.eval_return_expr(txn, source, row)?;
+                let items = match source_v {
+                    Value::List(items) => items,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}")))
+                    }
+                };
+                let mut preds = Vec::with_capacity(items.len());
+                for item in &items {
+                    let mut scoped_row = row.clone();
+                    scoped_row.insert(var.clone(), value_to_binding_restore(item));
+                    preds.push(match where_clause {
+                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)?,
+                        None => item_truthy(item),
+                    });
+                }
+                Ok(match eval_quantifier(*kind, &preds) {
+                    Some(b) => Value::Literal(Literal::Bool(b)),
+                    None => Value::Null,
+                })
+            }
+            ReturnExpr::MapLit(entries) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in entries {
+                    map.insert(k.clone(), self.eval_return_expr(txn, v, row)?);
+                }
+                Ok(Value::Map(map))
+            }
         }
     }
 
@@ -1605,7 +1696,7 @@ impl<'a> Executor<'a> {
                     // silent no-op, not an error (real Cypher: "deleting
                     // null does nothing").
                     Binding::Value(PropertyValue::Null) => {}
-                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                    Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
                         return Err(QueryError::UnboundVariable(format!(
                             "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
                         )))
@@ -1696,7 +1787,7 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
                 // without a trailing RETURN to observe it" story as the
                 // null-removes-property bug just above).
                 Binding::Value(PropertyValue::Null) => {}
-                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
                         pa.var
@@ -1715,7 +1806,7 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
                     GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                 }
                 Binding::Value(PropertyValue::Null) => {}
-                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
                         pa.var
@@ -1759,7 +1850,7 @@ fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &Remo
                 // via TCK's Remove1 "Ignore null when removing property"
                 // scenarios).
                 Binding::Value(PropertyValue::Null) => {}
-                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{}' is a WITH-projected scalar, not a node/edge — REMOVE needs a graph binding",
                         pa.var
@@ -1856,7 +1947,12 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
         ReturnExpr::Arith(..) => format!("col{idx}"),
-        ReturnExpr::ListLit(..) | ReturnExpr::Index(..) | ReturnExpr::Slice(..) => format!("col{idx}"),
+        ReturnExpr::ListLit(..)
+        | ReturnExpr::Index(..)
+        | ReturnExpr::Slice(..)
+        | ReturnExpr::ListComp { .. }
+        | ReturnExpr::Quantifier { .. }
+        | ReturnExpr::MapLit(..) => format!("col{idx}"),
     }
 }
 
@@ -1899,6 +1995,15 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
                 || start.as_deref().is_some_and(contains_aggregate)
                 || end.as_deref().is_some_and(contains_aggregate)
         }
+        // `where_clause` isn't checked -- same scope limitation as
+        // `UnwindClause`'s own filter, which never routes through this
+        // check either; the source/project halves are the ones a real
+        // TCK scenario nests an aggregate in (`size([x IN collect(r) ...])`).
+        ReturnExpr::ListComp { source, project, .. } => {
+            contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate)
+        }
+        ReturnExpr::Quantifier { source, .. } => contains_aggregate(source),
+        ReturnExpr::MapLit(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -1983,6 +2088,13 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
                     .into(),
             ))
         }
+        // Same stance as `Path` above -- see `value_hash_key`'s matching
+        // `Value::Map` arm.
+        Binding::Map(_) => {
+            return Err(QueryError::Parse(
+                "grouping or using DISTINCT with a map value isn't supported".into(),
+            ))
+        }
     })
 }
 
@@ -1994,6 +2106,7 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
 fn value_to_binding(v: Value) -> Binding {
     match v {
         Value::List(items) => Binding::List(items),
+        Value::Map(m) => Binding::Map(m),
         other => Binding::Value(value_to_property_value(&other)),
     }
 }
@@ -2012,6 +2125,7 @@ fn value_to_binding_restore(v: &Value) -> Binding {
         Value::Property(pv) => Binding::Value(pv.clone()),
         Value::Literal(lit) => Binding::Value(literal_to_value(lit)),
         Value::List(items) => Binding::List(items.clone()),
+        Value::Map(m) => Binding::Map(m.clone()),
         Value::Path(elems) => Binding::Path(elems.iter().map(path_elem_to_binding).collect()),
         Value::Null => Binding::Value(PropertyValue::Null),
     }
@@ -2149,7 +2263,7 @@ fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> Option<bool> {
         Value::Null => None,
         Value::Property(pv) => Some(pv.clone()),
         Value::Literal(l) => Some(literal_to_value(l)),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => None,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => None,
     };
     compare(&prop, op, lit)
 }
@@ -2168,7 +2282,7 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
         Value::Null => PropertyValue::Null,
         Value::Property(pv) => pv.clone(),
         Value::Literal(lit) => literal_to_value(lit),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => PropertyValue::Null,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => PropertyValue::Null,
     }
 }
 
@@ -2509,7 +2623,10 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             .find(|v| !matches!(v, Value::Null))
             .cloned()
             .unwrap_or(Value::Null)),
-        "tointeger" => Ok(args.first().map(to_integer).unwrap_or(Value::Null)),
+        "tointeger" => match args.first() {
+            Some(v) => to_integer(v),
+            None => Ok(Value::Null),
+        },
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -2525,20 +2642,107 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
     }
 }
 
-fn to_integer(v: &Value) -> Value {
+/// A quantifier's own per-element truthiness check when it has no `WHERE`
+/// at all (`ANY(x IN list)`, not `ANY(x IN list WHERE ...)`) -- three-
+/// valued, same as a real `WHERE` predicate: `null` propagates as
+/// "unknown" (`None`), a literal bool passes through, anything else
+/// (non-bool, non-null) is definitely-false, same convention `CASE`'s
+/// subject-less `WHEN` branch already uses for a non-bool test value.
+fn item_truthy(v: &Value) -> Option<bool> {
+    match v {
+        Value::Null => None,
+        Value::Literal(Literal::Bool(b)) | Value::Property(PropertyValue::Bool(b)) => Some(*b),
+        _ => Some(false),
+    }
+}
+
+/// Real Cypher quantifiers use three-valued logic, not a simple count --
+/// a single definite `true`/`false` among the elements can already decide
+/// the answer even in the presence of other `null` elements, and only
+/// "no definite answer, but at least one unknown" actually yields `null`.
+/// Confirmed against the real TCK scenarios (Quantifier1-4, scenario 10,
+/// "... on lists containing nulls") rather than assumed -- a first version
+/// of this collapsed `null` predicates to `false`, which silently passed
+/// every non-null-list scenario but produced 19 real wrong answers on
+/// exactly these null-list cases.
+fn eval_quantifier(kind: QuantifierKind, preds: &[Option<bool>]) -> Option<bool> {
+    let true_count = preds.iter().filter(|p| **p == Some(true)).count();
+    let any_false = preds.iter().any(|p| *p == Some(false));
+    let any_null = preds.iter().any(|p| p.is_none());
+    match kind {
+        QuantifierKind::Any => {
+            if true_count > 0 {
+                Some(true)
+            } else if any_null {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        QuantifierKind::None => {
+            if true_count > 0 {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        QuantifierKind::All => {
+            if any_false {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        QuantifierKind::Single => {
+            if true_count >= 2 {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true_count == 1)
+            }
+        }
+    }
+}
+
+fn to_integer(v: &Value) -> Result<Value, QueryError> {
+    // A float-formatted string ('1.7', '2.9') isn't an i64, but real
+    // Cypher's toInteger() still accepts it -- parse as a float and
+    // truncate, same as the Float arm below, rather than failing straight
+    // to null the way a bare `i64::parse` would (found via a real TCK
+    // scenario: `toInteger('1.7')` must be `1`, not `null`).
     let as_str_parse = |s: &str| match s.trim().parse::<i64>() {
         Ok(i) => Value::Property(PropertyValue::Int(i)),
-        Err(_) => Value::Null,
+        Err(_) => match s.trim().parse::<f64>() {
+            Ok(f) => Value::Property(PropertyValue::Int(f as i64)),
+            Err(_) => Value::Null,
+        },
     };
-    match v {
+    Ok(match v {
         Value::Property(PropertyValue::Int(i)) => Value::Property(PropertyValue::Int(*i)),
         Value::Property(PropertyValue::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
         Value::Property(PropertyValue::String(s)) => as_str_parse(s),
         Value::Literal(Literal::Int(i)) => Value::Property(PropertyValue::Int(*i)),
         Value::Literal(Literal::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
         Value::Literal(Literal::String(s)) => as_str_parse(s),
-        _ => Value::Null,
-    }
+        Value::Property(PropertyValue::Bool(_) | PropertyValue::Null)
+        | Value::Literal(Literal::Bool(_) | Literal::Null)
+        | Value::Null => Value::Null,
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        // A node/edge/list/map/path has no numeric conversion at all -- a
+        // real error (found via a real TCK scenario expecting exactly
+        // this), not a silent null the way an out-of-range/unparseable
+        // scalar is.
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+            return Err(QueryError::Parse(format!("toInteger() cannot convert {v:?} to an integer")))
+        }
+    })
 }
 
 /// Sorts `rows` (already-projected `RETURN`/`WITH` output, `columns`
@@ -2592,15 +2796,18 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let base = row
                 .get(&pa.var)
                 .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
-            let pv = match base {
-                Value::Node(n) => n.props.get(&pa.prop).cloned(),
-                Value::Edge(e) => e.props.get(&pa.prop).cloned(),
-                _ => None,
-            };
-            Ok(match pv {
-                Some(PropertyValue::Null) | None => Value::Null,
-                Some(v) => Value::Property(v),
-            })
+            match base {
+                Value::Map(m) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
+                Value::Node(n) => Ok(match n.props.get(&pa.prop).cloned() {
+                    Some(PropertyValue::Null) | None => Value::Null,
+                    Some(v) => Value::Property(v),
+                }),
+                Value::Edge(e) => Ok(match e.props.get(&pa.prop).cloned() {
+                    Some(PropertyValue::Null) | None => Value::Null,
+                    Some(v) => Value::Property(v),
+                }),
+                _ => Ok(Value::Null),
+            }
         }
         ReturnExpr::Lit(lit) => Ok(match lit {
             Literal::Null => Value::Null,
@@ -2666,7 +2873,92 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let end_v = end.as_deref().map(|e| eval_projected_expr(e, row)).transpose()?;
             apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
         }
+        ReturnExpr::ListComp {
+            var,
+            source,
+            where_clause,
+            project,
+        } => {
+            let source_v = eval_projected_expr(source, row)?;
+            let items = match source_v {
+                Value::List(items) => items,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(QueryError::Parse(format!(
+                        "list comprehension source must be a list, got {other:?}"
+                    )))
+                }
+            };
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                let mut scoped_row = row.clone();
+                scoped_row.insert(var.clone(), item.clone());
+                let keep = match where_clause {
+                    Some(w) => eval_with_expr_projected(w, &scoped_row)? == Some(true),
+                    None => true,
+                };
+                if !keep {
+                    continue;
+                }
+                result.push(match project {
+                    Some(p) => eval_projected_expr(p, &scoped_row)?,
+                    None => item,
+                });
+            }
+            Ok(Value::List(result))
+        }
+        ReturnExpr::Quantifier {
+            kind,
+            var,
+            source,
+            where_clause,
+        } => {
+            let source_v = eval_projected_expr(source, row)?;
+            let items = match source_v {
+                Value::List(items) => items,
+                Value::Null => return Ok(Value::Null),
+                other => return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}"))),
+            };
+            let mut preds = Vec::with_capacity(items.len());
+            for item in &items {
+                let mut scoped_row = row.clone();
+                scoped_row.insert(var.clone(), item.clone());
+                preds.push(match where_clause {
+                    Some(w) => eval_with_expr_projected(w, &scoped_row)?,
+                    None => item_truthy(item),
+                });
+            }
+            Ok(match eval_quantifier(*kind, &preds) {
+                Some(b) => Value::Literal(Literal::Bool(b)),
+                None => Value::Null,
+            })
+        }
+        ReturnExpr::MapLit(entries) => {
+            let mut map = BTreeMap::new();
+            for (k, v) in entries {
+                map.insert(k.clone(), eval_projected_expr(v, row)?);
+            }
+            Ok(Value::Map(map))
+        }
     }
+}
+
+/// `eval_with_expr`'s post-projection counterpart -- ORDER BY (the only
+/// caller of `eval_projected_expr`) needs a list comprehension's own
+/// `WHERE` evaluated against already-projected `Value`s, not a graph-bound
+/// `BindingRow`, so this can't reuse the method version (which also needs
+/// a `Txn` to resolve `Node`/`Edge` property lookups the projected values
+/// already carry inline).
+fn eval_with_expr_projected(expr: &WithExpr, row: &HashMap<String, Value>) -> Result<Option<bool>, QueryError> {
+    Ok(match expr {
+        WithExpr::And(l, r) => and3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
+        WithExpr::Or(l, r) => or3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
+        WithExpr::Not(e) => eval_with_expr_projected(e, row)?.map(|b| !b),
+        WithExpr::Compare(lhs, op, lit) => {
+            let value = eval_projected_expr(lhs, row)?;
+            compare_value(&value, *op, lit)
+        }
+    })
 }
 
 /// `RETURN DISTINCT`'s result-set-level dedup -- structural equality of

@@ -235,6 +235,33 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
                 substitute_return_expr(e, params)?;
             }
         }
+        ReturnExpr::ListComp {
+            source,
+            where_clause,
+            project,
+            ..
+        } => {
+            substitute_return_expr(source, params)?;
+            if let Some(w) = where_clause {
+                substitute_with_expr(w, params)?;
+            }
+            if let Some(p) = project {
+                substitute_return_expr(p, params)?;
+            }
+        }
+        ReturnExpr::Quantifier {
+            source, where_clause, ..
+        } => {
+            substitute_return_expr(source, params)?;
+            if let Some(w) = where_clause {
+                substitute_with_expr(w, params)?;
+            }
+        }
+        ReturnExpr::MapLit(entries) => {
+            for (_, v) in entries {
+                substitute_return_expr(v, params)?;
+            }
+        }
     }
     Ok(())
 }

@@ -234,6 +234,37 @@ fn to_integer_parses_string_and_passes_through_int() {
 }
 
 #[test]
+fn to_integer_parses_a_float_formatted_string_by_truncating() {
+    // Regression: `toInteger('1.7')` used to fail straight to null since
+    // the string-parse path only ever tried an i64 parse.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [2, 2.9, '1.7'] AS things RETURN [n IN things | toInteger(n)] AS x");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 2, 1]);
+}
+
+#[test]
+fn to_integer_on_an_unparseable_string_is_null_not_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH ['2', '2.9', 'foo'] AS numbers RETURN [n IN numbers | toInteger(n)] AS x");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(int(&items[0]), 2);
+            assert_eq!(int(&items[1]), 2);
+            assert!(matches!(items[2], Value::Null));
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_integer_on_a_list_errors_instead_of_silently_nulling() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN toInteger([1, 2])").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("tointeger"));
+}
+
+#[test]
 fn case_when_then_else() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {age: 30})");
@@ -1654,6 +1685,14 @@ fn list_ints(v: &Value) -> Vec<i64> {
     }
 }
 
+fn bool_val(v: &Value) -> bool {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Bool(b)) => *b,
+        Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
 #[test]
 fn standalone_with_no_preceding_match() {
     let store = GraphStore::open_memory().unwrap();
@@ -1719,6 +1758,180 @@ fn list_slice_basic_and_open_ended() {
     assert_eq!(list_ints(&result.rows[0][0]), vec![2, 3]);
     assert_eq!(list_ints(&result.rows[0][1]), vec![1, 2]);
     assert_eq!(list_ints(&result.rows[0][2]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_filter_and_project() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x % 2 = 0 | x * 10] AS y",
+    );
+    assert_eq!(list_ints(&result.rows[0][0]), vec![20, 40]);
+}
+
+#[test]
+fn list_comprehension_project_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list | x * 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 4, 6]);
+}
+
+#[test]
+fn list_comprehension_filter_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x > 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_bare_identity() {
+    // No WHERE, no projection -- a legal no-op comprehension.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
+}
+
+#[test]
+fn list_comprehension_over_collected_nodes_extracts_a_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'original'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN [x IN nodes | x.name] AS oldNames",
+    );
+    match &result.rows[0][0] {
+        Value::List(items) => match &items[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "original"),
+            other => panic!("expected a String property, got {other:?}"),
+        },
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_comprehension_plain_list_with_bare_identifier_is_not_misparsed_as_a_comprehension() {
+    // `x` alone in a list (no `IN` following) must fall through to the
+    // ordinary comma-separated list_expr alternative, not be swallowed
+    // partway through a failed list_comprehension attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH 1 AS x, 2 AS y RETURN [x, y]");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2]);
+}
+
+#[test]
+fn quantifier_all_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS a, all(x IN [1, 2, 3] WHERE x > 1) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_any_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN any(x IN [1, 2, 3] WHERE x > 2) AS a, any(x IN [1, 2, 3] WHERE x > 5) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_none_on_empty_list_is_true() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN none(x IN [] WHERE x > 0) AS a");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_single_counts_exact_matches() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS a, single(x IN [1, 2, 2] WHERE x = 2) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_over_collected_nodes_scopes_the_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'a'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN none(x IN nodes WHERE x.name = 'a') AS result",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_three_valued_null_propagation() {
+    // Regression: a first version collapsed a null predicate straight to
+    // false, which happened to pass every non-null-list scenario but was
+    // wrong on lists containing nulls -- a definite true/false among the
+    // elements still decides the answer even with nulls present; only
+    // "no definite answer, but at least one unknown" is null.
+    let store = GraphStore::open_memory().unwrap();
+
+    let all = run(&store, "RETURN all(x IN [null] WHERE x = 2) AS a, all(x IN [0, null] WHERE x = 2) AS b, all(x IN [2, null] WHERE x = 2) AS c");
+    assert!(matches!(all.rows[0][0], Value::Null));
+    assert!(!bool_val(&all.rows[0][1]));
+    assert!(matches!(all.rows[0][2], Value::Null));
+
+    let any = run(&store, "RETURN any(x IN [null] WHERE x = 2) AS a, any(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(any.rows[0][0], Value::Null));
+    assert!(bool_val(&any.rows[0][1]));
+
+    let none = run(&store, "RETURN none(x IN [null] WHERE x = 2) AS a, none(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(none.rows[0][0], Value::Null));
+    assert!(!bool_val(&none.rows[0][1]));
+
+    let single = run(
+        &store,
+        "RETURN single(x IN [2, null] WHERE x = 2) AS a, single(x IN [34, 0, null, 5, 900] WHERE x < 10) AS b",
+    );
+    assert!(matches!(single.rows[0][0], Value::Null));
+    assert!(!bool_val(&single.rows[0][1]));
+}
+
+#[test]
+fn quantifier_does_not_break_ordinary_function_calls() {
+    // Regression: `ALL(...)` etc share `identifier ~ "("` with an ordinary
+    // function_call -- an unrelated call like coalesce(...) must still
+    // fall through to function_call, not get swallowed by a failed
+    // quantifier_expr attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN coalesce(null, 5) AS x");
+    assert_eq!(int(&result.rows[0][0]), 5);
+}
+
+#[test]
+fn map_literal_property_access() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH {existing: 42, notMissing: null} AS m RETURN m.missing, m.notMissing, m.existing",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert_eq!(int(&result.rows[0][2]), 42);
+}
+
+#[test]
+fn map_literal_with_expression_values() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN {a: 1, b: 1 + 1} AS m");
+    match &result.rows[0][0] {
+        Value::Map(m) => {
+            assert_eq!(int(m.get("a").unwrap()), 1);
+            assert_eq!(int(m.get("b").unwrap()), 2);
+        }
+        other => panic!("expected a Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_literal_property_access_on_null_is_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH null AS m RETURN m.missing");
+    assert!(matches!(result.rows[0][0], Value::Null));
 }
 
 #[test]
