@@ -1200,7 +1200,18 @@ impl<'a> Executor<'a> {
         };
         if let Some(order_by) = order_by {
             if !order_by_pre_applied {
-                result.rows = apply_order_by(result.rows, &result.columns, order_by, skip, limit)?;
+                let tail_items: Option<&[ReturnItem]> = match tail {
+                    Some(Tail::Return(items, _)) => Some(items),
+                    _ => None,
+                };
+                result.rows = apply_order_by(
+                    result.rows,
+                    &result.columns,
+                    order_by,
+                    tail_items,
+                    skip,
+                    limit,
+                )?;
             }
         } else if distinct_return {
             // The pre-truncate above was skipped for exactly this case --
@@ -1238,7 +1249,14 @@ impl<'a> Executor<'a> {
         };
         let mut rows = self.materialize_with(txn, with, &rows)?;
         if let Some(with_order_by) = &with.order_by {
-            rows = self.apply_order_by_bindings(txn, rows, with_order_by, with.skip, with.limit)?;
+            rows = self.apply_order_by_bindings(
+                txn,
+                rows,
+                &with.items,
+                with_order_by,
+                with.skip,
+                with.limit,
+            )?;
         } else {
             let skip_n = with.skip.unwrap_or(0).max(0) as usize;
             if skip_n > 0 {
@@ -1558,16 +1576,41 @@ impl<'a> Executor<'a> {
         &self,
         txn: Txn,
         rows: Vec<BindingRow>,
+        with_items: &[ReturnItem],
         order_by: &[(ReturnExpr, SortDir)],
         skip: Option<i64>,
         limit: Option<i64>,
     ) -> Result<Vec<BindingRow>, QueryError> {
+        // Same reasoning as `apply_order_by`'s `order_by_col` shortcut: an
+        // ORDER BY item that repeats a WITH item's expression verbatim
+        // (`WITH sum(x) AS s ORDER BY sum(x)`, TCK's WithOrderBy4 [11])
+        // refers to that already-computed item, not a fresh expression --
+        // look it up by its output name directly (works whether or not
+        // that item has an alias) rather than re-evaluating the
+        // expression, which would need pre-aggregation bindings that no
+        // longer exist at this post-`materialize_with` point (an
+        // aggregate call reaching `eval_projected_expr` always errors, by
+        // design).
+        let order_by_output: Vec<Option<String>> = order_by
+            .iter()
+            .map(|(expr, _)| {
+                with_items
+                    .iter()
+                    .enumerate()
+                    .find(|(_, item)| item.expr == *expr)
+                    .map(with_item_output_name)
+            })
+            .collect();
         let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
         for row in rows {
             let value_map = self.binding_row_to_value_map(txn, &row)?;
             let keys = order_by
                 .iter()
-                .map(|(expr, _)| eval_projected_expr(expr, &value_map))
+                .zip(&order_by_output)
+                .map(|((expr, _), output_name)| match output_name {
+                    Some(name) => Ok(value_map.get(name).cloned().unwrap_or(Value::Null)),
+                    None => eval_projected_expr(expr, &value_map),
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
@@ -3311,7 +3354,7 @@ fn is_top_level_aggregate(expr: &ReturnExpr) -> bool {
 /// argument, or inside a non-aggregate expression's `CASE`/`Call`
 /// arguments (an aggregate must be a return item's *entire* top-level
 /// expression — see `validate_return_items`).
-fn contains_aggregate(expr: &ReturnExpr) -> bool {
+pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
     match expr {
         ReturnExpr::CountStar => true,
         ReturnExpr::Call { name, args, .. } => {
@@ -6403,6 +6446,7 @@ fn apply_order_by(
     rows: Vec<Vec<Value>>,
     columns: &[String],
     order_by: &[(ReturnExpr, SortDir)],
+    items: Option<&[ReturnItem]>,
     skip: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<Vec<Value>>, QueryError> {
@@ -6411,13 +6455,21 @@ fn apply_order_by(
     // output column by its default name -- match it directly by position
     // rather than re-evaluating the expression, which would need bindings
     // (e.g. `n`) that only the pre-aggregation rows had and are gone by
-    // this post-projection point.
+    // this post-projection point. That name-based match only works for an
+    // *unaliased* item (its column name literally is its default name) --
+    // an aliased item repeated verbatim (`RETURN sum(x) AS s ORDER BY
+    // sum(x)`, TCK's WithOrderBy4 [11]) needs a structural match against
+    // the item's own expression instead, falling back to position in
+    // `items` (1:1 with `columns`, one column per return item).
     let order_by_col: Vec<Option<usize>> = order_by
         .iter()
         .map(|(expr, _)| {
             columns
                 .iter()
                 .position(|c| *c == default_column_name(expr, 0))
+                .or_else(|| {
+                    items.and_then(|items| items.iter().position(|item| item.expr == *expr))
+                })
         })
         .collect();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());

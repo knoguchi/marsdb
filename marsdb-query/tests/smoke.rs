@@ -672,6 +672,88 @@ fn order_by_then_limit_with_aggregation() {
     assert_eq!(values, vec![4, 3]);
 }
 
+/// An aggregate in ORDER BY is only legal when the RETURN/WITH clause
+/// itself is aggregating -- a compile-time error otherwise (real Cypher's
+/// `InvalidAggregation`), not a runtime one. TCK's ReturnOrderBy2 [14] /
+/// WithOrderBy2 [25].
+#[test]
+fn order_by_aggregate_without_aggregating_return_or_with_is_a_semantic_error() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {idx: 1})");
+    let stmt = parse("MATCH (n) RETURN n.idx ORDER BY max(n.idx)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregat"));
+
+    let stmt = parse("MATCH (n) WITH n.idx AS x ORDER BY count(1) RETURN x").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregat"));
+}
+
+/// An ORDER BY item that repeats a RETURN/WITH item's expression verbatim
+/// refers to that already-aggregated item, not a fresh expression -- must
+/// not be re-evaluated against pre-aggregation bindings (which no longer
+/// exist post-grouping). Real, previously-broken TCK scenarios: WithOrderBy4
+/// [11] (aliased, still matched by expression) and ReturnOrderBy3 (unaliased).
+#[test]
+fn order_by_repeats_an_aggregating_return_or_with_item_verbatim() {
+    let store = GraphStore::open_memory().unwrap();
+    for (num, num2) in [(1, 4), (5, 2), (9, 0), (3, 3), (7, 1)] {
+        run(&store, &format!("CREATE (:A {{num: {num}, num2: {num2}}})"));
+    }
+    let result = run(
+        &store,
+        "MATCH (a:A) WITH a.num2 % 3 AS mod, sum(a.num + a.num2) AS sum \
+         ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, sum",
+    );
+    let rows: Vec<(i64, i64)> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let get = |v: &Value| match v {
+                Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+                other => panic!("unexpected value {other:?}"),
+            };
+            (get(&row[0]), get(&row[1]))
+        })
+        .collect();
+    assert_eq!(rows, vec![(2, 7), (1, 13)]);
+
+    let store2 = GraphStore::open_memory().unwrap();
+    run(&store2, "CREATE (:Person {division: 'Sweden'})");
+    run(&store2, "CREATE (:Person {division: 'Sweden'})");
+    run(&store2, "CREATE (:Person {division: 'England'})");
+    run(&store2, "CREATE (:Person {division: 'Germany'})");
+    let result2 = run(
+        &store2,
+        "MATCH (n:Person) RETURN n.division, count(*) ORDER BY count(*) DESC, n.division ASC",
+    );
+    let divisions: Vec<String> = result2
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(divisions, vec!["Sweden", "England", "Germany"]);
+}
+
+/// An ORDER BY aggregate that matches *no* RETURN/WITH item (not even by
+/// expression identity) is still rejected, even though the tail itself
+/// aggregates -- TCK's WithOrderBy4 [14].
+#[test]
+fn order_by_aggregate_not_matching_any_aggregating_item_is_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {num: 1, num2: 4})");
+    let stmt = parse(
+        "MATCH (a:A) WITH a.num2 % 3 AS mod, min(a.num + a.num2) AS min \
+         ORDER BY sum(a.num + a.num2) LIMIT 2 RETURN mod, min",
+    )
+    .unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregat"));
+}
+
 /// `LIMIT 0` combined with `ORDER BY` is valid Cypher and must return
 /// nothing, not error or return everything -- an edge case `top_k_by`'s
 /// partial-select path needs to special-case explicitly (`select_nth_

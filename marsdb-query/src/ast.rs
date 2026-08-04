@@ -69,7 +69,7 @@ pub enum Expr {
     VarEq(String, String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReturnExpr {
     Var(String),
     Prop(PropAccess),
