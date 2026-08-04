@@ -52,7 +52,7 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
         // Binding::Path arm — grouping/DISTINCT/collect(DISTINCT) by a
         // path isn't a case any real usage needs.
         Value::Path(_) => {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Type(
                 "grouping or using DISTINCT with a path (e.g. a named-path/shortestPath() variable) isn't supported"
                     .into(),
             ))
@@ -61,7 +61,7 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
         // hash convention this codebase has picked yet, and no real usage
         // needs grouping/DISTINCT by a whole map value.
         Value::Map(_) => {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Type(
                 "grouping or using DISTINCT with a map value isn't supported".into(),
             ))
         }
@@ -211,7 +211,7 @@ impl AggAcc {
                 if dedup_seen(distinct, v)? {
                     *n = n
                         .checked_add(1)
-                        .ok_or_else(|| QueryError::Parse("count() overflow".into()))?;
+                        .ok_or_else(|| QueryError::Type("count() overflow".into()))?;
                 }
             }
             AggAcc::Sum {
@@ -227,14 +227,14 @@ impl AggAcc {
                     Some(Numeric::Int(i)) => {
                         *total_int = total_int
                             .checked_add(i)
-                            .ok_or_else(|| QueryError::Parse("sum() integer overflow".into()))?;
+                            .ok_or_else(|| QueryError::Type("sum() integer overflow".into()))?;
                     }
                     Some(Numeric::Float(f)) => {
                         *saw_float = true;
                         *total_float += f;
                     }
                     None => {
-                        return Err(QueryError::Parse(format!(
+                        return Err(QueryError::Type(format!(
                             "sum() requires a numeric argument, got {}",
                             value_type_name(v)
                         )))
@@ -249,7 +249,7 @@ impl AggAcc {
                     Some(Numeric::Int(i)) => i as f64,
                     Some(Numeric::Float(f)) => f,
                     None => {
-                        return Err(QueryError::Parse(format!(
+                        return Err(QueryError::Type(format!(
                             "avg() requires a numeric argument, got {}",
                             value_type_name(v)
                         )))
@@ -258,14 +258,14 @@ impl AggAcc {
                 *total += f;
                 *n = n
                     .checked_add(1)
-                    .ok_or_else(|| QueryError::Parse("avg() count overflow".into()))?;
+                    .ok_or_else(|| QueryError::Type("avg() count overflow".into()))?;
             }
             AggAcc::Min { distinct, best } => {
                 if !dedup_seen(distinct, v)? {
                     return Ok(());
                 }
                 if comparable_ordering(v, v).is_none() {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Type(format!(
                         "min() requires a comparable scalar argument, got {}",
                         value_type_name(v)
                     )));
@@ -283,7 +283,7 @@ impl AggAcc {
                     return Ok(());
                 }
                 if comparable_ordering(v, v).is_none() {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Type(format!(
                         "max() requires a comparable scalar argument, got {}",
                         value_type_name(v)
                     )));

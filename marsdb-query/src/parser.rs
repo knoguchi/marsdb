@@ -11,7 +11,7 @@ struct CypherParser;
 
 pub fn parse(input: &str) -> Result<Statement, QueryError> {
     let mut pairs =
-        CypherParser::parse(Rule::query, input).map_err(|e| QueryError::Parse(e.to_string()))?;
+        CypherParser::parse(Rule::query, input).map_err(|e| QueryError::Syntax(e.to_string()))?;
     let query_pair = pairs.next().expect("query rule always produces one pair");
     let statement_pair = query_pair
         .into_inner()
@@ -25,7 +25,7 @@ pub fn parse(input: &str) -> Result<Statement, QueryError> {
 /// literal doesn't split anything — see `queries`' grammar comment.
 pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
     let mut pairs =
-        CypherParser::parse(Rule::queries, input).map_err(|e| QueryError::Parse(e.to_string()))?;
+        CypherParser::parse(Rule::queries, input).map_err(|e| QueryError::Syntax(e.to_string()))?;
     let queries_pair = pairs.next().expect("queries rule always produces one pair");
     queries_pair
         .into_inner()
@@ -130,7 +130,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     // clause kind's `with` uniformly.
     let with_count = clauses.iter().filter(|c| clause_with(c).is_some()).count();
     if with_count > 1 {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Syntax(
             "chaining past one WITH boundary in a single MATCH isn't supported yet".into(),
         ));
     }
@@ -141,7 +141,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
             continue;
         };
         if part.with.is_none() && !next.optional {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Syntax(
                 "multiple MATCH clauses must be separated by WITH".into(),
             ));
         }
@@ -153,7 +153,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     // mistake (`MATCH (n)` alone does nothing at all), so it's still
     // rejected.
     if tail.is_none() && !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_))) {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Syntax(
             "a query needs a RETURN/DELETE/SET tail, unless it has a MERGE clause with nothing after it".into(),
         ));
     }
@@ -197,7 +197,7 @@ fn parse_merge_clause(pair: Pair<Rule>) -> Result<MergeClause, QueryError> {
     let mut inner = pair.into_inner();
     let pattern = parse_pattern(inner.next().expect("merge_clause has a pattern"))?;
     if pattern.hops.len() > 1 {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Syntax(
             "MERGE with more than one relationship hop isn't supported yet — split it into a MATCH \
              for the already-known part and a MERGE for one new hop"
                 .into(),
@@ -359,7 +359,7 @@ fn parse_path_pattern(pair: Pair<Rule>) -> Result<(Option<String>, bool, Pattern
 /// traverse at all).
 fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
     if pattern.hops.len() != 1 || pattern.hops[0].0.hop_range.is_none() {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Syntax(
             "shortestPath() requires exactly one variable-length relationship pattern (e.g. (a)-[:TYPE*..5]-(b))"
                 .into(),
         ));
@@ -372,7 +372,7 @@ fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
 /// why a variable-length hop isn't supported there.
 fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
     if pattern.hops.iter().any(|(rel, _)| rel.hop_range.is_some()) {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Syntax(
             "named-path capture (`p = ...`) over a variable-length relationship pattern isn't supported yet \
              — use shortestPath() instead, or drop the path variable"
                 .into(),
@@ -475,9 +475,9 @@ fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
     let n = n_pair
         .as_str()
         .parse::<i64>()
-        .map_err(|_| QueryError::Parse("invalid LIMIT value".into()))?;
+        .map_err(|_| QueryError::Syntax("invalid LIMIT value".into()))?;
     if n < 0 {
-        return Err(QueryError::Parse("LIMIT can't be negative".into()));
+        return Err(QueryError::Syntax("LIMIT can't be negative".into()));
     }
     Ok(n)
 }
@@ -493,12 +493,12 @@ fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
 /// are rejected rather than silently mishandled.
 fn splice_patterns(mut patterns: Vec<Pattern>) -> Result<Pattern, QueryError> {
     if patterns.is_empty() {
-        return Err(QueryError::Parse("MATCH requires a pattern".into()));
+        return Err(QueryError::Syntax("MATCH requires a pattern".into()));
     }
     let mut combined = patterns.remove(0);
     for next in patterns {
         let Some(start_var) = next.start.var.clone() else {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Syntax(
                 "a comma-separated MATCH pattern must start from a named variable".into(),
             ));
         };
@@ -508,7 +508,7 @@ fn splice_patterns(mut patterns: Vec<Pattern>) -> Result<Pattern, QueryError> {
             .map(|(_, n)| n.var.clone())
             .unwrap_or_else(|| combined.start.var.clone());
         if last_var.as_deref() != Some(start_var.as_str()) {
-            return Err(QueryError::Parse(format!(
+            return Err(QueryError::Syntax(format!(
                 "comma-separated MATCH pattern must continue from the previous pattern's last \
                  variable ('{}'), not '{start_var}' — general cross-joins aren't supported",
                 last_var.unwrap_or_default()
@@ -1027,7 +1027,7 @@ fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let is_star = call_args.as_str().trim() == "*";
     if is_star {
         if !name.eq_ignore_ascii_case("count") {
-            return Err(QueryError::Parse(format!(
+            return Err(QueryError::Syntax(format!(
                 "'{name}(*)' isn't valid — '*' is only meaningful for count(*)"
             )));
         }
@@ -1042,7 +1042,7 @@ fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         }
     }
     if distinct && !is_aggregate_name(&name) {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Syntax(format!(
             "'{name}(DISTINCT ...)' isn't valid — DISTINCT is only meaningful inside an aggregate function"
         )));
     }
@@ -1075,7 +1075,7 @@ fn parse_pattern(pair: Pair<Rule>) -> Result<Pattern, QueryError> {
     while let Some(rel_pair) = inner.next() {
         let node_pair = inner
             .next()
-            .ok_or_else(|| QueryError::Parse("dangling relationship in pattern".into()))?;
+            .ok_or_else(|| QueryError::Syntax("dangling relationship in pattern".into()))?;
         hops.push((parse_rel_pattern(rel_pair)?, parse_node_pattern(node_pair)?));
     }
     Ok(Pattern { start, hops })
@@ -1157,21 +1157,21 @@ fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
         } else {
             min_str
                 .parse()
-                .map_err(|_| QueryError::Parse("invalid variable-length min hop count".into()))?
+                .map_err(|_| QueryError::Syntax("invalid variable-length min hop count".into()))?
         };
         let max =
             if max_str.is_empty() {
                 None
             } else {
                 Some(max_str.parse().map_err(|_| {
-                    QueryError::Parse("invalid variable-length max hop count".into())
+                    QueryError::Syntax("invalid variable-length max hop count".into())
                 })?)
             };
         Ok((min, max))
     } else {
         let n: u32 = rest
             .parse()
-            .map_err(|_| QueryError::Parse("invalid variable-length hop count".into()))?;
+            .map_err(|_| QueryError::Syntax("invalid variable-length hop count".into()))?;
         Ok((n, Some(n)))
     }
 }
@@ -1233,11 +1233,15 @@ fn unescape_string(s: &str) -> Result<String, QueryError> {
             Some('b') => out.push('\u{8}'),
             Some('f') => out.push('\u{c}'),
             Some(other) => {
-                return Err(QueryError::Parse(format!(
+                return Err(QueryError::Syntax(format!(
                     "unrecognized string escape '\\{other}'"
                 )))
             }
-            None => return Err(QueryError::Parse("string ends with a trailing '\\'".into())),
+            None => {
+                return Err(QueryError::Syntax(
+                    "string ends with a trailing '\\'".into(),
+                ))
+            }
         }
     }
     Ok(out)
@@ -1250,13 +1254,13 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
             inner
                 .as_str()
                 .parse()
-                .map_err(|_| QueryError::Parse("invalid integer literal".into()))?,
+                .map_err(|_| QueryError::Syntax("invalid integer literal".into()))?,
         ),
         Rule::float_literal => Literal::Float(
             inner
                 .as_str()
                 .parse()
-                .map_err(|_| QueryError::Parse("invalid float literal".into()))?,
+                .map_err(|_| QueryError::Syntax("invalid float literal".into()))?,
         ),
         Rule::string_literal => {
             let s = inner.as_str();

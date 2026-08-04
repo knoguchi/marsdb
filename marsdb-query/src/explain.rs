@@ -42,7 +42,7 @@ pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, Quer
             "(no query plan -- CREATE INDEX ON :{label}({prop}){} declares an index, it doesn't scan/match anything)",
             if *unique { " UNIQUE" } else { "" }
         )]),
-        Statement::Explain(_) => Err(QueryError::Parse(
+        Statement::Explain(_) => Err(QueryError::Semantic(
             "EXPLAIN EXPLAIN isn't supported".to_string(),
         )),
         Statement::Match { clauses, tail, .. } => {

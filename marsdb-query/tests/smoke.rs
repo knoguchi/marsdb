@@ -3684,3 +3684,32 @@ fn explain_shows_expand_between_two_scans() {
         .iter()
         .any(|l| l.contains("NodeByLabelScan(a:Person)")));
 }
+
+#[test]
+fn syntax_error_for_malformed_query_text() {
+    // Never reaches planning/execution at all -- pest itself rejects it.
+    let err = parse("MATCH (n RETURN n").unwrap_err();
+    assert!(err.to_string().starts_with("syntax error:"));
+}
+
+#[test]
+fn semantic_error_for_structurally_invalid_but_parseable_query() {
+    // Parses fine, but references a name never bound anywhere -- caught
+    // by the pre-execution semantic pass, not a grammar failure.
+    let stmt = parse("RETURN missing").unwrap();
+    let store = GraphStore::open_memory().unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
+}
+
+#[test]
+fn type_error_for_a_runtime_value_shape_mismatch() {
+    // The query is syntactically and structurally fine (both operands
+    // are "a scalar" as far as the pre-execution semantic pass can tell)
+    // -- the mismatch only exists once the actual values are in hand and
+    // one turns out to be a bool, not a number.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 + true").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("type error:"));
+}

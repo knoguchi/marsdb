@@ -119,7 +119,7 @@ pub fn build_match_plan(
         // Expand candidate happened to be instead of filtering down to it.
         if let Some(v) = &rel.var {
             if pattern_rel_var_names.contains(v) {
-                return Err(QueryError::Parse(format!(
+                return Err(QueryError::Semantic(format!(
                     "'{v}' is used for two different relationships in the same pattern — a relationship \
                      variable can't be reused within one MATCH pattern"
                 )));
@@ -160,7 +160,7 @@ pub fn build_match_plan(
                     // variable-length pattern's rel_var; v1 doesn't support
                     // that value shape, so reject rather than silently bind
                     // just the last hop's edge (wrong, not just incomplete).
-                    return Err(QueryError::Parse(
+                    return Err(QueryError::Semantic(
                         "binding a variable name to a variable-length relationship (e.g. \
                          [r:TYPE*1..3]) isn't supported — omit the variable name"
                             .into(),
@@ -172,7 +172,7 @@ pub fn build_match_plan(
                     // rather than silently ignore the props (same reasoning
                     // as everywhere else in this planner: a correctness trap
                     // otherwise).
-                    return Err(QueryError::Parse(
+                    return Err(QueryError::Semantic(
                         "inline properties on a variable-length relationship pattern (e.g. \
                          [:TYPE* {prop: 'x'}]) aren't supported"
                             .into(),
@@ -348,7 +348,7 @@ fn rebuild_and(mut exprs: Vec<Expr>) -> Option<Expr> {
 fn require_literal_pattern_prop(key: &str, expr: &ReturnExpr) -> Result<Literal, QueryError> {
     match expr {
         ReturnExpr::Lit(lit) => Ok(lit.clone()),
-        _ => Err(QueryError::Parse(format!(
+        _ => Err(QueryError::Semantic(format!(
             "MATCH/MERGE pattern property '{key}' must be a literal value, not a computed expression — \
              only CREATE's inline {{...}} supports that"
         ))),

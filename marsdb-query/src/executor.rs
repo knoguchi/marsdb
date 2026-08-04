@@ -59,7 +59,15 @@ impl CancellationToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionOutcome {
     Success,
-    ParseOrSemanticError,
+    /// The query text itself never parsed — see `QueryError::Syntax`.
+    SyntaxError,
+    /// The query parsed but is structurally invalid, independent of any
+    /// data/parameters — see `QueryError::Semantic`.
+    SemanticError,
+    /// A real value (from stored data or a `$parameter`) turned out to be
+    /// the wrong shape for what the query does with it — see
+    /// `QueryError::Type`.
+    TypeError,
     GraphError,
     UnboundVariable,
     MissingParameter,
@@ -71,7 +79,9 @@ pub enum ExecutionOutcome {
 impl ExecutionOutcome {
     pub fn from_error(error: &QueryError) -> Self {
         match error {
-            QueryError::Parse(_) => Self::ParseOrSemanticError,
+            QueryError::Syntax(_) => Self::SyntaxError,
+            QueryError::Semantic(_) => Self::SemanticError,
+            QueryError::Type(_) => Self::TypeError,
             QueryError::Graph(_) => Self::GraphError,
             QueryError::UnboundVariable(_) => Self::UnboundVariable,
             QueryError::MissingParam(_) => Self::MissingParameter,
@@ -567,7 +577,7 @@ impl<'a> Executor<'a> {
                 }
                 for (rel, node) in &pattern.hops {
                     if rel.hop_range.is_some() {
-                        return Err(QueryError::Parse(
+                        return Err(QueryError::Semantic(
                             "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                         ));
                     }
@@ -583,7 +593,7 @@ impl<'a> Executor<'a> {
                         RelDirection::Right => (prev_id, node_id),
                         RelDirection::Left => (node_id, prev_id),
                         RelDirection::Either => {
-                            return Err(QueryError::Parse(
+                            return Err(QueryError::Semantic(
                                 "CREATE requires a directed relationship (-> or <-), not an undirected pattern".into(),
                             ))
                         }
@@ -618,12 +628,12 @@ impl<'a> Executor<'a> {
         if let Some(var) = &node.var {
             if let Some(binding) = row.get(var) {
                 let Binding::Node(id) = binding else {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Type(format!(
                         "'{var}' is not a node — can't use it as a CREATE pattern endpoint"
                     )));
                 };
                 if !node.labels.is_empty() || !node.props.is_empty() {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Semantic(format!(
                         "'{var}' is already bound — CREATE can't add labels/properties to an existing node"
                     )));
                 }
@@ -654,7 +664,7 @@ impl<'a> Executor<'a> {
             .map(|(k, expr)| {
                 let value = self.eval_return_expr(txn, expr, row)?;
                 let pv = value_to_storable_property(&value).ok_or_else(|| {
-                    QueryError::Parse(format!(
+                    QueryError::Type(format!(
                         "property '{k}' can't be stored -- MarsDB's node/edge properties are limited to null/\
                          bool/int/float/string/date/duration; a list/map/node/edge/path value (got {value:?}) \
                          isn't storable, matching PropertyValue's real, deliberately fixed set of variants (see \
@@ -703,7 +713,7 @@ impl<'a> Executor<'a> {
         require_mergeable(&clause.pattern.start, row)?;
         for (rel, node) in &clause.pattern.hops {
             if rel.hop_range.is_some() {
-                return Err(QueryError::Parse(
+                return Err(QueryError::Semantic(
                     "MERGE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                 ));
             }
@@ -760,7 +770,7 @@ impl<'a> Executor<'a> {
             let (src, dst) = match rel.direction {
                 RelDirection::Right => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
-                RelDirection::Either => return Err(QueryError::Parse(
+                RelDirection::Either => return Err(QueryError::Semantic(
                     "MERGE requires a directed relationship (-> or <-), not an undirected pattern"
                         .into(),
                 )),
@@ -1090,7 +1100,7 @@ impl<'a> Executor<'a> {
                         .get(name)
                         .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
                     let Binding::List(items) = binding else {
-                        return Err(QueryError::Parse(format!(
+                        return Err(QueryError::Type(format!(
                             "'{name}' isn't a list — UNWIND needs a list (e.g. from collect())"
                         )));
                     };
@@ -2124,7 +2134,7 @@ impl<'a> Executor<'a> {
             }
             frontier = next_frontier;
             if depth == effective_max && unbounded && !frontier.is_empty() {
-                return Err(QueryError::Parse(format!(
+                return Err(QueryError::ResourceLimit(format!(
                     "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
                      hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
                      add an explicit upper bound (e.g. *0..10)"
@@ -2339,7 +2349,7 @@ impl<'a> Executor<'a> {
                 // subexpression (see `resolve_grouped_rows`), so this is
                 // an internal-consistency error, not a normal user path.
                 if is_aggregate_name(name) {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Semantic(format!(
                         "aggregate function '{name}' can only be used as a return item's top-level expression"
                     )));
                 }
@@ -2349,7 +2359,7 @@ impl<'a> Executor<'a> {
                     .collect::<Result<Vec<_>, _>>()?;
                 call_builtin(name, &arg_values)
             }
-            ReturnExpr::CountStar => Err(QueryError::Parse(
+            ReturnExpr::CountStar => Err(QueryError::Semantic(
                 "count(*) can only be used as a return item's top-level expression".into(),
             )),
             ReturnExpr::Case { test, whens, else_ } => {
@@ -2416,7 +2426,7 @@ impl<'a> Executor<'a> {
                     Value::List(items) => items,
                     Value::Null => return Ok(Value::Null),
                     other => {
-                        return Err(QueryError::Parse(format!(
+                        return Err(QueryError::Type(format!(
                             "list comprehension source must be a list, got {other:?}"
                         )))
                     }
@@ -2453,7 +2463,7 @@ impl<'a> Executor<'a> {
                     Value::List(items) => items,
                     Value::Null => return Ok(Value::Null),
                     other => {
-                        return Err(QueryError::Parse(format!(
+                        return Err(QueryError::Type(format!(
                             "quantifier source must be a list, got {other:?}"
                         )))
                     }
@@ -2956,19 +2966,19 @@ pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryErr
             ReturnExpr::CountStar => {}
             ReturnExpr::Call { name, args, .. } if is_aggregate_name(name) => {
                 if args.len() != 1 {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Semantic(format!(
                         "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
                     )));
                 }
                 if contains_aggregate(&args[0]) {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Semantic(format!(
                         "aggregate function '{name}' can't take another aggregate as an argument"
                     )));
                 }
             }
             other => {
                 if contains_aggregate(other) {
-                    return Err(QueryError::Parse(
+                    return Err(QueryError::Semantic(
                         "an aggregate function must be a return item's entire expression, not nested inside \
                          another expression"
                             .into(),
@@ -2997,7 +3007,7 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
         // usage needs, and this codebase's stance is to reject an
         // untested shape rather than guess at its semantics.
         Binding::Path(_) => {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Type(
                 "grouping or collecting by a path (e.g. a named-path/shortestPath() variable) isn't supported"
                     .into(),
             ))
@@ -3005,7 +3015,7 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
         // Same stance as `Path` above -- see `value_hash_key`'s matching
         // `Value::Map` arm.
         Binding::Map(_) => {
-            return Err(QueryError::Parse(
+            return Err(QueryError::Type(
                 "grouping or using DISTINCT with a map value isn't supported".into(),
             ))
         }
@@ -3276,7 +3286,7 @@ fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
 fn require_mergeable(node: &NodePattern, row: &BindingRow) -> Result<(), QueryError> {
     let already_bound = node.var.as_ref().is_some_and(|v| row.contains_key(v));
     if !already_bound && node.labels.is_empty() && node.props.is_empty() {
-        return Err(QueryError::Parse(
+        return Err(QueryError::Semantic(
             "MERGE requires a label or property to match/create by — an unconstrained node pattern is ambiguous"
                 .into(),
         ));
@@ -3380,7 +3390,7 @@ fn value_to_bool3(v: &Value) -> Result<Option<bool>, QueryError> {
     match v {
         Value::Null => Ok(None),
         Value::Literal(Literal::Bool(b)) | Value::Property(PropertyValue::Bool(b)) => Ok(Some(*b)),
-        other => Err(QueryError::Parse(format!(
+        other => Err(QueryError::Type(format!(
             "expected a boolean, got {other:?}"
         ))),
     }
@@ -3526,7 +3536,7 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
         return Ok(result);
     }
     let (Some(na), Some(nb)) = (as_arith_num(a), as_arith_num(b)) else {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "arithmetic needs two numbers (or, for +, two strings) -- got {a:?} and {b:?}"
         )));
     };
@@ -3536,7 +3546,7 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
     Ok(match (na, nb) {
         (ArithNum::Int(x), ArithNum::Int(y)) => {
             if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0 {
-                return Err(QueryError::Parse("division by zero".into()));
+                return Err(QueryError::Type("division by zero".into()));
             }
             let value = match op {
                 ArithOp::Add => x.checked_add(y),
@@ -3545,7 +3555,7 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
                 ArithOp::Div => x.checked_div(y),
                 ArithOp::Mod => x.checked_rem(y),
             }
-            .ok_or_else(|| QueryError::Parse("integer arithmetic overflow".into()))?;
+            .ok_or_else(|| QueryError::Type("integer arithmetic overflow".into()))?;
             Value::Property(PropertyValue::Int(value))
         }
         (x, y) => {
@@ -3618,7 +3628,7 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
             temporal::add_duration_to_date(d, months, days, seconds, nanos, negate)
                 .map(|d| Value::Property(PropertyValue::Date(d)))
                 .ok_or_else(|| {
-                    QueryError::Parse("date +/- duration produced an out-of-range date".into())
+                    QueryError::Type("date +/- duration produced an out-of-range date".into())
                 })
         };
     Ok(match op {
@@ -3629,7 +3639,7 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
                 Some(date_plus_duration(d, dur, false)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
                 Some(duration_value(temporal::add_duration(x, y).ok_or_else(
-                    || QueryError::Parse("duration addition overflow".into()),
+                    || QueryError::Type("duration addition overflow".into()),
                 )?))
             } else {
                 None
@@ -3640,7 +3650,7 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
                 Some(date_plus_duration(d, dur, true)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
                 Some(duration_value(temporal::sub_duration(x, y).ok_or_else(
-                    || QueryError::Parse("duration subtraction overflow".into()),
+                    || QueryError::Type("duration subtraction overflow".into()),
                 )?))
             } else {
                 None
@@ -3658,7 +3668,7 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
         ArithOp::Div => {
             if let (Some(dur), Some(f)) = (as_duration(a), value_as_f64(b)) {
                 if f == 0.0 {
-                    return Err(QueryError::Parse("division by zero".into()));
+                    return Err(QueryError::Type("division by zero".into()));
                 }
                 Some(duration_value(temporal::scale_duration(dur, 1.0 / f)))
             } else {
@@ -3686,19 +3696,19 @@ fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
     // needed the way `map_value_as_property` has to for `.prop`.
     if let Value::Map(entries) = list {
         let Some(key) = as_arith_str(index) else {
-            return Err(QueryError::Parse(format!(
+            return Err(QueryError::Type(format!(
                 "a map index must be a string, got {index:?}"
             )));
         };
         return Ok(entries.get(key).cloned().unwrap_or(Value::Null));
     }
     let Value::List(items) = list else {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "[] indexing needs a list or map, got {list:?}"
         )));
     };
     let Some(ArithNum::Int(i)) = as_arith_num(index) else {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "a list index must be an integer, got {index:?}"
         )));
     };
@@ -3725,7 +3735,7 @@ fn apply_slice(
         return Ok(Value::Null);
     }
     let Value::List(items) = list else {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "[..] slicing needs a list, got {list:?}"
         )));
     };
@@ -3740,7 +3750,7 @@ fn apply_slice(
             Some(Value::Null) => Ok(None),
             Some(other) => match as_arith_num(other) {
                 Some(ArithNum::Int(i)) => Ok(Some(clamp(i))),
-                _ => Err(QueryError::Parse(format!(
+                _ => Err(QueryError::Type(format!(
                     "a slice bound must be an integer, got {other:?}"
                 ))),
             },
@@ -3787,12 +3797,12 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             }
             Some(Value::Null) | None => Value::Null,
             Some(other) => {
-                return Err(QueryError::Parse(format!(
+                return Err(QueryError::Type(format!(
                     "length() expects a path, got {other:?}"
                 )))
             }
         }),
-        other => Err(QueryError::Parse(format!("unknown function: {other}"))),
+        other => Err(QueryError::Semantic(format!("unknown function: {other}"))),
     }
 }
 
@@ -3899,7 +3909,7 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
         | Value::List(_)
         | Value::Map(_)
         | Value::Path(_) => {
-            return Err(QueryError::Parse(format!(
+            return Err(QueryError::Type(format!(
                 "toInteger() cannot convert {v:?} to an integer"
             )))
         }
@@ -3934,7 +3944,7 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
         Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
-            return Err(QueryError::Parse(format!(
+            return Err(QueryError::Type(format!(
                 "toString() cannot convert {v:?} to a string"
             )))
         }
@@ -3955,7 +3965,7 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
 /// return a clear error/`None` for those rather than guessing.
 fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if args.len() > 1 {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Semantic(format!(
             "date() expects zero or one argument, got {}",
             args.len()
         )));
@@ -3973,7 +3983,7 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     if let Some(s) = as_arith_str(arg) {
         let d = temporal::parse_date(s).ok_or_else(|| {
-            QueryError::Parse(format!(
+            QueryError::Type(format!(
                 "'{s}' isn't a date string MarsDB can parse -- only the calendar forms YYYY-MM-DD/YYYYMMDD/\
                  YYYY-MM/YYYYMM/YYYY are supported, not week-date or ordinal-date forms"
             ))
@@ -3983,7 +3993,7 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if let Value::Map(m) = arg {
         return Ok(Value::Property(PropertyValue::Date(date_from_map(m)?)));
     }
-    Err(QueryError::Parse(format!(
+    Err(QueryError::Type(format!(
         "date() doesn't support this argument: {arg:?}"
     )))
 }
@@ -3993,22 +4003,22 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
 fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
     const ALLOWED: &[&str] = &["year", "month", "day"];
     if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "date({{...}}) key '{bad}' isn't supported -- MarsDB only builds a Date from a calendar {{year, month, \
              day}} map, not week-date/quarter/ordinal-day construction"
         )));
     }
     let integer_field = |key: &str, value: &Value| {
         value_as_i64(value)
-            .ok_or_else(|| QueryError::Parse(format!("date({{...}})'s '{key}' must be an integer")))
+            .ok_or_else(|| QueryError::Type(format!("date({{...}})'s '{key}' must be an integer")))
     };
     let year_raw = integer_field(
         "year",
         m.get("year")
-            .ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?,
+            .ok_or_else(|| QueryError::Type("date({...}) requires a 'year' key".into()))?,
     )?;
     let year = i32::try_from(year_raw).map_err(|_| {
-        QueryError::Parse(format!(
+        QueryError::Type(format!(
             "date({{...}})'s 'year' is out of range: {year_raw}"
         ))
     })?;
@@ -4017,7 +4027,7 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
         None => 1,
     };
     let month = u32::try_from(month_raw).map_err(|_| {
-        QueryError::Parse(format!(
+        QueryError::Type(format!(
             "date({{...}})'s 'month' is out of range: {month_raw}"
         ))
     })?;
@@ -4026,10 +4036,10 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
         None => 1,
     };
     let day = u32::try_from(day_raw).map_err(|_| {
-        QueryError::Parse(format!("date({{...}})'s 'day' is out of range: {day_raw}"))
+        QueryError::Type(format!("date({{...}})'s 'day' is out of range: {day_raw}"))
     })?;
     temporal::epoch_day_from_ymd(year, month, day).ok_or_else(|| {
-        QueryError::Parse(format!(
+        QueryError::Type(format!(
             "{year:04}-{month:02}-{day:02} isn't a valid calendar date"
         ))
     })
@@ -4042,7 +4052,7 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
 /// does).
 fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if args.len() != 1 {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Semantic(format!(
             "duration() expects exactly one argument, got {}",
             args.len()
         )));
@@ -4053,7 +4063,7 @@ fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     let (months, days, seconds, nanos) = if let Some(s) = as_arith_str(arg) {
         temporal::parse_duration(s).ok_or_else(|| {
-            QueryError::Parse(format!(
+            QueryError::Type(format!(
                 "'{s}' isn't a duration string MarsDB can parse -- only ISO-8601 'PnYnMnWnDTnHnMnS' text is \
                  supported, not the alternate combined date-time duration syntax"
             ))
@@ -4061,7 +4071,7 @@ fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
     } else if let Value::Map(m) = arg {
         temporal::normalize_duration(duration_fields_from_map(m)?)
     } else {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "duration() doesn't support this argument: {arg:?}"
         )));
     };
@@ -4089,7 +4099,7 @@ fn duration_fields_from_map(
         "nanoseconds",
     ];
     if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
-        return Err(QueryError::Parse(format!(
+        return Err(QueryError::Type(format!(
             "duration({{...}}) key '{bad}' isn't a recognized duration unit"
         )));
     }
@@ -4097,7 +4107,7 @@ fn duration_fields_from_map(
         match m.get(key) {
             None => Ok(0.0),
             Some(v) => value_as_f64(v).ok_or_else(|| {
-                QueryError::Parse(format!("duration({{...}})'s '{key}' must be a number"))
+                QueryError::Type(format!("duration({{...}})'s '{key}' must be a number"))
             }),
         }
     };
@@ -4245,7 +4255,7 @@ fn eval_projected_expr(
             // reaching this point means it wasn't top-level as
             // `validate_return_items` requires.
             if is_aggregate_name(name) {
-                return Err(QueryError::Parse(format!(
+                return Err(QueryError::Semantic(format!(
                     "aggregate function '{name}' can only be used as a return item's top-level expression"
                 )));
             }
@@ -4255,7 +4265,7 @@ fn eval_projected_expr(
                 .collect::<Result<Vec<_>, _>>()?;
             call_builtin(name, &arg_values)
         }
-        ReturnExpr::CountStar => Err(QueryError::Parse(
+        ReturnExpr::CountStar => Err(QueryError::Semantic(
             "count(*) can only be used as a return item's top-level expression".into(),
         )),
         ReturnExpr::Case { test, whens, else_ } => {
@@ -4317,7 +4327,7 @@ fn eval_projected_expr(
                 Value::List(items) => items,
                 Value::Null => return Ok(Value::Null),
                 other => {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Type(format!(
                         "list comprehension source must be a list, got {other:?}"
                     )))
                 }
@@ -4351,7 +4361,7 @@ fn eval_projected_expr(
                 Value::List(items) => items,
                 Value::Null => return Ok(Value::Null),
                 other => {
-                    return Err(QueryError::Parse(format!(
+                    return Err(QueryError::Type(format!(
                         "quantifier source must be a list, got {other:?}"
                     )))
                 }

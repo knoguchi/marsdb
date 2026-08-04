@@ -261,9 +261,9 @@ fn execution_observer_reports_success_and_failure_without_query_text() {
     assert_eq!(events[0].result_rows, Some(1));
     assert_eq!(events[0].statement_read_only, Some(true));
     assert!(events[0].relationship_expansions >= 1);
-    assert_eq!(events[1].outcome, ExecutionOutcome::ParseOrSemanticError);
+    assert_eq!(events[1].outcome, ExecutionOutcome::SemanticError);
     assert_eq!(events[1].result_rows, None);
-    assert_eq!(events[2].outcome, ExecutionOutcome::ParseOrSemanticError);
+    assert_eq!(events[2].outcome, ExecutionOutcome::SyntaxError);
     assert_eq!(events[2].statement_read_only, None);
     assert_eq!(events[3].outcome, ExecutionOutcome::MissingParameter);
     assert_eq!(events[3].statement_read_only, Some(true));
