@@ -217,6 +217,10 @@ other `null` elements present; only "no definite answer, but at least one
 `false`, not `null`, since `0 = 2` is a definite `false`).
 A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
 list[1]`) is also valid on its own.
+Map literals (`{a: 1, b: 2+1}`) in `RETURN`/`WITH`, and property-style
+access on a map-valued variable (`WITH {a: 1} AS m RETURN m.a`) — general
+postfix property access on an arbitrary non-identifier expression
+(`list[0].prop`) isn't supported yet, only `identifier.prop`.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`

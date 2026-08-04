@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use marsdb_graph::{Edge, Node, PropertyValue};
 
 use crate::ast::Literal;
@@ -26,5 +28,13 @@ pub enum Value {
     /// result — see `Binding::Path`'s docs (executor.rs) for how this
     /// gets assembled during MATCH evaluation.
     Path(Vec<PathElem>),
+    /// A map literal (`{a: 1, b: 2}`) — like `List`, a query-layer-only
+    /// concept, never persisted as a `PropertyValue` (nothing in the
+    /// grammar can construct a map literal to store as a node/edge
+    /// property; node/edge props are still each individually a scalar
+    /// `PropertyValue`). `BTreeMap`, not `HashMap` — canonical key order
+    /// makes display/comparison deterministic without a separate sort
+    /// step.
+    Map(BTreeMap<String, Value>),
     Null,
 }

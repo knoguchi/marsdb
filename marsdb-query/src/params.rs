@@ -240,6 +240,11 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
                 substitute_with_expr(w, params)?;
             }
         }
+        ReturnExpr::MapLit(entries) => {
+            for (_, v) in entries {
+                substitute_return_expr(v, params)?;
+            }
+        }
     }
     Ok(())
 }
