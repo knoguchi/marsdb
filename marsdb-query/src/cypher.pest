@@ -83,13 +83,39 @@ mutating_tail = { (detach_delete_clause | delete_clause | remove_clause | set_cl
 
 return_clause = { ^"RETURN" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }
-// Real arithmetic precedence: `*`/`/`/`%` (add_expr's `mul_expr` operand)
-// bind tighter than `+`/`-` (add_expr itself). `return_expr` stays the
-// name every other rule threads an expression through (call_args,
-// case_when, sort_item, ...) -- only its own production changed, from a
-// flat list of atom alternatives to this precedence chain bottoming out
-// at the same atoms (now in atom_expr).
-return_expr = { add_expr }
+// Full precedence chain, loosest to tightest: `OR` < `XOR` < `AND` <
+// `NOT` < a single comparison < `+`/`-` < `*`/`/`/`%` < postfix
+// (`[...]`) < atom. `return_expr` stays the name every other rule
+// threads an expression through (call_args, case_when, sort_item, ...)
+// -- only its own production changed, this time to grow the boolean/
+// comparison layers above the pre-existing arithmetic chain.
+return_expr   = { bool_or_expr }
+bool_or_expr  = { bool_xor_expr ~ (kw_or ~ bool_xor_expr)* }
+bool_xor_expr = { bool_and_expr ~ (kw_xor ~ bool_and_expr)* }
+bool_and_expr = { bool_not_expr ~ (kw_and ~ bool_not_expr)* }
+// Right-recursive (`NOT NOT x` is valid), not `NOT*` -- avoids a
+// separate repeat-then-fold step for what's already naturally a chain.
+bool_not_expr = { (kw_not ~ bool_not_expr) | compare_expr }
+// A bare `^"OR"`/`^"AND"`/`^"XOR"`/`^"NOT"` has no word-boundary check --
+// `^"OR"` alone would happily match the first two letters of `ORDER`,
+// leaving `DER` to parse as a bogus right-hand identifier and silently
+// mis-parsing `RETURN y ORDER BY y` as `RETURN (y OR DER)` followed by a
+// now-nonsensical `BY y` (a real regression this exact chain introduced
+// and a real TCK/smoke-test failure caught). `@` (atomic) so no implicit
+// whitespace gets inserted before the lookahead -- otherwise `AND true`
+// would consume the space first and check the lookahead against `t`
+// (alphanumeric), wrongly rejecting the legitimate keyword too. Atomic
+// rules still produce their own `Pair` (can't also be silent), so
+// `parse_bool_or_expr`/`_xor_expr`/`_and_expr` filter these out rather
+// than assuming `.into_inner()` alternates purely with the operand rule.
+kw_or  = @{ ^"OR" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_xor = @{ ^"XOR" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_and = @{ ^"AND" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_not = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
+// A single, optional comparison -- chained comparisons (`1 < x < 10`)
+// and `IS NULL`/`IS NOT NULL` are a deliberately separate, later change
+// (see README's Cypher coverage section).
+compare_expr  = { add_expr ~ (compare_op ~ add_expr)? }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
 mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }
@@ -133,12 +159,15 @@ map_kv      = { identifier ~ ":" ~ return_expr }
 list_expr           = { "[" ~ (list_comprehension | (return_expr ~ ("," ~ return_expr)*)?) ~ "]" }
 list_comprehension  = { filter_expr ~ ("|" ~ return_expr)? }
 // Shared by `list_comprehension` and `quantifier_expr` -- both bind one
-// variable over a list, optionally filtered. WHERE reuses `with_expr`
-// (not the pattern-level `where_clause`/`expr`) for the same reason
-// `unwind_clause` does -- the bound variable is a bare scalar/node/edge,
-// not necessarily something `comparison`'s `prop_access`-only LHS can
-// express.
-filter_expr         = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~ with_expr)? }
+// variable over a list, optionally filtered. WHERE is a plain
+// `return_expr` (not the pattern-level `where_clause`/`expr`, nor
+// `with_expr`) -- now that boolean logic/comparisons are real
+// `return_expr` productions, this is strictly wider than `with_expr` was
+// (a bare `WHERE x`/`WHERE true` parses, where `with_expr` only ever
+// accepted a `Compare`), and the bound variable is very often a bare
+// scalar/node/edge anyway, not something `comparison`'s
+// `prop_access`-only LHS could express even before this.
+filter_expr         = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~ return_expr)? }
 quantifier_expr      = { quantifier_kw ~ "(" ~ filter_expr ~ ")" }
 quantifier_kw        = { ^"ALL" | ^"ANY" | ^"NONE" | ^"SINGLE" }
 
@@ -166,7 +195,15 @@ with_expr         = { with_or_expr }
 with_or_expr      = { with_and_expr ~ (^"OR" ~ with_and_expr)* }
 with_and_expr     = { with_unary_expr ~ (^"AND" ~ with_unary_expr)* }
 with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_comparison | ("(" ~ with_expr ~ ")") }
-with_comparison   = { return_expr ~ compare_op ~ literal }
+// `add_expr`, not `return_expr` -- `return_expr` now includes its own
+// optional trailing comparison (`compare_expr`), so using it here would
+// let it greedily consume the whole `lhs op literal` shape itself
+// (`y > 10` fully parses as one `return_expr`), leaving nothing for this
+// rule's own trailing `compare_op ~ literal` to match. `add_expr` is the
+// same arithmetic-only layer real Cypher's own grammar puts on a
+// comparison's LHS anyway (a comparison's operand is never itself
+// another comparison without explicit parens).
+with_comparison   = { add_expr ~ compare_op ~ literal }
 
 detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }

@@ -210,11 +210,8 @@ from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
 open-ended `list[2..]`/`list[..3]` — unlike indexing, out-of-range slice
 bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
 List comprehensions (`[x IN list WHERE cond | expr]`, both `WHERE` and
-`| expr` independently optional — `[x IN list]` is a legal no-op filter),
-whose `WHERE` reuses the same expression shape as `WITH ... WHERE`
-(comparisons + `AND`/`OR`/`NOT`, not yet arbitrary boolean expressions —
-a bare `WHERE x`/`WHERE true` isn't parseable yet, only `WHERE x > 2`
-shapes). Quantifiers `ALL(x IN list WHERE cond)`/`ANY(...)`/`NONE(...)`/
+`| expr` independently optional — `[x IN list]` is a legal no-op filter).
+Quantifiers `ALL(x IN list WHERE cond)`/`ANY(...)`/`NONE(...)`/
 `SINGLE(...)` (same `WHERE` shape as list comprehensions, no `WHERE` means
 "every element's own truthiness"), with real three-valued NULL logic — a
 definite `true`/`false` among the elements decides the answer even with
@@ -227,6 +224,20 @@ Map literals (`{a: 1, b: 2+1}`) in `RETURN`/`WITH`, and property-style
 access on a map-valued variable (`WITH {a: 1} AS m RETURN m.a`) — general
 postfix property access on an arbitrary non-identifier expression
 (`list[0].prop`) isn't supported yet, only `identifier.prop`.
+Boolean logic (`AND`/`OR`/`XOR`/`NOT`) and comparisons (`=`/`<>`/`<`/`<=`/
+`>`/`>=`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`) are first-class `RETURN`/
+`WITH` expressions now (`RETURN true AND (1 < 2)`), not just a separate
+`WHERE`-only grammar — this is also what list comprehensions' and
+quantifiers' `WHERE` clauses use, so a bare `WHERE x`/`WHERE true` parses
+now (previously rejected). Real three-valued NULL logic throughout
+(`false AND null` is `false`, not `null` — a definite operand still
+decides the answer), list/map equality is real structural comparison
+(`[1,2] = [1,2]` is `true`, not `null`), and lists order lexicographically
+(`[1,0] >= [1]` is `true`). A type-mismatched comparison's result depends
+on the operator: `=`/`<>` are always definite (`1 = 'a'` is `false`,
+`1 <> 'a'` is `true`), while ordering and the string predicates are `null`
+(no defined answer), not `false`. Chained comparisons (`1 < x < 10`) and
+`IS NULL`/`IS NOT NULL` aren't supported yet.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`

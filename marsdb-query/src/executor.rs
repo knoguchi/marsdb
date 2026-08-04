@@ -1602,7 +1602,7 @@ impl<'a> Executor<'a> {
                     let mut scoped_row = row.clone();
                     scoped_row.insert(var.clone(), value_to_binding_restore(&item));
                     let keep = match where_clause {
-                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)? == Some(true),
+                        Some(w) => self.eval_return_expr_bool3(txn, w, &scoped_row)? == Some(true),
                         None => true,
                     };
                     if !keep {
@@ -1634,7 +1634,7 @@ impl<'a> Executor<'a> {
                     let mut scoped_row = row.clone();
                     scoped_row.insert(var.clone(), value_to_binding_restore(item));
                     preds.push(match where_clause {
-                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)?,
+                        Some(w) => self.eval_return_expr_bool3(txn, w, &scoped_row)?,
                         None => item_truthy(item),
                     });
                 }
@@ -1650,7 +1650,38 @@ impl<'a> Executor<'a> {
                 }
                 Ok(Value::Map(map))
             }
+            ReturnExpr::And(l, r) => Ok(bool3_to_value(and3(
+                self.eval_return_expr_bool3(txn, l, row)?,
+                self.eval_return_expr_bool3(txn, r, row)?,
+            ))),
+            ReturnExpr::Or(l, r) => Ok(bool3_to_value(or3(
+                self.eval_return_expr_bool3(txn, l, row)?,
+                self.eval_return_expr_bool3(txn, r, row)?,
+            ))),
+            ReturnExpr::Xor(l, r) => Ok(bool3_to_value(xor3(
+                self.eval_return_expr_bool3(txn, l, row)?,
+                self.eval_return_expr_bool3(txn, r, row)?,
+            ))),
+            ReturnExpr::Not(e) => Ok(bool3_to_value(self.eval_return_expr_bool3(txn, e, row)?.map(|b| !b))),
+            ReturnExpr::Compare(l, op, r) => {
+                let lv = self.eval_return_expr(txn, l, row)?;
+                let rv = self.eval_return_expr(txn, r, row)?;
+                Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
+            }
         }
+    }
+
+    /// A `WHERE`-position `ReturnExpr` (list comprehension/quantifier
+    /// filters) evaluated as three-valued logic instead of a plain
+    /// `Value` -- delegates to `eval_return_expr` then folds the result
+    /// down via `value_to_bool3`.
+    fn eval_return_expr_bool3(
+        &self,
+        txn: Txn,
+        expr: &ReturnExpr,
+        row: &BindingRow,
+    ) -> Result<Option<bool>, QueryError> {
+        value_to_bool3(&self.eval_return_expr(txn, expr, row)?)
     }
 
     /// `ret`, when present, is evaluated *after* the physical delete runs,
@@ -1952,7 +1983,12 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Slice(..)
         | ReturnExpr::ListComp { .. }
         | ReturnExpr::Quantifier { .. }
-        | ReturnExpr::MapLit(..) => format!("col{idx}"),
+        | ReturnExpr::MapLit(..)
+        | ReturnExpr::And(..)
+        | ReturnExpr::Or(..)
+        | ReturnExpr::Xor(..)
+        | ReturnExpr::Not(..)
+        | ReturnExpr::Compare(..) => format!("col{idx}"),
     }
 }
 
@@ -2004,6 +2040,11 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
         }
         ReturnExpr::Quantifier { source, .. } => contains_aggregate(source),
         ReturnExpr::MapLit(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
+        ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
+            contains_aggregate(l) || contains_aggregate(r)
+        }
+        ReturnExpr::Not(e) => contains_aggregate(e),
+        ReturnExpr::Compare(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -2381,24 +2422,235 @@ fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> Option
     if matches!(prop, PropertyValue::Null) || matches!(lit, Literal::Null) {
         return None;
     }
-    Some(match (prop, lit) {
-        (PropertyValue::Int(a), Literal::Int(b)) => cmp_ord(op, *a, *b),
-        (PropertyValue::Int(a), Literal::Float(b)) => cmp_f64(op, *a as f64, *b),
-        (PropertyValue::Float(a), Literal::Float(b)) => cmp_f64(op, *a, *b),
-        (PropertyValue::Float(a), Literal::Int(b)) => cmp_f64(op, *a, *b as f64),
-        (PropertyValue::String(a), Literal::String(b)) => match op {
+    compare_property_pair(prop, op, &literal_to_value(lit))
+}
+
+/// The actual per-type comparison rules, shared by `compare()`
+/// (`PropertyValue` vs a `Literal`, reduced to a `PropertyValue` via
+/// `literal_to_value`) and `compare_values` (two arbitrary `Value`s,
+/// each reduced to a `PropertyValue` via `value_to_property_value`) --
+/// both callers have already handled the "either side is null" case
+/// before reaching here. Returns `Option<bool>`, not `bool` -- a
+/// type-mismatched pair (`1 < 'a'`) isn't a uniform "false" the way an
+/// earlier version of this function had it: real Cypher's `=`/`<>` on
+/// mismatched types is a definite `false`/`true` (never equal, so
+/// "not equal" is true), but ordering (`<`/`<=`/`>`/`>=`) on mismatched
+/// types is `null` (no defined ordering exists to be definite about) --
+/// confirmed against real TCK scenarios (`'1.0' < 1.0` is `null`, not
+/// `false`; `NaN <> 'a'` is `true`, not `false`), not assumed.
+fn compare_property_pair(a: &PropertyValue, op: CompareOp, b: &PropertyValue) -> Option<bool> {
+    match (a, b) {
+        (PropertyValue::Int(a), PropertyValue::Int(b)) => Some(cmp_ord(op, *a, *b)),
+        (PropertyValue::Int(a), PropertyValue::Float(b)) => Some(cmp_f64(op, *a as f64, *b)),
+        (PropertyValue::Float(a), PropertyValue::Float(b)) => Some(cmp_f64(op, *a, *b)),
+        (PropertyValue::Float(a), PropertyValue::Int(b)) => Some(cmp_f64(op, *a, *b as f64)),
+        (PropertyValue::String(a), PropertyValue::String(b)) => Some(match op {
             CompareOp::StartsWith => a.starts_with(b.as_str()),
             CompareOp::EndsWith => a.ends_with(b.as_str()),
             CompareOp::Contains => a.contains(b.as_str()),
             _ => cmp_ord(op, a.as_str(), b.as_str()),
+        }),
+        // Real Cypher defines boolean ordering (`false < true`), same as
+        // Rust's own `bool: PartialOrd` -- confirmed via a real TCK
+        // scenario (`Quantifier7 :: [3]`) that specifically compares two
+        // boolean expressions with `<=`.
+        (PropertyValue::Bool(a), PropertyValue::Bool(b)) => Some(cmp_ord(op, *a, *b)),
+        _ => match op {
+            CompareOp::Eq => Some(false),
+            CompareOp::Ne => Some(true),
+            // A string predicate on a non-null, non-string operand has no
+            // defined answer (undefined, not "definitely false") -- same
+            // "type mismatch -> null" stance as ordering, confirmed via a
+            // real TCK scenario (`'abc' STARTS WITH true` must be `null`,
+            // not `false`, so `(x STARTS WITH true) <> (x STARTS WITH
+            // true)` correctly stays `null` rather than folding to a
+            // spurious `false`/`true`).
+            CompareOp::StartsWith
+            | CompareOp::EndsWith
+            | CompareOp::Contains
+            | CompareOp::Lt
+            | CompareOp::Le
+            | CompareOp::Gt
+            | CompareOp::Ge => None,
         },
-        (PropertyValue::Bool(a), Literal::Bool(b)) => match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            _ => false,
-        },
-        _ => false,
-    })
+    }
+}
+
+/// `ReturnExpr::Compare`'s general value-vs-value comparison -- unlike
+/// `compare_value` (`WithExpr::Compare`'s `Value`-vs-`Literal` shape),
+/// both sides here can be any expression, including two lists/maps.
+/// Lists/maps get real structural three-valued equality (`value_eq3`),
+/// not `value_to_property_value`'s lossy Null-collapse -- an earlier
+/// version routed everything through that collapse, which made every
+/// list/map `=`/`<>` comparison silently `null` regardless of content
+/// (a real bug, caught via real TCK scenarios: `[1,2] = [1,2]` must be
+/// `true`, not `null`). Ordering ops on a list/map are still null (no
+/// defined ordering), same as any other type-mismatched ordering.
+fn compare_values(l: &Value, op: CompareOp, r: &Value) -> Option<bool> {
+    if matches!(l, Value::List(_) | Value::Map(_)) || matches!(r, Value::List(_) | Value::Map(_)) {
+        return match op {
+            CompareOp::Eq => value_eq3(l, r),
+            CompareOp::Ne => value_eq3(l, r).map(|b| !b),
+            // Real Cypher orders lists lexicographically (confirmed via a
+            // real TCK scenario: `[1, 0] >= [1]` is `true` -- `[1]` is a
+            // prefix of `[1, 0]`, so the longer list is greater once
+            // every shared prefix position compares equal).
+            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
+                value_ord3(l, r).map(|ord| match op {
+                    CompareOp::Lt => ord.is_lt(),
+                    CompareOp::Le => ord.is_le(),
+                    CompareOp::Gt => ord.is_gt(),
+                    CompareOp::Ge => ord.is_ge(),
+                    _ => unreachable!(),
+                })
+            }
+            CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => None,
+        };
+    }
+    let lp = value_to_property_value(l);
+    let rp = value_to_property_value(r);
+    if matches!(lp, PropertyValue::Null) || matches!(rp, PropertyValue::Null) {
+        return None;
+    }
+    compare_property_pair(&lp, op, &rp)
+}
+
+/// `compare_values`'s ordering counterpart to `value_eq3` -- a list
+/// compares lexicographically: the first position where the two lists
+/// definitely differ decides the order; a `null` at the first
+/// undecided position makes the whole comparison `None` (matches real
+/// Cypher and a real TCK scenario: `[1, 2] >= [1, null]` is `null`, not
+/// decided by list length the way `[1, null] >= [1]` is, since that
+/// pair never even reaches the differing/null position -- `[1]` runs
+/// out first). If every shared-prefix position compares equal, the
+/// shorter list sorts first (same convention as string/tuple ordering).
+fn value_ord3(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    if let (Value::List(xs), Value::List(ys)) = (a, b) {
+        for (x, y) in xs.iter().zip(ys) {
+            match value_ord3(x, y) {
+                None => return None,
+                Some(Ordering::Equal) => continue,
+                decided => return decided,
+            }
+        }
+        return Some(xs.len().cmp(&ys.len()));
+    }
+    if matches!(a, Value::List(_) | Value::Map(_)) || matches!(b, Value::List(_) | Value::Map(_)) {
+        return None;
+    }
+    let pa = value_to_property_value(a);
+    let pb = value_to_property_value(b);
+    if matches!(pa, PropertyValue::Null) || matches!(pb, PropertyValue::Null) {
+        return None;
+    }
+    property_ord3(&pa, &pb)
+}
+
+/// Per-type ordering, mirroring `compare_property_pair`'s per-type
+/// dispatch but returning a real `Ordering` (needed by `value_ord3`'s
+/// recursive list-element comparison, which must distinguish "equal, keep
+/// comparing the rest of the list" from "decided, stop here"). NaN
+/// correctly yields `None` via `f64::partial_cmp` -- IEEE NaN has no
+/// order relative to anything, including itself.
+fn property_ord3(a: &PropertyValue, b: &PropertyValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (PropertyValue::Int(x), PropertyValue::Int(y)) => x.partial_cmp(y),
+        (PropertyValue::Int(x), PropertyValue::Float(y)) => (*x as f64).partial_cmp(y),
+        (PropertyValue::Float(x), PropertyValue::Float(y)) => x.partial_cmp(y),
+        (PropertyValue::Float(x), PropertyValue::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (PropertyValue::String(x), PropertyValue::String(y)) => Some(x.cmp(y)),
+        (PropertyValue::Bool(x), PropertyValue::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+/// Three-valued structural equality for `compare_values`'s list/map
+/// operands -- a definite length/key mismatch is `false` regardless of
+/// any `null` elsewhere (confirmed via real TCK scenarios: `{} = {k:
+/// null}` is `false`, and `[1,2] = [1]` is `false` despite no nulls
+/// needing to be considered at all); otherwise every element must
+/// compare `Some(true)` for an overall `true`, any element comparing
+/// `Some(false)` makes the whole thing `false` immediately, and
+/// anything else (some elements `None`, none definitely mismatched)
+/// is `None`. Scalars fall through to the ordinary `Eq` case of
+/// `compare_property_pair`.
+fn value_eq3(a: &Value, b: &Value) -> Option<bool> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    match (a, b) {
+        (Value::List(xs), Value::List(ys)) => {
+            if xs.len() != ys.len() {
+                return Some(false);
+            }
+            let mut any_null = false;
+            for (x, y) in xs.iter().zip(ys) {
+                match value_eq3(x, y) {
+                    Some(false) => return Some(false),
+                    None => any_null = true,
+                    Some(true) => {}
+                }
+            }
+            if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        (Value::Map(ma), Value::Map(mb)) => {
+            if ma.len() != mb.len() {
+                return Some(false);
+            }
+            let mut any_null = false;
+            for (k, v) in ma {
+                match mb.get(k) {
+                    None => return Some(false),
+                    Some(v2) => match value_eq3(v, v2) {
+                        Some(false) => return Some(false),
+                        None => any_null = true,
+                        Some(true) => {}
+                    },
+                }
+            }
+            if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        (Value::List(_) | Value::Map(_), _) | (_, Value::List(_) | Value::Map(_)) => Some(false),
+        _ => {
+            let pa = value_to_property_value(a);
+            let pb = value_to_property_value(b);
+            if matches!(pa, PropertyValue::Null) || matches!(pb, PropertyValue::Null) {
+                None
+            } else {
+                compare_property_pair(&pa, CompareOp::Eq, &pb)
+            }
+        }
+    }
+}
+
+/// A `ReturnExpr` boolean operand -- `Null` is "unknown" (`None`), a real
+/// bool passes through, anything else is a genuine type error (real
+/// Cypher: `1 AND true` doesn't silently coerce).
+fn value_to_bool3(v: &Value) -> Result<Option<bool>, QueryError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Literal(Literal::Bool(b)) | Value::Property(PropertyValue::Bool(b)) => Ok(Some(*b)),
+        other => Err(QueryError::Parse(format!("expected a boolean, got {other:?}"))),
+    }
+}
+
+fn bool3_to_value(b: Option<bool>) -> Value {
+    match b {
+        Some(b) => Value::Literal(Literal::Bool(b)),
+        None => Value::Null,
+    }
 }
 
 /// `None`/`None` (both unknown) combines to unknown, matching Cypher's
@@ -2417,6 +2669,16 @@ fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     match (a, b) {
         (Some(true), _) | (_, Some(true)) => Some(true),
         (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// `XOR` has no "one side already decides it" shortcut the way `AND`/`OR`
+/// do -- either operand being unknown makes the whole result unknown,
+/// since flipping the unknown side could flip the answer either way.
+fn xor3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a != b),
         _ => None,
     }
 }
@@ -2894,7 +3156,7 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
                 let mut scoped_row = row.clone();
                 scoped_row.insert(var.clone(), item.clone());
                 let keep = match where_clause {
-                    Some(w) => eval_with_expr_projected(w, &scoped_row)? == Some(true),
+                    Some(w) => value_to_bool3(&eval_projected_expr(w, &scoped_row)?)? == Some(true),
                     None => true,
                 };
                 if !keep {
@@ -2924,7 +3186,7 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
                 let mut scoped_row = row.clone();
                 scoped_row.insert(var.clone(), item.clone());
                 preds.push(match where_clause {
-                    Some(w) => eval_with_expr_projected(w, &scoped_row)?,
+                    Some(w) => value_to_bool3(&eval_projected_expr(w, &scoped_row)?)?,
                     None => item_truthy(item),
                 });
             }
@@ -2940,25 +3202,25 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             }
             Ok(Value::Map(map))
         }
-    }
-}
-
-/// `eval_with_expr`'s post-projection counterpart -- ORDER BY (the only
-/// caller of `eval_projected_expr`) needs a list comprehension's own
-/// `WHERE` evaluated against already-projected `Value`s, not a graph-bound
-/// `BindingRow`, so this can't reuse the method version (which also needs
-/// a `Txn` to resolve `Node`/`Edge` property lookups the projected values
-/// already carry inline).
-fn eval_with_expr_projected(expr: &WithExpr, row: &HashMap<String, Value>) -> Result<Option<bool>, QueryError> {
-    Ok(match expr {
-        WithExpr::And(l, r) => and3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
-        WithExpr::Or(l, r) => or3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
-        WithExpr::Not(e) => eval_with_expr_projected(e, row)?.map(|b| !b),
-        WithExpr::Compare(lhs, op, lit) => {
-            let value = eval_projected_expr(lhs, row)?;
-            compare_value(&value, *op, lit)
+        ReturnExpr::And(l, r) => Ok(bool3_to_value(and3(
+            value_to_bool3(&eval_projected_expr(l, row)?)?,
+            value_to_bool3(&eval_projected_expr(r, row)?)?,
+        ))),
+        ReturnExpr::Or(l, r) => Ok(bool3_to_value(or3(
+            value_to_bool3(&eval_projected_expr(l, row)?)?,
+            value_to_bool3(&eval_projected_expr(r, row)?)?,
+        ))),
+        ReturnExpr::Xor(l, r) => Ok(bool3_to_value(xor3(
+            value_to_bool3(&eval_projected_expr(l, row)?)?,
+            value_to_bool3(&eval_projected_expr(r, row)?)?,
+        ))),
+        ReturnExpr::Not(e) => Ok(bool3_to_value(value_to_bool3(&eval_projected_expr(e, row)?)?.map(|b| !b))),
+        ReturnExpr::Compare(l, op, r) => {
+            let lv = eval_projected_expr(l, row)?;
+            let rv = eval_projected_expr(r, row)?;
+            Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
         }
-    })
+    }
 }
 
 /// `RETURN DISTINCT`'s result-set-level dedup -- structural equality of

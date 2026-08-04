@@ -101,14 +101,19 @@ pub enum ReturnExpr {
     Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
     /// `[x IN <source> WHERE <cond> | <project>]` — `WHERE`/`| project` are
     /// each independently optional (`[x IN list]` is a legal no-op
-    /// identity-filter comprehension). `where_clause` reuses `WithExpr`
+    /// identity-filter comprehension). `where_clause` is a `ReturnExpr`
     /// (not pattern-level `Expr`) for the same reason `UnwindClause`'s own
-    /// filter does — `var` is very often a bare scalar/node/edge, not
-    /// something `Expr::Compare`'s `prop_access`-only LHS can express.
+    /// filter used to reuse `WithExpr` — `var` is very often a bare
+    /// scalar/node/edge, not something `Expr::Compare`'s
+    /// `prop_access`-only LHS can express. Now that boolean logic/
+    /// comparisons are real `ReturnExpr` variants (`And`/`Or`/`Not`/
+    /// `Compare`), this is the wider type `WithExpr` used to be, letting a
+    /// bare `WHERE x`/`WHERE true` parse (previously rejected — `WithExpr`
+    /// only ever wrapped a `Compare`, never a standalone boolean value).
     ListComp {
         var: String,
         source: Box<ReturnExpr>,
-        where_clause: Option<Box<WithExpr>>,
+        where_clause: Option<Box<ReturnExpr>>,
         project: Option<Box<ReturnExpr>>,
     },
     /// `ALL(x IN list WHERE cond)` / `ANY(...)` / `NONE(...)` / `SINGLE(...)`
@@ -121,13 +126,31 @@ pub enum ReturnExpr {
         kind: QuantifierKind,
         var: String,
         source: Box<ReturnExpr>,
-        where_clause: Option<Box<WithExpr>>,
+        where_clause: Option<Box<ReturnExpr>>,
     },
     /// `{a: 1, b: 2 + 1}` — a general expression map, the `RETURN`-level
     /// counterpart to `prop_map`'s literal-only property-map syntax used
     /// by `CREATE`/`MERGE`/`prop_kv` (which stays scoped to a
     /// `Literal` value, since a stored property is always a scalar).
     MapLit(Vec<(String, ReturnExpr)>),
+    /// `lhs AND/OR/XOR rhs`, `NOT rhs` — real three-valued logic (`Null`
+    /// propagates per Cypher's truth tables, see `and3`/`or3`/`xor3` in
+    /// executor.rs), evaluating to `Value::Literal(Bool(_))` or
+    /// `Value::Null`, not `Option<bool>` the way pattern-level `Expr`/
+    /// `WithExpr` do — a `ReturnExpr` always evaluates to one `Value`,
+    /// there's no separate "unbound" state to fold in beyond `Null`
+    /// itself. A non-bool, non-null operand is a real error (`1 AND
+    /// true`), not silently coerced.
+    And(Box<ReturnExpr>, Box<ReturnExpr>),
+    Or(Box<ReturnExpr>, Box<ReturnExpr>),
+    Xor(Box<ReturnExpr>, Box<ReturnExpr>),
+    Not(Box<ReturnExpr>),
+    /// `lhs op rhs` — a single comparison between two arbitrary
+    /// expressions (unlike `WithExpr::Compare`'s `ReturnExpr`-vs-`Literal`
+    /// shape, `rhs` here can itself be a variable/property/arithmetic
+    /// expression). Chained comparisons (`1 < x < 10`) aren't supported
+    /// yet — see the README's Cypher coverage section.
+    Compare(Box<ReturnExpr>, CompareOp, Box<ReturnExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
