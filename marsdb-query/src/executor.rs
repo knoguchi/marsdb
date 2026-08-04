@@ -6845,25 +6845,30 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// `WHERE`'s three-valued comparison semantics) -- only covers the types
 /// that can actually reach here with no same-type match already handling
 /// them (see `compare_non_null`'s cross-type fallback and `list_cmp_asc`).
-/// `Map`/`Node`/`Edge`/`Path`/`Duration` have no defined orderability
-/// against other types either in real Cypher or in this codebase (matches
-/// `compare_non_null`'s pre-existing plain `Equal` fallback for them) --
-/// `None` here, not a rank, so they keep comparing as ties rather than
-/// claiming a real position in this order.
+/// `List` sorts *before* every scalar (confirmed against a real TCK
+/// scenario -- `max()`/`min()` over `[1, 'a', null, [1, 2], 0.2, 'b']`
+/// picks `1` for max and `[1, 2]` for min, only consistent with List
+/// ranking lowest, not highest as an earlier version of this function
+/// had it, unverified against any real cross-type-vs-list case at the
+/// time). `Map`/`Node`/`Edge`/`Path`/`Duration` have no defined
+/// orderability against other types either in real Cypher or in this
+/// codebase (matches `compare_non_null`'s pre-existing plain `Equal`
+/// fallback for them) -- `None` here, not a rank, so they keep
+/// comparing as ties rather than claiming a real position in this order.
 fn type_rank(v: &Value) -> Option<u8> {
     match v {
-        Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_)) => Some(0),
-        Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_)) => Some(1),
+        Value::List(_) => Some(0),
+        Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_)) => Some(1),
+        Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_)) => Some(2),
         Value::Literal(Literal::Int(_))
         | Value::Property(PropertyValue::Int(_))
         | Value::Literal(Literal::Float(_))
-        | Value::Property(PropertyValue::Float(_)) => Some(2),
-        Value::Property(PropertyValue::Date(_)) => Some(3),
-        Value::Property(PropertyValue::LocalTime(_)) => Some(4),
-        Value::Property(PropertyValue::Time { .. }) => Some(5),
-        Value::Property(PropertyValue::LocalDateTime { .. }) => Some(6),
-        Value::Property(PropertyValue::DateTime { .. }) => Some(7),
-        Value::List(_) => Some(8),
+        | Value::Property(PropertyValue::Float(_)) => Some(3),
+        Value::Property(PropertyValue::Date(_)) => Some(4),
+        Value::Property(PropertyValue::LocalTime(_)) => Some(5),
+        Value::Property(PropertyValue::Time { .. }) => Some(6),
+        Value::Property(PropertyValue::LocalDateTime { .. }) => Some(7),
+        Value::Property(PropertyValue::DateTime { .. }) => Some(8),
         _ => None,
     }
 }
@@ -6910,18 +6915,35 @@ fn value_to_comparable(v: &Value) -> Option<PropertyValue> {
 }
 
 /// Ordering for `min`/`max` aggregate folding — `None` for values with no
-/// natural order (`Node`/`Edge`/`List`, or a `Null`, which `AggAcc::fold`
-/// never passes here anyway since null contributions are skipped before
-/// folding). The caller turns `None` into a clear error rather than an
-/// arbitrary "always equal" fallback — unlike ORDER BY's
+/// natural order (`Node`/`Edge`/`Map`/`Path`, or a `Null`, which
+/// `AggAcc::fold` never passes here anyway since null contributions are
+/// skipped before folding). The caller turns `None` into a clear error
+/// rather than an arbitrary "always equal" fallback — unlike ORDER BY's
 /// `compare_non_null`, which tolerates that for presentation ordering
 /// (see its docs), silently treating two nodes as "equal" inside an
 /// aggregate would be a wrong-answer failure mode, not just an
 /// unhelpful sort order.
+///
+/// `List` *is* comparable here (real Cypher's `max()`/`min()` handle a
+/// list argument, ordered element-by-element the same way ORDER BY
+/// does — reuses `list_cmp_asc`), and so is a genuine cross-type pair
+/// (`max()` over `[1, 'a', [1, 2]]`-shaped input), via the same
+/// `type_rank` fallback `compare_non_null` uses.
 pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    let pa = value_to_comparable(a)?;
-    let pb = value_to_comparable(b)?;
+    if let (Value::List(_), Value::List(_)) = (a, b) {
+        return Some(list_cmp_asc(a, b));
+    }
+    let (pa, pb) = match (value_to_comparable(a), value_to_comparable(b)) {
+        (Some(pa), Some(pb)) => (pa, pb),
+        _ => {
+            return match (type_rank(a), type_rank(b)) {
+                (Some(ra), Some(rb)) if ra != rb => Some(ra.cmp(&rb)),
+                (Some(_), Some(_)) => Some(Ordering::Equal),
+                _ => None,
+            }
+        }
+    };
     Some(match (pa, pb) {
         (PropertyValue::Int(x), PropertyValue::Int(y)) => x.cmp(&y),
         (PropertyValue::Int(x), PropertyValue::Float(y)) => {
