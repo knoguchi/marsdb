@@ -644,6 +644,20 @@ impl GraphStore {
         crate::index::lookup_exact(txn, label, prop, value, Some(limit))
     }
 
+    /// Cheap, exact count of nodes under `(label, prop) = value` — for the
+    /// query planner to compare selectivity between several indexed
+    /// equality candidates, not for fetching the nodes themselves (see
+    /// `lookup_by_index_in_txn`). O(1), same contract as `lookup_by_index`
+    /// re: "no index" vs "index, no match" both reading as `0`.
+    pub fn index_match_count_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        value: &PropertyValue,
+    ) -> Result<u64, GraphError> {
+        crate::index::match_count(txn, label, prop, value)
+    }
+
     /// Every node currently indexed under `(label, prop) = value`. Empty
     /// (not an error) if no such index exists — check `index_def` first if
     /// the caller needs to distinguish "no index" from "index, no match".
