@@ -71,6 +71,28 @@ pub fn value_to_tck(v: &Value) -> TckValue {
         Value::List(items) => TckValue::List(items.iter().map(value_to_tck).collect()),
         Value::Literal(lit) => literal_to_tck(lit),
         Value::Path(_) => TckValue::Scalar(TckScalar::Str("<path -- not TCK-comparable in v1>".to_string())),
+        // A bare map value returned directly (not as a node/rel's props)
+        // -- same shape `parse_cell`'s `parse_map_value` produces for the
+        // TCK's expected-result side, so the two sides compare correctly
+        // structurally. Only scalar-valued entries are TCK-comparable
+        // this way (matching `parse_props`' own restriction below); a
+        // nested map/list value falls back to a `null` placeholder rather
+        // than failing outright, since MarsDB's own map-typed RETURN
+        // values are already a niche case (see `Value::Map`'s docs) not
+        // otherwise TCK-relevant.
+        Value::Map(entries) => TckValue::Node {
+            labels: BTreeSet::new(),
+            props: entries
+                .iter()
+                .map(|(k, v)| {
+                    let scalar = match value_to_tck(v) {
+                        TckValue::Scalar(s) => s,
+                        _ => TckScalar::Str("null".to_string()),
+                    };
+                    (k.clone(), scalar)
+                })
+                .collect(),
+        },
     }
 }
 
@@ -81,6 +103,16 @@ fn property_to_scalar(p: &PropertyValue) -> TckScalar {
         PropertyValue::Int(i) => TckScalar::Int(*i),
         PropertyValue::Float(f) => TckScalar::Float(*f),
         PropertyValue::String(s) => TckScalar::Str(s.clone()),
+        // The TCK's expected-result cells write a date/duration as its
+        // ISO-8601 string (`'1984-10-11'`, `'P12Y5M...'`), never a
+        // distinct literal syntax -- comparing as `Str` (not adding a
+        // `TckScalar::Date`/`Duration` variant) is what makes that
+        // comparison line up, matching `format_property`'s equivalent
+        // choice in `marsdb-cli`.
+        PropertyValue::Date(d) => TckScalar::Str(marsdb::temporal::format_date(*d)),
+        PropertyValue::Duration { months, days, seconds, nanos } => {
+            TckScalar::Str(marsdb::temporal::format_duration(*months, *days, *seconds, *nanos))
+        }
     }
 }
 

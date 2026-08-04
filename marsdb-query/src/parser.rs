@@ -372,7 +372,7 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
 
 fn parse_with_comparison(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let lhs = parse_return_expr(inner.next().expect("with_comparison has a return_expr"))?;
+    let lhs = parse_add_expr(inner.next().expect("with_comparison has an add_expr"))?;
     let op_pair = inner.next().expect("with_comparison has a compare_op");
     let op = parse_compare_op(op_pair);
     let literal = parse_literal(inner.next().expect("with_comparison has a literal"))?;
@@ -541,8 +541,19 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 }
 
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("return_expr has one child (add_expr)");
-    parse_add_expr(inner)
+    let inner = pair.into_inner().next().expect("return_expr has one child (comparison_expr)");
+    parse_comparison_expr(inner)
+}
+
+fn parse_comparison_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let lhs = parse_add_expr(inner.next().expect("comparison_expr has at least one add_expr"))?;
+    let Some(op_pair) = inner.next() else {
+        return Ok(lhs);
+    };
+    let op = parse_compare_op(op_pair);
+    let rhs = parse_add_expr(inner.next().expect("compare_op has a following add_expr"))?;
+    Ok(ReturnExpr::Compare(Box::new(lhs), op, Box::new(rhs)))
 }
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
@@ -629,6 +640,7 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         Rule::list_expr => Ok(ReturnExpr::ListLit(
             inner.into_inner().map(parse_return_expr).collect::<Result<Vec<_>, _>>()?,
         )),
+        Rule::map_expr => parse_map_expr(inner),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
@@ -724,7 +736,7 @@ fn parse_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, QueryError> {
             Rule::node_label => {
                 labels.push(p.into_inner().next().expect("node_label has an identifier").as_str().to_string())
             }
-            Rule::prop_map => props = parse_prop_map(p)?,
+            Rule::map_expr => props = parse_map_expr_as_props(p)?,
             r => unreachable!("unexpected node_pattern child rule {r:?}"),
         }
     }
@@ -750,7 +762,7 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
                 rel_type = Some(p.into_inner().next().expect("rel_type has an identifier").as_str().to_string())
             }
             Rule::rel_range => hop_range = Some(parse_rel_range(p.as_str())?),
-            Rule::prop_map => props = parse_prop_map(p)?,
+            Rule::map_expr => props = parse_map_expr_as_props(p)?,
             r => unreachable!("unexpected rel_right/rel_left/rel_either child rule {r:?}"),
         }
     }
@@ -800,16 +812,32 @@ fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
     }
 }
 
-fn parse_prop_map(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>, QueryError> {
-    pair.into_inner()
-        .filter(|p| p.as_rule() == Rule::prop_kv)
+/// A node/relationship pattern's `{...}` prop map -- same `map_expr`
+/// grammar rule as a general map-literal expression (see `parse_map_expr`
+/// below), just re-shaped into the `Vec<(String, ReturnExpr)>` form
+/// `NodePattern`/`RelPattern` carry rather than a `ReturnExpr::MapLit`.
+fn parse_map_expr_as_props(pair: Pair<Rule>) -> Result<Vec<(String, ReturnExpr)>, QueryError> {
+    let ReturnExpr::MapLit(entries) = parse_map_expr(pair)? else {
+        unreachable!("parse_map_expr always returns MapLit")
+    };
+    Ok(entries)
+}
+
+/// `{key: <expr>, ...}` -- shared by `atom_expr`'s `map_expr` alternative
+/// (a map used as an ordinary expression) and node/relationship pattern
+/// prop maps (via `parse_map_expr_as_props` above), since both are
+/// exactly the same grammar production (`cypher.pest`'s `map_expr`).
+fn parse_map_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let entries = pair
+        .into_inner()
         .map(|p| {
             let mut inner = p.into_inner();
-            let key = inner.next().expect("prop_kv has a key").as_str().to_string();
-            let value = parse_literal(inner.next().expect("prop_kv has a value"))?;
+            let key = inner.next().expect("map_kv has a key").as_str().to_string();
+            let value = parse_return_expr(inner.next().expect("map_kv has a value"))?;
             Ok((key, value))
         })
-        .collect()
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    Ok(ReturnExpr::MapLit(entries))
 }
 
 /// Resolves `\`-escapes in a `string_literal`'s already-quote-stripped

@@ -95,3 +95,31 @@ fn label_index_tracks_multi_label_create_and_delete() {
     assert_eq!(store.all_nodes(Some("Post")).unwrap().len(), 0);
     assert_eq!(store.all_nodes(Some("Person")).unwrap().len(), 1);
 }
+
+/// `PropertyValue::Date`/`Duration` round-trip through real postcard
+/// encode/decode (`store.create_node`/`get_node` go through `encode.rs`'s
+/// `encode`/`decode`, not an in-memory shortcut) unchanged -- the whole
+/// point of giving them first-class variants instead of reusing `Int`/
+/// `String` (see `PropertyValue`'s doc comment) is that this survives the
+/// storage boundary exactly, not just within one query's execution.
+#[test]
+fn date_and_duration_properties_round_trip_through_storage() {
+    let store = GraphStore::open_memory().unwrap();
+    let mut props = BTreeMap::new();
+    // 1984-10-11, as an epoch-day count -- see temporal.rs's
+    // `epoch_day_from_ymd` for how the query layer derives this same
+    // value from calendar year/month/day.
+    props.insert("date".to_string(), PropertyValue::Date(5397));
+    props.insert(
+        "duration".to_string(),
+        PropertyValue::Duration { months: 149, days: 14, seconds: 58390, nanos: 2 },
+    );
+    let id = store.create_node(&["Val"], props).unwrap();
+
+    let node = store.get_node(id).unwrap().unwrap();
+    assert_eq!(node.props.get("date"), Some(&PropertyValue::Date(5397)));
+    assert_eq!(
+        node.props.get("duration"),
+        Some(&PropertyValue::Duration { months: 149, days: 14, seconds: 58390, nanos: 2 })
+    );
+}

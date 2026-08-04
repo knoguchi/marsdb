@@ -7,6 +7,7 @@ mod params;
 mod parser;
 mod planner;
 mod result;
+pub mod temporal;
 mod value;
 
 pub use ast::{Literal, Statement};

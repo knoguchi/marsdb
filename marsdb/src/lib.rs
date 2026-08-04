@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use marsdb_graph::PropertyValue;
-pub use marsdb_query::{Literal, PathElem, QueryResult, Value};
+pub use marsdb_query::{temporal, Literal, PathElem, QueryResult, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -122,8 +122,8 @@ fn substitute_with_expr(expr: &mut WithExpr, params: &HashMap<String, PropertyVa
 fn substitute_pattern(pattern: &mut Pattern, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
     substitute_node(&mut pattern.start, params)?;
     for (rel, node) in &mut pattern.hops {
-        for (_, lit) in &mut rel.props {
-            substitute_literal(lit, params)?;
+        for (_, expr) in &mut rel.props {
+            substitute_return_expr(expr, params)?;
         }
         substitute_node(node, params)?;
     }
@@ -131,8 +131,8 @@ fn substitute_pattern(pattern: &mut Pattern, params: &HashMap<String, PropertyVa
 }
 
 fn substitute_node(node: &mut NodePattern, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
-    for (_, lit) in &mut node.props {
-        substitute_literal(lit, params)?;
+    for (_, expr) in &mut node.props {
+        substitute_return_expr(expr, params)?;
     }
     Ok(())
 }
@@ -218,6 +218,15 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
                 substitute_return_expr(e, params)?;
             }
         }
+        ReturnExpr::MapLit(entries) => {
+            for (_, v) in entries {
+                substitute_return_expr(v, params)?;
+            }
+        }
+        ReturnExpr::Compare(l, _, r) => {
+            substitute_return_expr(l, params)?;
+            substitute_return_expr(r, params)?;
+        }
     }
     Ok(())
 }
@@ -227,17 +236,29 @@ fn substitute_literal(lit: &mut Literal, params: &HashMap<String, PropertyValue>
         let value = params
             .get(name)
             .ok_or_else(|| QueryError::MissingParam(name.clone()))?;
-        *lit = property_value_to_literal(value);
+        *lit = property_value_to_literal(name, value)?;
     }
     Ok(())
 }
 
-fn property_value_to_literal(pv: &PropertyValue) -> Literal {
-    match pv {
+fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, QueryError> {
+    Ok(match pv {
         PropertyValue::Null => Literal::Null,
         PropertyValue::Bool(b) => Literal::Bool(*b),
         PropertyValue::Int(i) => Literal::Int(*i),
         PropertyValue::Float(f) => Literal::Float(*f),
         PropertyValue::String(s) => Literal::String(s.clone()),
-    }
+        // `Literal` has no temporal variant (there's no temporal *literal*
+        // syntax in Cypher -- see cypher.pest's docs: a date/duration is
+        // always built via `date(...)`/`duration(...)`), so a Date/
+        // Duration bound in from Rust as a `$param` has nowhere to
+        // substitute to. Erroring here (not silently dropping to Null) is
+        // the same "a real gap should say so, not produce a plausible-
+        // looking wrong answer" stance `apply_arith` already documents.
+        PropertyValue::Date(_) | PropertyValue::Duration { .. } => {
+            return Err(QueryError::Parse(format!(
+                "${name}: passing a Date/Duration value as a query parameter isn't supported yet"
+            )))
+        }
+    })
 }

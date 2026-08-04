@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ast::{CompareOp, Expr, NodePattern, Pattern, PropAccess, RelDirection};
+use crate::ast::{CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr};
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
 
@@ -39,9 +39,9 @@ pub fn build_match_plan(
         // Already bound by a prior QueryPart's WITH output — continue from
         // it instead of re-scanning, same Filter treatment as a hop node
         // (no preceding scan narrowed it, so check every listed label).
-        wrap_labels_and_props(LogicalPlan::Seed { var: start_var.clone() }, &start_var, &pattern.start, 0)
+        wrap_labels_and_props(LogicalPlan::Seed { var: start_var.clone() }, &start_var, &pattern.start, 0)?
     } else {
-        scan_for(&start_var, &pattern.start)
+        scan_for(&start_var, &pattern.start)?
     };
     let mut from_var = start_var.clone();
     // Real Cypher pattern matching is edge-isomorphic: no single MATCH
@@ -170,15 +170,15 @@ pub fn build_match_plan(
         // pre-filter by label at all (unlike the start node's
         // NodeByLabelScan) — every listed label must be Filter-checked
         // here, not just the extras beyond the first.
-        plan = wrap_labels_and_props(plan, &to_var, node, 0);
+        plan = wrap_labels_and_props(plan, &to_var, node, 0)?;
         if let Some(rel_var) = &rel_filter_var {
-            for (key, lit) in &rel.props {
+            for (key, expr) in &rel.props {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: Expr::Compare(
                         PropAccess { var: rel_var.clone(), prop: key.clone() },
                         CompareOp::Eq,
-                        lit.clone(),
+                        require_literal_pattern_prop(key, expr)?,
                     ),
                 };
             }
@@ -221,7 +221,7 @@ pub fn build_match_plan(
     Ok(plan)
 }
 
-fn scan_for(var: &str, node: &NodePattern) -> LogicalPlan {
+fn scan_for(var: &str, node: &NodePattern) -> Result<LogicalPlan, QueryError> {
     // The first label (if any) narrows the scan; any additional labels
     // (`(n:Post:Message)`) become extra HasLabel filters — a node must
     // have ALL listed labels, matching Cypher's multi-label AND semantics.
@@ -239,8 +239,13 @@ fn scan_for(var: &str, node: &NodePattern) -> LogicalPlan {
 /// Inline node-pattern properties (`(a:Person {name:'Alice'})`) and any
 /// labels not already handled by a preceding scan (`skip` labels from the
 /// front) compile to the same Filter machinery as a WHERE clause, just
-/// synthesized from the pattern.
-fn wrap_labels_and_props(plan: LogicalPlan, var: &str, node: &NodePattern, skip: usize) -> LogicalPlan {
+/// synthesized from the pattern. `MATCH`'s inline `{...}` (unlike
+/// `CREATE`'s, see `Executor::eval_props_to_values`) must resolve to a
+/// plain `Literal` at plan-build time, before any row exists to evaluate
+/// a real expression against — `require_literal_pattern_prop` below
+/// rejects anything else with a clear error rather than this silently
+/// matching nothing.
+fn wrap_labels_and_props(plan: LogicalPlan, var: &str, node: &NodePattern, skip: usize) -> Result<LogicalPlan, QueryError> {
     let mut plan = plan;
     for label in node.labels.iter().skip(skip) {
         plan = LogicalPlan::Filter {
@@ -248,21 +253,38 @@ fn wrap_labels_and_props(plan: LogicalPlan, var: &str, node: &NodePattern, skip:
             predicate: Expr::HasLabel(var.to_string(), label.clone()),
         };
     }
-    for (key, lit) in &node.props {
+    for (key, expr) in &node.props {
         let predicate = Expr::Compare(
             PropAccess {
                 var: var.to_string(),
                 prop: key.clone(),
             },
             CompareOp::Eq,
-            lit.clone(),
+            require_literal_pattern_prop(key, expr)?,
         );
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
             predicate,
         };
     }
-    plan
+    Ok(plan)
+}
+
+/// A `MATCH`/`MERGE` pattern's inline `{key: value}` must be a plain
+/// literal (real Cypher's own restriction too — `MATCH (n {x: f()})`
+/// isn't valid there either) since it compiles straight into a `Filter`
+/// predicate at plan-build time, before any row/graph access exists to
+/// evaluate a computed expression against. `CREATE`'s `{...}` doesn't go
+/// through this at all (see `Executor::eval_props_to_values`), which is
+/// what actually lets `CREATE (:Val {d: date({year: 1984, ...})})` work.
+fn require_literal_pattern_prop(key: &str, expr: &ReturnExpr) -> Result<Literal, QueryError> {
+    match expr {
+        ReturnExpr::Lit(lit) => Ok(lit.clone()),
+        _ => Err(QueryError::Parse(format!(
+            "MATCH/MERGE pattern property '{key}' must be a literal value, not a computed expression — \
+             only CREATE's inline {{...}} supports that"
+        ))),
+    }
 }
 
 /// All variable names (node + relationship) a pattern binds, regardless of

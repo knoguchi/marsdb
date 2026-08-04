@@ -36,6 +36,10 @@ fn format_value(value: &Value) -> String {
                 .collect();
             parts.join("")
         }
+        Value::Map(entries) => {
+            let cells: Vec<String> = entries.iter().map(|(k, v)| format!("{k}: {}", format_value(v))).collect();
+            format!("{{{}}}", cells.join(", "))
+        }
         Value::Null => "null".to_string(),
     }
 }
@@ -47,6 +51,10 @@ fn format_property(p: &PropertyValue) -> String {
         PropertyValue::Int(i) => i.to_string(),
         PropertyValue::Float(f) => f.to_string(),
         PropertyValue::String(s) => s.clone(),
+        PropertyValue::Date(d) => marsdb::temporal::format_date(*d),
+        PropertyValue::Duration { months, days, seconds, nanos } => {
+            marsdb::temporal::format_duration(*months, *days, *seconds, *nanos)
+        }
     }
 }
 

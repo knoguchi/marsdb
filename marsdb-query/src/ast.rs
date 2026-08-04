@@ -99,6 +99,26 @@ pub enum ReturnExpr {
     /// out-of-range bounds clamp instead of nulling out, and a start at or
     /// past the (clamped) end yields `[]` rather than erroring.
     Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
+    /// `{key: <expr>, ...}` — a general expression map, e.g. `date({year:
+    /// 1984, month: 10, day: 11})`'s argument, a bare `RETURN {a: 1}`, or
+    /// (via `NodePattern`/`RelPattern`'s `props`, which reuse this same
+    /// variant — see `cypher.pest`'s `map_expr` docs) a CREATE pattern's
+    /// `{...}` property map. Evaluates to `Value::Map`, a query-layer-only
+    /// concept with nowhere to persist as a `PropertyValue` on its own
+    /// (same reasoning as `Value::List`'s docs) — only meaningful as an
+    /// intermediate, e.g. a `date(...)`/`duration(...)` call's argument,
+    /// or (per-key) a real storable prop value once each entry is itself
+    /// evaluated down to a `PropertyValue`.
+    MapLit(Vec<(String, ReturnExpr)>),
+    /// `lhs op rhs` as a general RETURN/WITH expression (`x > d`, `1 + 1 =
+    /// 2`) — separate from the pattern-level `Expr::Compare`/`WithExpr::
+    /// Compare` (both of which require a literal RHS, compiled at
+    /// plan-build/projection time respectively): this one evaluates both
+    /// sides as ordinary `ReturnExpr`s at row-evaluation time via
+    /// `compare_values` (executor.rs), the only way to compare two
+    /// *computed* values against each other (e.g. two `date(...)` call
+    /// results) rather than a bound property against a literal.
+    Compare(Box<ReturnExpr>, CompareOp, Box<ReturnExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,14 +164,19 @@ pub enum RelDirection {
 pub struct NodePattern {
     pub var: Option<String>,
     pub labels: Vec<String>,
-    pub props: Vec<(String, Literal)>,
+    /// `ReturnExpr`, not `Literal` — a CREATE prop value can be any
+    /// expression (`{date: date({year: 1984, ...})}`, `{x: 1 + 2}`), not
+    /// just a literal; see `cypher.pest`'s `map_expr` docs and
+    /// `Executor::eval_props_to_values`, which evaluates each one against
+    /// the row already bound so far in the same CREATE.
+    pub props: Vec<(String, ReturnExpr)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RelPattern {
     pub var: Option<String>,
     pub rel_type: Option<String>,
-    pub props: Vec<(String, Literal)>,
+    pub props: Vec<(String, ReturnExpr)>,
     pub direction: RelDirection,
     /// `[:TYPE*min..max]` — `None` means a fixed single hop (existing
     /// behavior). `max: None` means unbounded, capped at a safety depth by

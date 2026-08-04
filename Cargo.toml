@@ -34,3 +34,9 @@ clap = { version = "4", features = ["derive"] }
 rustyline = "14"
 criterion = "0.5"
 tempfile = "3"
+# Calendar math (leap years, month lengths) plus the system clock (`date()`
+# with no arguments) only -- no timezone database (`iana-time-zone`/
+# `js-sys`/`winapi` etc are all off via `default-features = false`), since
+# MarsDB's temporal support is offset-naive so far (see PropertyValue::
+# Date's doc comment).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use marsdb_graph::{Edge, Node, PropertyValue};
 
 use crate::ast::Literal;
@@ -26,5 +28,15 @@ pub enum Value {
     /// result — see `Binding::Path`'s docs (executor.rs) for how this
     /// gets assembled during MATCH evaluation.
     Path(Vec<PathElem>),
+    /// A `{key: <expr>, ...}` map literal (`ReturnExpr::MapLit`) — same
+    /// "query-layer-only concept, not persisted" reasoning as `List`
+    /// above (nothing in the grammar can construct a bare map literal to
+    /// store as a node/edge property; a `CREATE {...}` prop map's *values*
+    /// each become their own `PropertyValue` individually, the map
+    /// structure itself never does). Its main real use is as a `date(...)
+    /// `/`duration(...)` construction function's argument, e.g.
+    /// `date({year: 1984, month: 10, day: 11})` — see `Executor::
+    /// call_builtin`.
+    Map(BTreeMap<String, Value>),
     Null,
 }

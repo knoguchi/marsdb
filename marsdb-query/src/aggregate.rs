@@ -36,6 +36,8 @@ pub(crate) enum HashKey {
     FloatBits(u64),
     Str(String),
     List(Vec<HashKey>),
+    Date(i32),
+    Duration(i64, i64, i64, i32),
 }
 
 pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
@@ -55,6 +57,13 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
                     .into(),
             ))
         }
+        // Same reasoning as `Value::Path` above -- a map literal is only
+        // ever a transient construction-function argument in practice
+        // (see `Value::Map`'s docs), never something real usage groups by
+        // or collects with DISTINCT.
+        Value::Map(_) => {
+            return Err(QueryError::Parse("grouping or using DISTINCT with a map value isn't supported".into()))
+        }
     })
 }
 
@@ -65,6 +74,8 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
         PropertyValue::Int(i) => HashKey::Int(*i),
         PropertyValue::Float(f) => HashKey::FloatBits(f.to_bits()),
         PropertyValue::String(s) => HashKey::Str(s.clone()),
+        PropertyValue::Date(d) => HashKey::Date(*d),
+        PropertyValue::Duration { months, days, seconds, nanos } => HashKey::Duration(*months, *days, *seconds, *nanos),
     }
 }
 
@@ -113,6 +124,7 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Edge(_) => "an edge",
         Value::List(_) => "a list",
         Value::Path(_) => "a path",
+        Value::Map(_) => "a map",
         Value::Property(_) | Value::Literal(_) => "a scalar",
         Value::Null => "null",
     }
