@@ -413,6 +413,11 @@ fn format_property_value(v: &PropertyValue) -> String {
         PropertyValue::Int(i) => i.to_string(),
         PropertyValue::Float(f) => f.to_string(),
         PropertyValue::String(s) => format!("'{s}'"),
-        PropertyValue::Date(_) | PropertyValue::Duration { .. } => format!("{v:?}"),
+        PropertyValue::Date(_)
+        | PropertyValue::Duration { .. }
+        | PropertyValue::LocalTime(_)
+        | PropertyValue::Time { .. }
+        | PropertyValue::LocalDateTime { .. }
+        | PropertyValue::DateTime { .. } => format!("{v:?}"),
     }
 }

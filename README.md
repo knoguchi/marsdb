@@ -219,15 +219,15 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 1948/3880 TCK scenarios pass (50.2%), 0 wrong-result
+Short version: 2097/3880 TCK scenarios pass (54.0%), 0 wrong-result
 scenarios (no known silent-correctness bugs in the supported surface).
 
 ## Roadmap
 
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
-- `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` temporal types (a
-  time-of-day, plus a timezone — offset and/or an IANA name — on top of
-  the `Date`/`Duration` support that already exists)
+- Named-timezone support (`'Europe/Stockholm'`) for `Time`/`DateTime` —
+  needs a real IANA timezone database (DST transition rules), only a
+  fixed UTC offset (`'+01:00'`) is supported today
 - `duration.between(...)`/`.inDays(...)`/`.inSeconds(...)` and
   `<temporal>.truncate(unit, ...)` — the TCK's two single largest
   remaining `expressions/temporal` gaps by scenario count

@@ -279,6 +279,31 @@ fn push_property_json(out: &mut String, p: &PropertyValue) {
             out,
             &marsdb::temporal::format_duration(*months, *days, *seconds, *nanos),
         ),
+        PropertyValue::LocalTime(nanos_of_day) => {
+            push_json_string(out, &marsdb::temporal::format_local_time(*nanos_of_day))
+        }
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => push_json_string(
+            out,
+            &marsdb::temporal::format_time(*nanos_of_day, *offset_seconds),
+        ),
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => push_json_string(
+            out,
+            &marsdb::temporal::format_local_date_time(*epoch_seconds, *nanos),
+        ),
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        } => push_json_string(
+            out,
+            &marsdb::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
+        ),
     }
 }
 

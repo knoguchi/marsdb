@@ -89,6 +89,49 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
             out.extend_from_slice(&nanos.to_be_bytes());
             out
         }
+        // Always non-negative by construction (`0..86_400_000_000_000`) --
+        // plain BE bytes already sort correctly, no sign-flip needed.
+        PropertyValue::LocalTime(nanos_of_day) => {
+            let mut out = vec![0x07];
+            out.extend_from_slice(&nanos_of_day.to_be_bytes());
+            out
+        }
+        // Keyed by the UTC-equivalent instant-of-day (`nanos_of_day -
+        // offset_seconds`), not the raw wall-clock fields -- matches
+        // `Time`'s own equality/ordering rule (see its doc comment), so
+        // two structurally-different `Time`s that represent the same
+        // instant correctly collapse to the same index key.
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => {
+            let instant = nanos_of_day - *offset_seconds as i64 * 1_000_000_000;
+            let mut out = vec![0x08];
+            out.extend_from_slice(&((instant as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+            out
+        }
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => {
+            let mut out = vec![0x09];
+            out.extend_from_slice(&((*epoch_seconds as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+            out.extend_from_slice(&nanos.to_be_bytes());
+            out
+        }
+        // `offset_seconds` deliberately excluded -- `DateTime`'s equality/
+        // ordering is instant-only (see its doc comment), same reasoning
+        // as `Time` above.
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            ..
+        } => {
+            let mut out = vec![0x0A];
+            out.extend_from_slice(&((*epoch_seconds as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+            out.extend_from_slice(&nanos.to_be_bytes());
+            out
+        }
     }
 }
 

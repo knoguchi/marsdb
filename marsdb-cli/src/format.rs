@@ -69,6 +69,22 @@ fn format_property(p: &PropertyValue) -> String {
             seconds,
             nanos,
         } => marsdb::temporal::format_duration(*months, *days, *seconds, *nanos),
+        PropertyValue::LocalTime(nanos_of_day) => {
+            marsdb::temporal::format_local_time(*nanos_of_day)
+        }
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => marsdb::temporal::format_time(*nanos_of_day, *offset_seconds),
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => marsdb::temporal::format_local_date_time(*epoch_seconds, *nanos),
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        } => marsdb::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
     }
 }
 

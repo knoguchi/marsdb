@@ -19,8 +19,8 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 45 | 0 | 2 | 31 | 0 | 57.7% |
 | clauses/delete | 41 | 20 | 0 | 0 | 21 | 0 | 48.8% |
-| clauses/match | 381 | 272 | 0 | 0 | 74 | 35 | 71.4% |
-| clauses/match-where | 34 | 8 | 0 | 0 | 26 | 0 | 23.5% |
+| clauses/match | 381 | 273 | 0 | 0 | 73 | 35 | 71.7% |
+| clauses/match-where | 34 | 15 | 0 | 0 | 19 | 0 | 44.1% |
 | clauses/merge | 75 | 25 | 0 | 3 | 47 | 0 | 33.3% |
 | clauses/remove | 33 | 18 | 0 | 0 | 15 | 0 | 54.5% |
 | clauses/return | 63 | 31 | 0 | 2 | 30 | 0 | 49.2% |
@@ -30,15 +30,15 @@ scope.
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/unwind | 14 | 9 | 0 | 0 | 3 | 2 | 64.3% |
 | clauses/with | 29 | 10 | 0 | 1 | 17 | 1 | 34.5% |
-| clauses/with-orderBy | 292 | 143 | 0 | 1 | 146 | 2 | 49.0% |
+| clauses/with-orderBy | 292 | 163 | 0 | 1 | 126 | 2 | 55.8% |
 | clauses/with-skip-limit | 9 | 4 | 0 | 0 | 5 | 0 | 44.4% |
 | clauses/with-where | 19 | 2 | 0 | 0 | 17 | 0 | 10.5% |
 | expressions/aggregation | 35 | 21 | 0 | 4 | 10 | 0 | 60.0% |
 | expressions/boolean | 150 | 140 | 0 | 0 | 10 | 0 | 93.3% |
-| expressions/comparison | 72 | 52 | 0 | 0 | 20 | 0 | 72.2% |
+| expressions/comparison | 72 | 54 | 0 | 0 | 18 | 0 | 75.0% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
-| expressions/graph | 61 | 35 | 0 | 7 | 19 | 0 | 57.4% |
+| expressions/graph | 61 | 40 | 0 | 7 | 14 | 0 | 65.6% |
 | expressions/list | 185 | 121 | 0 | 2 | 55 | 7 | 65.4% |
 | expressions/literals | 131 | 71 | 0 | 0 | 51 | 9 | 54.2% |
 | expressions/map | 44 | 16 | 0 | 6 | 17 | 5 | 36.4% |
@@ -49,11 +49,11 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 55 | 0 | 37 | 912 | 0 | 5.5% |
+| expressions/temporal | 1004 | 169 | 0 | 356 | 479 | 0 | 16.8% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **1948** | **0** | **68** | **1795** | **69** | **50.2%** |
+| **TOTAL** | **3880** | **2097** | **0** | **387** | **1327** | **69** | **54.0%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -71,13 +71,15 @@ Column meanings:
   vendored, or an untested step form).
 
 `expressions/temporal` is 1004 of the 3880 total scenarios (26%) and pulls
-the aggregate average down hard — no `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/
-`DATETIME` type at all (no timezone database is linked in), so the whole
-suite of scenarios exercising those fails at the `reject` stage. Every
-other category's pass rate is a better read on where things actually
-stand; see [Temporal types](#temporal-types) below for exactly what *is*
-supported (`Date`/`Duration` construction, arithmetic, component access,
-comparison).
+the aggregate average down — `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/
+`DATETIME` are supported, but only with a *fixed* UTC offset (`'+01:00'`);
+a named timezone (`'Europe/Stockholm'`) needs a real IANA timezone
+database, deliberately out of scope (no DST/zone-rule awareness anywhere
+in `marsdb-query::temporal`), so the scenarios exercising those still
+fail at the `reject` stage. See [Temporal types](#temporal-types) below
+for exactly what *is* supported (construction, arithmetic, component
+access, comparison, string round-tripping — for all six temporal types,
+not just `Date`/`Duration`).
 
 ## Clauses
 
@@ -226,47 +228,69 @@ fails at execution time with a clear error, not silently as `null`).
 
 ## Temporal types
 
-`Date`/`Duration` (`PropertyValue::Date`/`Duration`, first-class storage
-variants, not `Int`/`String` reused — see `marsdb-graph/src/model.rs`'s
-doc comment): `date()` (today, UTC), `date('2015-07-21')` (calendar
-string forms only — `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY`),
-`date({year, month, day})` (calendar map construction only), and
-`duration({years, months, weeks, days, hours, minutes, seconds,
-milliseconds, microseconds, nanoseconds})`/`duration('P1Y2M3DT4H5M6S')`
-(real ISO-8601 duration normalization, verified line-by-line against the
-TCK's examples, including fractional units — `duration({months: 0.75})`
-correctly becomes `P22DT19H51M49.5S`).
+All six Cypher temporal types are supported: `Date`, `Duration`,
+`LocalTime`, `Time`, `LocalDateTime`, `DateTime` (each a first-class
+`PropertyValue` storage variant, not `Int`/`String` reused — see
+`marsdb-graph/src/model.rs`'s doc comment). `Time`/`DateTime` only accept
+a *fixed* UTC offset (`'+01:00'`, `{timezone: '+01:00'}`) — a named
+timezone (`'Europe/Stockholm'`) is rejected with a clear error, not
+misparsed; see the gap list below.
 
-Comparison (`<` `<=` `>` `>=` `=` `<>` on two `Date`s; `=`/`<>` only on
-two `Duration`s — component equality, no defined ordering), arithmetic
-(`date +/- duration`, `duration +/- duration`, `duration * number`,
-`duration / number` — `date` arithmetic uses real calendar month math,
-e.g. Jan 31 + 1 month clamps to Feb 28/29), component access
-(`d.year`/`.month`/`.day`/`.quarter`/`.ordinalDay`/`.weekDay`/`.week`/
-`.weekYear`/`.dayOfQuarter` for a `Date`; `d.years`/`.quarters`/`.months`/
-`.weeks`/`.days`/`.hours`/`.minutes`/`.seconds`/`.milliseconds`/
-`.microseconds`/`.nanoseconds` (each the *whole* duration re-expressed in
-that one unit alone, not a calendar-style breakdown —
-`duration({years: 1, months: 4}).months` is `16`, not `4`) plus
-`.quartersOfYear`/`.monthsOfQuarter`/`.monthsOfYear`/`.daysOfWeek`/
-`.minutesOfHour`/`.secondsOfMinute`/`.millisecondsOfSecond`/
-`.microsecondsOfSecond`/`.nanosecondsOfSecond` (each unit's remainder
-within the next one up) for a `Duration`), and `toString()` (round-trips:
-`date(toString(d)) = d`).
+Construction: `date()`/`localtime()`/`time()`/`localdatetime()`/
+`datetime()` with no arguments (the current UTC value); from a string
+(`date('2015-07-21')`, `time('21:40:32.142+01:00')`, ... — calendar-only
+date forms, `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY`, no
+week-date/ordinal-date forms); from a map (`date({year, month, day})`,
+`time({hour, minute, second, millisecond, microsecond, nanosecond,
+timezone})`, ...); or from another value of the same type (identity,
+e.g. round-tripping through `toString`). `duration({years, months,
+weeks, days, hours, minutes, seconds, milliseconds, microseconds,
+nanoseconds})`/`duration('P1Y2M3DT4H5M6S')` (real ISO-8601 duration
+normalization, verified line-by-line against the TCK's examples,
+including fractional units — `duration({months: 0.75})` correctly
+becomes `P22DT19H51M49.5S`).
 
-**Not** supported: `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` (no
-time-of-day or timezone type at all — no timezone database is linked in
-either), week-date/ordinal-date/quarter construction
-(`date({year: 2015, week: 1})`, `date('2015-W30-2')`, `date('2015-202')`
-— only the calendar year/month/day forms), projecting one temporal value
-from another (`date({date: d, day: 5})`), `duration.between(...)`/
-`.inDays(...)`/etc, `.truncate(...)`, and the alternate ISO-8601 combined
-date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`).
-Together these cover the two largest, most foundational shapes of the
-TCK's `expressions/temporal` suite (construction + storage round-trip +
-comparison + component access + arithmetic for `Date`/`Duration`); the
-timezone-aware types and the truncate/between function families are real,
-substantial remaining gaps, not attempted — see `marsdb-query/src/
+Comparison (`<` `<=` `>` `>=` `=` `<>` on two values of the same type;
+`=`/`<>` only on two `Duration`s — component equality, no defined
+ordering): `Time`/`DateTime` compare by the UTC-equivalent instant, not
+the raw wall-clock reading, so two values at different offsets can
+compare equal even though they print differently. Arithmetic (`+`/`-` a
+`Duration` to/from any of the other five types, `duration +/- duration`,
+`duration * number`, `duration / number`) — `Date`/`LocalDateTime`/
+`DateTime` arithmetic uses real calendar month math (Jan 31 + 1 month
+clamps to Feb 28/29); `Time`/`LocalTime` + `Duration` wraps at the 24h
+boundary instead (no calendar to carry an extra day into), truncating
+the duration's `months`/`days` components.
+
+Component access: `d.year`/`.month`/`.day`/`.quarter`/`.ordinalDay`/
+`.weekDay`/`.week`/`.weekYear`/`.dayOfQuarter` (`Date`, and the
+calendar half of `LocalDateTime`/`DateTime`); `.hour`/`.minute`/
+`.second`/`.millisecond`/`.microsecond`/`.nanosecond` (`LocalTime`, and
+the clock half of `Time`/`LocalDateTime`/`DateTime`); `.timezone`/
+`.offset`/`.offsetSeconds`/`.offsetMinutes` (`Time`/`DateTime` only);
+`.epochSeconds`/`.epochMillis` (`DateTime` only, always the UTC instant
+— every other `DateTime` component reflects the *local*, offset-adjusted
+reading that was written, not the UTC one); the full `Duration` set
+(`.years`/`.quarters`/`.months`/`.weeks`/`.days`/`.hours`/`.minutes`/
+`.seconds`/`.milliseconds`/`.microseconds`/`.nanoseconds`, each the
+*whole* duration re-expressed in that one unit alone, not a
+calendar-style breakdown — `duration({years: 1, months:
+4}).months` is `16`, not `4` — plus `.quartersOfYear`/
+`.monthsOfQuarter`/`.monthsOfYear`/`.daysOfWeek`/`.minutesOfHour`/
+`.secondsOfMinute`/`.millisecondsOfSecond`/`.microsecondsOfSecond`/
+`.nanosecondsOfSecond`, each unit's remainder within the next one up).
+`toString()` round-trips for every type (`date(toString(d)) = d`, ...).
+
+**Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
+`DateTime` — needs a real IANA timezone database (DST transition rules,
+zone-name lookup), deliberately out of scope, no dependency pulled in
+for it; week-date/ordinal-date/quarter construction (`date({year: 2015,
+week: 1})`, `date('2015-W30-2')`, `date('2015-202')` — only the calendar
+year/month/day forms, for the date half of every type); projecting one
+temporal value from another (`date({date: d, day: 5})`);
+`duration.between(...)`/`.inDays(...)`/etc, `.truncate(...)`, and the
+alternate ISO-8601 combined date-time duration syntax
+(`duration('P2012-02-02T14:37:21.545')`). See `marsdb-query/src/
 temporal.rs`'s module doc comment for the same list in code.
 
 ## Indexes & EXPLAIN

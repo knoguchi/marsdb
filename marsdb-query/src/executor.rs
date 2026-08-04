@@ -3685,6 +3685,64 @@ fn compare_property_pair(a: &PropertyValue, op: CompareOp, b: &PropertyValue) ->
         // scenario (`Quantifier7 :: [3]`) that specifically compares two
         // boolean expressions with `<=`.
         (PropertyValue::Bool(a), PropertyValue::Bool(b)) => Some(cmp_ord(op, *a, *b)),
+        // `Date` had no arm here at all before -- fell through to the
+        // generic mismatch fallback below, which always answers
+        // `Eq -> false`/`Ne -> true` regardless of the actual values, so
+        // `WHERE a.date = b.date` on two genuinely-equal stored dates
+        // incorrectly evaluated to `false`. A real, pre-existing gap,
+        // fixed here rather than left alongside the new temporal types.
+        (PropertyValue::Date(a), PropertyValue::Date(b)) => Some(cmp_ord(op, *a, *b)),
+        (PropertyValue::LocalTime(a), PropertyValue::LocalTime(b)) => Some(cmp_ord(op, *a, *b)),
+        // Compares the UTC-equivalent instant-of-day, not the raw
+        // wall-clock fields -- see `PropertyValue::Time`'s doc comment.
+        (
+            PropertyValue::Time {
+                nanos_of_day: na,
+                offset_seconds: oa,
+            },
+            PropertyValue::Time {
+                nanos_of_day: nb,
+                offset_seconds: ob,
+            },
+        ) => Some(cmp_ord(
+            op,
+            na - *oa as i64 * 1_000_000_000,
+            nb - *ob as i64 * 1_000_000_000,
+        )),
+        (
+            PropertyValue::LocalDateTime {
+                epoch_seconds: sa,
+                nanos: na,
+            },
+            PropertyValue::LocalDateTime {
+                epoch_seconds: sb,
+                nanos: nb,
+            },
+        ) => Some(cmp_ord(op, (*sa, *na), (*sb, *nb))),
+        // Instant-only, `offset_seconds` ignored -- see
+        // `PropertyValue::DateTime`'s doc comment.
+        (
+            PropertyValue::DateTime {
+                epoch_seconds: sa,
+                nanos: na,
+                ..
+            },
+            PropertyValue::DateTime {
+                epoch_seconds: sb,
+                nanos: nb,
+                ..
+            },
+        ) => Some(cmp_ord(op, (*sa, *na), (*sb, *nb))),
+        // `Duration` has no defined *ordering* (see its own doc comment)
+        // but `=`/`<>` are still real, component-wise comparisons (the
+        // same bug `Date` had above -- the generic mismatch fallback's
+        // unconditional `Eq -> false` would otherwise make two
+        // genuinely-equal durations compare unequal).
+        (PropertyValue::Duration { .. }, PropertyValue::Duration { .. }) => match op {
+            CompareOp::Eq => Some(a == b),
+            CompareOp::Ne => Some(a != b),
+            _ => None,
+        },
         _ => match op {
             CompareOp::Eq => Some(false),
             CompareOp::Ne => Some(true),
@@ -3797,7 +3855,7 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Null, _) | (_, Value::Null) => false,
-        (Value::Property(pa), Value::Property(pb)) => pa == pb,
+        (Value::Property(pa), Value::Property(pb)) => property_value_eq(pa, pb),
         (Value::Literal(la), Value::Literal(lb)) => la == lb,
         (Value::Property(pa), Value::Literal(lb)) => *pa == literal_to_value(lb),
         (Value::Literal(la), Value::Property(pb)) => literal_to_value(la) == *pb,
@@ -3807,6 +3865,40 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
             la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y))
         }
         _ => false,
+    }
+}
+
+/// `PropertyValue`'s derived `PartialEq` is structural (every field must
+/// match), which is wrong for `Time`/`DateTime`: two values at the same
+/// instant but different offsets must compare equal (see their own doc
+/// comments -- same rule `compare_property_pair`/`compare_non_null`/
+/// `comparable_ordering` already apply for `<`/`>`/ORDER BY/min/max).
+/// Everything else keeps plain structural equality.
+fn property_value_eq(a: &PropertyValue, b: &PropertyValue) -> bool {
+    match (a, b) {
+        (
+            PropertyValue::Time {
+                nanos_of_day: na,
+                offset_seconds: oa,
+            },
+            PropertyValue::Time {
+                nanos_of_day: nb,
+                offset_seconds: ob,
+            },
+        ) => na - *oa as i64 * 1_000_000_000 == nb - *ob as i64 * 1_000_000_000,
+        (
+            PropertyValue::DateTime {
+                epoch_seconds: sa,
+                nanos: na,
+                ..
+            },
+            PropertyValue::DateTime {
+                epoch_seconds: sb,
+                nanos: nb,
+                ..
+            },
+        ) => sa == sb && na == nb,
+        _ => a == b,
     }
 }
 
@@ -3929,21 +4021,57 @@ fn duration_value((months, days, seconds, nanos): temporal::DurationParts) -> Va
     })
 }
 
-/// The `Date`/`Duration` cases of `+`/`-`/`*`/`/` -- tried before
-/// `apply_arith`'s generic numeric path, since a `Date`/`Duration`
-/// operand is never an `ArithNum`. Returns `Ok(None)` (not an error) for
-/// any operand-type combination it doesn't recognize, so `apply_arith`
-/// falls through to its own "not two numbers" error with the *original*
-/// operands in the message, rather than this function needing to
-/// duplicate that error text.
+fn as_local_time(v: &Value) -> Option<i64> {
+    match v {
+        Value::Property(PropertyValue::LocalTime(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+fn as_time(v: &Value) -> Option<(i64, i32)> {
+    match v {
+        Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }) => Some((*nanos_of_day, *offset_seconds)),
+        _ => None,
+    }
+}
+
+fn as_local_date_time(v: &Value) -> Option<(i64, i32)> {
+    match v {
+        Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }) => Some((*epoch_seconds, *nanos)),
+        _ => None,
+    }
+}
+
+fn as_date_time(v: &Value) -> Option<(i64, i32, i32)> {
+    match v {
+        Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }) => Some((*epoch_seconds, *nanos, *offset_seconds)),
+        _ => None,
+    }
+}
+
+/// The `Date`/`Duration`/`LocalTime`/`Time`/`LocalDateTime`/`DateTime`
+/// cases of `+`/`-`/`*`/`/` -- tried before `apply_arith`'s generic
+/// numeric path, since none of these are ever an `ArithNum`. Returns
+/// `Ok(None)` (not an error) for any operand-type combination it doesn't
+/// recognize, so `apply_arith` falls through to its own "not two
+/// numbers" error with the *original* operands in the message, rather
+/// than this function needing to duplicate that error text.
 ///
-/// Only `Date`/`Duration` arithmetic is implemented here -- there's no
-/// `Time`/`DateTime`/`LocalDateTime` to add a `Duration` to (see this
-/// module's temporal-support docs), and `Date - Date` (which real Cypher
-/// doesn't define as a direct operator either -- `duration.between(...)`
-/// is the real spelling, itself out of scope, see the README) is
-/// deliberately *not* handled, falling through to the same "not two
-/// numbers" error a truly nonsensical subtraction would already get.
+/// `<temporal> - <temporal>` (real Cypher's `duration.between(...)` is
+/// the actual spelling for that, itself out of scope -- see the README)
+/// is deliberately *not* handled for any of the 5 non-Duration types,
+/// falling through to the same "not two numbers" error a truly
+/// nonsensical subtraction would already get.
 fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Value>, QueryError> {
     let date_plus_duration =
         |d: i32, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
@@ -3954,12 +4082,92 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
                     QueryError::Type("date +/- duration produced an out-of-range date".into())
                 })
         };
+    let local_time_plus_duration = |t: i64, dur: temporal::DurationParts, negate: bool| -> Value {
+        let (_, _, seconds, nanos) = dur;
+        Value::Property(PropertyValue::LocalTime(temporal::add_duration_to_time(
+            t, seconds, nanos, negate,
+        )))
+    };
+    let time_plus_duration =
+        |(t, offset): (i64, i32), dur: temporal::DurationParts, negate: bool| -> Value {
+            let (_, _, seconds, nanos) = dur;
+            Value::Property(PropertyValue::Time {
+                nanos_of_day: temporal::add_duration_to_time(t, seconds, nanos, negate),
+                offset_seconds: offset,
+            })
+        };
+    let local_date_time_plus_duration = |(epoch_seconds, existing_nanos): (i64, i32),
+                                         dur: temporal::DurationParts,
+                                         negate: bool|
+     -> Result<Value, QueryError> {
+        let (months, days, seconds, nanos) = dur;
+        temporal::add_duration_to_local_date_time(
+            epoch_seconds,
+            existing_nanos,
+            months,
+            days,
+            seconds,
+            nanos,
+            negate,
+        )
+        .map(|(epoch_seconds, nanos)| {
+            Value::Property(PropertyValue::LocalDateTime {
+                epoch_seconds,
+                nanos,
+            })
+        })
+        .ok_or_else(|| {
+            QueryError::Type("local date-time +/- duration produced an out-of-range value".into())
+        })
+    };
+    let date_time_plus_duration =
+        |(epoch_seconds, existing_nanos, offset_seconds): (i64, i32, i32),
+         dur: temporal::DurationParts,
+         negate: bool|
+         -> Result<Value, QueryError> {
+            let (months, days, seconds, nanos) = dur;
+            temporal::add_duration_to_local_date_time(
+                epoch_seconds + offset_seconds as i64,
+                existing_nanos,
+                months,
+                days,
+                seconds,
+                nanos,
+                negate,
+            )
+            .map(|(local_epoch_seconds, nanos)| {
+                Value::Property(PropertyValue::DateTime {
+                    epoch_seconds: local_epoch_seconds - offset_seconds as i64,
+                    nanos,
+                    offset_seconds,
+                })
+            })
+            .ok_or_else(|| {
+                QueryError::Type("date-time +/- duration produced an out-of-range value".into())
+            })
+        };
     Ok(match op {
         ArithOp::Add => {
             if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
                 Some(date_plus_duration(d, dur, false)?)
             } else if let (Some(dur), Some(d)) = (as_duration(a), as_date(b)) {
                 Some(date_plus_duration(d, dur, false)?)
+            } else if let (Some(t), Some(dur)) = (as_local_time(a), as_duration(b)) {
+                Some(local_time_plus_duration(t, dur, false))
+            } else if let (Some(dur), Some(t)) = (as_duration(a), as_local_time(b)) {
+                Some(local_time_plus_duration(t, dur, false))
+            } else if let (Some(t), Some(dur)) = (as_time(a), as_duration(b)) {
+                Some(time_plus_duration(t, dur, false))
+            } else if let (Some(dur), Some(t)) = (as_duration(a), as_time(b)) {
+                Some(time_plus_duration(t, dur, false))
+            } else if let (Some(dt), Some(dur)) = (as_local_date_time(a), as_duration(b)) {
+                Some(local_date_time_plus_duration(dt, dur, false)?)
+            } else if let (Some(dur), Some(dt)) = (as_duration(a), as_local_date_time(b)) {
+                Some(local_date_time_plus_duration(dt, dur, false)?)
+            } else if let (Some(dt), Some(dur)) = (as_date_time(a), as_duration(b)) {
+                Some(date_time_plus_duration(dt, dur, false)?)
+            } else if let (Some(dur), Some(dt)) = (as_duration(a), as_date_time(b)) {
+                Some(date_time_plus_duration(dt, dur, false)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
                 Some(duration_value(temporal::add_duration(x, y).ok_or_else(
                     || QueryError::Type("duration addition overflow".into()),
@@ -3971,6 +4179,14 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
         ArithOp::Sub => {
             if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
                 Some(date_plus_duration(d, dur, true)?)
+            } else if let (Some(t), Some(dur)) = (as_local_time(a), as_duration(b)) {
+                Some(local_time_plus_duration(t, dur, true))
+            } else if let (Some(t), Some(dur)) = (as_time(a), as_duration(b)) {
+                Some(time_plus_duration(t, dur, true))
+            } else if let (Some(dt), Some(dur)) = (as_local_date_time(a), as_duration(b)) {
+                Some(local_date_time_plus_duration(dt, dur, true)?)
+            } else if let (Some(dt), Some(dur)) = (as_date_time(a), as_duration(b)) {
+                Some(date_time_plus_duration(dt, dur, true)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
                 Some(duration_value(temporal::sub_duration(x, y).ok_or_else(
                     || QueryError::Type("duration subtraction overflow".into()),
@@ -4110,6 +4326,10 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
         },
         "date" => date_builtin(args),
         "duration" => duration_builtin(args),
+        "localtime" => local_time_builtin(args),
+        "time" => time_builtin(args),
+        "localdatetime" => local_date_time_builtin(args),
+        "datetime" => date_time_builtin(args),
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -4736,7 +4956,14 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
         // real error (found via a real TCK scenario expecting exactly
         // this), not a silent null the way an out-of-range/unparseable
         // scalar is.
-        Value::Property(PropertyValue::Date(_) | PropertyValue::Duration { .. })
+        Value::Property(
+            PropertyValue::Date(_)
+            | PropertyValue::Duration { .. }
+            | PropertyValue::LocalTime(_)
+            | PropertyValue::Time { .. }
+            | PropertyValue::LocalDateTime { .. }
+            | PropertyValue::DateTime { .. },
+        )
         | Value::Node(_)
         | Value::Edge(_)
         | Value::List(_)
@@ -4770,6 +4997,22 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
             seconds,
             nanos,
         }) => temporal::format_duration(*months, *days, *seconds, *nanos),
+        Value::Property(PropertyValue::LocalTime(nanos_of_day)) => {
+            temporal::format_local_time(*nanos_of_day)
+        }
+        Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }) => temporal::format_time(*nanos_of_day, *offset_seconds),
+        Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }) => temporal::format_local_date_time(*epoch_seconds, *nanos),
+        Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }) => temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
         Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
             return Ok(Value::Null);
         }
@@ -4958,6 +5201,382 @@ fn duration_fields_from_map(
     })
 }
 
+/// Sums the 3 sub-second map keys (`millisecond`/`microsecond`/
+/// `nanosecond`) shared by every one-of-day-or-later temporal map
+/// constructor into one nanosecond count -- separate from `duration`'s
+/// own `nanoseconds` field of the same name, but the same "each unit is
+/// independent, they don't cascade into each other at this layer" idea.
+fn sub_second_nanos_from_map(m: &BTreeMap<String, Value>) -> Result<i64, QueryError> {
+    let field = |key: &str| -> Result<i64, QueryError> {
+        match m.get(key) {
+            None => Ok(0),
+            Some(v) => value_as_i64(v)
+                .ok_or_else(|| QueryError::Type(format!("'{key}' must be an integer"))),
+        }
+    };
+    Ok(field("millisecond")? * 1_000_000 + field("microsecond")? * 1_000 + field("nanosecond")?)
+}
+
+fn int_field(m: &BTreeMap<String, Value>, key: &str, default: i64) -> Result<i64, QueryError> {
+    match m.get(key) {
+        None => Ok(default),
+        Some(v) => {
+            value_as_i64(v).ok_or_else(|| QueryError::Type(format!("'{key}' must be an integer")))
+        }
+    }
+}
+
+/// `localtime(...)` -- zero args (now, UTC), a string (`temporal::
+/// parse_local_time`), a map (`localtime({hour: 21, minute: 40, ...})`),
+/// or another `LocalTime` (identity, e.g. round-tripping through
+/// `toString`).
+fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Semantic(format!(
+            "localtime() expects zero or one argument, got {}",
+            args.len()
+        )));
+    }
+    let Some(arg) = args.first() else {
+        return Ok(Value::Property(PropertyValue::LocalTime(
+            temporal::now_utc_nanos_of_day(),
+        )));
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Property(PropertyValue::LocalTime(t)) = arg {
+        return Ok(Value::Property(PropertyValue::LocalTime(*t)));
+    }
+    if let Some(s) = as_arith_str(arg) {
+        let t = temporal::parse_local_time(s).ok_or_else(|| {
+            QueryError::Type(format!("'{s}' isn't a local time string MarsDB can parse"))
+        })?;
+        return Ok(Value::Property(PropertyValue::LocalTime(t)));
+    }
+    if let Value::Map(m) = arg {
+        const ALLOWED: &[&str] = &[
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+        ];
+        if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+            return Err(QueryError::Type(format!(
+                "localtime({{...}}) key '{bad}' isn't a recognized field"
+            )));
+        }
+        let nanos = sub_second_nanos_from_map(m)?;
+        let t = temporal::local_time_nanos_from_fields(
+            int_field(m, "hour", 0)?,
+            int_field(m, "minute", 0)?,
+            int_field(m, "second", 0)?,
+            nanos,
+        )
+        .ok_or_else(|| QueryError::Type("localtime({...}) has an out-of-range field".into()))?;
+        return Ok(Value::Property(PropertyValue::LocalTime(t)));
+    }
+    Err(QueryError::Type(format!(
+        "localtime() doesn't support this argument: {arg:?}"
+    )))
+}
+
+/// `time(...)` -- same shapes as `localtime(...)`, but every form
+/// (except identity) requires a `timezone` map key / string offset
+/// suffix. A bracketed named-zone suffix (`[Europe/Stockholm]`) gets a
+/// specific "not supported" error rather than the generic parse-failure
+/// message, since that's a real (if out of scope) Cypher form, not
+/// malformed input.
+fn time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Semantic(format!(
+            "time() expects zero or one argument, got {}",
+            args.len()
+        )));
+    }
+    let Some(arg) = args.first() else {
+        return Ok(Value::Property(PropertyValue::Time {
+            nanos_of_day: temporal::now_utc_nanos_of_day(),
+            offset_seconds: 0,
+        }));
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Property(PropertyValue::Time {
+        nanos_of_day,
+        offset_seconds,
+    }) = arg
+    {
+        return Ok(Value::Property(PropertyValue::Time {
+            nanos_of_day: *nanos_of_day,
+            offset_seconds: *offset_seconds,
+        }));
+    }
+    if let Some(s) = as_arith_str(arg) {
+        if s.contains('[') {
+            return Err(QueryError::Type(
+                "time('...'): named timezones (e.g. '[Europe/Stockholm]') aren't supported, only a fixed UTC \
+                 offset like '+01:00'"
+                    .into(),
+            ));
+        }
+        let (nanos_of_day, offset_seconds) = temporal::parse_time(s).ok_or_else(|| {
+            QueryError::Type(format!("'{s}' isn't a time string MarsDB can parse"))
+        })?;
+        return Ok(Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }));
+    }
+    if let Value::Map(m) = arg {
+        const ALLOWED: &[&str] = &[
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "timezone",
+        ];
+        if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+            return Err(QueryError::Type(format!(
+                "time({{...}}) key '{bad}' isn't a recognized field"
+            )));
+        }
+        let offset_seconds = match m.get("timezone") {
+            Some(v) => offset_from_timezone_value(v)?,
+            None => 0,
+        };
+        let nanos = sub_second_nanos_from_map(m)?;
+        let nanos_of_day = temporal::local_time_nanos_from_fields(
+            int_field(m, "hour", 0)?,
+            int_field(m, "minute", 0)?,
+            int_field(m, "second", 0)?,
+            nanos,
+        )
+        .ok_or_else(|| QueryError::Type("time({...}) has an out-of-range field".into()))?;
+        return Ok(Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }));
+    }
+    Err(QueryError::Type(format!(
+        "time() doesn't support this argument: {arg:?}"
+    )))
+}
+
+/// `{timezone: '+01:00'}`'s value -- a string offset only, matching this
+/// module's offset-only scope (see `temporal.rs`'s top-of-file docs).
+fn offset_from_timezone_value(v: &Value) -> Result<i32, QueryError> {
+    let s = as_arith_str(v).ok_or_else(|| {
+        QueryError::Type("'timezone' must be a string offset, e.g. '+01:00'".into())
+    })?;
+    if s.contains('/') {
+        return Err(QueryError::Type(format!(
+            "'timezone': '{s}' looks like a named timezone (e.g. 'Europe/Stockholm') -- MarsDB only supports a \
+             fixed UTC offset like '+01:00'"
+        )));
+    }
+    temporal::parse_offset_seconds(s)
+        .ok_or_else(|| QueryError::Type(format!("'timezone': '{s}' isn't a valid UTC offset")))
+}
+
+/// `localdatetime(...)` -- zero args (now, UTC), a string, a map
+/// (`localdatetime({year, month, day, hour, minute, second, ...})`), or
+/// another `LocalDateTime` (identity).
+fn local_date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Semantic(format!(
+            "localdatetime() expects zero or one argument, got {}",
+            args.len()
+        )));
+    }
+    let Some(arg) = args.first() else {
+        let (epoch_seconds, nanos) = temporal::now_utc_epoch_seconds_and_nanos();
+        return Ok(Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }));
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Property(PropertyValue::LocalDateTime {
+        epoch_seconds,
+        nanos,
+    }) = arg
+    {
+        return Ok(Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds: *epoch_seconds,
+            nanos: *nanos,
+        }));
+    }
+    if let Some(s) = as_arith_str(arg) {
+        let (epoch_seconds, nanos) = temporal::parse_local_date_time(s).ok_or_else(|| {
+            QueryError::Type(format!(
+                "'{s}' isn't a local date-time string MarsDB can parse"
+            ))
+        })?;
+        return Ok(Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }));
+    }
+    if let Value::Map(m) = arg {
+        let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
+        let nanos_field = sub_second_nanos_from_map(m)?;
+        let (epoch_seconds, nanos) =
+            temporal::local_date_time_from_fields(temporal::CalendarDateTime {
+                year,
+                month,
+                day,
+                hour: int_field(m, "hour", 0)?,
+                minute: int_field(m, "minute", 0)?,
+                second: int_field(m, "second", 0)?,
+                nanos: nanos_field,
+            })
+            .ok_or_else(|| {
+                QueryError::Type("localdatetime({...}) has an out-of-range field".into())
+            })?;
+        return Ok(Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }));
+    }
+    Err(QueryError::Type(format!(
+        "localdatetime() doesn't support this argument: {arg:?}"
+    )))
+}
+
+const DATE_TIME_ALLOWED_KEYS: &[&str] = &[
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "timezone",
+];
+
+/// `year`/`month`/`day` extraction shared by `localdatetime`/`datetime`'s
+/// map form -- same defaulting rule `date_from_map` uses (month/day
+/// default to `1`), factored out since both callers need it alongside
+/// their own extra fields.
+fn date_ymd_from_map(
+    m: &BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<(i32, u32, u32), QueryError> {
+    if let Some(bad) = m.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(QueryError::Type(format!(
+            "'{bad}' isn't a recognized field"
+        )));
+    }
+    let Some(year_val) = m.get("year") else {
+        return Err(QueryError::Type("requires a 'year' key".into()));
+    };
+    let year_raw = value_as_i64(year_val)
+        .ok_or_else(|| QueryError::Type("'year' must be an integer".into()))?;
+    let year = i32::try_from(year_raw)
+        .map_err(|_| QueryError::Type(format!("'year' is out of range: {year_raw}")))?;
+    let month_raw = int_field(m, "month", 1)?;
+    let month = u32::try_from(month_raw)
+        .map_err(|_| QueryError::Type(format!("'month' is out of range: {month_raw}")))?;
+    let day_raw = int_field(m, "day", 1)?;
+    let day = u32::try_from(day_raw)
+        .map_err(|_| QueryError::Type(format!("'day' is out of range: {day_raw}")))?;
+    Ok((year, month, day))
+}
+
+/// `datetime(...)` -- zero args (now, UTC), a string, a map
+/// (`datetime({year, ..., timezone: '+01:00'})`), or another `DateTime`
+/// (identity). Requires a `timezone` for every constructed form except
+/// identity (defaults to UTC, `offset_seconds: 0`, if the map omits it
+/// -- matches `date()`'s own "no timezone info -> UTC" convention).
+fn date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Semantic(format!(
+            "datetime() expects zero or one argument, got {}",
+            args.len()
+        )));
+    }
+    let Some(arg) = args.first() else {
+        let (epoch_seconds, nanos) = temporal::now_utc_epoch_seconds_and_nanos();
+        return Ok(Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds: 0,
+        }));
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Property(PropertyValue::DateTime {
+        epoch_seconds,
+        nanos,
+        offset_seconds,
+    }) = arg
+    {
+        return Ok(Value::Property(PropertyValue::DateTime {
+            epoch_seconds: *epoch_seconds,
+            nanos: *nanos,
+            offset_seconds: *offset_seconds,
+        }));
+    }
+    if let Some(s) = as_arith_str(arg) {
+        if s.contains('[') {
+            return Err(QueryError::Type(
+                "datetime('...'): named timezones (e.g. '[Europe/Stockholm]') aren't supported, only a fixed \
+                 UTC offset like '+01:00'"
+                    .into(),
+            ));
+        }
+        let (epoch_seconds, nanos, offset_seconds) =
+            temporal::parse_date_time(s).ok_or_else(|| {
+                QueryError::Type(format!("'{s}' isn't a date-time string MarsDB can parse"))
+            })?;
+        return Ok(Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }));
+    }
+    if let Value::Map(m) = arg {
+        let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
+        let offset_seconds = match m.get("timezone") {
+            Some(v) => offset_from_timezone_value(v)?,
+            None => 0,
+        };
+        let nanos_field = sub_second_nanos_from_map(m)?;
+        let (epoch_seconds, nanos) = temporal::date_time_from_fields(
+            temporal::CalendarDateTime {
+                year,
+                month,
+                day,
+                hour: int_field(m, "hour", 0)?,
+                minute: int_field(m, "minute", 0)?,
+                second: int_field(m, "second", 0)?,
+                nanos: nanos_field,
+            },
+            offset_seconds,
+        )
+        .ok_or_else(|| QueryError::Type("datetime({...}) has an out-of-range field".into()))?;
+        return Ok(Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }));
+    }
+    Err(QueryError::Type(format!(
+        "datetime() doesn't support this argument: {arg:?}"
+    )))
+}
+
 fn value_as_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(*i),
@@ -4989,8 +5608,82 @@ fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
             nanos,
         } => temporal::duration_component(*months, *days, *seconds, *nanos, prop)
             .map(PropertyValue::Int),
+        PropertyValue::LocalTime(nanos_of_day) => {
+            temporal::local_time_component(*nanos_of_day, prop).map(PropertyValue::Int)
+        }
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => time_component(*nanos_of_day, *offset_seconds, prop),
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => date_time_component(*epoch_seconds, *nanos, None, prop),
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        } => date_time_component(*epoch_seconds, *nanos, Some(*offset_seconds), prop),
         _ => None,
     }
+}
+
+/// `Time`'s own component set: `LocalTime`'s fields plus the offset
+/// ones (`timezone`/`offset` as text, `offsetSeconds`/`offsetMinutes`
+/// as integers).
+fn time_component(nanos_of_day: i64, offset_seconds: i32, prop: &str) -> Option<PropertyValue> {
+    match prop {
+        "timezone" | "offset" => Some(PropertyValue::String(temporal::format_offset(
+            offset_seconds,
+        ))),
+        "offsetSeconds" => Some(PropertyValue::Int(offset_seconds as i64)),
+        "offsetMinutes" => Some(PropertyValue::Int(offset_seconds as i64 / 60)),
+        _ => temporal::local_time_component(nanos_of_day, prop).map(PropertyValue::Int),
+    }
+}
+
+/// `LocalDateTime`/`DateTime`'s shared component set: every `Date`
+/// component, every `LocalTime` component, and (only when
+/// `offset_seconds` is `Some`, i.e. a real `DateTime`) the same offset/
+/// epoch fields `Time`/this-function's own `epochSeconds`/`epochMillis`
+/// add on top.
+///
+/// Calendar/clock components (`year`..`nanosecond`) are computed against
+/// the *local* (offset-adjusted) wall-clock reading, not the stored UTC
+/// instant -- `datetime({..., hour: 12, timezone: '+01:00'}).hour` must
+/// answer `12` (what was written/displayed), not `11` (the UTC hour) --
+/// same "display the local reading" rule `format_date_time` already
+/// follows. `epochSeconds`/`epochMillis` are the one exception,
+/// deliberately using the raw (UTC) `epoch_seconds` -- "epoch" always
+/// means the UTC instant, regardless of offset.
+fn date_time_component(
+    epoch_seconds: i64,
+    nanos: i32,
+    offset_seconds: Option<i32>,
+    prop: &str,
+) -> Option<PropertyValue> {
+    if let Some(offset_seconds) = offset_seconds {
+        match prop {
+            "timezone" | "offset" => {
+                return Some(PropertyValue::String(temporal::format_offset(
+                    offset_seconds,
+                )))
+            }
+            "offsetSeconds" => return Some(PropertyValue::Int(offset_seconds as i64)),
+            "offsetMinutes" => return Some(PropertyValue::Int(offset_seconds as i64 / 60)),
+            "epochSeconds" => return Some(PropertyValue::Int(epoch_seconds)),
+            "epochMillis" => {
+                return Some(PropertyValue::Int(
+                    temporal::epoch_seconds_and_millis(epoch_seconds, nanos).1,
+                ))
+            }
+            _ => {}
+        }
+    }
+    let local_epoch_seconds = epoch_seconds + offset_seconds.unwrap_or(0) as i64;
+    temporal::date_time_calendar_component(local_epoch_seconds, prop)
+        .or_else(|| temporal::date_time_clock_component(local_epoch_seconds, nanos, prop))
+        .map(PropertyValue::Int)
 }
 
 /// Sorts `rows` (already-projected `RETURN`/`WITH` output, `columns`
@@ -5385,6 +6078,39 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
         (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
         (Some(PropertyValue::Date(x)), Some(PropertyValue::Date(y))) => x.cmp(&y),
+        (Some(PropertyValue::LocalTime(x)), Some(PropertyValue::LocalTime(y))) => x.cmp(&y),
+        (
+            Some(PropertyValue::Time {
+                nanos_of_day: x,
+                offset_seconds: ox,
+            }),
+            Some(PropertyValue::Time {
+                nanos_of_day: y,
+                offset_seconds: oy,
+            }),
+        ) => (x - ox as i64 * 1_000_000_000).cmp(&(y - oy as i64 * 1_000_000_000)),
+        (
+            Some(PropertyValue::LocalDateTime {
+                epoch_seconds: xs,
+                nanos: xn,
+            }),
+            Some(PropertyValue::LocalDateTime {
+                epoch_seconds: ys,
+                nanos: yn,
+            }),
+        ) => (xs, xn).cmp(&(ys, yn)),
+        (
+            Some(PropertyValue::DateTime {
+                epoch_seconds: xs,
+                nanos: xn,
+                ..
+            }),
+            Some(PropertyValue::DateTime {
+                epoch_seconds: ys,
+                nanos: yn,
+                ..
+            }),
+        ) => (xs, xn).cmp(&(ys, yn)),
         // Cross-type scalars (e.g. a String vs a Number) fall through to
         // `type_rank`'s real Cypher orderability rank rather than this
         // arm's own `Equal` fallback -- see `list_cmp_asc`, the only
@@ -5417,7 +6143,11 @@ fn type_rank(v: &Value) -> Option<u8> {
         | Value::Literal(Literal::Float(_))
         | Value::Property(PropertyValue::Float(_)) => Some(2),
         Value::Property(PropertyValue::Date(_)) => Some(3),
-        Value::List(_) => Some(4),
+        Value::Property(PropertyValue::LocalTime(_)) => Some(4),
+        Value::Property(PropertyValue::Time { .. }) => Some(5),
+        Value::Property(PropertyValue::LocalDateTime { .. }) => Some(6),
+        Value::Property(PropertyValue::DateTime { .. }) => Some(7),
+        Value::List(_) => Some(8),
         _ => None,
     }
 }
@@ -5494,6 +6224,39 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
         // `compare_values`'s docs on why months/days/seconds aren't
         // fungible enough to order against each other).
         (PropertyValue::Date(x), PropertyValue::Date(y)) => x.cmp(&y),
+        (PropertyValue::LocalTime(x), PropertyValue::LocalTime(y)) => x.cmp(&y),
+        (
+            PropertyValue::Time {
+                nanos_of_day: x,
+                offset_seconds: ox,
+            },
+            PropertyValue::Time {
+                nanos_of_day: y,
+                offset_seconds: oy,
+            },
+        ) => (x - ox as i64 * 1_000_000_000).cmp(&(y - oy as i64 * 1_000_000_000)),
+        (
+            PropertyValue::LocalDateTime {
+                epoch_seconds: xs,
+                nanos: xn,
+            },
+            PropertyValue::LocalDateTime {
+                epoch_seconds: ys,
+                nanos: yn,
+            },
+        ) => (xs, xn).cmp(&(ys, yn)),
+        (
+            PropertyValue::DateTime {
+                epoch_seconds: xs,
+                nanos: xn,
+                ..
+            },
+            PropertyValue::DateTime {
+                epoch_seconds: ys,
+                nanos: yn,
+                ..
+            },
+        ) => (xs, xn).cmp(&(ys, yn)),
         _ => return None,
     })
 }
