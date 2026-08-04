@@ -26,6 +26,10 @@ fn format_value(value: &Value) -> String {
             let cells: Vec<String> = items.iter().map(format_value).collect();
             format!("[{}]", cells.join(", "))
         }
+        Value::Map(m) => {
+            let cells: Vec<String> = m.iter().map(|(k, v)| format!("{k}: {}", format_value(v))).collect();
+            format!("{{{}}}", cells.join(", "))
+        }
         Value::Path(elems) => {
             let parts: Vec<String> = elems
                 .iter()
@@ -35,10 +39,6 @@ fn format_value(value: &Value) -> String {
                 })
                 .collect();
             parts.join("")
-        }
-        Value::Map(entries) => {
-            let cells: Vec<String> = entries.iter().map(|(k, v)| format!("{k}: {}", format_value(v))).collect();
-            format!("{{{}}}", cells.join(", "))
         }
         Value::Null => "null".to_string(),
     }

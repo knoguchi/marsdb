@@ -69,30 +69,37 @@ pub fn value_to_tck(v: &Value) -> TckValue {
             other => TckValue::Scalar(property_to_scalar(other)),
         },
         Value::List(items) => TckValue::List(items.iter().map(value_to_tck).collect()),
+        // A bare map literal used as a returned value compares the same
+        // way node props already do -- see `parse_map_value`'s matching
+        // choice on the expected-cell-parsing side. `TckValue::Node`'s
+        // `props` is scalar-only, so a nested non-scalar value (a map
+        // containing a list/map/node) is dropped rather than compared --
+        // real, pre-existing limitation of this comparator, not new here.
+        Value::Map(m) => TckValue::Node {
+            labels: BTreeSet::new(),
+            props: m.iter().filter_map(|(k, v)| value_to_scalar(v).map(|s| (k.clone(), s))).collect(),
+        },
         Value::Literal(lit) => literal_to_tck(lit),
         Value::Path(_) => TckValue::Scalar(TckScalar::Str("<path -- not TCK-comparable in v1>".to_string())),
-        // A bare map value returned directly (not as a node/rel's props)
-        // -- same shape `parse_cell`'s `parse_map_value` produces for the
-        // TCK's expected-result side, so the two sides compare correctly
-        // structurally. Only scalar-valued entries are TCK-comparable
-        // this way (matching `parse_props`' own restriction below); a
-        // nested map/list value falls back to a `null` placeholder rather
-        // than failing outright, since MarsDB's own map-typed RETURN
-        // values are already a niche case (see `Value::Map`'s docs) not
-        // otherwise TCK-relevant.
-        Value::Map(entries) => TckValue::Node {
-            labels: BTreeSet::new(),
-            props: entries
-                .iter()
-                .map(|(k, v)| {
-                    let scalar = match value_to_tck(v) {
-                        TckValue::Scalar(s) => s,
-                        _ => TckScalar::Str("null".to_string()),
-                    };
-                    (k.clone(), scalar)
-                })
-                .collect(),
+    }
+}
+
+/// Mirrors `parse_props`'s own convention exactly (the expected-cell
+/// side): a null map value is a `TckScalar::Str("null")` sentinel, not
+/// dropped -- found via a real TCK scenario (`Literals8 :: [7] Return a
+/// map containing a null`) where dropping it made `{k: null}` compare
+/// as an empty map instead of a one-entry map with a null value.
+fn value_to_scalar(v: &Value) -> Option<TckScalar> {
+    match v {
+        Value::Null => Some(TckScalar::Str("null".to_string())),
+        Value::Property(PropertyValue::Null) => Some(TckScalar::Str("null".to_string())),
+        Value::Property(p) => Some(property_to_scalar(p)),
+        Value::Literal(lit) => match literal_to_tck(lit) {
+            TckValue::Scalar(s) => Some(s),
+            TckValue::Null => Some(TckScalar::Str("null".to_string())),
+            _ => None,
         },
+        _ => None,
     }
 }
 

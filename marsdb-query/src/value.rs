@@ -28,15 +28,18 @@ pub enum Value {
     /// result — see `Binding::Path`'s docs (executor.rs) for how this
     /// gets assembled during MATCH evaluation.
     Path(Vec<PathElem>),
-    /// A `{key: <expr>, ...}` map literal (`ReturnExpr::MapLit`) — same
-    /// "query-layer-only concept, not persisted" reasoning as `List`
-    /// above (nothing in the grammar can construct a bare map literal to
-    /// store as a node/edge property; a `CREATE {...}` prop map's *values*
-    /// each become their own `PropertyValue` individually, the map
-    /// structure itself never does). Its main real use is as a `date(...)
-    /// `/`duration(...)` construction function's argument, e.g.
-    /// `date({year: 1984, month: 10, day: 11})` — see `Executor::
-    /// call_builtin`.
+    /// A map literal (`{a: 1, b: 2}`) — like `List`, a query-layer-only
+    /// concept, never persisted as a `PropertyValue` (nothing in the
+    /// grammar can construct a map literal to store as a node/edge
+    /// property directly; a `CREATE {...}` prop map's *values* are each
+    /// evaluated and stored individually as their own scalar
+    /// `PropertyValue` — see `Executor::eval_props_to_values` — a `Value::
+    /// Map` reaching there is a real error, not silently dropped). Its
+    /// other main real use is as a `date(...)`/`duration(...)`
+    /// construction function's argument, e.g. `date({year: 1984, month:
+    /// 10, day: 11})` — see `Executor::call_builtin`. `BTreeMap`, not
+    /// `HashMap` — canonical key order makes display/comparison
+    /// deterministic without a separate sort step.
     Map(BTreeMap<String, Value>),
     Null,
 }

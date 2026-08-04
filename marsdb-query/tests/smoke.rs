@@ -234,6 +234,37 @@ fn to_integer_parses_string_and_passes_through_int() {
 }
 
 #[test]
+fn to_integer_parses_a_float_formatted_string_by_truncating() {
+    // Regression: `toInteger('1.7')` used to fail straight to null since
+    // the string-parse path only ever tried an i64 parse.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [2, 2.9, '1.7'] AS things RETURN [n IN things | toInteger(n)] AS x");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 2, 1]);
+}
+
+#[test]
+fn to_integer_on_an_unparseable_string_is_null_not_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH ['2', '2.9', 'foo'] AS numbers RETURN [n IN numbers | toInteger(n)] AS x");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(int(&items[0]), 2);
+            assert_eq!(int(&items[1]), 2);
+            assert!(matches!(items[2], Value::Null));
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_integer_on_a_list_errors_instead_of_silently_nulling() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN toInteger([1, 2])").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("tointeger"));
+}
+
+#[test]
 fn case_when_then_else() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {age: 30})");
@@ -1654,6 +1685,14 @@ fn list_ints(v: &Value) -> Vec<i64> {
     }
 }
 
+fn bool_val(v: &Value) -> bool {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Bool(b)) => *b,
+        Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
 #[test]
 fn standalone_with_no_preceding_match() {
     let store = GraphStore::open_memory().unwrap();
@@ -1719,6 +1758,346 @@ fn list_slice_basic_and_open_ended() {
     assert_eq!(list_ints(&result.rows[0][0]), vec![2, 3]);
     assert_eq!(list_ints(&result.rows[0][1]), vec![1, 2]);
     assert_eq!(list_ints(&result.rows[0][2]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_filter_and_project() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x % 2 = 0 | x * 10] AS y",
+    );
+    assert_eq!(list_ints(&result.rows[0][0]), vec![20, 40]);
+}
+
+#[test]
+fn list_comprehension_project_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list | x * 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 4, 6]);
+}
+
+#[test]
+fn list_comprehension_filter_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x > 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_bare_identity() {
+    // No WHERE, no projection -- a legal no-op comprehension.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
+}
+
+#[test]
+fn list_comprehension_over_collected_nodes_extracts_a_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'original'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN [x IN nodes | x.name] AS oldNames",
+    );
+    match &result.rows[0][0] {
+        Value::List(items) => match &items[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "original"),
+            other => panic!("expected a String property, got {other:?}"),
+        },
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_comprehension_plain_list_with_bare_identifier_is_not_misparsed_as_a_comprehension() {
+    // `x` alone in a list (no `IN` following) must fall through to the
+    // ordinary comma-separated list_expr alternative, not be swallowed
+    // partway through a failed list_comprehension attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH 1 AS x, 2 AS y RETURN [x, y]");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2]);
+}
+
+#[test]
+fn quantifier_all_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS a, all(x IN [1, 2, 3] WHERE x > 1) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_any_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN any(x IN [1, 2, 3] WHERE x > 2) AS a, any(x IN [1, 2, 3] WHERE x > 5) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_none_on_empty_list_is_true() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN none(x IN [] WHERE x > 0) AS a");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_single_counts_exact_matches() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS a, single(x IN [1, 2, 2] WHERE x = 2) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_over_collected_nodes_scopes_the_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'a'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN none(x IN nodes WHERE x.name = 'a') AS result",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_three_valued_null_propagation() {
+    // Regression: a first version collapsed a null predicate straight to
+    // false, which happened to pass every non-null-list scenario but was
+    // wrong on lists containing nulls -- a definite true/false among the
+    // elements still decides the answer even with nulls present; only
+    // "no definite answer, but at least one unknown" is null.
+    let store = GraphStore::open_memory().unwrap();
+
+    let all = run(&store, "RETURN all(x IN [null] WHERE x = 2) AS a, all(x IN [0, null] WHERE x = 2) AS b, all(x IN [2, null] WHERE x = 2) AS c");
+    assert!(matches!(all.rows[0][0], Value::Null));
+    assert!(!bool_val(&all.rows[0][1]));
+    assert!(matches!(all.rows[0][2], Value::Null));
+
+    let any = run(&store, "RETURN any(x IN [null] WHERE x = 2) AS a, any(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(any.rows[0][0], Value::Null));
+    assert!(bool_val(&any.rows[0][1]));
+
+    let none = run(&store, "RETURN none(x IN [null] WHERE x = 2) AS a, none(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(none.rows[0][0], Value::Null));
+    assert!(!bool_val(&none.rows[0][1]));
+
+    let single = run(
+        &store,
+        "RETURN single(x IN [2, null] WHERE x = 2) AS a, single(x IN [34, 0, null, 5, 900] WHERE x < 10) AS b",
+    );
+    assert!(matches!(single.rows[0][0], Value::Null));
+    assert!(!bool_val(&single.rows[0][1]));
+}
+
+#[test]
+fn quantifier_does_not_break_ordinary_function_calls() {
+    // Regression: `ALL(...)` etc share `identifier ~ "("` with an ordinary
+    // function_call -- an unrelated call like coalesce(...) must still
+    // fall through to function_call, not get swallowed by a failed
+    // quantifier_expr attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN coalesce(null, 5) AS x");
+    assert_eq!(int(&result.rows[0][0]), 5);
+}
+
+#[test]
+fn map_literal_property_access() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH {existing: 42, notMissing: null} AS m RETURN m.missing, m.notMissing, m.existing",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert_eq!(int(&result.rows[0][2]), 42);
+}
+
+#[test]
+fn map_literal_with_expression_values() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN {a: 1, b: 1 + 1} AS m");
+    match &result.rows[0][0] {
+        Value::Map(m) => {
+            assert_eq!(int(m.get("a").unwrap()), 1);
+            assert_eq!(int(m.get("b").unwrap()), 2);
+        }
+        other => panic!("expected a Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_literal_property_access_on_null_is_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH null AS m RETURN m.missing");
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn boolean_expr_and_or_xor_not() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN true AND false AS a, true OR false AS b, true XOR true AS c, NOT true AS d",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(!bool_val(&result.rows[0][2]));
+    assert!(!bool_val(&result.rows[0][3]));
+}
+
+#[test]
+fn boolean_expr_comparison_as_return_value() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN 1 = 1 AS a, 1 < 2 AS b, 2 > 3 AS c, 'ab' STARTS WITH 'a' AS d");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(!bool_val(&result.rows[0][2]));
+    assert!(bool_val(&result.rows[0][3]));
+}
+
+#[test]
+fn boolean_expr_precedence_and_binds_tighter_than_or() {
+    let store = GraphStore::open_memory().unwrap();
+    // AND binds tighter than OR: false AND false = false, then true OR
+    // false = true -- if OR bound tighter this would instead need to
+    // evaluate (true OR false) AND false = false.
+    let result = run(&store, "RETURN true OR false AND false AS x");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn boolean_expr_not_binds_looser_than_comparison() {
+    let store = GraphStore::open_memory().unwrap();
+    // NOT (1 = 2), not (NOT 1) = 2 -- comparison binds tighter.
+    let result = run(&store, "RETURN NOT 1 = 2 AS x");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn boolean_expr_three_valued_null_propagation() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN null AND false AS a, null AND true AS b, null OR true AS c, null OR false AS d",
+    );
+    assert!(!bool_val(&result.rows[0][0])); // false wins over unknown
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert!(bool_val(&result.rows[0][2])); // true wins over unknown
+    assert!(matches!(result.rows[0][3], Value::Null));
+}
+
+#[test]
+fn boolean_expr_non_bool_operand_errors() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 AND true").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("boolean"));
+}
+
+#[test]
+fn with_where_comparison_followed_by_order_by_still_parses() {
+    // Regression: widening `return_expr` to include an optional trailing
+    // comparison broke `with_comparison`'s own separate `return_expr ~
+    // compare_op ~ literal` shape (used by WITH's own WHERE) -- the
+    // return_expr operand greedily swallowed the whole `y > 10` itself,
+    // leaving nothing for with_comparison's own trailing compare_op to
+    // match. Fixed by narrowing with_comparison's LHS to add_expr.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {idx: 20})");
+    run(&store, "CREATE (:Item {idx: 5})");
+    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 20);
+}
+
+#[test]
+fn return_expr_or_immediately_before_order_by_does_not_swallow_order() {
+    // Regression: a bare `^"OR"` keyword has no word-boundary check, so
+    // it happily matched the first two letters of `ORDER`, mis-parsing
+    // `RETURN x OR y ORDER BY z` as `RETURN (x OR y OR DER) BY z` --
+    // caught because `y ORDER BY y` (nothing between the boolean
+    // expression and the ORDER BY clause) is exactly what a `RETURN`
+    // item's own trailing structure looks like.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {idx: 2})");
+    run(&store, "CREATE (:Item {idx: 1})");
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx = 1 OR n.idx = 2 AS x, n.idx ORDER BY n.idx DESC");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(int(&result.rows[0][1]), 2);
+    assert_eq!(int(&result.rows[1][1]), 1);
+}
+
+#[test]
+fn list_equality_is_structural_not_null() {
+    // Regression: compare_values used to reduce List/Map operands
+    // through value_to_property_value, which collapses both to
+    // PropertyValue::Null -- every list/map `=`/`<>` comparison silently
+    // became `null` regardless of actual content.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN [1, 2] = [1, 2] AS a, [1, 2] = [1, 3] AS b, [null] = [1] AS c");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+}
+
+#[test]
+fn list_ordering_is_lexicographic() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN [1, 0] >= [1] AS a, [1, null] >= [1] AS b, [1, 2] >= [1, null] AS c");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+}
+
+#[test]
+fn boolean_ordering_false_less_than_true() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN false <= true AS x, false > true AS y");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn type_mismatch_comparison_semantics_differ_by_operator() {
+    // Regression: a single blanket "type mismatch -> false" was wrong for
+    // three different operator families -- confirmed against real TCK
+    // scenarios: `=` on mismatched types is false, `<>` is true (never
+    // equal, so "not equal" holds), ordering is null (no defined order),
+    // and STARTS WITH/ENDS WITH/CONTAINS on a non-string operand is also
+    // null, not false.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN (1 = 'a') AS a, (1 <> 'a') AS b, ('1.0' < 1.0) AS c, ('abc' STARTS WITH true) AS d");
+    assert!(!bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+    assert!(matches!(result.rows[0][3], Value::Null));
+}
+
+#[test]
+fn list_comprehension_bare_where_now_parses() {
+    // Regression: previously `filter_expr`'s WHERE reused WithExpr, which
+    // only ever wrapped a single Compare -- a bare boolean value (`WHERE
+    // x`/`WHERE true`) failed to parse. Now that boolean logic is a real
+    // ReturnExpr, this works.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [true, false, true] AS list RETURN [x IN list WHERE x] AS y");
+    match &result.rows[0][0] {
+        Value::List(items) => assert_eq!(items.len(), 2),
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn quantifier_bare_where_now_parses() {
+    // Just the parsing gap this task fixes -- none() on an empty list is
+    // vacuously true regardless of the WHERE condition (real Cypher
+    // semantics, already covered by quantifier_none_on_empty_list_is_true).
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN none(x IN [] WHERE true) AS a, none(x IN [] WHERE false) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
 }
 
 #[test]
@@ -2017,3 +2396,226 @@ fn create_with_unsupported_list_property_errors_clearly_not_silently_nulls() {
     assert!(err.to_string().contains("property"), "expected a clear error, got: {err}");
 }
 
+// --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
+// MATCH...CREATE followed directly by a RETURN in the same statement) ---
+
+#[test]
+fn set_then_return_sees_the_just_set_value() {
+    // The RETURN must see the *updated* property, not the pre-SET one --
+    // materialize_set applies the mutation before materialize_return runs,
+    // same real-Cypher shape as TCK's Set2.feature scenario [1].
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {property1: 'orig'})");
+    let result = run(&store, "MATCH (n:A) SET n.property1 = 'updated' RETURN n.property1");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "updated");
+}
+
+#[test]
+fn set_label_then_return_labels() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:X)");
+    let result = run(&store, "MATCH (n:X) SET n:Foo RETURN n");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            let mut labels = node.labels.clone();
+            labels.sort();
+            assert_eq!(labels, vec!["Foo".to_string(), "X".to_string()]);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_then_return_computed_value_not_the_deleted_var() {
+    // Real TCK DELETE+RETURN scenarios (Delete1/Delete4/Delete6) never
+    // RETURN the deleted variable's live properties -- they return a
+    // computed value (a literal, count(*), or a WITH-projected scalar
+    // captured before the delete). Exact shape and expected count (2, not
+    // 1 -- the undirected pattern matches both directions) from Delete4's
+    // scenario [1]: "Undirected expand followed by delete and count".
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A)-[:R]->(b:B)");
+    let result = run(&store, "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c");
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+    // The delete itself really happened -- nothing left to match.
+    let remaining = run(&store, "MATCH (n) RETURN n");
+    assert_eq!(remaining.rows.len(), 0);
+}
+
+#[test]
+fn delete_then_return_the_deleted_var_itself_errors_not_panics() {
+    // Not a shape any real TCK scenario directly tests with a bare `RETURN
+    // n`, but real TCK scenarios *do* test the property-access cousin of
+    // this shape (`MATCH (n) DELETE n RETURN n.num` must raise
+    // `DeletedEntityAccess`, TCK's Return2 [15]/[17]) -- and `materialize_
+    // delete` runs the physical delete before evaluating the trailing
+    // RETURN to get that right. `binding_to_value`/`lookup_prop` (via
+    // `deleted_entity_access`) must turn "the bound id's record is gone"
+    // into a proper `QueryError`, not a panic — this is the regression
+    // guard for that path specifically (accessing the whole node, not just
+    // one of its properties).
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    let stmt = parse("MATCH (n:A) DELETE n RETURN n").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+    // A failed statement rolls back its whole write transaction (see
+    // `Executor::execute`'s abort-on-error path) -- the delete itself must
+    // NOT have taken effect, same as any other error mid-statement.
+    let remaining = run(&store, "MATCH (n:A) RETURN n");
+    assert_eq!(remaining.rows.len(), 1, "a failed statement must roll back, not partially apply its delete");
+}
+
+#[test]
+fn delete_then_return_a_property_of_the_deleted_var_errors() {
+    // TCK Return2 scenarios [15]/[17]: accessing a property of a just-
+    // deleted node/relationship must raise DeletedEntityAccess, not
+    // silently succeed with the pre-delete value.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n {num: 0})");
+    let stmt = parse("MATCH (n) DELETE n RETURN n.num").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+
+    let store2 = GraphStore::open_memory().unwrap();
+    run(&store2, "CREATE ()-[:T {num: 0}]->()");
+    let stmt2 = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
+    let err2 = Executor::new(&store2).execute(&stmt2).unwrap_err();
+    assert!(err2.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err2}");
+}
+
+#[test]
+fn detach_delete_then_return() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    let result = run(&store, "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN 42 AS num");
+    // `42` is a bare literal, not a node/edge property -- eval_return_expr
+    // yields Value::Literal here, not Value::Property.
+    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(42))));
+    let remaining = run(&store, "MATCH (n:Person) RETURN n.name");
+    assert_eq!(remaining.rows.len(), 1);
+    assert_eq!(str_value(&remaining.rows[0][0]), "Bob");
+}
+
+#[test]
+fn optional_match_delete_null_return_null() {
+    // TCK Delete1 scenario [5]: "Ignore null when deleting node" -- an
+    // OPTIONAL MATCH that finds nothing pads with a null binding, DELETE on
+    // null is a documented no-op, and the trailing RETURN of that same
+    // (null) variable must round-trip as null, not error.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Real)");
+    let result = run(&store, "OPTIONAL MATCH (a:DoesNotExist) DELETE a RETURN a");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn remove_then_return() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p1: 1, p2: 2})");
+    let result = run(&store, "MATCH (n:A) REMOVE n.p1 RETURN n");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            assert!(!node.props.contains_key("p1"));
+            assert_eq!(int_value(&Value::Property(node.props.get("p2").unwrap().clone())), 2);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn match_create_then_return_sees_the_newly_created_binding() {
+    // The trailing RETURN must see `i`, the node CREATE just made in this
+    // same statement -- materialize_create threads each row's updated
+    // bindings forward for exactly this.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})");
+    let result = run(&store, "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:OWNS]->(i:Item {name: 'Widget'}) RETURN i.name");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Widget");
+}
+
+#[test]
+fn set_then_return_distinct_dedups() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A)-[:R]->(x:X {tag: 'same'})");
+    run(&store, "CREATE (b:A)-[:R]->(y:X {tag: 'same'})");
+    let result = run(&store, "MATCH (a:A)-[:R]->(x:X) SET a.touched = true RETURN DISTINCT x.tag");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "same");
+}
+
+#[test]
+fn set_then_return_with_param_substitution() {
+    // Regression guard for `params::substitute_tail`/`substitute_return_tail`
+    // -- a `$param` inside the trailing RETURN of a mutating tail must be
+    // resolved just like one inside the mutating clause itself.
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    let mut params = HashMap::new();
+    params.insert("newp".to_string(), marsdb_graph::PropertyValue::Int(99));
+    let mut stmt = marsdb_query::parse("MATCH (n:A) SET n.p = 2 RETURN $newp AS x").unwrap();
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(99))));
+    let after = run(&store, "MATCH (n:A) RETURN n.p");
+    assert_eq!(int_value(&after.rows[0][0]), 2);
+}
+
+#[test]
+fn set_property_to_null_removes_it_not_stores_a_null_value() {
+    // Regression guard for a real bug found while adding SET...RETURN:
+    // `SET n.prop = null` must *remove* the property (real Cypher, TCK's
+    // Set2 "Set a Property to Null" scenarios), not store a literal
+    // `PropertyValue::Null` under that key -- the two are observably
+    // different (a stored null still shows up when a node's props are
+    // enumerated). This bug pre-dated SET...RETURN but was unreachable
+    // until a RETURN could follow SET to observe it.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {property1: 45, property2: 46})");
+    let result = run(&store, "MATCH (n:A) SET n.property1 = null RETURN n");
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            assert!(!node.props.contains_key("property1"), "property1 must be gone, not null: {:?}", node.props);
+            assert_eq!(int_value(&Value::Property(node.props.get("property2").unwrap().clone())), 46);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_and_remove_on_a_null_binding_are_silent_no_ops() {
+    // Regression guard for a second real bug found the same way: an
+    // OPTIONAL MATCH miss pads its variable with a null binding, and
+    // SET/REMOVE (property *and* label forms) on that null must be silent
+    // no-ops -- same documented behavior DELETE already had -- not an
+    // "isn't a node" error. TCK's Set1/Set3/Remove1/Remove2 "Ignore null
+    // when setting/removing property/label" scenarios.
+    let store = GraphStore::open_memory().unwrap();
+    let prop_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a.num = 42 RETURN a");
+    assert!(matches!(prop_set.rows[0][0], Value::Null));
+    let label_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a:L RETURN a");
+    assert!(matches!(label_set.rows[0][0], Value::Null));
+    let prop_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a.num RETURN a");
+    assert!(matches!(prop_remove.rows[0][0], Value::Null));
+    let label_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a:L RETURN a");
+    assert!(matches!(label_remove.rows[0][0], Value::Null));
+}
+
+#[test]
+fn mutating_tail_with_no_return_is_still_terminal() {
+    // Regression guard: the grammar change (`return_clause?` after a
+    // mutating clause) must not force a RETURN -- the pre-existing
+    // terminal-mutation shape (no trailing RETURN at all) still has to
+    // keep working exactly as before.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    run(&store, "MATCH (n:A) SET n.p = 2");
+    let result = run(&store, "MATCH (n:A) RETURN n.p");
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+}

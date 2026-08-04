@@ -99,26 +99,73 @@ pub enum ReturnExpr {
     /// out-of-range bounds clamp instead of nulling out, and a start at or
     /// past the (clamped) end yields `[]` rather than erroring.
     Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
-    /// `{key: <expr>, ...}` — a general expression map, e.g. `date({year:
-    /// 1984, month: 10, day: 11})`'s argument, a bare `RETURN {a: 1}`, or
-    /// (via `NodePattern`/`RelPattern`'s `props`, which reuse this same
-    /// variant — see `cypher.pest`'s `map_expr` docs) a CREATE pattern's
-    /// `{...}` property map. Evaluates to `Value::Map`, a query-layer-only
-    /// concept with nowhere to persist as a `PropertyValue` on its own
-    /// (same reasoning as `Value::List`'s docs) — only meaningful as an
-    /// intermediate, e.g. a `date(...)`/`duration(...)` call's argument,
-    /// or (per-key) a real storable prop value once each entry is itself
-    /// evaluated down to a `PropertyValue`.
+    /// `[x IN <source> WHERE <cond> | <project>]` — `WHERE`/`| project` are
+    /// each independently optional (`[x IN list]` is a legal no-op
+    /// identity-filter comprehension). `where_clause` is a `ReturnExpr`
+    /// (not pattern-level `Expr`) for the same reason `UnwindClause`'s own
+    /// filter used to reuse `WithExpr` — `var` is very often a bare
+    /// scalar/node/edge, not something `Expr::Compare`'s
+    /// `prop_access`-only LHS can express. Now that boolean logic/
+    /// comparisons are real `ReturnExpr` variants (`And`/`Or`/`Not`/
+    /// `Compare`), this is the wider type `WithExpr` used to be, letting a
+    /// bare `WHERE x`/`WHERE true` parse (previously rejected — `WithExpr`
+    /// only ever wrapped a `Compare`, never a standalone boolean value).
+    ListComp {
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<ReturnExpr>>,
+        project: Option<Box<ReturnExpr>>,
+    },
+    /// `ALL(x IN list WHERE cond)` / `ANY(...)` / `NONE(...)` / `SINGLE(...)`
+    /// — shares `ListComp`'s "one bound variable over a list, optionally
+    /// filtered" shape (no `project` half; a quantifier always yields a
+    /// `Bool`, never a projected list). `where_clause` absent means "every
+    /// element's own truthiness", same convention `CASE`'s subject-less
+    /// `WHEN` branch already uses (`matches!(v, Literal(Bool(true)))`).
+    Quantifier {
+        kind: QuantifierKind,
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<ReturnExpr>>,
+    },
+    /// `{a: 1, b: 2 + 1}` — a general expression map. `NodePattern`/
+    /// `RelPattern`'s own `props` reuse this same `ReturnExpr` value type
+    /// (not a separate `Literal`-only map) for the identical `{...}`
+    /// pattern syntax — a `CREATE`/`MERGE` prop value can be any
+    /// expression too (`{date: date({year: 1984, ...})}`), evaluated
+    /// against the row already bound so far (`Executor::
+    /// eval_props_to_values`). `MATCH`/`MERGE`'s own inline pattern props
+    /// specifically are further restricted back down to plain literals at
+    /// plan-build time (`planner::require_literal_pattern_prop`) — a
+    /// computed value there doesn't make sense before any row exists to
+    /// evaluate it against, matching real Cypher's own restriction.
     MapLit(Vec<(String, ReturnExpr)>),
-    /// `lhs op rhs` as a general RETURN/WITH expression (`x > d`, `1 + 1 =
-    /// 2`) — separate from the pattern-level `Expr::Compare`/`WithExpr::
-    /// Compare` (both of which require a literal RHS, compiled at
-    /// plan-build/projection time respectively): this one evaluates both
-    /// sides as ordinary `ReturnExpr`s at row-evaluation time via
-    /// `compare_values` (executor.rs), the only way to compare two
-    /// *computed* values against each other (e.g. two `date(...)` call
-    /// results) rather than a bound property against a literal.
+    /// `lhs AND/OR/XOR rhs`, `NOT rhs` — real three-valued logic (`Null`
+    /// propagates per Cypher's truth tables, see `and3`/`or3`/`xor3` in
+    /// executor.rs), evaluating to `Value::Literal(Bool(_))` or
+    /// `Value::Null`, not `Option<bool>` the way pattern-level `Expr`/
+    /// `WithExpr` do — a `ReturnExpr` always evaluates to one `Value`,
+    /// there's no separate "unbound" state to fold in beyond `Null`
+    /// itself. A non-bool, non-null operand is a real error (`1 AND
+    /// true`), not silently coerced.
+    And(Box<ReturnExpr>, Box<ReturnExpr>),
+    Or(Box<ReturnExpr>, Box<ReturnExpr>),
+    Xor(Box<ReturnExpr>, Box<ReturnExpr>),
+    Not(Box<ReturnExpr>),
+    /// `lhs op rhs` — a single comparison between two arbitrary
+    /// expressions (unlike `WithExpr::Compare`'s `ReturnExpr`-vs-`Literal`
+    /// shape, `rhs` here can itself be a variable/property/arithmetic
+    /// expression). Chained comparisons (`1 < x < 10`) aren't supported
+    /// yet — see the README's Cypher coverage section.
     Compare(Box<ReturnExpr>, CompareOp, Box<ReturnExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,10 +246,16 @@ pub enum Tail {
     /// an aggregate call (`count(DISTINCT x)`), which only affects that one
     /// aggregate's own accumulation.
     Return(Vec<ReturnItem>, bool),
-    Delete(Vec<String>),
-    DetachDelete(Vec<String>),
-    Set(Vec<SetItem>),
-    Remove(Vec<RemoveItem>),
+    /// Every mutating tail variant's trailing `Option<ReturnTail>` is real
+    /// Cypher: `MATCH (n) SET n.x = 1 RETURN n`, `MATCH (n) DELETE n RETURN
+    /// count(n)`, etc — see `ReturnTail`'s docs for why it's `None` (the
+    /// pre-existing terminal-mutation shape) vs `Some` (this statement's
+    /// final clause is actually this RETURN, projected off whatever the
+    /// mutation left in scope).
+    Delete(Vec<String>, Option<ReturnTail>),
+    DetachDelete(Vec<String>, Option<ReturnTail>),
+    Set(Vec<SetItem>, Option<ReturnTail>),
+    Remove(Vec<RemoveItem>, Option<ReturnTail>),
     /// `MATCH ... CREATE ...` — same pattern syntax as `Statement::Create`,
     /// but runs once per row already bound by the preceding MATCH/WITH: a
     /// node pattern token whose variable is already bound in that row
@@ -210,7 +263,24 @@ pub enum Tail {
     /// the only way to add an edge between two nodes that already exist —
     /// `Statement::Create` alone can't (every node token it sees is
     /// always fresh).
-    Create(Vec<Pattern>),
+    Create(Vec<Pattern>, Option<ReturnTail>),
+}
+
+/// A `RETURN` trailing a mutating `Tail` (`SET`/`DELETE`/`DETACH DELETE`/
+/// `REMOVE`/`MATCH ... CREATE`) in the same statement, e.g. `MATCH (n) SET
+/// n.prop = 1 RETURN n`. Same two fields `Tail::Return` itself carries
+/// (`items`, `distinct`) — wrapped in its own type so every mutating `Tail`
+/// variant can carry one `Option<ReturnTail>` instead of repeating a
+/// `(Vec<ReturnItem>, bool)` tuple five times. Arbitrary multi-clause
+/// chaining (`SET ... DELETE ... RETURN`, a mutating clause followed by
+/// `WITH` before the final `RETURN`) isn't supported yet — this only covers
+/// exactly one mutating clause directly followed by exactly one `RETURN`,
+/// which is the shape the real TCK scenarios for SET/DELETE/REMOVE
+/// overwhelmingly use.
+#[derive(Debug, Clone)]
+pub struct ReturnTail {
+    pub items: Vec<ReturnItem>,
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]

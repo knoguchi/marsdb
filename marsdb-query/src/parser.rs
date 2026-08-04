@@ -455,45 +455,73 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
     let inner = pair.into_inner().next().expect("tail_clause has one child");
     match inner.as_rule() {
         Rule::return_clause => {
-            let children: Vec<_> = inner.into_inner().collect();
-            let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
-            let items = children
-                .into_iter()
-                .filter(|p| p.as_rule() == Rule::return_item)
-                .map(parse_return_item)
-                .collect::<Result<Vec<_>, _>>()?;
+            let (items, distinct) = parse_return_clause(inner)?;
             Ok(Tail::Return(items, distinct))
         }
+        Rule::mutating_tail => parse_mutating_tail(inner),
+        r => unreachable!("unexpected tail_clause child rule {r:?}"),
+    }
+}
+
+/// `return_clause`'s children -- `(items, distinct)` -- shared by
+/// `Tail::Return` itself (`parse_tail_clause`) and a trailing `ReturnTail`
+/// after a mutating clause (`parse_mutating_tail`), same grammar rule
+/// either way.
+fn parse_return_clause(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool), QueryError> {
+    let children: Vec<_> = pair.into_inner().collect();
+    let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
+    let items = children
+        .into_iter()
+        .filter(|p| p.as_rule() == Rule::return_item)
+        .map(parse_return_item)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((items, distinct))
+}
+
+/// A mutating clause (`DETACH DELETE`/`DELETE`/`REMOVE`/`SET`/`CREATE`)
+/// optionally followed by one trailing `RETURN` — see `mutating_tail`'s
+/// grammar comment and `Tail::Delete`'s docs for the exact shape supported.
+fn parse_mutating_tail(pair: Pair<Rule>) -> Result<Tail, QueryError> {
+    let mut inner = pair.into_inner();
+    let clause = inner.next().expect("mutating_tail has a mutating clause");
+    let ret = inner
+        .next()
+        .map(|p| -> Result<ReturnTail, QueryError> {
+            let (items, distinct) = parse_return_clause(p)?;
+            Ok(ReturnTail { items, distinct })
+        })
+        .transpose()?;
+    match clause.as_rule() {
         Rule::detach_delete_clause => {
-            let vars = inner
+            let vars = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::identifier)
                 .map(|p| p.as_str().to_string())
                 .collect();
-            Ok(Tail::DetachDelete(vars))
+            Ok(Tail::DetachDelete(vars, ret))
         }
         Rule::delete_clause => {
-            let vars = inner
+            let vars = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::identifier)
                 .map(|p| p.as_str().to_string())
                 .collect();
-            Ok(Tail::Delete(vars))
+            Ok(Tail::Delete(vars, ret))
         }
         Rule::set_clause => {
-            let items = inner
+            let items = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::set_item)
                 .map(parse_set_item)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Tail::Set(items))
+            Ok(Tail::Set(items, ret))
         }
         Rule::remove_clause => {
-            let items = inner.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
-            Ok(Tail::Remove(items))
+            let items = clause.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
+            Ok(Tail::Remove(items, ret))
         }
-        Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(inner)?)),
-        r => unreachable!("unexpected tail_clause child rule {r:?}"),
+        Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(clause)?, ret)),
+        r => unreachable!("unexpected mutating_tail child rule {r:?}"),
     }
 }
 
@@ -541,19 +569,72 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 }
 
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("return_expr has one child (comparison_expr)");
-    parse_comparison_expr(inner)
+    let inner = pair.into_inner().next().expect("return_expr has one child (bool_or_expr)");
+    parse_bool_or_expr(inner)
 }
 
-fn parse_comparison_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+/// `kw_or`/`kw_xor`/`kw_and`/`kw_not` are atomic (see their grammar
+/// comments -- word-boundary lookahead needs no implicit whitespace
+/// inserted), so unlike the pre-existing inline-literal operators
+/// elsewhere in this grammar, they DO produce their own `Pair` and show
+/// up in `.into_inner()`. Filtered out here rather than relied on for
+/// structure -- only the operand rule (`bool_xor_expr`/etc) matters for
+/// building the left-fold.
+fn parse_bool_or_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_xor_expr);
+    let mut lhs = parse_bool_xor_expr(inner.next().expect("bool_or_expr has at least one bool_xor_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::Or(Box::new(lhs), Box::new(parse_bool_xor_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+fn parse_bool_xor_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_and_expr);
+    let mut lhs = parse_bool_and_expr(inner.next().expect("bool_xor_expr has at least one bool_and_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::Xor(Box::new(lhs), Box::new(parse_bool_and_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+fn parse_bool_and_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_not_expr);
+    let mut lhs = parse_bool_not_expr(inner.next().expect("bool_and_expr has at least one bool_not_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::And(Box::new(lhs), Box::new(parse_bool_not_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+/// `bool_not_expr = { (kw_not ~ bool_not_expr) | compare_expr }` -- right-
+/// recursive, so (ignoring the atomic `kw_not` token when present) this
+/// either has one `bool_not_expr` child (peel one `NOT`, recurse) or one
+/// `compare_expr` child (base case).
+fn parse_bool_not_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() != Rule::kw_not)
+        .expect("bool_not_expr has a bool_not_expr or compare_expr child");
+    match inner.as_rule() {
+        Rule::bool_not_expr => Ok(ReturnExpr::Not(Box::new(parse_bool_not_expr(inner)?))),
+        Rule::compare_expr => parse_compare_expr(inner),
+        r => unreachable!("unexpected bool_not_expr child rule {r:?}"),
+    }
+}
+
+fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let lhs = parse_add_expr(inner.next().expect("comparison_expr has at least one add_expr"))?;
-    let Some(op_pair) = inner.next() else {
-        return Ok(lhs);
-    };
-    let op = parse_compare_op(op_pair);
-    let rhs = parse_add_expr(inner.next().expect("compare_op has a following add_expr"))?;
-    Ok(ReturnExpr::Compare(Box::new(lhs), op, Box::new(rhs)))
+    let lhs = parse_add_expr(inner.next().expect("compare_expr has at least one add_expr"))?;
+    match (inner.next(), inner.next()) {
+        (Some(op_pair), Some(rhs_pair)) => {
+            let op = parse_compare_op(op_pair);
+            let rhs = parse_add_expr(rhs_pair)?;
+            Ok(ReturnExpr::Compare(Box::new(lhs), op, Box::new(rhs)))
+        }
+        (None, None) => Ok(lhs),
+        _ => unreachable!("compare_expr's compare_op/add_expr pair must appear together"),
+    }
 }
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
@@ -636,10 +717,19 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let inner = pair.into_inner().next().expect("atom_expr has one child");
     match inner.as_rule() {
         Rule::case_expr => parse_case_expr(inner),
+        Rule::quantifier_expr => parse_quantifier_expr(inner),
         Rule::function_call => parse_function_call(inner),
-        Rule::list_expr => Ok(ReturnExpr::ListLit(
-            inner.into_inner().map(parse_return_expr).collect::<Result<Vec<_>, _>>()?,
-        )),
+        Rule::list_expr => {
+            let mut items = inner.into_inner().peekable();
+            match items.peek().map(|p| p.as_rule()) {
+                Some(Rule::list_comprehension) => parse_list_comprehension(items.next().unwrap()),
+                _ => Ok(ReturnExpr::ListLit(items.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?)),
+            }
+        }
+        // `parse_map_expr` (below `parse_node_pattern`/`parse_rel_pattern`
+        // in this file) is shared with a `CREATE`/`MERGE` pattern's own
+        // `{...}` prop map -- both are exactly the same grammar
+        // production, `cypher.pest`'s `map_expr`.
         Rule::map_expr => parse_map_expr(inner),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
@@ -650,6 +740,55 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         Rule::return_expr => parse_return_expr(inner),
         r => unreachable!("unexpected atom_expr child rule {r:?}"),
     }
+}
+
+/// `list_comprehension = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~
+/// with_expr)? ~ ("|" ~ return_expr)? }` -- the `WHERE`/`|` clauses are
+/// each independently optional, so the remaining children (after the
+/// mandatory bound-variable identifier and source `return_expr`) are
+/// distinguished by rule, not position.
+/// `filter_expr = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~
+/// with_expr)? }` -- shared by `list_comprehension` and `quantifier_expr`,
+/// so this returns the three parsed pieces rather than an `Expr` directly;
+/// each caller wraps them into its own `ReturnExpr` variant.
+fn parse_filter_expr(pair: Pair<Rule>) -> Result<(String, Box<ReturnExpr>, Option<Box<ReturnExpr>>), QueryError> {
+    let mut inner = pair.into_inner();
+    let var = inner.next().expect("filter_expr has a bound variable").as_str().to_string();
+    let source = parse_return_expr(inner.next().expect("filter_expr has a source return_expr"))?;
+    let where_clause = inner.next().map(|w| parse_return_expr(w).map(Box::new)).transpose()?;
+    Ok((var, Box::new(source), where_clause))
+}
+
+fn parse_list_comprehension(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let (var, source, where_clause) =
+        parse_filter_expr(inner.next().expect("list_comprehension has a filter_expr"))?;
+    let project = inner.next().map(parse_return_expr).transpose()?.map(Box::new);
+    Ok(ReturnExpr::ListComp {
+        var,
+        source,
+        where_clause,
+        project,
+    })
+}
+
+fn parse_quantifier_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let kind = match inner.next().expect("quantifier_expr has a quantifier_kw").as_str().to_ascii_uppercase().as_str()
+    {
+        "ALL" => QuantifierKind::All,
+        "ANY" => QuantifierKind::Any,
+        "NONE" => QuantifierKind::None,
+        "SINGLE" => QuantifierKind::Single,
+        other => unreachable!("unexpected quantifier_kw {other:?}"),
+    };
+    let (var, source, where_clause) = parse_filter_expr(inner.next().expect("quantifier_expr has a filter_expr"))?;
+    Ok(ReturnExpr::Quantifier {
+        kind,
+        var,
+        source,
+        where_clause,
+    })
 }
 
 fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {

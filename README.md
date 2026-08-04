@@ -182,9 +182,15 @@ boundary per statement (projection/rename, its own `WHERE`/
 already-matched nodes — a node token whose variable is already bound
 reuses that node instead of creating a new one). `SET`/`REMOVE` cover
 both properties (`SET n.prop = 'x'`/`REMOVE n.prop`) and labels
-(`SET n:Label`/`REMOVE n:Label`) — but, like `DELETE`, can't be
-followed by anything else in the same statement (no `SET ... RETURN`
-in one query yet — each is a terminal tail, not a chainable clause).
+(`SET n:Label`/`REMOVE n:Label`); `SET n.prop = null` removes the
+property rather than storing a literal null, matching real Cypher.
+`DELETE`/`DETACH DELETE`/`SET`/`REMOVE`/`MATCH ... CREATE` can each
+optionally be followed by one trailing `RETURN` in the same statement
+(`MATCH (n) SET n.prop = 1 RETURN n`, `MATCH (n) DELETE n RETURN
+count(n)`) — the shape the real TCK scenarios for these clauses
+overwhelmingly use. Not yet supported: chaining more than one mutating
+clause before the final `RETURN`, or a `WITH` between the mutating
+clause and that `RETURN`.
 Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 `coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
@@ -203,8 +209,35 @@ List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
 from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
 open-ended `list[2..]`/`list[..3]` — unlike indexing, out-of-range slice
 bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
+List comprehensions (`[x IN list WHERE cond | expr]`, both `WHERE` and
+`| expr` independently optional — `[x IN list]` is a legal no-op filter).
+Quantifiers `ALL(x IN list WHERE cond)`/`ANY(...)`/`NONE(...)`/
+`SINGLE(...)` (same `WHERE` shape as list comprehensions, no `WHERE` means
+"every element's own truthiness"), with real three-valued NULL logic — a
+definite `true`/`false` among the elements decides the answer even with
+other `null` elements present; only "no definite answer, but at least one
+`null`" actually yields `null` (e.g. `all(x IN [0, null] WHERE x = 2)` is
+`false`, not `null`, since `0 = 2` is a definite `false`).
 A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
 list[1]`) is also valid on its own.
+Map literals (`{a: 1, b: 2+1}`) in `RETURN`/`WITH`, and property-style
+access on a map-valued variable (`WITH {a: 1} AS m RETURN m.a`) — general
+postfix property access on an arbitrary non-identifier expression
+(`list[0].prop`) isn't supported yet, only `identifier.prop`.
+Boolean logic (`AND`/`OR`/`XOR`/`NOT`) and comparisons (`=`/`<>`/`<`/`<=`/
+`>`/`>=`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`) are first-class `RETURN`/
+`WITH` expressions now (`RETURN true AND (1 < 2)`), not just a separate
+`WHERE`-only grammar — this is also what list comprehensions' and
+quantifiers' `WHERE` clauses use, so a bare `WHERE x`/`WHERE true` parses
+now (previously rejected). Real three-valued NULL logic throughout
+(`false AND null` is `false`, not `null` — a definite operand still
+decides the answer), list/map equality is real structural comparison
+(`[1,2] = [1,2]` is `true`, not `null`), and lists order lexicographically
+(`[1,0] >= [1]` is `true`). A type-mismatched comparison's result depends
+on the operator: `=`/`<>` are always definite (`1 = 'a'` is `false`,
+`1 <> 'a'` is `true`), while ordering and the string predicates are `null`
+(no defined answer), not `false`. Chained comparisons (`1 < x < 10`) and
+`IS NULL`/`IS NOT NULL` aren't supported yet.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`
