@@ -182,9 +182,15 @@ boundary per statement (projection/rename, its own `WHERE`/
 already-matched nodes — a node token whose variable is already bound
 reuses that node instead of creating a new one). `SET`/`REMOVE` cover
 both properties (`SET n.prop = 'x'`/`REMOVE n.prop`) and labels
-(`SET n:Label`/`REMOVE n:Label`) — but, like `DELETE`, can't be
-followed by anything else in the same statement (no `SET ... RETURN`
-in one query yet — each is a terminal tail, not a chainable clause).
+(`SET n:Label`/`REMOVE n:Label`); `SET n.prop = null` removes the
+property rather than storing a literal null, matching real Cypher.
+`DELETE`/`DETACH DELETE`/`SET`/`REMOVE`/`MATCH ... CREATE` can each
+optionally be followed by one trailing `RETURN` in the same statement
+(`MATCH (n) SET n.prop = 1 RETURN n`, `MATCH (n) DELETE n RETURN
+count(n)`) — the shape the real TCK scenarios for these clauses
+overwhelmingly use. Not yet supported: chaining more than one mutating
+clause before the final `RETURN`, or a `WITH` between the mutating
+clause and that `RETURN`.
 Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 `coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with

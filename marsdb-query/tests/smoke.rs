@@ -1943,3 +1943,227 @@ fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
     assert_eq!(list_ints(&result.rows[0][1]), Vec::<i64>::new());
 }
+
+// --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
+// MATCH...CREATE followed directly by a RETURN in the same statement) ---
+
+#[test]
+fn set_then_return_sees_the_just_set_value() {
+    // The RETURN must see the *updated* property, not the pre-SET one --
+    // materialize_set applies the mutation before materialize_return runs,
+    // same real-Cypher shape as TCK's Set2.feature scenario [1].
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {property1: 'orig'})");
+    let result = run(&store, "MATCH (n:A) SET n.property1 = 'updated' RETURN n.property1");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "updated");
+}
+
+#[test]
+fn set_label_then_return_labels() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:X)");
+    let result = run(&store, "MATCH (n:X) SET n:Foo RETURN n");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            let mut labels = node.labels.clone();
+            labels.sort();
+            assert_eq!(labels, vec!["Foo".to_string(), "X".to_string()]);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_then_return_computed_value_not_the_deleted_var() {
+    // Real TCK DELETE+RETURN scenarios (Delete1/Delete4/Delete6) never
+    // RETURN the deleted variable's live properties -- they return a
+    // computed value (a literal, count(*), or a WITH-projected scalar
+    // captured before the delete). Exact shape and expected count (2, not
+    // 1 -- the undirected pattern matches both directions) from Delete4's
+    // scenario [1]: "Undirected expand followed by delete and count".
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A)-[:R]->(b:B)");
+    let result = run(&store, "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c");
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+    // The delete itself really happened -- nothing left to match.
+    let remaining = run(&store, "MATCH (n) RETURN n");
+    assert_eq!(remaining.rows.len(), 0);
+}
+
+#[test]
+fn delete_then_return_the_deleted_var_itself_errors_not_panics() {
+    // Not a shape any real TCK scenario directly tests with a bare `RETURN
+    // n`, but real TCK scenarios *do* test the property-access cousin of
+    // this shape (`MATCH (n) DELETE n RETURN n.num` must raise
+    // `DeletedEntityAccess`, TCK's Return2 [15]/[17]) -- and `materialize_
+    // delete` runs the physical delete before evaluating the trailing
+    // RETURN to get that right. `binding_to_value`/`lookup_prop` (via
+    // `deleted_entity_access`) must turn "the bound id's record is gone"
+    // into a proper `QueryError`, not a panic — this is the regression
+    // guard for that path specifically (accessing the whole node, not just
+    // one of its properties).
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    let stmt = parse("MATCH (n:A) DELETE n RETURN n").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+    // A failed statement rolls back its whole write transaction (see
+    // `Executor::execute`'s abort-on-error path) -- the delete itself must
+    // NOT have taken effect, same as any other error mid-statement.
+    let remaining = run(&store, "MATCH (n:A) RETURN n");
+    assert_eq!(remaining.rows.len(), 1, "a failed statement must roll back, not partially apply its delete");
+}
+
+#[test]
+fn delete_then_return_a_property_of_the_deleted_var_errors() {
+    // TCK Return2 scenarios [15]/[17]: accessing a property of a just-
+    // deleted node/relationship must raise DeletedEntityAccess, not
+    // silently succeed with the pre-delete value.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n {num: 0})");
+    let stmt = parse("MATCH (n) DELETE n RETURN n.num").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+
+    let store2 = GraphStore::open_memory().unwrap();
+    run(&store2, "CREATE ()-[:T {num: 0}]->()");
+    let stmt2 = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
+    let err2 = Executor::new(&store2).execute(&stmt2).unwrap_err();
+    assert!(err2.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err2}");
+}
+
+#[test]
+fn detach_delete_then_return() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    let result = run(&store, "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN 42 AS num");
+    // `42` is a bare literal, not a node/edge property -- eval_return_expr
+    // yields Value::Literal here, not Value::Property.
+    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(42))));
+    let remaining = run(&store, "MATCH (n:Person) RETURN n.name");
+    assert_eq!(remaining.rows.len(), 1);
+    assert_eq!(str_value(&remaining.rows[0][0]), "Bob");
+}
+
+#[test]
+fn optional_match_delete_null_return_null() {
+    // TCK Delete1 scenario [5]: "Ignore null when deleting node" -- an
+    // OPTIONAL MATCH that finds nothing pads with a null binding, DELETE on
+    // null is a documented no-op, and the trailing RETURN of that same
+    // (null) variable must round-trip as null, not error.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Real)");
+    let result = run(&store, "OPTIONAL MATCH (a:DoesNotExist) DELETE a RETURN a");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn remove_then_return() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p1: 1, p2: 2})");
+    let result = run(&store, "MATCH (n:A) REMOVE n.p1 RETURN n");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            assert!(!node.props.contains_key("p1"));
+            assert_eq!(int_value(&Value::Property(node.props.get("p2").unwrap().clone())), 2);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn match_create_then_return_sees_the_newly_created_binding() {
+    // The trailing RETURN must see `i`, the node CREATE just made in this
+    // same statement -- materialize_create threads each row's updated
+    // bindings forward for exactly this.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {name: 'Alice'})");
+    let result = run(&store, "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:OWNS]->(i:Item {name: 'Widget'}) RETURN i.name");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "Widget");
+}
+
+#[test]
+fn set_then_return_distinct_dedups() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A)-[:R]->(x:X {tag: 'same'})");
+    run(&store, "CREATE (b:A)-[:R]->(y:X {tag: 'same'})");
+    let result = run(&store, "MATCH (a:A)-[:R]->(x:X) SET a.touched = true RETURN DISTINCT x.tag");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "same");
+}
+
+#[test]
+fn set_then_return_with_param_substitution() {
+    // Regression guard for `params::substitute_tail`/`substitute_return_tail`
+    // -- a `$param` inside the trailing RETURN of a mutating tail must be
+    // resolved just like one inside the mutating clause itself.
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    let mut params = HashMap::new();
+    params.insert("newp".to_string(), marsdb_graph::PropertyValue::Int(99));
+    let mut stmt = marsdb_query::parse("MATCH (n:A) SET n.p = 2 RETURN $newp AS x").unwrap();
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(99))));
+    let after = run(&store, "MATCH (n:A) RETURN n.p");
+    assert_eq!(int_value(&after.rows[0][0]), 2);
+}
+
+#[test]
+fn set_property_to_null_removes_it_not_stores_a_null_value() {
+    // Regression guard for a real bug found while adding SET...RETURN:
+    // `SET n.prop = null` must *remove* the property (real Cypher, TCK's
+    // Set2 "Set a Property to Null" scenarios), not store a literal
+    // `PropertyValue::Null` under that key -- the two are observably
+    // different (a stored null still shows up when a node's props are
+    // enumerated). This bug pre-dated SET...RETURN but was unreachable
+    // until a RETURN could follow SET to observe it.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {property1: 45, property2: 46})");
+    let result = run(&store, "MATCH (n:A) SET n.property1 = null RETURN n");
+    match &result.rows[0][0] {
+        Value::Node(node) => {
+            assert!(!node.props.contains_key("property1"), "property1 must be gone, not null: {:?}", node.props);
+            assert_eq!(int_value(&Value::Property(node.props.get("property2").unwrap().clone())), 46);
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_and_remove_on_a_null_binding_are_silent_no_ops() {
+    // Regression guard for a second real bug found the same way: an
+    // OPTIONAL MATCH miss pads its variable with a null binding, and
+    // SET/REMOVE (property *and* label forms) on that null must be silent
+    // no-ops -- same documented behavior DELETE already had -- not an
+    // "isn't a node" error. TCK's Set1/Set3/Remove1/Remove2 "Ignore null
+    // when setting/removing property/label" scenarios.
+    let store = GraphStore::open_memory().unwrap();
+    let prop_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a.num = 42 RETURN a");
+    assert!(matches!(prop_set.rows[0][0], Value::Null));
+    let label_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a:L RETURN a");
+    assert!(matches!(label_set.rows[0][0], Value::Null));
+    let prop_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a.num RETURN a");
+    assert!(matches!(prop_remove.rows[0][0], Value::Null));
+    let label_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a:L RETURN a");
+    assert!(matches!(label_remove.rows[0][0], Value::Null));
+}
+
+#[test]
+fn mutating_tail_with_no_return_is_still_terminal() {
+    // Regression guard: the grammar change (`return_clause?` after a
+    // mutating clause) must not force a RETURN -- the pre-existing
+    // terminal-mutation shape (no trailing RETURN at all) still has to
+    // keep working exactly as before.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A {p: 1})");
+    run(&store, "MATCH (n:A) SET n.p = 2");
+    let result = run(&store, "MATCH (n:A) RETURN n.p");
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+}

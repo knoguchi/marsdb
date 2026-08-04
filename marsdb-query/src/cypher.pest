@@ -68,7 +68,18 @@ on_match_clause   = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 // statement; only the AST/executor treat a node token whose variable is
 // already bound differently (reuse the existing node instead of making a
 // new one — see `Tail::Create`'s docs).
-tail_clause = { return_clause | detach_delete_clause | delete_clause | remove_clause | set_clause | create_stmt }
+// `return_clause` is tried first: with no leading keyword of its own
+// besides `RETURN`, there's no ambiguity with `mutating_tail` (which always
+// starts with DETACH/DELETE/REMOVE/SET/CREATE instead), so choice order
+// here doesn't matter for correctness -- just avoids one extra failed
+// alternative on the (more common) plain `RETURN ...` tail.
+tail_clause = { return_clause | mutating_tail }
+// A mutating tail clause optionally followed by one trailing `RETURN` —
+// real Cypher (`MATCH (n) SET n.x = 1 RETURN n`). Only this one shape is
+// supported (a single mutating clause, then a single optional RETURN) —
+// arbitrary chaining (multiple mutating clauses, or a WITH between the
+// mutation and the RETURN) isn't attempted here; see `Tail::Delete`'s docs.
+mutating_tail = { (detach_delete_clause | delete_clause | remove_clause | set_clause | create_stmt) ~ return_clause? }
 
 return_clause = { ^"RETURN" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }

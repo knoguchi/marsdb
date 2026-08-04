@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use marsdb_graph::PropertyValue;
 
 use crate::ast::{
-    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, SetItem, Statement, Tail,
-    UnwindClause, UnwindSource, WithClause, WithExpr,
+    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, ReturnTail, SetItem,
+    Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 
@@ -158,18 +158,35 @@ fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> 
                 substitute_return_expr(&mut item.expr, params)?;
             }
         }
-        Tail::Delete(_) | Tail::DetachDelete(_) | Tail::Remove(_) => {}
-        Tail::Set(items) => {
+        Tail::Delete(_, ret) | Tail::DetachDelete(_, ret) | Tail::Remove(_, ret) => {
+            substitute_return_tail(ret, params)?;
+        }
+        Tail::Set(items, ret) => {
             for item in items {
                 if let SetItem::Prop(_, lit) = item {
                     substitute_literal(lit, params)?;
                 }
             }
+            substitute_return_tail(ret, params)?;
         }
-        Tail::Create(patterns) => {
+        Tail::Create(patterns, ret) => {
             for pattern in patterns {
                 substitute_pattern(pattern, params)?;
             }
+            substitute_return_tail(ret, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// Substitutes params in a mutating tail's optional trailing `RETURN`
+/// (`MATCH (n) SET n.x = $x RETURN n` needs both the `SET`'s own `$x` *and*
+/// nothing extra here since this RETURN has none — but `MATCH (n) DELETE n
+/// RETURN $y` does).
+fn substitute_return_tail(ret: &mut Option<ReturnTail>, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+    if let Some(rt) = ret {
+        for item in &mut rt.items {
+            substitute_return_expr(&mut item.expr, params)?;
         }
     }
     Ok(())
