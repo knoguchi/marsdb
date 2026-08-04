@@ -381,8 +381,13 @@ impl<'a> Executor<'a> {
         // rather than pulling lazily, so pushing LIMIT further (past a
         // Filter, an Expand, more than one clause, ...) would need a real
         // streaming executor to stay correct, not just a deeper check here.
+        // A DISTINCT RETURN can also drop rows -- capping the raw scan at
+        // `limit` before dedup could return fewer than `limit` *distinct*
+        // rows even when more exist past what got scanned, so this shape
+        // is excluded the same way a WHERE/Filter already is.
         let scan_limit_shortcut = order_by.is_none()
             && limit.is_some()
+            && !matches!(tail, Some(Tail::Return(_, true)))
             && matches!(clauses, [QueryClause::Match(part)] if
                 !part.shortest_path
                     && part.path_var.is_none()
@@ -476,8 +481,13 @@ impl<'a> Executor<'a> {
         // (the v1 "doesn't short-circuit" path) when there's no ORDER BY to
         // invalidate it; DELETE/SET+LIMIT keep their "stop after N
         // bindings" behavior since they have no ORDER BY position in the
-        // grammar.
-        if order_by.is_none() {
+        // grammar. RETURN DISTINCT is excluded too, same reasoning as
+        // ORDER BY: DISTINCT can still drop rows *after* this point, so
+        // pre-truncating the raw input here could return fewer than
+        // `limit` distinct rows even when more exist -- its LIMIT gets
+        // applied after dedup instead, below.
+        let distinct_return = matches!(tail, Some(Tail::Return(_, true)));
+        if order_by.is_none() && !distinct_return {
             if let Some(count) = limit {
                 current_rows.truncate(count.max(0) as usize);
             }
@@ -508,10 +518,16 @@ impl<'a> Executor<'a> {
             // `current_rows`, which a synthetic `Tail::Return(vec![])`
             // would produce instead).
             None => QueryResult { columns: vec![], rows: vec![] },
-            Some(Tail::Return(items)) => {
-                let projected = self.materialize_return(txn, items, &current_rows)?;
+            Some(Tail::Return(items, distinct)) => {
+                let projected = self.materialize_return(txn, items, &current_rows, *distinct)?;
                 if let Some(ob) = order_by {
-                    if !has_aggregate(items) {
+                    // DISTINCT (like aggregation) can drop rows, breaking
+                    // the 1:1 correspondence `apply_order_by_with_scope`
+                    // needs between `current_rows` and the projected
+                    // output -- ORDER BY after DISTINCT can only sort the
+                    // post-projection, post-dedup result, same as the
+                    // aggregating case just below.
+                    if !has_aggregate(items) && !distinct {
                         order_by_pre_applied = true;
                         self.apply_order_by_with_scope(txn, &current_rows, projected, ob, limit)?
                     } else {
@@ -536,6 +552,12 @@ impl<'a> Executor<'a> {
         if let Some(order_by) = order_by {
             if !order_by_pre_applied {
                 result.rows = apply_order_by(result.rows, &result.columns, order_by, limit)?;
+            }
+        } else if distinct_return {
+            // The pre-truncate above was skipped for exactly this case --
+            // apply LIMIT now, after materialize_return's dedup, instead.
+            if let Some(count) = limit {
+                result.rows.truncate(count.max(0) as usize);
             }
         }
         Ok(result)
@@ -1375,13 +1397,14 @@ impl<'a> Executor<'a> {
         txn: Txn,
         items: &[ReturnItem],
         rows: &[BindingRow],
+        distinct: bool,
     ) -> Result<QueryResult, QueryError> {
         let columns = items
             .iter()
             .enumerate()
             .map(|(i, item)| item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i)))
             .collect();
-        let out_rows = if !has_aggregate(items) {
+        let mut out_rows = if !has_aggregate(items) {
             let mut out_rows = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut out_row = Vec::with_capacity(items.len());
@@ -1404,6 +1427,9 @@ impl<'a> Executor<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        if distinct {
+            out_rows = dedup_rows(out_rows)?;
+        }
         Ok(QueryResult {
             columns,
             rows: out_rows,
@@ -1646,7 +1672,7 @@ fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &Remo
 /// this to decide whether to open a `ReadTransaction` (no contention with
 /// concurrent readers or a concurrent writer) or a `WriteTransaction`.
 fn is_read_only(stmt: &Statement) -> bool {
-    let Statement::Match { tail: Some(Tail::Return(_)), clauses, .. } = stmt else {
+    let Statement::Match { tail: Some(Tail::Return(_, _)), clauses, .. } = stmt else {
         return false;
     };
     !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_)))
@@ -2290,6 +2316,25 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             }
         }
     }
+}
+
+/// `RETURN DISTINCT`'s result-set-level dedup -- structural equality of
+/// the whole row (same `HashKey` machinery `DISTINCT` inside an aggregate
+/// call and `resolve_grouped_rows`' grouping already use, not `value_eq`'s
+/// definite-equality-only comparison, since a `HashSet` needs `Hash` too).
+/// Keeps the first occurrence of each distinct row, preserving order --
+/// what every other DB's `DISTINCT` does, and what a human reading the
+/// query would expect.
+fn dedup_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, QueryError> {
+    let mut seen: HashSet<Vec<HashKey>> = HashSet::with_capacity(rows.len());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = row.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?;
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    Ok(out)
 }
 
 /// Sorts `keyed` (each entry paired with its precomputed per-column sort

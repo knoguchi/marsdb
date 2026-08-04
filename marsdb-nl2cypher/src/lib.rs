@@ -131,25 +131,24 @@ pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError>
 /// `README.md` at build/runtime — every token here is a token in every
 /// prompt. Beyond what's supported, this specifically calls out the
 /// sharp edges an LLM trained on general Neo4j Cypher will otherwise
-/// reach for (the bare `-->` shorthand, `RETURN DISTINCT`, multi-hop
-/// `MERGE`, `*` inside a named path) — telling the model what *not* to
-/// try is a real, standard technique for cutting down failed generations
-/// against a narrower dialect than what it was trained on.
+/// reach for (the bare `-->` shorthand, multi-hop `MERGE`, `*` inside a
+/// named path) — telling the model what *not* to try is a real, standard
+/// technique for cutting down failed generations against a narrower
+/// dialect than what it was trained on.
 const CAPABILITIES: &str = "\
 MarsDB supports a subset of openCypher. Rules that matter for generating valid queries:
 - Relationships must be written explicitly as -[:TYPE]-> or -[:TYPE]-. The bare --> shorthand
   does not exist here -- always name the relationship type in brackets.
-- MATCH, OPTIONAL MATCH, WHERE, WITH (at most one WITH boundary per statement), RETURN,
-  ORDER BY, LIMIT.
+- MATCH, OPTIONAL MATCH, WHERE, WITH (at most one WITH boundary per statement), RETURN
+  (optionally RETURN DISTINCT), ORDER BY, LIMIT.
 - CREATE. MERGE with ON CREATE SET / ON MATCH SET, capped at exactly one relationship hop --
   never write a MERGE pattern with two or more relationships.
 - UNWIND <list> AS x, where <list> is an inline literal list (e.g. [1, 2, 3]) or a variable
   bound by a preceding WITH ... collect(...).
 - Aggregation: count(), count(*), sum(), avg(), min(), max(), collect(), with implicit
   GROUP BY -- every non-aggregating RETURN/WITH item automatically becomes a grouping key,
-  there is no GROUP BY keyword.
-- DISTINCT only works inside an aggregate call, e.g. count(DISTINCT x). RETURN DISTINCT as
-  a standalone result-set modifier does not exist -- never write it.
+  there is no GROUP BY keyword. DISTINCT also works inside an aggregate call, e.g.
+  count(DISTINCT x).
 - Named path capture: MATCH p = (a)-[:TYPE]->(b) RETURN p -- fixed-hop patterns only, never
   a variable-length (*) hop inside a named path.
 - shortestPath((a)-[:TYPE*..N]-(b)): both endpoints must already be matched by a preceding

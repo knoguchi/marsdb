@@ -92,6 +92,42 @@ fn limit_clause_pushed_into_scan_edge_cases() {
 }
 
 #[test]
+fn return_distinct_dedups_whole_row() {
+    let store = GraphStore::open_memory().unwrap();
+    for city in ["A", "B", "A", "A", "B"] {
+        run(&store, &format!("CREATE (n:City {{name: '{city}'}})"));
+    }
+    let result = run(&store, "MATCH (n:City) RETURN DISTINCT n.name AS c ORDER BY c");
+    let names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["A", "B"]);
+}
+
+/// `RETURN DISTINCT ... LIMIT k` (no ORDER BY) must apply LIMIT *after*
+/// dedup, not before -- both the LIMIT push-down-into-scan shortcut and
+/// the pre-tail truncate (`execute_match`'s `distinct_return` exclusion)
+/// need to skip this shape, or fewer than `k` distinct rows could come
+/// back even when more exist past what got scanned/truncated first.
+#[test]
+fn return_distinct_then_limit_counts_distinct_rows_not_raw_rows() {
+    let store = GraphStore::open_memory().unwrap();
+    // Two duplicate 'A's scanned first, then 'B' and 'C' -- a naive
+    // truncate-before-dedup would only ever see the two 'A's and return
+    // just one distinct row for LIMIT 2, not two.
+    for city in ["A", "A", "B", "C"] {
+        run(&store, &format!("CREATE (n:City {{name: '{city}'}})"));
+    }
+    let result = run(&store, "MATCH (n:City) RETURN DISTINCT n.name LIMIT 2");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
 fn detach_delete() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
