@@ -48,10 +48,30 @@ let options = marsdb::ExecutionOptions {
 };
 let result = db.execute_with_options("MATCH (n) RETURN n", &options)?;
 
+// Group statements into one atomic unit. Reads through `tx` see its earlier
+// writes; any statement error aborts and closes the whole transaction.
+let mut tx = db.begin_transaction()?;
+tx.execute("CREATE (:Person {name: 'Bob'})")?;
+tx.execute("CREATE (:Person {name: 'Carol'})")?;
+tx.commit()?;
+
+// Operational checks and crash-consistent backup. The backup destination
+// must be new, so an existing file is never overwritten.
+db.backup_to("path/to-backup.db")?;
+let mut db = db;
+let report = db.check_integrity()?;
+assert_eq!(report.nodes, 3);
+
 // Or run a `;`-separated batch, one transaction per statement, one
 // QueryResult per statement back:
 let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
 ```
+
+`ExecutionOptions::observer` accepts an `ExecutionObserver` callback for
+dependency-free telemetry. Events contain duration, outcome category,
+read/write classification, result-row count, and relationship expansions;
+they deliberately exclude query text and error messages. Syntax and missing-
+parameter rejections are reported too, and observer panics are contained.
 
 More: `cargo run -p marsdb --example task_tracker` (CRUD + aggregation),
 `--example social_graph` (variable-length traversal, `MATCH...CREATE`), or
@@ -110,9 +130,9 @@ marsdb mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated bat
 
 `marsdb-nl2cypher` translates an English question into Cypher against a
 database's actual schema (labels/relationship-types/properties in use,
-introspected automatically), validates the result by really parsing it, and
-retries once with the exact parse error fed back if the first attempt
-doesn't parse. No HTTP/LLM-SDK dependency in the core crate — bring your
+introspected automatically), validates its syntax and variable/type binding,
+and retries once with the exact validation error fed back if the first attempt
+is invalid. No HTTP/LLM-SDK dependency in the core crate — bring your
 own `LlmClient`:
 
 ```rust
@@ -167,7 +187,9 @@ transaction — a read-only `MATCH ... RETURN` opens a `ReadTransaction`
 (a consistent snapshot that runs alongside other concurrent readers or a
 concurrent writer without contending for redb's single-writer lock),
 everything else opens a `WriteTransaction`, committed or aborted as a
-whole. MarsDB records its own table/record format version in metadata when
+whole. `Database::begin_transaction` lets callers explicitly extend that
+atomic boundary across multiple statements. MarsDB records its own
+table/record format version in metadata when
 the file is created or first opened by a version-aware build, and refuses
 to open a database written by a newer unsupported format.
 

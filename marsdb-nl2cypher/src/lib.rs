@@ -3,9 +3,9 @@
 //! Introspects a database's schema (labels, relationship types, and
 //! property keys actually in use — see [`introspect_schema`]), builds a
 //! grounded prompt (see [`build_prompt`]), calls a caller-supplied
-//! [`LlmClient`], and validates the result by actually parsing it with
-//! `marsdb_query::parse` — with one repair attempt if the first response
-//! doesn't parse, feeding the exact parse error back (this codebase's
+//! [`LlmClient`], and validates the result by parsing and semantically
+//! binding it — with one repair attempt if the first response is invalid,
+//! feeding the exact validation error back (this codebase's
 //! error messages are unusually descriptive, which this leans on
 //! directly).
 //!
@@ -259,8 +259,8 @@ fn extract_cypher(raw: &str) -> String {
     }
 }
 
-/// Translates `question` into Cypher against `schema`, validating the
-/// result by actually parsing it. One repair attempt on failure — not an
+/// Translates `question` into Cypher against `schema`, validating syntax,
+/// variable scope, and structural types. One repair attempt on failure — not an
 /// open-ended retry loop, matching this codebase's stance throughout of
 /// erroring clearly over retrying indefinitely hoping it works.
 pub fn translate(
@@ -271,22 +271,28 @@ pub fn translate(
     let prompt = build_prompt(schema, question, None);
     let raw = client.complete(&prompt).map_err(Nl2CypherError::Llm)?;
     let cypher = extract_cypher(&raw);
-    if marsdb_query::parse(&cypher).is_ok() {
+    if parse_and_validate(&cypher).is_ok() {
         return Ok(cypher);
     }
-    let first_err = marsdb_query::parse(&cypher).unwrap_err().to_string();
+    let first_err = parse_and_validate(&cypher).unwrap_err().to_string();
 
     let repair_prompt = build_prompt(schema, question, Some((&cypher, &first_err)));
     let raw2 = client
         .complete(&repair_prompt)
         .map_err(Nl2CypherError::Llm)?;
     let cypher2 = extract_cypher(&raw2);
-    match marsdb_query::parse(&cypher2) {
+    match parse_and_validate(&cypher2) {
         Ok(_) => Ok(cypher2),
         Err(second_err) => Err(Nl2CypherError::InvalidCypher {
             attempts: vec![(cypher, first_err), (cypher2, second_err.to_string())],
         }),
     }
+}
+
+fn parse_and_validate(cypher: &str) -> Result<marsdb_query::Statement, marsdb_query::QueryError> {
+    let statement = marsdb_query::parse(cypher)?;
+    marsdb_query::validate_statement(&statement)?;
+    Ok(statement)
 }
 
 /// The common case in one call: introspect, translate, execute.

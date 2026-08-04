@@ -53,8 +53,12 @@ impl MarsdbResult {
 
 /// Open (creating if absent) a single-file, on-disk database. Returns
 /// NULL if `path` isn't valid UTF-8 or the underlying open fails.
+///
+/// # Safety
+/// `path` must be NULL or point to a valid NUL-terminated byte string for
+/// the duration of this call.
 #[no_mangle]
-pub extern "C" fn marsdb_open(path: *const c_char) -> *mut MarsdbDatabase {
+pub unsafe extern "C" fn marsdb_open(path: *const c_char) -> *mut MarsdbDatabase {
     if path.is_null() {
         return std::ptr::null_mut();
     }
@@ -80,8 +84,12 @@ pub extern "C" fn marsdb_open_in_memory() -> *mut MarsdbDatabase {
 /// Reclaims a handle returned by `marsdb_open`/`marsdb_open_in_memory`.
 /// Passing NULL is a no-op; passing a pointer twice, or one not returned
 /// by this crate, is undefined behavior (same contract as `Box::from_raw`).
+///
+/// # Safety
+/// A non-NULL `db` must be an owned, live handle returned by MarsDB and must
+/// not be used after this call.
 #[no_mangle]
-pub extern "C" fn marsdb_close(db: *mut MarsdbDatabase) {
+pub unsafe extern "C" fn marsdb_close(db: *mut MarsdbDatabase) {
     if db.is_null() {
         return;
     }
@@ -90,8 +98,15 @@ pub extern "C" fn marsdb_close(db: *mut MarsdbDatabase) {
 
 /// Run one Cypher statement, returning the result as JSON:
 /// `{"columns": [...], "rows": [[...], ...]}`.
+///
+/// # Safety
+/// `db` must be NULL or a live MarsDB handle, and `cypher` must be NULL or
+/// point to a valid NUL-terminated byte string for the duration of the call.
 #[no_mangle]
-pub extern "C" fn marsdb_execute(db: *mut MarsdbDatabase, cypher: *const c_char) -> MarsdbResult {
+pub unsafe extern "C" fn marsdb_execute(
+    db: *mut MarsdbDatabase,
+    cypher: *const c_char,
+) -> MarsdbResult {
     if db.is_null() || cypher.is_null() {
         return MarsdbResult::err("null db or cypher pointer");
     }
@@ -114,8 +129,12 @@ pub extern "C" fn marsdb_execute(db: *mut MarsdbDatabase, cypher: *const c_char)
 /// `MarsdbResult.error`. The caller MUST NOT free these with anything
 /// other than this function — they were allocated by Rust's global
 /// allocator via `CString::into_raw`, not `malloc`.
+///
+/// # Safety
+/// A non-NULL `s` must be a live pointer returned in a MarsDB result and may
+/// be passed to this function exactly once.
 #[no_mangle]
-pub extern "C" fn marsdb_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn marsdb_free_string(s: *mut c_char) {
     if s.is_null() {
         return;
     }
@@ -334,31 +353,35 @@ mod tests {
 
     #[test]
     fn execute_reports_invalid_utf8_and_null_inputs() {
-        let null_result = marsdb_execute(std::ptr::null_mut(), std::ptr::null());
+        let null_result = unsafe { marsdb_execute(std::ptr::null_mut(), std::ptr::null()) };
         assert!(null_result.json.is_null());
         assert!(!null_result.error.is_null());
-        marsdb_free_string(null_result.error);
+        unsafe { marsdb_free_string(null_result.error) };
 
         let db = marsdb_open_in_memory();
         assert!(!db.is_null());
         let invalid_utf8 = [0xff_u8, 0];
-        let result = marsdb_execute(db, invalid_utf8.as_ptr().cast());
+        let result = unsafe { marsdb_execute(db, invalid_utf8.as_ptr().cast()) };
         assert!(result.json.is_null());
         assert!(!result.error.is_null());
-        marsdb_free_string(result.error);
-        marsdb_close(db);
+        unsafe {
+            marsdb_free_string(result.error);
+            marsdb_close(db);
+        }
     }
 
     #[test]
     fn execute_returns_engine_arithmetic_errors() {
         let db = marsdb_open_in_memory();
         let cypher = CString::new("RETURN -9223372036854775808 / -1").unwrap();
-        let result = marsdb_execute(db, cypher.as_ptr());
+        let result = unsafe { marsdb_execute(db, cypher.as_ptr()) };
         assert!(result.json.is_null());
         assert!(!result.error.is_null());
         let message = unsafe { CStr::from_ptr(result.error) }.to_str().unwrap();
         assert!(message.contains("integer arithmetic overflow"));
-        marsdb_free_string(result.error);
-        marsdb_close(db);
+        unsafe {
+            marsdb_free_string(result.error);
+            marsdb_close(db);
+        }
     }
 }

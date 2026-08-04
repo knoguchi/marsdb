@@ -53,8 +53,71 @@ impl CancellationToken {
     }
 }
 
-/// Per-statement safety limits. Every field defaults to `None`, preserving
-/// the existing unlimited behavior for trusted embedded callers.
+/// Coarse, stable outcome category for telemetry. Error messages and query
+/// text are deliberately excluded to avoid leaking user data through an
+/// observer by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    Success,
+    ParseOrSemanticError,
+    GraphError,
+    UnboundVariable,
+    MissingParameter,
+    Cancelled,
+    Timeout,
+    ResourceLimit,
+}
+
+impl ExecutionOutcome {
+    pub fn from_error(error: &QueryError) -> Self {
+        match error {
+            QueryError::Parse(_) => Self::ParseOrSemanticError,
+            QueryError::Graph(_) => Self::GraphError,
+            QueryError::UnboundVariable(_) => Self::UnboundVariable,
+            QueryError::MissingParam(_) => Self::MissingParameter,
+            QueryError::Cancelled => Self::Cancelled,
+            QueryError::Timeout => Self::Timeout,
+            QueryError::ResourceLimit(_) => Self::ResourceLimit,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionEvent {
+    pub elapsed: Duration,
+    /// Unknown when parsing failed before a statement was available.
+    pub statement_read_only: Option<bool>,
+    pub result_rows: Option<usize>,
+    pub relationship_expansions: u64,
+    pub outcome: ExecutionOutcome,
+}
+
+/// Dependency-free callback adapter for sending execution events to an
+/// application's logger, metrics collector, or tracing system.
+#[derive(Clone)]
+pub struct ExecutionObserver(Arc<dyn Fn(&ExecutionEvent) + Send + Sync>);
+
+impl ExecutionObserver {
+    pub fn new(callback: impl Fn(&ExecutionEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn observe(&self, event: &ExecutionEvent) {
+        // Observability must never turn a committed query into a reported
+        // failure (or unwind through FFI callers), so observer panics are
+        // contained at this boundary.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(event)));
+    }
+}
+
+impl std::fmt::Debug for ExecutionObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ExecutionObserver(..)")
+    }
+}
+
+/// Per-statement safety limits and optional telemetry. Limit fields default
+/// to `None`, preserving unlimited behavior for trusted embedded callers.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionOptions {
     pub max_intermediate_rows: Option<usize>,
@@ -62,6 +125,7 @@ pub struct ExecutionOptions {
     pub max_relationship_expansions: Option<u64>,
     pub timeout: Option<Duration>,
     pub cancellation_token: Option<CancellationToken>,
+    pub observer: Option<ExecutionObserver>,
 }
 
 struct ExecutionGuard<'a> {
@@ -196,6 +260,13 @@ enum PathBinding {
     Edge(EdgeId),
 }
 
+struct ShortestPathSpec<'a> {
+    direction: ExpandDirection,
+    rel_label: Option<&'a str>,
+    min_hops: u32,
+    max_hops: Option<u32>,
+}
+
 type BindingRow = HashMap<String, Binding>;
 
 /// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
@@ -234,7 +305,19 @@ impl<'a> Executor<'a> {
         stmt: &Statement,
         options: &ExecutionOptions,
     ) -> Result<QueryResult, QueryError> {
+        let started = Instant::now();
         let guard = ExecutionGuard::new(options);
+        let result = self.execute_with_guard(stmt, &guard);
+        Self::notify_observer(options, stmt, started, &guard, &result);
+        result
+    }
+
+    fn execute_with_guard(
+        &self,
+        stmt: &Statement,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
         if is_read_only(stmt) {
             let read_txn = self.store.begin_read()?;
@@ -255,29 +338,11 @@ impl<'a> Executor<'a> {
                 tail,
                 order_by,
                 *limit,
-                &guard,
+                guard,
             );
         }
         let write_txn = self.store.begin_write()?;
-        let outcome = match stmt {
-            Statement::Create(patterns) => {
-                guard.checkpoint()?;
-                self.execute_create(&write_txn, patterns)
-            }
-            Statement::Match {
-                clauses,
-                tail,
-                order_by,
-                limit,
-            } => self.execute_match(
-                Txn::Write(&write_txn),
-                clauses,
-                tail,
-                order_by,
-                *limit,
-                &guard,
-            ),
-        };
+        let outcome = self.execute_in_write_transaction_validated(stmt, &write_txn, guard);
         match outcome {
             Ok(result) => {
                 GraphStore::commit(write_txn)?;
@@ -288,6 +353,96 @@ impl<'a> Executor<'a> {
                 let _ = GraphStore::abort(write_txn);
                 Err(e)
             }
+        }
+    }
+
+    /// Execute without committing against a caller-owned write transaction.
+    /// The caller must commit or abort the transaction. This is the low-level
+    /// primitive used by `marsdb::Transaction` for atomic multi-statement
+    /// units of work.
+    pub fn execute_in_write_transaction(
+        &self,
+        stmt: &Statement,
+        write_txn: &WriteTransaction,
+    ) -> Result<QueryResult, QueryError> {
+        self.execute_in_write_transaction_with_options(
+            stmt,
+            write_txn,
+            &ExecutionOptions::default(),
+        )
+    }
+
+    pub fn execute_in_write_transaction_with_options(
+        &self,
+        stmt: &Statement,
+        write_txn: &WriteTransaction,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, QueryError> {
+        let started = Instant::now();
+        let guard = ExecutionGuard::new(options);
+        let result = self.execute_in_write_transaction_with_guard(stmt, write_txn, &guard);
+        Self::notify_observer(options, stmt, started, &guard, &result);
+        result
+    }
+
+    fn execute_in_write_transaction_with_guard(
+        &self,
+        stmt: &Statement,
+        write_txn: &WriteTransaction,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        crate::semantic::validate_statement(stmt)?;
+        guard.checkpoint()?;
+        self.execute_in_write_transaction_validated(stmt, write_txn, guard)
+    }
+
+    fn notify_observer(
+        options: &ExecutionOptions,
+        stmt: &Statement,
+        started: Instant,
+        guard: &ExecutionGuard<'_>,
+        result: &Result<QueryResult, QueryError>,
+    ) {
+        let Some(observer) = &options.observer else {
+            return;
+        };
+        let (result_rows, outcome) = match result {
+            Ok(result) => (Some(result.rows.len()), ExecutionOutcome::Success),
+            Err(error) => (None, ExecutionOutcome::from_error(error)),
+        };
+        observer.observe(&ExecutionEvent {
+            elapsed: started.elapsed(),
+            statement_read_only: Some(is_read_only(stmt)),
+            result_rows,
+            relationship_expansions: guard.relationship_expansions.get(),
+            outcome,
+        });
+    }
+
+    fn execute_in_write_transaction_validated(
+        &self,
+        stmt: &Statement,
+        write_txn: &WriteTransaction,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        match stmt {
+            Statement::Create(patterns) => {
+                guard.checkpoint()?;
+                self.execute_create(write_txn, patterns)
+            }
+            Statement::Match {
+                clauses,
+                tail,
+                order_by,
+                limit,
+            } => self.execute_match(
+                Txn::Write(write_txn),
+                clauses,
+                tail,
+                order_by,
+                *limit,
+                guard,
+            ),
         }
     }
 
@@ -366,7 +521,11 @@ impl<'a> Executor<'a> {
                             ))
                         }
                     };
-                    GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+                    let edge_id =
+                        GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+                    if let Some(var) = &rel.var {
+                        row.insert(var.clone(), Binding::Edge(edge_id));
+                    }
                     prev_id = node_id;
                 }
             }
@@ -558,7 +717,7 @@ impl<'a> Executor<'a> {
         &self,
         write_txn: &WriteTransaction,
         clause: &MergeClause,
-        rows: &mut Vec<BindingRow>,
+        rows: &mut [BindingRow],
     ) -> Result<(), QueryError> {
         for row in rows.iter_mut() {
             let created = match row.remove(MERGE_CREATED_KEY) {
@@ -996,7 +1155,15 @@ impl<'a> Executor<'a> {
             let start_id = require_bound_node(row, start_var)?;
             let end_id = require_bound_node(row, end_var)?;
             let path = self.shortest_path_between(
-                txn, start_id, end_id, direction, rel_label, min_hops, max_hops,
+                txn,
+                start_id,
+                end_id,
+                ShortestPathSpec {
+                    direction,
+                    rel_label,
+                    min_hops,
+                    max_hops,
+                },
             )?;
             let mut new_row = row.clone();
             let binding = match path {
@@ -1031,15 +1198,12 @@ impl<'a> Executor<'a> {
         txn: Txn,
         start: NodeId,
         end: NodeId,
-        direction: ExpandDirection,
-        rel_label: Option<&str>,
-        min_hops: u32,
-        max_hops: Option<u32>,
+        spec: ShortestPathSpec<'_>,
     ) -> Result<Option<Vec<PathBinding>>, QueryError> {
-        if start == end && min_hops == 0 {
+        if start == end && spec.min_hops == 0 {
             return Ok(Some(vec![PathBinding::Node(start)]));
         }
-        let cap = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
+        let cap = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
         let mut parent: HashMap<NodeId, (NodeId, EdgeId)> = HashMap::new();
         let mut visited: HashSet<NodeId> = HashSet::new();
         visited.insert(start);
@@ -1049,7 +1213,7 @@ impl<'a> Executor<'a> {
             depth += 1;
             let mut next_frontier = Vec::new();
             for node in frontier {
-                for entry in neighbors_for_direction(txn, node, direction, rel_label)? {
+                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_label)? {
                     if entry.other == end {
                         parent.insert(entry.other, (node, entry.edge_id));
                         return Ok(Some(reconstruct_path(&parent, start, end)));
@@ -2544,7 +2708,7 @@ fn has_aggregate(items: &[ReturnItem]) -> bool {
 /// operators anywhere in this engine yet, so `count(n) * 2`-style
 /// composition is already impossible, and nothing in the target query set
 /// needs an aggregate nested inside a `CASE` branch).
-fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
+pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
     for item in items {
         match &item.expr {
             ReturnExpr::CountStar => {}
@@ -3415,7 +3579,7 @@ fn item_truthy(v: &Value) -> Option<bool> {
 /// exactly these null-list cases.
 fn eval_quantifier(kind: QuantifierKind, preds: &[Option<bool>]) -> Option<bool> {
     let true_count = preds.iter().filter(|p| **p == Some(true)).count();
-    let any_false = preds.iter().any(|p| *p == Some(false));
+    let any_false = preds.contains(&Some(false));
     let any_null = preds.iter().any(|p| p.is_none());
     match kind {
         QuantifierKind::Any => {

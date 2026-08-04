@@ -181,7 +181,7 @@ pub fn parse_cell(text: &str) -> Result<TckValue, String> {
     if p.pos != p.chars.len() {
         return Err(format!(
             "trailing input after value: {:?}",
-            &p.chars[p.pos..].iter().collect::<String>()
+            p.chars[p.pos..].iter().collect::<String>()
         ));
     }
     Ok(v)
@@ -495,8 +495,8 @@ mod tests {
     #[test]
     fn parses_negative_float() {
         assert_eq!(
-            parse_cell("-3.14").unwrap(),
-            TckValue::Scalar(TckScalar::Float(-3.14))
+            parse_cell("-3.125").unwrap(),
+            TckValue::Scalar(TckScalar::Float(-3.125))
         );
     }
 

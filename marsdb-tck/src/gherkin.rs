@@ -220,8 +220,7 @@ fn parse_scenario(
     let mut examples: Option<Examples> = None;
     let mut seen_first_then = false;
 
-    loop {
-        let Some(raw) = cursor.peek() else { break };
+    while let Some(raw) = cursor.peek() {
         let line = raw.trim();
         if line.is_empty() {
             cursor.pos += 1;

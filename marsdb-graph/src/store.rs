@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use marsdb_storage::{
@@ -15,6 +15,17 @@ pub struct GraphStore {
     storage: StorageEngine,
 }
 
+/// Successful physical and logical integrity-check summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityReport {
+    /// `false` means redb detected physical damage and repaired it before
+    /// MarsDB's logical checks ran.
+    pub physical_was_clean: bool,
+    pub labels: u64,
+    pub nodes: u64,
+    pub edges: u64,
+}
+
 impl GraphStore {
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, GraphError> {
         Ok(Self {
@@ -26,6 +37,213 @@ impl GraphStore {
         Ok(Self {
             storage: StorageEngine::open_memory()?,
         })
+    }
+
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), GraphError> {
+        self.storage.backup_to(path)?;
+        Ok(())
+    }
+
+    /// Check physical storage plus MarsDB's graph invariants. This requires
+    /// exclusive mutable access because redb may repair physical metadata.
+    pub fn check_integrity(&mut self) -> Result<IntegrityReport, GraphError> {
+        let physical_was_clean = self.storage.check_integrity()?;
+        let read = self.storage.begin_read()?;
+
+        let mut labels_by_id = BTreeMap::new();
+        {
+            let table = read.open_table(marsdb_storage::tables::ID_TO_LABEL)?;
+            for entry in table.iter()? {
+                let (id, label) = entry?;
+                labels_by_id.insert(id.value(), label.value().to_owned());
+            }
+        }
+        {
+            let table = read.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
+            let mut count = 0usize;
+            for entry in table.iter()? {
+                let (label, id) = entry?;
+                count += 1;
+                if labels_by_id.get(&id.value()).map(String::as_str) != Some(label.value()) {
+                    return Err(GraphError::CorruptData(format!(
+                        "label mapping {:?} -> {} has no matching reverse mapping",
+                        label.value(),
+                        id.value()
+                    )));
+                }
+            }
+            if count != labels_by_id.len() {
+                return Err(GraphError::CorruptData(
+                    "label mapping tables have different entry counts".into(),
+                ));
+            }
+        }
+
+        let mut nodes = BTreeMap::<u64, Vec<u32>>::new();
+        {
+            let table = read.open_table(marsdb_storage::tables::NODES)?;
+            for entry in table.iter()? {
+                let (id, value) = entry?;
+                let record: NodeRecord = decode(value.value())?;
+                for label_id in &record.label_ids {
+                    if !labels_by_id.contains_key(label_id) {
+                        return Err(GraphError::CorruptData(format!(
+                            "node {} references unknown label {}",
+                            id.value(),
+                            label_id
+                        )));
+                    }
+                }
+                nodes.insert(id.value(), record.label_ids);
+            }
+        }
+
+        let mut indexed_labels = BTreeSet::new();
+        {
+            let table = read.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            for entry in table.iter()? {
+                let (label_id, values) = entry?;
+                let label_id = label_id.value();
+                if !labels_by_id.contains_key(&label_id) {
+                    return Err(GraphError::CorruptData(format!(
+                        "node label index references unknown label {label_id}"
+                    )));
+                }
+                for node_id in values {
+                    let node_id = node_id?.value();
+                    let Some(node_labels) = nodes.get(&node_id) else {
+                        return Err(GraphError::CorruptData(format!(
+                            "node label index references missing node {node_id}"
+                        )));
+                    };
+                    if !node_labels.contains(&label_id) {
+                        return Err(GraphError::CorruptData(format!(
+                            "node label index has label {label_id} for node {node_id}, but the node does not"
+                        )));
+                    }
+                    indexed_labels.insert((label_id, node_id));
+                }
+            }
+        }
+        for (node_id, label_ids) in &nodes {
+            for label_id in label_ids {
+                if !indexed_labels.contains(&(*label_id, *node_id)) {
+                    return Err(GraphError::CorruptData(format!(
+                        "node {node_id} has label {label_id} but is missing from the label index"
+                    )));
+                }
+            }
+        }
+
+        let mut edges = BTreeMap::<u64, (u32, u64, u64)>::new();
+        {
+            let table = read.open_table(marsdb_storage::tables::EDGES)?;
+            for entry in table.iter()? {
+                let (id, value) = entry?;
+                let record: EdgeRecord = decode(value.value())?;
+                if !labels_by_id.contains_key(&record.label_id) {
+                    return Err(GraphError::CorruptData(format!(
+                        "edge {} references unknown label {}",
+                        id.value(),
+                        record.label_id
+                    )));
+                }
+                if !nodes.contains_key(&record.src) || !nodes.contains_key(&record.dst) {
+                    return Err(GraphError::CorruptData(format!(
+                        "edge {} references missing endpoint {} -> {}",
+                        id.value(),
+                        record.src,
+                        record.dst
+                    )));
+                }
+                edges.insert(id.value(), (record.label_id, record.src, record.dst));
+            }
+        }
+
+        let outgoing =
+            Self::check_adjacency(&read, marsdb_storage::tables::ADJ_OUT, &nodes, &edges, true)?;
+        let incoming =
+            Self::check_adjacency(&read, marsdb_storage::tables::ADJ_IN, &nodes, &edges, false)?;
+        for (&edge_id, &(label_id, src, dst)) in &edges {
+            if !outgoing.contains(&(src, edge_id, dst, label_id)) {
+                return Err(GraphError::CorruptData(format!(
+                    "edge {edge_id} is missing from outgoing adjacency"
+                )));
+            }
+            if !incoming.contains(&(dst, edge_id, src, label_id)) {
+                return Err(GraphError::CorruptData(format!(
+                    "edge {edge_id} is missing from incoming adjacency"
+                )));
+            }
+        }
+
+        let meta = read.open_table(marsdb_storage::tables::META)?;
+        for (counter, maximum) in [
+            ("next_node_id", nodes.keys().next_back().copied()),
+            ("next_edge_id", edges.keys().next_back().copied()),
+        ] {
+            if let Some(maximum) = maximum {
+                let stored = meta.get(counter)?.map(|value| value.value()).unwrap_or(0);
+                if stored < maximum {
+                    return Err(GraphError::CorruptData(format!(
+                        "{counter} counter {stored} is below maximum allocated id {maximum}"
+                    )));
+                }
+            }
+        }
+
+        Ok(IntegrityReport {
+            physical_was_clean,
+            labels: labels_by_id.len() as u64,
+            nodes: nodes.len() as u64,
+            edges: edges.len() as u64,
+        })
+    }
+
+    fn check_adjacency(
+        read: &ReadTransaction,
+        definition: marsdb_storage::MultimapTableDefinition<u64, &[u8]>,
+        nodes: &BTreeMap<u64, Vec<u32>>,
+        edges: &BTreeMap<u64, (u32, u64, u64)>,
+        outgoing: bool,
+    ) -> Result<BTreeSet<(u64, u64, u64, u32)>, GraphError> {
+        let table = read.open_multimap_table(definition)?;
+        let mut found = BTreeSet::new();
+        for entry in table.iter()? {
+            let (owner, values) = entry?;
+            let owner = owner.value();
+            if !nodes.contains_key(&owner) {
+                return Err(GraphError::CorruptData(format!(
+                    "adjacency references missing owner node {owner}"
+                )));
+            }
+            for value in values {
+                let adjacency = AdjEntry::decode(value?.value())?;
+                let Some(&(label_id, src, dst)) = edges.get(&adjacency.edge_id.0) else {
+                    return Err(GraphError::CorruptData(format!(
+                        "adjacency references missing edge {}",
+                        adjacency.edge_id.0
+                    )));
+                };
+                let expected = if outgoing { (src, dst) } else { (dst, src) };
+                if owner != expected.0
+                    || adjacency.other.0 != expected.1
+                    || adjacency.label_id != label_id
+                {
+                    return Err(GraphError::CorruptData(format!(
+                        "adjacency entry for edge {} does not match the edge record",
+                        adjacency.edge_id.0
+                    )));
+                }
+                found.insert((
+                    owner,
+                    adjacency.edge_id.0,
+                    adjacency.other.0,
+                    adjacency.label_id,
+                ));
+            }
+        }
+        Ok(found)
     }
 
     /// Open a write transaction spanning multiple graph operations. Callers
@@ -621,5 +839,61 @@ impl GraphStore {
             });
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integrity_check_rejects_missing_node_label_index_entry() {
+        let mut store = GraphStore::open_memory().unwrap();
+        let node = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+
+        let write = store.begin_write().unwrap();
+        let label_id = {
+            let labels = write
+                .open_table(marsdb_storage::tables::LABEL_TO_ID)
+                .unwrap();
+            let id = labels.get("Person").unwrap().unwrap().value();
+            id
+        };
+        write
+            .open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)
+            .unwrap()
+            .remove(label_id, node.0)
+            .unwrap();
+        write.commit().unwrap();
+
+        let error = store.check_integrity().unwrap_err();
+        assert!(
+            matches!(error, GraphError::CorruptData(message) if message.contains("missing from the label index"))
+        );
+    }
+
+    #[test]
+    fn integrity_check_rejects_dangling_adjacency_entry() {
+        let mut store = GraphStore::open_memory().unwrap();
+        let node = store.create_node(&[], BTreeMap::new()).unwrap();
+
+        let write = store.begin_write().unwrap();
+        let bytes = AdjEntry {
+            edge_id: EdgeId(999),
+            other: node,
+            label_id: 0,
+        }
+        .encode();
+        write
+            .open_multimap_table(marsdb_storage::tables::ADJ_OUT)
+            .unwrap()
+            .insert(node.0, bytes.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+
+        let error = store.check_integrity().unwrap_err();
+        assert!(
+            matches!(error, GraphError::CorruptData(message) if message.contains("missing edge 999"))
+        );
     }
 }

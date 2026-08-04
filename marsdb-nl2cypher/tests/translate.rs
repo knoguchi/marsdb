@@ -69,6 +69,17 @@ fn translate_repairs_after_one_bad_attempt() {
 }
 
 #[test]
+fn translate_repairs_semantically_invalid_cypher() {
+    let client = FakeLlmClient::new(vec![
+        "MATCH (n:Person) RETURN missing",
+        "MATCH (n:Person) RETURN n.name",
+    ]);
+    let schema = SchemaSummary::default();
+    let cypher = translate(&client, &schema, "who are all the people?").unwrap();
+    assert_eq!(cypher, "MATCH (n:Person) RETURN n.name");
+}
+
+#[test]
 fn translate_gives_up_after_the_repair_attempt_also_fails() {
     let client = FakeLlmClient::new(vec![
         "MATCH (a)-->(b) RETURN a",
