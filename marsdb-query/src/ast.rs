@@ -174,10 +174,16 @@ pub enum Tail {
     /// an aggregate call (`count(DISTINCT x)`), which only affects that one
     /// aggregate's own accumulation.
     Return(Vec<ReturnItem>, bool),
-    Delete(Vec<String>),
-    DetachDelete(Vec<String>),
-    Set(Vec<SetItem>),
-    Remove(Vec<RemoveItem>),
+    /// Every mutating tail variant's trailing `Option<ReturnTail>` is real
+    /// Cypher: `MATCH (n) SET n.x = 1 RETURN n`, `MATCH (n) DELETE n RETURN
+    /// count(n)`, etc — see `ReturnTail`'s docs for why it's `None` (the
+    /// pre-existing terminal-mutation shape) vs `Some` (this statement's
+    /// final clause is actually this RETURN, projected off whatever the
+    /// mutation left in scope).
+    Delete(Vec<String>, Option<ReturnTail>),
+    DetachDelete(Vec<String>, Option<ReturnTail>),
+    Set(Vec<SetItem>, Option<ReturnTail>),
+    Remove(Vec<RemoveItem>, Option<ReturnTail>),
     /// `MATCH ... CREATE ...` — same pattern syntax as `Statement::Create`,
     /// but runs once per row already bound by the preceding MATCH/WITH: a
     /// node pattern token whose variable is already bound in that row
@@ -185,7 +191,24 @@ pub enum Tail {
     /// the only way to add an edge between two nodes that already exist —
     /// `Statement::Create` alone can't (every node token it sees is
     /// always fresh).
-    Create(Vec<Pattern>),
+    Create(Vec<Pattern>, Option<ReturnTail>),
+}
+
+/// A `RETURN` trailing a mutating `Tail` (`SET`/`DELETE`/`DETACH DELETE`/
+/// `REMOVE`/`MATCH ... CREATE`) in the same statement, e.g. `MATCH (n) SET
+/// n.prop = 1 RETURN n`. Same two fields `Tail::Return` itself carries
+/// (`items`, `distinct`) — wrapped in its own type so every mutating `Tail`
+/// variant can carry one `Option<ReturnTail>` instead of repeating a
+/// `(Vec<ReturnItem>, bool)` tuple five times. Arbitrary multi-clause
+/// chaining (`SET ... DELETE ... RETURN`, a mutating clause followed by
+/// `WITH` before the final `RETURN`) isn't supported yet — this only covers
+/// exactly one mutating clause directly followed by exactly one `RETURN`,
+/// which is the shape the real TCK scenarios for SET/DELETE/REMOVE
+/// overwhelmingly use.
+#[derive(Debug, Clone)]
+pub struct ReturnTail {
+    pub items: Vec<ReturnItem>,
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]

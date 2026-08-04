@@ -5,8 +5,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir, Statement, Tail,
-    UnwindClause, UnwindSource, WithClause, WithExpr,
+    QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir,
+    Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -137,23 +137,37 @@ impl<'a> Executor<'a> {
         // single empty row -- `resolve_or_create_node` below never finds
         // any variable already bound in an empty `BindingRow`, so every
         // node token is fresh, exactly like standalone CREATE always was.
-        self.materialize_create(write_txn, patterns, &[BindingRow::new()])
+        // No trailing RETURN is possible on a standalone `CREATE` statement
+        // (that's the `MATCH ... CREATE ... RETURN` tail's job instead), so
+        // the resulting bindings are just discarded here.
+        self.materialize_create(write_txn, patterns, &[BindingRow::new()])?;
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
     }
 
-    /// Runs CREATE patterns once per row in `rows`. Shared by a
-    /// standalone `CREATE` statement (`execute_create`, a single empty
-    /// row) and a `MATCH ... CREATE` tail (`execute_match`, rows carry
-    /// bindings from the preceding MATCH/WITH). The only real difference
-    /// between the two is what `resolve_or_create_node` finds already
-    /// bound in a row -- nothing for standalone CREATE, real nodes for a
-    /// MATCH...CREATE tail, which is what lets the tail form add an edge
-    /// between two nodes that already exist.
+    /// Runs CREATE patterns once per row in `rows`, returning each row's
+    /// bindings extended with whatever the CREATE patterns bound (newly
+    /// created node/edge ids, or the reused id for an already-bound
+    /// variable) -- this is what lets a trailing `RETURN` after a `MATCH
+    /// ... CREATE` tail (e.g. `MATCH (a) CREATE (a)-[:R]->(b) RETURN b`)
+    /// see the newly created `b`. Shared by a standalone `CREATE` statement
+    /// (`execute_create`, a single empty row, return value discarded -- no
+    /// RETURN is possible there) and a `MATCH ... CREATE` tail
+    /// (`execute_match`, rows carry bindings from the preceding
+    /// MATCH/WITH). The only real difference between the two is what
+    /// `resolve_or_create_node` finds already bound in a row -- nothing for
+    /// standalone CREATE, real nodes for a MATCH...CREATE tail, which is
+    /// what lets the tail form add an edge between two nodes that already
+    /// exist.
     fn materialize_create(
         &self,
         write_txn: &WriteTransaction,
         patterns: &[Pattern],
         rows: &[BindingRow],
-    ) -> Result<QueryResult, QueryError> {
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             // A variable bound earlier in this same CREATE (an earlier hop,
             // or an earlier comma-separated pattern) must be visible to
@@ -192,11 +206,9 @@ impl<'a> Executor<'a> {
                     prev_id = node_id;
                 }
             }
+            out.push(row);
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(out)
     }
 
     /// A node pattern token reuses an existing binding iff it names a
@@ -387,7 +399,7 @@ impl<'a> Executor<'a> {
         // is excluded the same way a WHERE/Filter already is.
         let scan_limit_shortcut = order_by.is_none()
             && limit.is_some()
-            && !matches!(tail, Some(Tail::Return(_, true)))
+            && !tail_is_distinct_return(tail)
             && matches!(clauses, [QueryClause::Match(part)] if
                 !part.shortest_path
                     && part.path_var.is_none()
@@ -496,7 +508,7 @@ impl<'a> Executor<'a> {
         // pre-truncating the raw input here could return fewer than
         // `limit` distinct rows even when more exist -- its LIMIT gets
         // applied after dedup instead, below.
-        let distinct_return = matches!(tail, Some(Tail::Return(_, true)));
+        let distinct_return = tail_is_distinct_return(tail);
         if order_by.is_none() && !distinct_return {
             if let Some(count) = limit {
                 current_rows.truncate(count.max(0) as usize);
@@ -547,16 +559,16 @@ impl<'a> Executor<'a> {
                     projected
                 }
             }
-            Some(Tail::Delete(vars)) => {
-                self.materialize_delete(require_write_txn(txn), vars, &current_rows, false)?
-            }
-            Some(Tail::DetachDelete(vars)) => {
-                self.materialize_delete(require_write_txn(txn), vars, &current_rows, true)?
-            }
-            Some(Tail::Set(items)) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
-            Some(Tail::Remove(items)) => self.materialize_remove(require_write_txn(txn), items, &current_rows)?,
-            Some(Tail::Create(patterns)) => {
-                self.materialize_create(require_write_txn(txn), patterns, &current_rows)?
+            Some(Tail::Delete(vars, ret)) => self.materialize_delete(txn, vars, &current_rows, false, ret)?,
+            Some(Tail::DetachDelete(vars, ret)) => self.materialize_delete(txn, vars, &current_rows, true, ret)?,
+            Some(Tail::Set(items, ret)) => self.materialize_set(txn, items, &current_rows, ret)?,
+            Some(Tail::Remove(items, ret)) => self.materialize_remove(txn, items, &current_rows, ret)?,
+            Some(Tail::Create(patterns, ret)) => {
+                let updated_rows = self.materialize_create(require_write_txn(txn), patterns, &current_rows)?;
+                match ret {
+                    Some(rt) => self.materialize_return(txn, &rt.items, &updated_rows, rt.distinct)?,
+                    None => QueryResult { columns: vec![], rows: vec![] },
+                }
             }
         };
         if let Some(order_by) = order_by {
@@ -930,14 +942,8 @@ impl<'a> Executor<'a> {
     /// `Value::Null`, same as everywhere else null is represented).
     fn binding_to_value(&self, txn: Txn, b: &Binding) -> Result<Value, QueryError> {
         Ok(match b {
-            Binding::Node(id) => Value::Node(
-                GraphStore::get_node_in_txn(txn, *id)?
-                    .expect("bound node exists within this statement's transaction"),
-            ),
-            Binding::Edge(id) => Value::Edge(
-                GraphStore::get_edge_in_txn(txn, *id)?
-                    .expect("bound edge exists within this statement's transaction"),
-            ),
+            Binding::Node(id) => Value::Node(deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?),
+            Binding::Edge(id) => Value::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?),
             Binding::Value(PropertyValue::Null) => Value::Null,
             Binding::Value(pv) => Value::Property(pv.clone()),
             Binding::List(items) => Value::List(items.clone()),
@@ -954,14 +960,8 @@ impl<'a> Executor<'a> {
             .iter()
             .map(|e| {
                 Ok(match e {
-                    PathBinding::Node(id) => PathElem::Node(
-                        GraphStore::get_node_in_txn(txn, *id)?
-                            .expect("bound node exists within this statement's transaction"),
-                    ),
-                    PathBinding::Edge(id) => PathElem::Edge(
-                        GraphStore::get_edge_in_txn(txn, *id)?
-                            .expect("bound edge exists within this statement's transaction"),
-                    ),
+                    PathBinding::Node(id) => PathElem::Node(deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?),
+                    PathBinding::Edge(id) => PathElem::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?),
                 })
             })
             .collect()
@@ -1401,13 +1401,20 @@ impl<'a> Executor<'a> {
             .get(&pa.var)
             .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
         match binding {
+            // A missing *property key* on an existing node/edge is a real,
+            // legal "absent" (-> null downstream) -- but a missing
+            // *node/edge record* means it was deleted earlier in this same
+            // statement (`deleted_entity_access`'s docs), which is a real
+            // error (`MATCH (n) DELETE n RETURN n.num` -- TCK's Return2
+            // scenario [15]), not a silent null. These are two different
+            // kinds of "missing" and must not be collapsed into one.
             Binding::Node(id) => {
-                let node = GraphStore::get_node_in_txn(txn, *id)?;
-                Ok(node.and_then(|n| n.props.get(&pa.prop).cloned()))
+                let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?;
+                Ok(node.props.get(&pa.prop).cloned())
             }
             Binding::Edge(id) => {
-                let edge = GraphStore::get_edge_in_txn(txn, *id)?;
-                Ok(edge.and_then(|e| e.props.get(&pa.prop).cloned()))
+                let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
+                Ok(edge.props.get(&pa.prop).cloned())
             }
             // A WITH-projected scalar (or list/path) has no `.prop` to
             // access — e.g. `WITH message.id AS messageId` then
@@ -1555,13 +1562,27 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// `ret`, when present, is evaluated *after* the physical delete runs,
+    /// not before — real Cypher's own DELETE+RETURN TCK scenarios agree on
+    /// this ordering: `MATCH (n) DELETE n RETURN n.num` must raise a
+    /// `DeletedEntityAccess` error (TCK's Return2 scenarios [15]/[17]), not
+    /// silently return the pre-delete value. `lookup_prop`/
+    /// `binding_to_value` (via `deleted_entity_access`) already turn "the
+    /// bound id's record is gone" into a proper `QueryError` rather than a
+    /// silent null or a panic, which is exactly what makes deleting first
+    /// safe here — every other real DELETE+RETURN shape (`count(*)`,
+    /// `sum(num)` off a WITH-projected scalar, a literal, a null OPTIONAL
+    /// MATCH binding) never touches the just-deleted entity's live record
+    /// at all, so this ordering changes nothing for them.
     fn materialize_delete(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         vars: &[String],
         rows: &[BindingRow],
         detach: bool,
+        ret: &Option<ReturnTail>,
     ) -> Result<QueryResult, QueryError> {
+        let write_txn = require_write_txn(txn);
         let mut deleted_nodes = HashSet::new();
         let mut deleted_edges = HashSet::new();
         for row in rows {
@@ -1592,49 +1613,97 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        let result = match ret {
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct)?,
+            None => QueryResult {
+                columns: vec![],
+                rows: vec![],
+            },
+        };
+        Ok(result)
     }
 
     fn materialize_set(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         items: &[SetItem],
         rows: &[BindingRow],
+        ret: &Option<ReturnTail>,
     ) -> Result<QueryResult, QueryError> {
+        let write_txn = require_write_txn(txn);
         for row in rows {
             for item in items {
                 apply_set_item(write_txn, row, item)?;
             }
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        match ret {
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct),
+            None => Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            }),
+        }
     }
 
     fn materialize_remove(
         &self,
-        write_txn: &WriteTransaction,
+        txn: Txn,
         items: &[RemoveItem],
         rows: &[BindingRow],
+        ret: &Option<ReturnTail>,
     ) -> Result<QueryResult, QueryError> {
+        let write_txn = require_write_txn(txn);
         for row in rows {
             for item in items {
                 apply_remove_item(write_txn, row, item)?;
             }
         }
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        match ret {
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct),
+            None => Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            }),
+        }
     }
 }
 
 fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem) -> Result<(), QueryError> {
     match item {
+        // `SET n.prop = null` *removes* the property in real Cypher (found
+        // via TCK's Set2 "Set a Property to Null" scenarios, which this
+        // codebase previously couldn't parse at all -- `SET` had no
+        // trailing RETURN to observe the result with, so this bug was
+        // never exercised until that gap closed). Storing a literal
+        // `PropertyValue::Null` instead is observably different: `n.prop`
+        // still shows up as a (nulled-out) key when a caller enumerates a
+        // node's own props (e.g. this RETURN's own node-to-string
+        // rendering), where a real missing property wouldn't.
+        SetItem::Prop(pa, Literal::Null) => {
+            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            match binding {
+                Binding::Node(id) => {
+                    GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
+                }
+                Binding::Edge(id) => {
+                    GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
+                }
+                // `SET` on a null binding is a documented no-op, same as
+                // `DELETE`/`REMOVE` on one -- an `OPTIONAL MATCH` that
+                // found nothing pads its variables with null (found via
+                // TCK's Set1/Set3 "Ignore null when setting
+                // property/label" scenarios; same "previously unparseable
+                // without a trailing RETURN to observe it" story as the
+                // null-removes-property bug just above).
+                Binding::Value(PropertyValue::Null) => {}
+                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
+                        pa.var
+                    )))
+                }
+            }
+        }
         SetItem::Prop(pa, lit) => {
             let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
             let value = literal_to_value(lit);
@@ -1645,6 +1714,7 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
                 Binding::Edge(id) => {
                     GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
                 }
+                Binding::Value(PropertyValue::Null) => {}
                 Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
@@ -1655,13 +1725,19 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
         }
         SetItem::Labels(var, labels) => {
             let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-            let Binding::Node(id) = binding else {
-                return Err(QueryError::UnboundVariable(format!(
-                    "'{var}' isn't a node — SET can only add labels to a node"
-                )));
-            };
-            for label in labels {
-                GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+            match binding {
+                Binding::Node(id) => {
+                    for label in labels {
+                        GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+                    }
+                }
+                // Same null-is-a-no-op rule as the property arm above.
+                Binding::Value(PropertyValue::Null) => {}
+                _ => {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{var}' isn't a node — SET can only add labels to a node"
+                    )))
+                }
             }
         }
     }
@@ -1679,6 +1755,10 @@ fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &Remo
                 Binding::Edge(id) => {
                     GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
                 }
+                // Same null-is-a-no-op rule DELETE already follows (found
+                // via TCK's Remove1 "Ignore null when removing property"
+                // scenarios).
+                Binding::Value(PropertyValue::Null) => {}
                 Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{}' is a WITH-projected scalar, not a node/edge — REMOVE needs a graph binding",
@@ -1689,17 +1769,44 @@ fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &Remo
         }
         RemoveItem::Labels(var, labels) => {
             let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-            let Binding::Node(id) = binding else {
-                return Err(QueryError::UnboundVariable(format!(
-                    "'{var}' isn't a node — REMOVE can only remove labels from a node"
-                )));
-            };
-            for label in labels {
-                GraphStore::remove_node_label_in_txn(write_txn, *id, label)?;
+            match binding {
+                Binding::Node(id) => {
+                    for label in labels {
+                        GraphStore::remove_node_label_in_txn(write_txn, *id, label)?;
+                    }
+                }
+                // Same null-is-a-no-op rule as the property arm above
+                // (found via TCK's Remove2 "Ignore null when removing a
+                // node label" scenario).
+                Binding::Value(PropertyValue::Null) => {}
+                _ => {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{var}' isn't a node — REMOVE can only remove labels from a node"
+                    )))
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Whether `tail`'s ultimate RETURN (if it has one at all -- either
+/// `Tail::Return` itself, or a mutating tail's trailing `ReturnTail`) is a
+/// `RETURN DISTINCT`. Used by `execute_match`'s LIMIT pre-truncate and
+/// scan-limit-pushdown shortcuts, both of which must NOT fire for a
+/// DISTINCT return -- dedup can drop rows, so capping the raw input at
+/// `limit` before it runs could return fewer than `limit` distinct rows
+/// even when more exist.
+fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
+    match tail {
+        Some(Tail::Return(_, distinct)) => *distinct,
+        Some(Tail::Delete(_, ret))
+        | Some(Tail::DetachDelete(_, ret))
+        | Some(Tail::Set(_, ret))
+        | Some(Tail::Remove(_, ret))
+        | Some(Tail::Create(_, ret)) => ret.as_ref().is_some_and(|rt| rt.distinct),
+        None => false,
+    }
 }
 
 /// A statement never mutates anything iff it's a `MATCH ... RETURN` with no
@@ -2063,6 +2170,24 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
         Value::Literal(lit) => literal_to_value(lit),
         Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => PropertyValue::Null,
     }
+}
+
+/// A bound `NodeId`/`EdgeId` whose record is no longer in the store means
+/// exactly one thing within a single statement's transaction: it was
+/// deleted earlier in this same statement (e.g. `MATCH (n) DELETE n RETURN
+/// n.num` -- real Cypher's `DeletedEntityAccess` error, TCK's Return2
+/// scenarios [15]/[16]/[17]). Nothing else can cause a `None` here --
+/// there's no concurrent deletion mid-statement, and a `Binding::Node`/
+/// `Edge` only ever gets constructed from an id a prior MATCH/CREATE/MERGE
+/// in this same transaction actually found or made. Centralized here
+/// (rather than each of `binding_to_value`/`resolve_path_elems`/
+/// `lookup_prop` re-deriving the message) so the wording stays one place.
+fn deleted_entity_access<T>(record: Option<T>) -> Result<T, QueryError> {
+    record.ok_or_else(|| {
+        QueryError::UnboundVariable(
+            "refers to a node/relationship that no longer exists — it was deleted earlier in this statement".into(),
+        )
+    })
 }
 
 fn literal_to_value(lit: &Literal) -> PropertyValue {

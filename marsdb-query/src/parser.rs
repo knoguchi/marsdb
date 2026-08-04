@@ -455,45 +455,73 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
     let inner = pair.into_inner().next().expect("tail_clause has one child");
     match inner.as_rule() {
         Rule::return_clause => {
-            let children: Vec<_> = inner.into_inner().collect();
-            let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
-            let items = children
-                .into_iter()
-                .filter(|p| p.as_rule() == Rule::return_item)
-                .map(parse_return_item)
-                .collect::<Result<Vec<_>, _>>()?;
+            let (items, distinct) = parse_return_clause(inner)?;
             Ok(Tail::Return(items, distinct))
         }
+        Rule::mutating_tail => parse_mutating_tail(inner),
+        r => unreachable!("unexpected tail_clause child rule {r:?}"),
+    }
+}
+
+/// `return_clause`'s children -- `(items, distinct)` -- shared by
+/// `Tail::Return` itself (`parse_tail_clause`) and a trailing `ReturnTail`
+/// after a mutating clause (`parse_mutating_tail`), same grammar rule
+/// either way.
+fn parse_return_clause(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool), QueryError> {
+    let children: Vec<_> = pair.into_inner().collect();
+    let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
+    let items = children
+        .into_iter()
+        .filter(|p| p.as_rule() == Rule::return_item)
+        .map(parse_return_item)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((items, distinct))
+}
+
+/// A mutating clause (`DETACH DELETE`/`DELETE`/`REMOVE`/`SET`/`CREATE`)
+/// optionally followed by one trailing `RETURN` — see `mutating_tail`'s
+/// grammar comment and `Tail::Delete`'s docs for the exact shape supported.
+fn parse_mutating_tail(pair: Pair<Rule>) -> Result<Tail, QueryError> {
+    let mut inner = pair.into_inner();
+    let clause = inner.next().expect("mutating_tail has a mutating clause");
+    let ret = inner
+        .next()
+        .map(|p| -> Result<ReturnTail, QueryError> {
+            let (items, distinct) = parse_return_clause(p)?;
+            Ok(ReturnTail { items, distinct })
+        })
+        .transpose()?;
+    match clause.as_rule() {
         Rule::detach_delete_clause => {
-            let vars = inner
+            let vars = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::identifier)
                 .map(|p| p.as_str().to_string())
                 .collect();
-            Ok(Tail::DetachDelete(vars))
+            Ok(Tail::DetachDelete(vars, ret))
         }
         Rule::delete_clause => {
-            let vars = inner
+            let vars = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::identifier)
                 .map(|p| p.as_str().to_string())
                 .collect();
-            Ok(Tail::Delete(vars))
+            Ok(Tail::Delete(vars, ret))
         }
         Rule::set_clause => {
-            let items = inner
+            let items = clause
                 .into_inner()
                 .filter(|p| p.as_rule() == Rule::set_item)
                 .map(parse_set_item)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Tail::Set(items))
+            Ok(Tail::Set(items, ret))
         }
         Rule::remove_clause => {
-            let items = inner.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
-            Ok(Tail::Remove(items))
+            let items = clause.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
+            Ok(Tail::Remove(items, ret))
         }
-        Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(inner)?)),
-        r => unreachable!("unexpected tail_clause child rule {r:?}"),
+        Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(clause)?, ret)),
+        r => unreachable!("unexpected mutating_tail child rule {r:?}"),
     }
 }
 
