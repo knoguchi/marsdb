@@ -3000,7 +3000,9 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
             } else if let (Some(dur), Some(d)) = (as_duration(a), as_date(b)) {
                 Some(date_plus_duration(d, dur, false)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
-                Some(duration_value(temporal::add_duration(x, y)))
+                Some(duration_value(temporal::add_duration(x, y).ok_or_else(
+                    || QueryError::Parse("duration addition overflow".into()),
+                )?))
             } else {
                 None
             }
@@ -3009,7 +3011,9 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
             if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
                 Some(date_plus_duration(d, dur, true)?)
             } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
-                Some(duration_value(temporal::sub_duration(x, y)))
+                Some(duration_value(temporal::sub_duration(x, y).ok_or_else(
+                    || QueryError::Parse("duration subtraction overflow".into()),
+                )?))
             } else {
                 None
             }

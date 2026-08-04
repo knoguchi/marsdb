@@ -165,19 +165,19 @@ pub fn add_duration_to_date(
 ) -> Option<i32> {
     let total_ns: i128 = seconds as i128 * NANOS_PER_SEC + nanos as i128;
     let extra_days = (total_ns / (86_400 * NANOS_PER_SEC)) as i64;
-    let days = days + extra_days;
+    let days = days.checked_add(extra_days)?;
     let (months, days) = if negate {
-        (-months, -days)
+        (months.checked_neg()?, days.checked_neg()?)
     } else {
         (months, days)
     };
     let d = date_from_epoch_day(epoch_day);
     let with_months = if months >= 0 {
-        d.checked_add_months(chrono::Months::new(months as u32))?
+        d.checked_add_months(chrono::Months::new(months.try_into().ok()?))?
     } else {
-        d.checked_sub_months(chrono::Months::new((-months) as u32))?
+        d.checked_sub_months(chrono::Months::new(months.checked_neg()?.try_into().ok()?))?
     };
-    let result = with_months.checked_add_signed(chrono::Duration::days(days))?;
+    let result = with_months.checked_add_signed(chrono::Duration::try_days(days)?)?;
     Some(result.signed_duration_since(epoch()).num_days() as i32)
 }
 
@@ -262,26 +262,32 @@ fn cascade(months_f: f64, days_f: f64, seconds_f: f64, extra_nanos: i128) -> Dur
 /// durations" examples, which sum months and days independently and only
 /// ever carry between `seconds`/`nanos` (via the exact `i128` total,
 /// avoiding the sign-mismatch bug a naive `a.nanos + b.nanos` would hit
-/// when the two operands' `seconds` signs differ).
-pub fn add_duration(a: DurationParts, b: DurationParts) -> DurationParts {
-    let months = a.0 + b.0;
-    let days = a.1 + b.1;
+/// when the two operands' `seconds` signs differ). Returns `None` if any
+/// component would overflow its persisted integer representation.
+pub fn add_duration(a: DurationParts, b: DurationParts) -> Option<DurationParts> {
+    let months = a.0.checked_add(b.0)?;
+    let days = a.1.checked_add(b.1)?;
     let total_ns =
         a.2 as i128 * NANOS_PER_SEC + a.3 as i128 + b.2 as i128 * NANOS_PER_SEC + b.3 as i128;
-    (
+    Some((
         months,
         days,
-        (total_ns / NANOS_PER_SEC) as i64,
+        (total_ns / NANOS_PER_SEC).try_into().ok()?,
         (total_ns % NANOS_PER_SEC) as i32,
-    )
+    ))
 }
 
-pub fn negate_duration(a: DurationParts) -> DurationParts {
-    (-a.0, -a.1, -a.2, -a.3)
+pub fn negate_duration(a: DurationParts) -> Option<DurationParts> {
+    Some((
+        a.0.checked_neg()?,
+        a.1.checked_neg()?,
+        a.2.checked_neg()?,
+        a.3.checked_neg()?,
+    ))
 }
 
-pub fn sub_duration(a: DurationParts, b: DurationParts) -> DurationParts {
-    add_duration(a, negate_duration(b))
+pub fn sub_duration(a: DurationParts, b: DurationParts) -> Option<DurationParts> {
+    add_duration(a, negate_duration(b)?)
 }
 
 /// `duration * factor` / `duration / factor` (`factor` is `1.0 / n` for
@@ -612,7 +618,7 @@ mod tests {
     fn add_durations() {
         let a = du(149.0, 14.0, 16.0, 12.0, 70.0);
         let a = (a.0, a.1, a.2, 1);
-        let sum = add_duration(a, a);
+        let sum = add_duration(a, a).unwrap();
         assert_eq!(format_duration_parts(sum), "P24Y10M28DT32H26M20.000000002S");
     }
 
