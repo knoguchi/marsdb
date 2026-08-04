@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub use marsdb_graph::PropertyValue;
-pub use marsdb_query::{temporal, Literal, PathElem, QueryResult, Value};
+pub use marsdb_query::{
+    temporal, CancellationToken, ExecutionOptions, Literal, PathElem, QueryResult, Value,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -45,6 +47,17 @@ impl Database {
         self.execute_with_params(cypher, &HashMap::new())
     }
 
+    /// Execute one statement with cooperative timeout, cancellation, and
+    /// row/expansion limits. Limits are checked during plan evaluation, not
+    /// only after the full result has already been materialized.
+    pub fn execute_with_options(
+        &self,
+        cypher: &str,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        self.execute_with_params_and_options(cypher, &HashMap::new(), options)
+    }
+
     /// Run a Cypher statement with `$name` placeholders resolved from
     /// `params` before execution.
     pub fn execute_with_params(
@@ -52,9 +65,19 @@ impl Database {
         cypher: &str,
         params: &HashMap<String, PropertyValue>,
     ) -> Result<QueryResult, Error> {
+        self.execute_with_params_and_options(cypher, params, &ExecutionOptions::default())
+    }
+
+    pub fn execute_with_params_and_options(
+        &self,
+        cypher: &str,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
         let mut stmt = marsdb_query::parse(cypher)?;
         marsdb_query::substitute_params(&mut stmt, params)?;
-        let result = marsdb_query::Executor::new(&self.store).execute(&stmt)?;
+        let result =
+            marsdb_query::Executor::new(&self.store).execute_with_options(&stmt, options)?;
         Ok(result)
     }
 

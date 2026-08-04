@@ -814,6 +814,7 @@ name = "marsdb-storage"
 version = "0.5.0"
 dependencies = [
  "redb",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

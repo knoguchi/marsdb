@@ -104,14 +104,20 @@ impl AdjEntry {
         buf
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Self {
-        let edge_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-        let other = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let label_id = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        AdjEntry {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, crate::GraphError> {
+        let bytes: &[u8; 20] = bytes.try_into().map_err(|_| {
+            crate::GraphError::CorruptData(format!(
+                "adjacency entry has {} bytes; expected 20",
+                bytes.len()
+            ))
+        })?;
+        let edge_id = u64::from_be_bytes(bytes[0..8].try_into().expect("fixed-size slice"));
+        let other = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed-size slice"));
+        let label_id = u32::from_be_bytes(bytes[16..20].try_into().expect("fixed-size slice"));
+        Ok(AdjEntry {
             edge_id: EdgeId(edge_id),
             other: NodeId(other),
             label_id,
-        }
+        })
     }
 }

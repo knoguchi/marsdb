@@ -14,4 +14,8 @@ pub enum GraphError {
     Encode(#[from] postcard::Error),
     #[error("node {0:?} has incident edges; use detach delete")]
     NodeHasEdges(NodeId),
+    #[error("node {0:?} does not exist")]
+    NodeNotFound(NodeId),
+    #[error("corrupt database: {0}")]
+    CorruptData(String),
 }

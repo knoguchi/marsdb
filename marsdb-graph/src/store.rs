@@ -156,6 +156,15 @@ impl GraphStore {
         dst: NodeId,
         props: BTreeMap<String, PropertyValue>,
     ) -> Result<EdgeId, GraphError> {
+        {
+            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            if nodes.get(src.0)?.is_none() {
+                return Err(GraphError::NodeNotFound(src));
+            }
+            if nodes.get(dst.0)?.is_none() {
+                return Err(GraphError::NodeNotFound(dst));
+            }
+        }
         let label_id = intern_label(write_txn, label)?;
         let id = next_id(write_txn, "next_edge_id")?;
         let record = EdgeRecord {
@@ -246,7 +255,7 @@ impl GraphStore {
         };
         let table = txn.open_multimap_table(table_def)?;
         for item in table.get(node.0)? {
-            let entry = AdjEntry::decode(item?.value());
+            let entry = AdjEntry::decode(item?.value())?;
             if label_id_filter.is_none_or(|lid| lid == entry.label_id) {
                 result.push(entry);
             }
@@ -315,11 +324,11 @@ impl GraphStore {
         {
             let adj_out = write_txn.open_multimap_table(marsdb_storage::tables::ADJ_OUT)?;
             for item in adj_out.get(id.0)? {
-                incident.push(AdjEntry::decode(item?.value()).edge_id);
+                incident.push(AdjEntry::decode(item?.value())?.edge_id);
             }
             let adj_in = write_txn.open_multimap_table(marsdb_storage::tables::ADJ_IN)?;
             for item in adj_in.get(id.0)? {
-                incident.push(AdjEntry::decode(item?.value()).edge_id);
+                incident.push(AdjEntry::decode(item?.value())?.edge_id);
             }
         }
         if !incident.is_empty() && !detach {
@@ -595,9 +604,9 @@ impl GraphStore {
         let mut result = Vec::with_capacity(node_ids.len());
         let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
         for id in node_ids {
-            let guard = nodes
-                .get(id)?
-                .expect("node_label_index entry must reference a live node");
+            let guard = nodes.get(id)?.ok_or_else(|| {
+                GraphError::CorruptData(format!("node label index references missing node {}", id))
+            })?;
             let record: NodeRecord = decode(guard.value())?;
             drop(guard);
             let labels = record

@@ -48,6 +48,22 @@ fn create_and_traverse_in_memory() {
 }
 
 #[test]
+fn create_edge_rejects_missing_endpoints() {
+    let store = GraphStore::open_memory().unwrap();
+    let live = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let missing = marsdb_graph::NodeId(u64::MAX);
+
+    let err = store
+        .create_edge("KNOWS", live, missing, BTreeMap::new())
+        .unwrap_err();
+    assert!(matches!(err, marsdb_graph::GraphError::NodeNotFound(id) if id == missing));
+    assert!(store
+        .neighbors(live, Direction::Out, None)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn delete_node_detach() {
     let store = GraphStore::open_memory().unwrap();
     let a = store.create_node(&["Person"], BTreeMap::new()).unwrap();

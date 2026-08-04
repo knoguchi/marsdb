@@ -82,6 +82,13 @@ fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<
             }
             list.into_any()
         }
+        ::marsdb::Value::Map(items) => {
+            let dict = PyDict::new(py);
+            for (key, item) in items {
+                dict.set_item(key, value_to_py(py, item)?)?;
+            }
+            dict.into_any()
+        }
         // A path is a list of node/edge dicts, alternating -- the same
         // dict shape Value::Node/Edge above already produce, so a caller
         // walking a path sees exactly what they'd see walking `RETURN`ed
@@ -100,13 +107,29 @@ fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<
     })
 }
 
-fn property_to_py<'py>(py: Python<'py>, p: &marsdb_graph::PropertyValue) -> PyResult<Bound<'py, PyAny>> {
+fn property_to_py<'py>(
+    py: Python<'py>,
+    p: &marsdb_graph::PropertyValue,
+) -> PyResult<Bound<'py, PyAny>> {
     Ok(match p {
         marsdb_graph::PropertyValue::Null => py.None().into_bound(py),
         marsdb_graph::PropertyValue::Bool(b) => b.into_pyobject(py)?.to_owned().into_any(),
         marsdb_graph::PropertyValue::Int(i) => i.into_pyobject(py)?.into_any(),
         marsdb_graph::PropertyValue::Float(f) => f.into_pyobject(py)?.into_any(),
         marsdb_graph::PropertyValue::String(s) => s.into_pyobject(py)?.into_any(),
+        // Keep temporal values lossless and consistent with the C/Go
+        // bindings. Python's timedelta cannot represent calendar months.
+        marsdb_graph::PropertyValue::Date(days) => ::marsdb::temporal::format_date(*days)
+            .into_pyobject(py)?
+            .into_any(),
+        marsdb_graph::PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => ::marsdb::temporal::format_duration(*months, *days, *seconds, *nanos)
+            .into_pyobject(py)?
+            .into_any(),
     })
 }
 

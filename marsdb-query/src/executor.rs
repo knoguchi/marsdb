@@ -1,4 +1,10 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use marsdb_graph::{
     AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction,
@@ -27,6 +33,125 @@ const OPTIONAL_SEED_IDX_KEY: &str = "__seed_idx";
 /// the match-path, consumed (and stripped) by `apply_merge_set` before the
 /// row becomes visible to the rest of the query.
 const MERGE_CREATED_KEY: &str = "__merge_created";
+
+/// Cooperative cancellation handle for a running query. Clone it before
+/// execution and call [`cancel`](Self::cancel) from another thread.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// Per-statement safety limits. Every field defaults to `None`, preserving
+/// the existing unlimited behavior for trusted embedded callers.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionOptions {
+    pub max_intermediate_rows: Option<usize>,
+    pub max_result_rows: Option<usize>,
+    pub max_relationship_expansions: Option<u64>,
+    pub timeout: Option<Duration>,
+    pub cancellation_token: Option<CancellationToken>,
+}
+
+struct ExecutionGuard<'a> {
+    options: &'a ExecutionOptions,
+    deadline: Option<Instant>,
+    relationship_expansions: Cell<u64>,
+}
+
+impl<'a> ExecutionGuard<'a> {
+    fn new(options: &'a ExecutionOptions) -> Self {
+        Self {
+            options,
+            deadline: options
+                .timeout
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            relationship_expansions: Cell::new(0),
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), QueryError> {
+        if self
+            .options
+            .cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(QueryError::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(QueryError::Timeout);
+        }
+        Ok(())
+    }
+
+    fn check_intermediate_rows(&self, rows: usize) -> Result<(), QueryError> {
+        self.checkpoint()?;
+        if self
+            .options
+            .max_intermediate_rows
+            .is_some_and(|limit| rows > limit)
+        {
+            return Err(QueryError::ResourceLimit(format!(
+                "intermediate row count {rows} exceeds configured maximum {}",
+                self.options.max_intermediate_rows.unwrap()
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_result_rows(&self, rows: usize) -> Result<(), QueryError> {
+        self.checkpoint()?;
+        if self
+            .options
+            .max_result_rows
+            .is_some_and(|limit| rows > limit)
+        {
+            return Err(QueryError::ResourceLimit(format!(
+                "result row count {rows} exceeds configured maximum {}",
+                self.options.max_result_rows.unwrap()
+            )));
+        }
+        Ok(())
+    }
+
+    fn relationship_expansion(&self) -> Result<(), QueryError> {
+        self.checkpoint()?;
+        let count = self
+            .relationship_expansions
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| {
+                QueryError::ResourceLimit("relationship expansion counter overflow".into())
+            })?;
+        self.relationship_expansions.set(count);
+        if self
+            .options
+            .max_relationship_expansions
+            .is_some_and(|limit| count > limit)
+        {
+            return Err(QueryError::ResourceLimit(format!(
+                "relationship expansion count {count} exceeds configured maximum {}",
+                self.options.max_relationship_expansions.unwrap()
+            )));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -75,11 +200,9 @@ type BindingRow = HashMap<String, Binding>;
 
 /// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
 /// Hitting it errors rather than silently truncating — see `VarExpand`
-/// evaluation. Node-visited-set BFS (not relationship-uniqueness) is used
-/// throughout, which is only correct because the graphs this targets
-/// (LDBC's REPLY_OF-style reply chains) form a forest, not a general
-/// cyclic graph — not safe to reuse as-is for a variable-length pattern
-/// over a cyclic relationship type without revisiting that assumption.
+/// evaluation. Expansion uses relationship uniqueness per path: a node may
+/// be revisited and two distinct paths to the same node remain distinct, but
+/// a relationship cannot occur twice in one path.
 const VAR_EXPAND_DEPTH_CAP: u32 = 30;
 
 pub struct Executor<'a> {
@@ -103,6 +226,16 @@ impl<'a> Executor<'a> {
     /// which open (and would deadlock trying to re-open) their own
     /// transaction.
     pub fn execute(&self, stmt: &Statement) -> Result<QueryResult, QueryError> {
+        self.execute_with_options(stmt, &ExecutionOptions::default())
+    }
+
+    pub fn execute_with_options(
+        &self,
+        stmt: &Statement,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, QueryError> {
+        let guard = ExecutionGuard::new(options);
+        guard.checkpoint()?;
         if is_read_only(stmt) {
             let read_txn = self.store.begin_read()?;
             let Statement::Match {
@@ -116,17 +249,34 @@ impl<'a> Executor<'a> {
             };
             // No explicit commit/abort — a ReadTransaction is a pure
             // snapshot view with nothing to roll back; it releases on drop.
-            return self.execute_match(Txn::Read(&read_txn), clauses, tail, order_by, *limit);
+            return self.execute_match(
+                Txn::Read(&read_txn),
+                clauses,
+                tail,
+                order_by,
+                *limit,
+                &guard,
+            );
         }
         let write_txn = self.store.begin_write()?;
         let outcome = match stmt {
-            Statement::Create(patterns) => self.execute_create(&write_txn, patterns),
+            Statement::Create(patterns) => {
+                guard.checkpoint()?;
+                self.execute_create(&write_txn, patterns)
+            }
             Statement::Match {
                 clauses,
                 tail,
                 order_by,
                 limit,
-            } => self.execute_match(Txn::Write(&write_txn), clauses, tail, order_by, *limit),
+            } => self.execute_match(
+                Txn::Write(&write_txn),
+                clauses,
+                tail,
+                order_by,
+                *limit,
+                &guard,
+            ),
         };
         match outcome {
             Ok(result) => {
@@ -300,10 +450,13 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         clause: &MergeClause,
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut out = Vec::new();
         for row in rows {
-            out.extend(self.merge_one_row(write_txn, clause, row)?);
+            guard.checkpoint()?;
+            out.extend(self.merge_one_row(write_txn, clause, row, guard)?);
+            guard.check_intermediate_rows(out.len())?;
         }
         self.apply_merge_set(write_txn, clause, &mut out)?;
         Ok(out)
@@ -314,6 +467,7 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         clause: &MergeClause,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         // Validate every token before doing any graph work (search or
         // create) — an unconstrained node pattern that isn't already bound
@@ -341,7 +495,12 @@ impl<'a> Executor<'a> {
         // free by reusing this instead of inventing bespoke search logic.
         let carried_vars: HashSet<String> = row.keys().cloned().collect();
         let plan = build_match_plan(&clause.pattern, &None, &carried_vars)?;
-        let found = self.eval_plan(Txn::Write(write_txn), &plan, std::slice::from_ref(row))?;
+        let found = self.eval_plan(
+            Txn::Write(write_txn),
+            &plan,
+            std::slice::from_ref(row),
+            guard,
+        )?;
         if !found.is_empty() {
             return Ok(found
                 .into_iter()
@@ -427,6 +586,7 @@ impl<'a> Executor<'a> {
         tail: &Option<Tail>,
         order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         // Threads bindings through each MATCH/UNWIND/WITH clause.
         // `carried_vars` tells the planner which of the next MATCH clause's
@@ -477,7 +637,7 @@ impl<'a> Executor<'a> {
                 .expect("checked by scan_limit_shortcut");
             let label = part.pattern.start.labels.first().map(String::as_str);
             let limit_usize = limit.expect("checked by scan_limit_shortcut").max(0) as usize;
-            current_rows = self.scan(txn, var, label, &current_rows, Some(limit_usize))?;
+            current_rows = self.scan(txn, var, label, &current_rows, Some(limit_usize), guard)?;
         } else {
             for clause in clauses {
                 match clause {
@@ -495,9 +655,15 @@ impl<'a> Executor<'a> {
                             )?;
                             let mut rows = if part.optional {
                                 let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
-                                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                                self.eval_optional_part(
+                                    txn,
+                                    &plan,
+                                    &current_rows,
+                                    &new_vars,
+                                    guard,
+                                )?
                             } else {
-                                self.eval_plan(txn, &plan, &current_rows)?
+                                self.eval_plan(txn, &plan, &current_rows, guard)?
                             };
                             for row in &mut rows {
                                 let path_binding = assemble_path(&named_pattern, row);
@@ -512,9 +678,15 @@ impl<'a> Executor<'a> {
                                 build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
                             if part.optional {
                                 let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                                self.eval_optional_part(
+                                    txn,
+                                    &plan,
+                                    &current_rows,
+                                    &new_vars,
+                                    guard,
+                                )?
                             } else {
-                                self.eval_plan(txn, &plan, &current_rows)?
+                                self.eval_plan(txn, &plan, &current_rows, guard)?
                             }
                         };
                         let mut new_vars = pattern_all_vars(&part.pattern);
@@ -547,7 +719,7 @@ impl<'a> Executor<'a> {
                         // this by checking `clauses` too, so `txn` is
                         // guaranteed to be `Txn::Write` here.
                         let write_txn = require_write_txn(txn);
-                        current_rows = self.eval_merge(write_txn, m, &current_rows)?;
+                        current_rows = self.eval_merge(write_txn, m, &current_rows, guard)?;
                         current_rows = self.apply_with_or_carry(
                             txn,
                             &m.with,
@@ -572,6 +744,7 @@ impl<'a> Executor<'a> {
                         )?;
                     }
                 }
+                guard.check_intermediate_rows(current_rows.len())?;
             }
         }
         // ORDER BY must see every matching row before LIMIT truncates —
@@ -673,6 +846,7 @@ impl<'a> Executor<'a> {
                 result.rows.truncate(count.max(0) as usize);
             }
         }
+        guard.check_result_rows(result.rows.len())?;
         Ok(result)
     }
 
@@ -1299,6 +1473,7 @@ impl<'a> Executor<'a> {
         plan: &LogicalPlan,
         outer_rows: &[BindingRow],
         new_vars: &HashSet<String>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let tagged: Vec<BindingRow> = outer_rows
             .iter()
@@ -1312,7 +1487,8 @@ impl<'a> Executor<'a> {
                 r
             })
             .collect();
-        let results = self.eval_plan(txn, plan, &tagged)?;
+        guard.check_intermediate_rows(tagged.len())?;
+        let results = self.eval_plan(txn, plan, &tagged, guard)?;
         let mut by_idx: HashMap<i64, Vec<BindingRow>> = HashMap::new();
         for mut row in results {
             let idx = match row.remove(OPTIONAL_SEED_IDX_KEY) {
@@ -1335,6 +1511,7 @@ impl<'a> Executor<'a> {
                     out.push(padded);
                 }
             }
+            guard.check_intermediate_rows(out.len())?;
         }
         Ok(out)
     }
@@ -1344,6 +1521,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         plan: &LogicalPlan,
         seed: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         match plan {
             LogicalPlan::Seed { var } => {
@@ -1351,11 +1529,12 @@ impl<'a> Executor<'a> {
                     seed.first().is_none_or(|row| row.contains_key(var)),
                     "Seed{{var: {var:?}}} planned for a var not present in the carried-forward rows"
                 );
+                guard.check_intermediate_rows(seed.len())?;
                 Ok(seed.to_vec())
             }
-            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed, None),
+            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed, None, guard),
             LogicalPlan::NodeByLabelScan { var, label } => {
-                self.scan(txn, var, Some(label), seed, None)
+                self.scan(txn, var, Some(label), seed, None, guard)
             }
             LogicalPlan::Expand {
                 input,
@@ -1365,7 +1544,7 @@ impl<'a> Executor<'a> {
                 rel_label,
                 direction,
             } => {
-                let base_rows = self.eval_plan(txn, input, seed)?;
+                let base_rows = self.eval_plan(txn, input, seed, guard)?;
                 let mut out = Vec::new();
                 for row in base_rows {
                     let from_id = match row.get(from_var) {
@@ -1381,12 +1560,14 @@ impl<'a> Executor<'a> {
                     let entries =
                         neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
                     for entry in entries {
+                        guard.relationship_expansion()?;
                         let mut new_row = row.clone();
                         new_row.insert(to_var.clone(), Binding::Node(entry.other));
                         if let Some(rv) = rel_var {
                             new_row.insert(rv.clone(), Binding::Edge(entry.edge_id));
                         }
                         out.push(new_row);
+                        guard.check_intermediate_rows(out.len())?;
                     }
                 }
                 Ok(out)
@@ -1400,7 +1581,7 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
             } => {
-                let base_rows = self.eval_plan(txn, input, seed)?;
+                let base_rows = self.eval_plan(txn, input, seed, guard)?;
                 let mut out = Vec::new();
                 let unbounded = max_hops.is_none();
                 let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
@@ -1411,19 +1592,22 @@ impl<'a> Executor<'a> {
                         Some(Binding::Value(PropertyValue::Null)) => continue,
                         _ => return Err(QueryError::UnboundVariable(from_var.clone())),
                     };
-                    let mut visited = HashSet::new();
-                    visited.insert(start_id);
                     if *min_hops == 0 {
                         let mut new_row = row.clone();
                         new_row.insert(to_var.clone(), Binding::Node(start_id));
                         out.push(new_row);
+                        guard.check_intermediate_rows(out.len())?;
                     }
-                    let mut frontier = vec![start_id];
+                    // Keep relationship usage on each frontier entry rather
+                    // than a global node-visited set. Cypher variable-length
+                    // patterns enumerate relationship-unique paths, so a
+                    // diamond must yield both routes to its shared endpoint.
+                    let mut frontier = vec![(start_id, HashSet::<EdgeId>::new())];
                     let mut depth = 0u32;
                     while depth < effective_max && !frontier.is_empty() {
                         depth += 1;
                         let mut next_frontier = Vec::new();
-                        for node in frontier {
+                        for (node, used_edges) in frontier {
                             let entries = neighbors_for_direction(
                                 txn,
                                 node,
@@ -1431,13 +1615,19 @@ impl<'a> Executor<'a> {
                                 rel_label.as_deref(),
                             )?;
                             for entry in entries {
-                                if visited.insert(entry.other) {
-                                    next_frontier.push(entry.other);
-                                    if depth >= *min_hops {
-                                        let mut new_row = row.clone();
-                                        new_row.insert(to_var.clone(), Binding::Node(entry.other));
-                                        out.push(new_row);
-                                    }
+                                guard.relationship_expansion()?;
+                                if used_edges.contains(&entry.edge_id) {
+                                    continue;
+                                }
+                                let mut next_used_edges = used_edges.clone();
+                                next_used_edges.insert(entry.edge_id);
+                                next_frontier.push((entry.other, next_used_edges));
+                                guard.check_intermediate_rows(next_frontier.len())?;
+                                if depth >= *min_hops {
+                                    let mut new_row = row.clone();
+                                    new_row.insert(to_var.clone(), Binding::Node(entry.other));
+                                    out.push(new_row);
+                                    guard.check_intermediate_rows(out.len())?;
                                 }
                             }
                         }
@@ -1459,11 +1649,13 @@ impl<'a> Executor<'a> {
                 Ok(out)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let rows = self.eval_plan(txn, input, seed)?;
+                let rows = self.eval_plan(txn, input, seed, guard)?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
+                    guard.checkpoint()?;
                     if self.eval_expr(txn, predicate, &row)? == Some(true) {
                         out.push(row);
+                        guard.check_intermediate_rows(out.len())?;
                     }
                 }
                 Ok(out)
@@ -1497,14 +1689,39 @@ impl<'a> Executor<'a> {
         label: Option<&str>,
         seed: &[BindingRow],
         row_limit: Option<usize>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
-        let nodes = match row_limit {
+        if seed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Ask storage for at most one row beyond the configured budget so
+        // an oversized scan is rejected without first materializing the
+        // entire table. The +1 is what distinguishes "exactly at limit"
+        // from "more rows exist".
+        let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+            max_rows
+                .checked_div(seed.len())
+                .unwrap_or(0)
+                .saturating_add(1)
+        });
+        let storage_limit = match (row_limit, budget_node_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let nodes = match storage_limit {
             Some(limit) => GraphStore::all_nodes_limited_in_txn(txn, label, limit)?,
             None => GraphStore::all_nodes_in_txn(txn, label)?,
         };
-        let mut out = Vec::with_capacity(seed.len() * nodes.len());
+        let row_count = seed.len().checked_mul(nodes.len()).ok_or_else(|| {
+            QueryError::ResourceLimit("scan cross-join row count overflow".into())
+        })?;
+        guard.check_intermediate_rows(row_count)?;
+        let mut out = Vec::with_capacity(row_count);
         for base_row in seed {
             for n in &nodes {
+                guard.checkpoint()?;
                 let mut row = base_row.clone();
                 row.insert(var.to_string(), Binding::Node(n.id));
                 out.push(row);
@@ -2179,7 +2396,10 @@ fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
 /// `create_node_in_txn`/`create_edge_in_txn`). `Executor::execute` uses
 /// this to decide whether to open a `ReadTransaction` (no contention with
 /// concurrent readers or a concurrent writer) or a `WriteTransaction`.
-fn is_read_only(stmt: &Statement) -> bool {
+/// Returns whether executing `stmt` can mutate the graph. Public so callers
+/// which execute generated or otherwise untrusted Cypher can enforce a
+/// read-only policy using the same classification as the executor.
+pub fn is_read_only(stmt: &Statement) -> bool {
     let Statement::Match {
         tail: Some(Tail::Return(_, _)),
         clauses,

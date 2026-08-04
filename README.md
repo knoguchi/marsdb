@@ -37,6 +37,17 @@ let db = marsdb::Database::in_memory()?; // or Database::open("path/to.db")
 db.execute("CREATE (a:Person {name: 'Alice'})")?;
 let result = db.execute("MATCH (n:Person) RETURN n.name")?;
 
+// Bound work from untrusted callers. A CancellationToken can also be
+// cloned and cancelled from another thread.
+let options = marsdb::ExecutionOptions {
+    max_intermediate_rows: Some(100_000),
+    max_result_rows: Some(10_000),
+    max_relationship_expansions: Some(1_000_000),
+    timeout: Some(std::time::Duration::from_secs(5)),
+    ..Default::default()
+};
+let result = db.execute_with_options("MATCH (n) RETURN n", &options)?;
+
 // Or run a `;`-separated batch, one transaction per statement, one
 // QueryResult per statement back:
 let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
@@ -114,6 +125,11 @@ db.execute("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
 let (cypher, result) = translate_and_run(&db, &my_llm_client, "who does Alice know?")?;
 ```
 
+`translate_and_run` enforces read-only generated Cypher. Model-generated
+writes are rejected before execution unless the caller explicitly uses
+`translate_and_run_with_policy(..., ExecutionPolicy::AllowWrites)` after
+performing its own authentication and authorization.
+
 A real, runnable example against a local [Ollama](https://ollama.com) instance:
 
 ```
@@ -151,13 +167,17 @@ transaction — a read-only `MATCH ... RETURN` opens a `ReadTransaction`
 (a consistent snapshot that runs alongside other concurrent readers or a
 concurrent writer without contending for redb's single-writer lock),
 everything else opens a `WriteTransaction`, committed or aborted as a
-whole.
+whole. MarsDB records its own table/record format version in metadata when
+the file is created or first opened by a version-aware build, and refuses
+to open a database written by a newer unsupported format.
 
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 
 Execution materializes a `Vec` of bindings at every step rather than
 pulling rows lazily — there's no general query optimizer or streaming
-iterator model. Two narrow, hand-written exceptions: a `MATCH (n[:Label])
+iterator model. Use `ExecutionOptions` to put hard ceilings on intermediate
+rows, result rows, relationship expansions, and elapsed time. Two narrow,
+hand-written optimizations: a `MATCH (n[:Label])
 RETURN ... LIMIT k` with no `WHERE`/hops/`ORDER BY` pushes the `LIMIT`
 straight into the storage scan (`GraphStore::all_nodes_limited_in_txn`
 stops once it has `k` nodes, whether or not a label narrows it first —

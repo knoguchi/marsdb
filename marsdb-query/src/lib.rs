@@ -12,7 +12,7 @@ mod value;
 
 pub use ast::{Literal, Statement};
 pub use error::QueryError;
-pub use executor::Executor;
+pub use executor::{is_read_only, CancellationToken, ExecutionOptions, Executor};
 pub use params::substitute_params;
 pub use parser::{parse, parse_many};
 pub use result::QueryResult;

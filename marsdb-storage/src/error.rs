@@ -7,6 +7,11 @@ pub enum StorageError {
     Table(redb::TableError),
     Storage(redb::StorageError),
     Commit(redb::CommitError),
+    UnsupportedFormat {
+        found: u64,
+        oldest_supported: u64,
+        current: u64,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -17,6 +22,14 @@ impl fmt::Display for StorageError {
             StorageError::Table(e) => write!(f, "table error: {e}"),
             StorageError::Storage(e) => write!(f, "storage error: {e}"),
             StorageError::Commit(e) => write!(f, "commit error: {e}"),
+            StorageError::UnsupportedFormat {
+                found,
+                oldest_supported,
+                current,
+            } => write!(
+                f,
+                "unsupported database format version {found}; this build supports {oldest_supported}..={current}"
+            ),
         }
     }
 }

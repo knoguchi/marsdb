@@ -8,4 +8,10 @@ pub enum QueryError {
     UnboundVariable(String),
     #[error("missing value for parameter: ${0}")]
     MissingParam(String),
+    #[error("query cancelled")]
+    Cancelled,
+    #[error("query timed out")]
+    Timeout,
+    #[error("query resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
