@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measured 2026-08-02 on a single MacBook (Apple Silicon, arm64), release build,
+Measured 2026-08-03 on a single MacBook (Apple Silicon, arm64), release build,
 in-process (`cargo bench`, [criterion](https://github.com/bheisler/criterion.rs)).
 No other graph database was benchmarked under the same conditions — these
 numbers aren't a competitive comparison, they're here to track regressions
@@ -13,36 +13,31 @@ Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
 
 | Operation | Result |
 |---|---|
-| `create_node` | 36.7 µs |
-| `create_edge` | 48.7 µs |
-| `get_node` (point lookup by id) | 1.7 µs |
-| `neighbors`, 1-hop, fanout 1 | 1.2 µs |
-| `neighbors`, 1-hop, fanout 10 | 1.7 µs |
-| `neighbors`, 1-hop, fanout 100 | 7.0 µs |
-| `neighbors`, 1-hop, fanout 1,000 | 55.3 µs |
-| `all_nodes` scan, label matches 100% of rows, 100 rows | 81.6 µs |
-| Same query, 1,000 rows | 877.8 µs |
-| Same query, 10,000 rows | 9.08 ms |
-| `all_nodes` scan, label matches 1% of rows, 100 rows | 2.9 µs |
-| Same query, 1,000 rows | 10.9 µs |
-| Same query, 10,000 rows | 91.5 µs |
-| Same query, 100,000 rows | 1.03 ms |
+| `create_node` | 37.1 µs |
+| `create_edge` | 50.6 µs |
+| `get_node` (point lookup by id) | 832 ns |
+| `neighbors`, 1-hop, fanout 1 | 620 ns |
+| `neighbors`, 1-hop, fanout 10 | 1.05 µs |
+| `neighbors`, 1-hop, fanout 100 | 6.42 µs |
+| `neighbors`, 1-hop, fanout 1,000 | 54.9 µs |
+| `all_nodes` scan, label matches 100% of rows, 100 rows | 57.7 µs |
+| Same query, 1,000 rows | 652 µs |
+| Same query, 10,000 rows | 6.97 ms |
+| `all_nodes` scan, label matches 1% of rows, 100 rows | 1.77 µs |
+| Same query, 1,000 rows | 7.60 µs |
+| Same query, 10,000 rows | 68.3 µs |
+| Same query, 100,000 rows | 801 µs |
 
 `NODE_LABEL_INDEX` (label_id -> node_ids) backs label-filtered scans: a
 lookup in that index plus one point-`get` per matching node, instead of
 decoding every row in the table. This is a genuine trade, not a strict
-win, and both sides show up above. On a query that only wants 1% of the
-table, it's roughly 60-100x faster than the old full scan (91.5 µs vs. the
-~6-9 ms a linear scan takes at the same table size) and stays close to flat
-per matching row as the table grows to 100,000. But `create_node` got
-~65% slower (22.3 µs -> 36.7 µs, extra index writes on every insert), and a
-query where every row matches the label got ~30-45% slower (62.6 µs -> 81.6
-µs at 100 rows, 6.22 ms -> 9.08 ms at 10,000) — the index still does N
-random point-`get`s where the old code did one sequential pass, and there's
-no matching-row count cheap enough to skip the index and fall back to a
-plain scan when selectivity is high. `AllNodesScan` (no label filter, e.g.
-`MATCH (n) RETURN n`) is untouched — it never had a filter to index against,
-so it still does the one sequential pass and isn't affected either way.
+win: on a query that only wants 1% of the table, it's roughly 30-80x
+faster than a full scan at the same size (801 µs vs. the ~7 ms `all_nodes`
+takes at 100% selectivity) and stays close to flat per matching row as the
+table grows. `create_node` pays for the extra index write on every insert.
+`AllNodesScan` (no label filter, e.g. `MATCH (n) RETURN n`) is untouched —
+it never had a filter to index against, so it still does one sequential
+pass either way.
 
 ### Transaction batching
 
@@ -51,8 +46,8 @@ Comparison of one write-transaction per node vs. one shared transaction for
 
 | Strategy | Result |
 |---|---|
-| One `WriteTransaction` per node | 17.6 ms |
-| One shared `WriteTransaction` for all 1,000 | 6.17 ms (2.85x faster) |
+| One `WriteTransaction` per node | 26.2 ms |
+| One shared `WriteTransaction` for all 1,000 | 8.67 ms (3.0x faster) |
 
 MarsDB runs each Cypher statement inside a single transaction rather than
 one transaction per graph operation, for two reasons this table shows: it's
@@ -64,20 +59,46 @@ partially-created pattern if the process dies mid-statement.
 
 | Operation | Result |
 |---|---|
-| Parse only, 10-hop `CREATE` | 14.1 µs |
-| Parse only, 100-hop `CREATE` | 124.9 µs |
-| Parse only, 1,000-hop `CREATE` | 1.22 ms |
-| Parse + execute, 10-hop `CREATE` | 3.21 ms |
-| Parse + execute, 100-hop `CREATE` | 4.23 ms |
-| Parse + execute, 1,000-hop `CREATE` | 13.3 ms |
-| `MATCH (n)-[:R]->(m) RETURN m.idx LIMIT 10`, 100-node dataset | 228 µs |
-| Same query, 1,000-node dataset | 2.03 ms |
-| Same query, 10,000-node dataset | 21.0 ms |
+| Parse only, 10-hop `CREATE` | 15.7 µs |
+| Parse only, 100-hop `CREATE` | 135 µs |
+| Parse only, 1,000-hop `CREATE` | 1.34 ms |
+| Parse + execute, 10-hop `CREATE` | 3.58 ms |
+| Parse + execute, 100-hop `CREATE` | 4.75 ms |
+| Parse + execute, 1,000-hop `CREATE` | 15.9 ms |
+| `MATCH (n)-[:R]->(m) RETURN m.idx LIMIT 10`, 100-node dataset | 267 µs |
+| Same query, 1,000-node dataset | 2.66 ms |
+| Same query, 10,000-node dataset | 27.9 ms |
+| `MATCH (n:Label) RETURN n LIMIT 10` (no hop/WHERE/ORDER BY), 100-node dataset | 19.2 µs |
+| Same query, 1,000-node dataset | 20.8 µs |
+| Same query, 10,000-node dataset | 20.9 µs |
+| Same query, 100,000-node dataset | 22.4 µs |
 
-`LIMIT` does not short-circuit: the last row shows 21 ms for a query that
-only returns 10 rows, because the query planner evaluates the full scan and
-expand before truncating to the limit. `LIMIT` short-circuiting is on the
-roadmap.
+The last four rows are the one shape `execute_match` pushes `LIMIT`
+straight into the storage scan for (no hop, no `WHERE`, no `ORDER BY` —
+see the Architecture section in `README.md`). The result: flat, ~19-22 µs
+regardless of dataset size, a ~1,000x-larger table costing barely 17% more
+— confirming it really does stop at the first `LIMIT` matches, not scan
+the whole table first. This needed two things to actually hold: the
+LIMIT-aware scan in `execute_match`, and a fix caught *while writing this
+benchmark* — `all_nodes_limited_in_txn`'s label-filtered path was
+collecting every matching id from `NODE_LABEL_INDEX` before truncating to
+`limit`, so it only skipped the (more expensive) per-id point-reads, not
+the index walk itself; the first version of this table showed
+21.9 µs -> 519 µs -> 4.98 ms, clearly *not* flat, which is what caught it.
+`.take(limit)` on the multimap iterator itself fixed it — the numbers
+above are post-fix.
+
+The `MATCH (n)-[:R]->(m) ... LIMIT 10` row above (with a hop) does *not*
+qualify for this push-down — `execute_match` only takes the shortcut for a
+zero-hop scan, since a hop's `Expand` could still filter out rows the raw
+scan can't predict — and its cost still scales with dataset size like any
+other 1-hop query (linear, ~10x per 10x rows). Its absolute numbers moved
+up since this table was first measured (2026-08-02: 228 µs / 2.03 ms /
+21.0 ms) — most plausibly because `Expand` now always binds an internal
+edge variable, even for an unnamed relationship, to enforce edge
+isomorphism (added a few PRs after that original measurement; see
+`marsdb-query/src/planner.rs`'s `prior_rel_vars` docs) — not from anything
+in this PR specifically, which doesn't touch that code path at all.
 
 ## LDBC-era features (`marsdb/benches/ldbc_ops.rs`)
 
@@ -88,38 +109,43 @@ same `(n0:Item)-[:R]->(n1:Item)-> ... ` chain fixture as the table above.
 
 | Operation | Result |
 |---|---|
-| `WITH`-chaining (`MATCH...WITH...ORDER BY...LIMIT...MATCH...RETURN`), 100-node dataset | 654 µs |
-| Same query, 1,000-node dataset | 6.18 ms |
-| Same query, 10,000-node dataset | 62.3 ms |
-| `OPTIONAL MATCH`, 100-node dataset | 603 µs |
-| Same query, 1,000-node dataset | 6.16 ms |
-| Same query, 10,000-node dataset | 62.4 ms |
-| Undirected 1-hop (`-[:R]-`) + `LIMIT 10`, 100-node dataset | 606 µs |
-| Same query, 1,000-node dataset | 5.94 ms |
-| Same query, 10,000-node dataset | 61.8 ms |
-| Variable-length `[:R*1..5]`, 1,000-node chain | 1.98 ms |
-| Variable-length `[:R*1..30]`, 1,000-node chain | 2.08 ms |
-| Variable-length `[:R*0..]` (unbounded, capped at 30 hops), 25-node chain | 154 µs |
+| `WITH`-chaining (`MATCH...WITH...ORDER BY...LIMIT...MATCH...RETURN`), 100-node dataset | 499 µs |
+| Same query, 1,000-node dataset | 4.91 ms |
+| Same query, 10,000-node dataset | 51.6 ms |
+| `OPTIONAL MATCH`, 100-node dataset | 491 µs |
+| Same query, 1,000-node dataset | 5.07 ms |
+| Same query, 10,000-node dataset | 52.4 ms |
+| Undirected 1-hop (`-[:R]-`) + `LIMIT 10`, 100-node dataset | 466 µs |
+| Same query, 1,000-node dataset | 4.71 ms |
+| Same query, 10,000-node dataset | 49.2 ms |
+| Variable-length `[:R*1..5]`, 1,000-node chain | 1.68 ms |
+| Variable-length `[:R*1..30]`, 1,000-node chain | 1.76 ms |
+| Variable-length `[:R*0..]` (unbounded, capped at 30 hops), 25-node chain | 116 µs |
 
-`WITH`-chaining, `OPTIONAL MATCH`, and the undirected pattern all land in the
-same range as each other and close to the plain directed 1-hop `MATCH` in
-the table above (2.03 ms at 1,000 rows, 21.0 ms at 10,000) — the dominant
-cost in all of them is still the unindexed label scan, not the new
-mechanism layered on top. The undirected query is the one clear outlier
-(61.8 ms vs 21.0 ms at 10,000 rows, ~3x): it runs `neighbors_in_txn` twice
-per row (once per direction) plus a dedupe-by-edge-id pass, so it pays
-roughly double the traversal work on top of the same scan.
+`WITH`-chaining and `OPTIONAL MATCH` now cost noticeably more than the
+plain directed 1-hop `MATCH` above (51.6/52.4 ms vs. 27.9 ms at 10,000
+rows, ~1.9x) — each layers real extra work on top of one `Expand` (a
+second bounded pass for `WITH`'s `ORDER BY`+`LIMIT`, or the
+tag-group-pad bookkeeping `eval_optional_part` does), and both also
+inherited the same per-`Expand` edge-isomorphism overhead the plain 1-hop
+query did (see above). The undirected query is still the clear standalone
+outlier in absolute terms (49.2 ms) but the *gap* to the plain directed
+query narrowed a lot since this was first measured (was ~2.9x at 10,000
+rows, now ~1.8x) — consistent with a roughly-constant per-`Expand`
+overhead landing on both sides of that comparison, shrinking the relative
+difference between them without changing what actually causes the
+undirected query's own extra cost (`neighbors_in_txn` runs twice per row,
+once per direction, plus a dedupe-by-edge-id pass).
 
 Variable-length cost scales with the hop bound actually walked, not the
 bound written in the query: `*1..5` and `*1..30` cost about the same
-(1.98 ms vs 2.08 ms) on a 1,000-node chain because both terminate once the
+(1.68 ms vs 1.76 ms) on a 1,000-node chain because both terminate once the
 chain runs out at ~30 hops in from any interior start node — see the depth
 cap note below. The unbounded case uses a 25-node chain instead of the
 1,000-node one: `*0..` on a chain longer than the 30-hop safety cap
 (`executor.rs::VAR_EXPAND_DEPTH_CAP`) errors by design rather than silently
-truncating (see README roadmap / `LogicalPlan::VarExpand`), so it can't be
-measured at the same dataset sizes as the rest of this table without
-tripping that guard.
+truncating, so it can't be measured at the same dataset sizes as the rest
+of this table without tripping that guard.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
 
@@ -131,41 +157,42 @@ Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
 needed because `PropertyValue`/`Node`/`Edge` don't derive `Eq`/`Hash`
 themselves (`PropertyValue::Float(f64)` can't; `HashKey` hashes floats by
 bit pattern instead — see its doc comment in `aggregate.rs`). `DISTINCT`
-dedup (`count(DISTINCT ...)`, `collect(DISTINCT ...)`, etc.) uses the same
-`HashKey` in a `HashSet`. Both used to be a linear scan/rescan instead —
-this table is the direct before/after. All queries run against `n` `Item`
-nodes created in one `CREATE` (one transaction), `cat` = `idx % num_groups`.
+dedup (`count(DISTINCT ...)`, `collect(DISTINCT ...)`, etc., and now
+`RETURN DISTINCT`'s whole-row dedup too — see `executor.rs`'s `dedup_rows`)
+uses the same `HashKey` in a `HashSet`, replacing what was originally a
+linear scan/rescan (the 2026-08-02 measurement this table is based on
+found the worst case — every row its own group — at 141 ms for 10,000
+rows; the hash-based version below is 31.1 ms). All queries run against
+`n` `Item` nodes created in one `CREATE` (one transaction), `cat` =
+`idx % num_groups`.
 
-| Operation | Result | vs. linear scan |
-|---|---|---|
-| Global aggregate (`count(*)`/`sum`/`avg`/`min`/`max`, 1 group), 100 rows | 460 µs | -28% |
-| Same query, 1,000 rows | 4.78 ms | -27% |
-| Same query, 10,000 rows | 51.6 ms | -25% |
-| `GROUP BY cat` (10 groups), 100 rows | 268 µs | -28% |
-| Same query, 1,000 rows | 2.75 ms | -27% |
-| Same query, 10,000 rows | 29.5 ms | -26% |
-| `GROUP BY cat` (every row its own group), 100 rows | 302 µs | -26% |
-| Same query, 1,000 rows | 3.18 ms | -37% |
-| Same query, 10,000 rows | 33.7 ms | **-76%** |
-| `collect(n.idx)`, 100 rows | 172 µs | -27% |
-| Same query, 1,000 rows | 1.83 ms | -25% |
-| Same query, 10,000 rows | 19.7 ms | -24% |
-| `count(DISTINCT n.cat)` (every row a distinct value), 100 rows | 175 µs | -31% |
-| Same query, 1,000 rows | 1.87 ms | -54% |
-| Same query, 10,000 rows | 20.1 ms | **-89%** |
-| `WITH...WHERE` on an aggregate result (10 groups), 100 rows | 268 µs | -28% |
-| Same query, 1,000 rows | 2.75 ms | -27% |
-| Same query, 10,000 rows | 29.5 ms | -26% |
+| Operation | Result |
+|---|---|
+| Global aggregate (`count(*)`/`sum`/`avg`/`min`/`max`, 1 group), 100 rows | 479 µs |
+| Same query, 1,000 rows | 5.04 ms |
+| Same query, 10,000 rows | 54.5 ms |
+| `GROUP BY cat` (10 groups), 100 rows | 284 µs |
+| Same query, 1,000 rows | 2.92 ms |
+| Same query, 10,000 rows | 30.9 ms |
+| `GROUP BY cat` (every row its own group), 100 rows | 311 µs |
+| Same query, 1,000 rows | 3.28 ms |
+| Same query, 10,000 rows | 35.3 ms |
+| `collect(n.idx)`, 100 rows | 181 µs |
+| Same query, 1,000 rows | 1.87 ms |
+| Same query, 10,000 rows | 20.1 ms |
+| `count(DISTINCT n.cat)` (every row a distinct value), 100 rows | 181 µs |
+| Same query, 1,000 rows | 1.95 ms |
+| Same query, 10,000 rows | 21.4 ms |
+| `WITH...WHERE` on an aggregate result (10 groups), 100 rows | 282 µs |
+| Same query, 1,000 rows | 2.92 ms |
+| Same query, 10,000 rows | 31.0 ms |
 
-The 10-groups case was already close to linear before this (few groups to
-scan either way), so it just gets a flat ~26-28% win from lower per-row
-constant overhead. The two cases this was actually for — every row its own
-group, and `DISTINCT` over all-distinct values — used to be visibly
-super-linear (10,000-row `GROUP BY` took 141 ms, `count(DISTINCT)` took
-187 ms) and are now close to linear: 100->1,000->10,000 scales roughly
-10x->10x for both (`GROUP BY`: 302 µs -> 3.18 ms -> 33.7 ms; `count(DISTINCT)`:
-175 µs -> 1.87 ms -> 20.1 ms), instead of the ~28x/~46x-per-decade blowup
-the old linear scan/rescan showed at the same sizes.
+All of these scale close to linearly with row count (100->1,000->10,000 is
+consistently ~10x->~10x across every operation above) — the property the
+original hash-based rewrite was for. See the 0.3.0 entry in
+`CHANGELOG.md` for the original linear-scan-vs-hash-based comparison this
+change was measured against; that comparison isn't re-run here since the
+old linear-scan code path no longer exists to benchmark against directly.
 
 Reproduce: `cargo bench -p marsdb --bench aggregate_ops`.
 
@@ -179,20 +206,21 @@ across `N` threads sharing one `Arc<Database>`:
 
 | Threads | Result | Speedup vs. 1 thread |
 |---|---|---|
-| 1 (sequential) | 326.0 ms | — |
-| 2 | 231.8 ms | 1.41x |
-| 4 | 175.0 ms | 1.86x |
-| 8 | 172.0 ms | 1.90x |
+| 1 (sequential) | 339.1 ms | — |
+| 2 | 268.2 ms | 1.26x |
+| 4 | 197.0 ms | 1.72x |
+| 8 | 181.5 ms | 1.87x |
 
-Real, but sub-linear, and it plateaus at 4 threads on the 14-core (10P+4E)
-machine this was measured on — nowhere near "N threads = N times faster."
-Two things this benchmark doesn't isolate: each `b.iter()` call spawns
-fresh OS threads via `std::thread::scope` rather than reusing a pool, and
-this hasn't been checked against a profiler for lock contention inside
-redb's own read-transaction bookkeeping — either could be inflating the
-per-thread overhead that caps the speedup here. The number that matters
-regardless: 2+ threads reading concurrently are reliably faster than 1,
-confirming the feature does what it's for, not just that it compiles.
+Real, but sub-linear, and it plateaus around 4-8 threads on the 14-core
+(10P+4E) machine this was measured on — nowhere near "N threads = N times
+faster." Two things this benchmark doesn't isolate: each `b.iter()` call
+spawns fresh OS threads via `std::thread::scope` rather than reusing a
+pool, and this hasn't been checked against a profiler for lock contention
+inside redb's own read-transaction bookkeeping — either could be inflating
+the per-thread overhead that caps the speedup here. The number that
+matters regardless: 2+ threads reading concurrently are reliably faster
+than 1, confirming the feature does what it's for, not just that it
+compiles.
 
 Reproduce: `cargo bench -p marsdb --bench concurrency_ops`.
 
@@ -206,3 +234,5 @@ Reproduce: `cargo bench -p marsdb --bench concurrency_ops`.
 - No benchmarks yet for `CASE`/function calls (`coalesce()`/`toInteger()`)
   in isolation — they're cheap scalar operations exercised inside the
   `WITH`-chaining query above, but not measured standalone.
+- No benchmarks for `REMOVE`, `SET`-label, or the `STARTS WITH`/`ENDS
+  WITH`/`CONTAINS` string predicates yet.

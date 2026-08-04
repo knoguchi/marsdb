@@ -520,17 +520,21 @@ impl GraphStore {
         let Some(label_id) = lookup_label_id(txn, label_filter)? else {
             return Ok(Vec::new());
         };
-        let mut node_ids: Vec<u64> = {
+        let node_ids: Vec<u64> = {
             let label_index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            // `.take(limit)` here, not a `.truncate()` after collecting --
+            // stops walking the multimap's own entries past `limit`, not
+            // just the (more expensive) per-id NODES point-reads below.
+            // Measured difference: without this, a labeled LIMIT query's
+            // cost still scaled with the *matching* row count, not `limit`
+            // (see BENCHMARKS.md's `execute_scan_limit_pushdown` numbers).
             let ids: Vec<u64> = label_index
                 .get(label_id)?
+                .take(limit)
                 .map(|item| item.map(|g| g.value()))
                 .collect::<Result<_, _>>()?;
             ids
         };
-        // Trim before the per-id NODES lookups below, not after -- each one
-        // is a real point-read, worth skipping entirely past `limit`.
-        node_ids.truncate(limit);
         let mut result = Vec::with_capacity(node_ids.len());
         let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
         for id in node_ids {
