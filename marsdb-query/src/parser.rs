@@ -141,12 +141,14 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let mut clauses = Vec::new();
     let mut tail = None;
     let mut order_by = None;
+    let mut skip = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::clause => clauses.push(parse_clause(p)?),
             Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
             Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
+            Rule::skip_clause => skip = Some(parse_skip_clause(p)?),
             Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
             r => unreachable!("unexpected match_stmt child rule {r:?}"),
         }
@@ -196,6 +198,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         clauses,
         tail,
         order_by,
+        skip,
         limit,
     })
 }
@@ -410,6 +413,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     let mut items = Vec::new();
     let mut where_clause = None;
     let mut order_by = None;
+    let mut skip = None;
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -419,6 +423,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
                 where_clause = Some(parse_with_expr(expr_pair)?);
             }
             Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
+            Rule::skip_clause => skip = Some(parse_skip_clause(p)?),
             Rule::limit_clause => limit = Some(parse_limit_clause(p)?),
             r => unreachable!("unexpected with_clause child rule {r:?}"),
         }
@@ -427,6 +432,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
         items,
         where_clause,
         order_by,
+        skip,
         limit,
     })
 }
@@ -503,6 +509,18 @@ fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
         .map_err(|_| QueryError::Syntax("invalid LIMIT value".into()))?;
     if n < 0 {
         return Err(QueryError::Syntax("LIMIT can't be negative".into()));
+    }
+    Ok(n)
+}
+
+fn parse_skip_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
+    let n_pair = pair.into_inner().next().expect("SKIP has an int_literal");
+    let n = n_pair
+        .as_str()
+        .parse::<i64>()
+        .map_err(|_| QueryError::Syntax("invalid SKIP value".into()))?;
+    if n < 0 {
+        return Err(QueryError::Syntax("SKIP can't be negative".into()));
     }
     Ok(n)
 }

@@ -105,6 +105,117 @@ fn limit_clause_pushed_into_scan_edge_cases() {
 }
 
 #[test]
+fn skip_alone_drops_the_first_n_rows_after_order_by() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS v ORDER BY v SKIP 2");
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(vals, vec![2, 3, 4]);
+}
+
+/// Real Cypher always applies SKIP before LIMIT, regardless of clause
+/// order in the query text -- `SKIP 1 LIMIT 2` over `[0,1,2,3,4]` must
+/// yield `[1,2]`, not the first two rows then skip one of those.
+#[test]
+fn skip_and_limit_together_skip_applies_before_limit() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx AS v ORDER BY v SKIP 1 LIMIT 2",
+    );
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2]);
+}
+
+/// SKIP with no ORDER BY at all -- covers the pre-truncate path
+/// (`execute_match`'s non-ORDER-BY, non-DISTINCT branch), not the
+/// `top_k_by`/ORDER BY path the other SKIP tests exercise.
+#[test]
+fn skip_without_order_by_drops_rows_from_the_scan_order() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS v SKIP 3");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn skip_zero_is_a_no_op() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS v ORDER BY v SKIP 0");
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn skip_past_the_end_of_the_result_set_returns_empty_not_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx AS v ORDER BY v SKIP 100",
+    );
+    assert_eq!(result.rows.len(), 0);
+}
+
+/// SKIP is negative -- must be a real (`Syntax`) error, not silently
+/// clamped to 0 or treated as unbounded.
+#[test]
+fn skip_negative_is_a_syntax_error() {
+    let err =
+        marsdb_query::parse("RETURN 1 AS x SKIP -1").expect_err("negative SKIP must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("SKIP"), "unexpected error: {msg}");
+}
+
+/// SKIP on a WITH clause -- separate code path from RETURN's own SKIP
+/// (`apply_with_or_carry`), needs its own coverage.
+#[test]
+fn skip_on_with_clause_paginates_before_the_next_match() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(
+        &store,
+        "MATCH (n:Item) WITH n.idx AS v ORDER BY v SKIP 1 LIMIT 2 RETURN v",
+    );
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2]);
+}
+
+#[test]
 fn return_distinct_dedups_whole_row() {
     let store = GraphStore::open_memory().unwrap();
     for city in ["A", "B", "A", "A", "B"] {

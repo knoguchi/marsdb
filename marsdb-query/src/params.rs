@@ -30,6 +30,7 @@ pub fn substitute_params(
             clauses,
             tail,
             order_by,
+            skip: _,
             limit: _,
         } => {
             for clause in clauses {
