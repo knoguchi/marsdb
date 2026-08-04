@@ -14,8 +14,7 @@ use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey}
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
     PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr,
-    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
-    WithClause, WithExpr,
+    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -1094,22 +1093,17 @@ impl<'a> Executor<'a> {
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut out = Vec::new();
         for row in rows {
-            let elements: Vec<Binding> = match &clause.source {
-                UnwindSource::Var(name) => {
-                    let binding = row
-                        .get(name)
-                        .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
-                    let Binding::List(items) = binding else {
-                        return Err(QueryError::Type(format!(
-                            "'{name}' isn't a list — UNWIND needs a list (e.g. from collect())"
-                        )));
-                    };
-                    items.iter().map(value_to_binding_restore).collect()
+            let source_value = self.eval_return_expr(txn, &clause.source.0, row)?;
+            let elements: Vec<Binding> = match source_value {
+                Value::List(items) => items.iter().map(value_to_binding_restore).collect(),
+                // `UNWIND null AS x` behaves like unwinding an empty list
+                // (zero rows) in real Cypher, not an error.
+                Value::Null => Vec::new(),
+                other => {
+                    return Err(QueryError::Type(format!(
+                        "UNWIND needs a list, got {other:?}"
+                    )))
                 }
-                UnwindSource::List(literals) => literals
-                    .iter()
-                    .map(|lit| Binding::Value(literal_to_value(lit)))
-                    .collect(),
             };
             for element in elements {
                 let mut new_row = row.clone();
@@ -5104,6 +5098,16 @@ fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::Ordering {
 
 fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // `List` has no `PropertyValue` to fall back on via `value_to_comparable`
+    // (a list is a query-layer-only `Value` shape) -- delegate to its own
+    // recursive comparator before reaching the scalar-only match below,
+    // which would otherwise silently treat every pair of lists as "equal"
+    // (found via TCK's ReturnOrderBy1 `[10]`/WithOrderBy1 `[10]`: `ORDER BY
+    // <list column>` produced no reordering at all, ASC and DESC alike --
+    // a stable sort over an always-`Equal` comparator is a no-op).
+    if let (Value::List(_), Value::List(_)) = (a, b) {
+        return list_cmp_asc(a, b);
+    }
     let pa = value_to_comparable(a);
     let pb = value_to_comparable(b);
     match (pa, pb) {
@@ -5120,8 +5124,74 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
         (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
         (Some(PropertyValue::Date(x)), Some(PropertyValue::Date(y))) => x.cmp(&y),
-        _ => Ordering::Equal,
+        // Cross-type scalars (e.g. a String vs a Number) fall through to
+        // `type_rank`'s real Cypher orderability rank rather than this
+        // arm's own `Equal` fallback -- see `list_cmp_asc`, the only
+        // caller that can actually produce a cross-type pair here (a
+        // top-level ORDER BY key is already one uniform column in
+        // practice, but a list's *elements* legitimately mix types, e.g.
+        // `['a', 1]`).
+        _ => match (type_rank(a), type_rank(b)) {
+            (Some(ra), Some(rb)) if ra != rb => ra.cmp(&rb),
+            _ => Ordering::Equal,
+        },
     }
+}
+
+/// Real Cypher's cross-type "orderability" rank (distinct from
+/// `WHERE`'s three-valued comparison semantics) -- only covers the types
+/// that can actually reach here with no same-type match already handling
+/// them (see `compare_non_null`'s cross-type fallback and `list_cmp_asc`).
+/// `Map`/`Node`/`Edge`/`Path`/`Duration` have no defined orderability
+/// against other types either in real Cypher or in this codebase (matches
+/// `compare_non_null`'s pre-existing plain `Equal` fallback for them) --
+/// `None` here, not a rank, so they keep comparing as ties rather than
+/// claiming a real position in this order.
+fn type_rank(v: &Value) -> Option<u8> {
+    match v {
+        Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_)) => Some(0),
+        Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_)) => Some(1),
+        Value::Literal(Literal::Int(_))
+        | Value::Property(PropertyValue::Int(_))
+        | Value::Literal(Literal::Float(_))
+        | Value::Property(PropertyValue::Float(_)) => Some(2),
+        Value::Property(PropertyValue::Date(_)) => Some(3),
+        Value::List(_) => Some(4),
+        _ => None,
+    }
+}
+
+/// Ascending, element-by-element list comparison for ORDER BY, mirroring
+/// `compare_with_dir`'s "null sorts last" rule recursively at every
+/// position (deliberately *not* `value_partial_cmp`'s WHERE-filter
+/// three-valued semantics, where a null anywhere makes the whole
+/// comparison undecided instead of a definite presentation order) — a
+/// shorter list that's a prefix of a longer one sorts first, same
+/// convention `value_partial_cmp` already uses. `compare_with_dir`
+/// reverses the *overall* result for `DESC`, not each element
+/// individually — verified element-by-element against TCK's
+/// ReturnOrderBy1 `[10]` ("ORDER BY DESC should order lists in the
+/// expected order").
+fn list_cmp_asc(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = matches!(a, Value::Null);
+    let b_null = matches!(b, Value::Null);
+    match (a_null, b_null) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    if let (Value::List(xs), Value::List(ys)) = (a, b) {
+        for (x, y) in xs.iter().zip(ys) {
+            match list_cmp_asc(x, y) {
+                Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        return xs.len().cmp(&ys.len());
+    }
+    compare_non_null(a, b)
 }
 
 fn value_to_comparable(v: &Value) -> Option<PropertyValue> {

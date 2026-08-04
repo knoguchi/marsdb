@@ -406,16 +406,18 @@ pub struct UnwindClause {
     pub with: Option<WithClause>,
 }
 
-/// Where an `UNWIND`'s list comes from. `Var` restores graph identity per
-/// element when the list came from `collect()`-ing nodes/edges (see
-/// `executor::value_to_binding_restore`) — there's no `PropertyValue::List`
-/// yet, so a `$param`-supplied list isn't reachable here; only a
-/// previously-bound `collect()` result or an inline Cypher-text list.
+/// Where an `UNWIND`'s list comes from — any expression (`range(0, 2)`,
+/// `n.tags`, a bound `collect()` result, an inline `[1, 2, 3]`, ...),
+/// evaluated per input row and required to produce a `Value::List`
+/// (`executor::eval_unwind`). Element bindings restore graph identity via
+/// the same `value_to_binding_restore` regardless of where the list came
+/// from — there's no `PropertyValue::List` yet, so a `$param` bound
+/// directly to a list still isn't reachable here on its own (every
+/// `$param` is a single scalar); a `$param` used *inside* an inline list
+/// literal (`[1, 2, $p]`) still works, since each element substitutes
+/// independently.
 #[derive(Debug, Clone)]
-pub enum UnwindSource {
-    Var(String),
-    List(Vec<Literal>),
-}
+pub struct UnwindSource(pub ReturnExpr);
 
 /// `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...] [WITH ...]` —
 /// match-or-create: try the pattern as an ordinary MATCH first (reusing

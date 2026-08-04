@@ -4188,3 +4188,106 @@ fn explain_over_a_union_shows_each_part_and_the_union_keyword() {
     assert!(lines.iter().any(|l| l == "UNION"));
     assert_eq!(lines.iter().filter(|l| l.contains("RETURN x")).count(), 2);
 }
+
+#[test]
+fn unwind_source_can_be_a_function_call() {
+    // UnwindSource used to be Var(String)/List(Vec<Literal>) only --
+    // `range(0, 2)` (or any other non-literal, non-bare-var expression)
+    // couldn't parse at all.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "UNWIND range(0, 2) AS i RETURN i");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(int_value(&result.rows[0][0]), 0);
+    assert_eq!(int_value(&result.rows[2][0]), 2);
+}
+
+#[test]
+fn unwind_source_can_be_a_property_access() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH {tags: [1, 2, 3]} AS m UNWIND m.tags AS t RETURN t",
+    );
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn unwind_null_produces_zero_rows() {
+    // Real Cypher: unwinding null behaves like unwinding an empty list,
+    // not an error and not one null row.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "UNWIND null AS x RETURN x");
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn unwind_source_bare_literal_list_and_bound_variable_still_work() {
+    // Regression guard for the two shapes UnwindSource used to hard-code.
+    let store = GraphStore::open_memory().unwrap();
+    let literal = run(&store, "UNWIND [1, 2, 3] AS x RETURN x");
+    assert_eq!(literal.rows.len(), 3);
+
+    run(&store, "CREATE (:N)");
+    run(&store, "CREATE (:N)");
+    let restored = run(
+        &store,
+        "MATCH (n) WITH collect(n) AS ns UNWIND ns AS n RETURN n",
+    );
+    assert_eq!(restored.rows.len(), 2);
+    assert!(matches!(restored.rows[0][0], Value::Node(_)));
+}
+
+/// Renders a `Value::List`'s scalar elements as a compact string
+/// (`Value` has no `PartialEq`, and this reads far better than a chain of
+/// nested `matches!`/`if let`s for an 8-row order assertion).
+fn list_repr(v: &Value) -> String {
+    fn scalar_repr(v: &Value) -> String {
+        match v {
+            Value::Null => "null".to_string(),
+            Value::Literal(marsdb_query::Literal::Int(i)) => i.to_string(),
+            Value::Literal(marsdb_query::Literal::String(s)) => format!("'{s}'"),
+            other => panic!("unexpected list element {other:?}"),
+        }
+    }
+    match v {
+        Value::List(items) => format!(
+            "[{}]",
+            items.iter().map(scalar_repr).collect::<Vec<_>>().join(", ")
+        ),
+        other => panic!("expected a list, got {other:?}"),
+    }
+}
+
+#[test]
+fn order_by_desc_sorts_lists_correctly() {
+    // Real bug found while widening UNWIND's source to a general
+    // expression (a previous session change): nested list literals like
+    // `[[], ['a'], [1, 'a'], ...]` couldn't parse at all before that fix,
+    // so this query -- and the list-vs-list ORDER BY path it exercises --
+    // had never actually run. `compare_non_null` had no `Value::List` arm,
+    // silently falling through to its scalar-only `_ => Ordering::Equal`
+    // catch-all, so ORDER BY on a list column was a silent no-op
+    // (stable-sort-over-always-Equal preserves input order) regardless of
+    // ASC/DESC. Exact scenario + expected order from TCK's ReturnOrderBy1
+    // `[10]`.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "UNWIND [[], ['a'], ['a', 1], [1], [1, 'a'], [1, null], [null, 1], [null, 2]] AS lists \
+         RETURN lists ORDER BY lists DESC",
+    );
+    let got: Vec<String> = result.rows.iter().map(|row| list_repr(&row[0])).collect();
+    assert_eq!(
+        got,
+        vec![
+            "[null, 2]",
+            "[null, 1]",
+            "[1, null]",
+            "[1, 'a']",
+            "[1]",
+            "['a', 1]",
+            "['a']",
+            "[]",
+        ]
+    );
+}
