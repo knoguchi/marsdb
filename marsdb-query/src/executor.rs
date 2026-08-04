@@ -3048,6 +3048,9 @@ fn to_string_value(v: &Value) -> Value {
 /// not a silent wrong answer: both `parse_date` and `date_from_map`
 /// return a clear error/`None` for those rather than guessing.
 fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Parse(format!("date() expects zero or one argument, got {}", args.len())));
+    }
     let Some(arg) = args.first() else {
         return Ok(Value::Property(PropertyValue::Date(temporal::today_epoch_day())));
     };
@@ -3082,16 +3085,27 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
              day}} map, not week-date/quarter/ordinal-day construction"
         )));
     }
-    let year = value_as_i64(m.get("year").ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?)
-        .ok_or_else(|| QueryError::Parse("date({...})'s 'year' must be an integer".into()))? as i32;
-    let month = match m.get("month") {
-        Some(v) => value_as_i64(v).ok_or_else(|| QueryError::Parse("date({...})'s 'month' must be an integer".into()))?,
+    let integer_field = |key: &str, value: &Value| {
+        value_as_i64(value).ok_or_else(|| QueryError::Parse(format!("date({{...}})'s '{key}' must be an integer")))
+    };
+    let year_raw = integer_field(
+        "year",
+        m.get("year").ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?,
+    )?;
+    let year = i32::try_from(year_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'year' is out of range: {year_raw}")))?;
+    let month_raw = match m.get("month") {
+        Some(v) => integer_field("month", v)?,
         None => 1,
-    } as u32;
-    let day = match m.get("day") {
-        Some(v) => value_as_i64(v).ok_or_else(|| QueryError::Parse("date({...})'s 'day' must be an integer".into()))?,
+    };
+    let month = u32::try_from(month_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'month' is out of range: {month_raw}")))?;
+    let day_raw = match m.get("day") {
+        Some(v) => integer_field("day", v)?,
         None => 1,
-    } as u32;
+    };
+    let day = u32::try_from(day_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'day' is out of range: {day_raw}")))?;
     temporal::epoch_day_from_ymd(year, month, day)
         .ok_or_else(|| QueryError::Parse(format!("{year:04}-{month:02}-{day:02} isn't a valid calendar date")))
 }
@@ -3102,9 +3116,10 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
 /// none either — a duration has no "current" value the way a date/time
 /// does).
 fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
-    let arg = args
-        .first()
-        .ok_or_else(|| QueryError::Parse("duration() requires one argument".into()))?;
+    if args.len() != 1 {
+        return Err(QueryError::Parse(format!("duration() expects exactly one argument, got {}", args.len())));
+    }
+    let arg = &args[0];
     if matches!(arg, Value::Null) {
         return Ok(Value::Null);
     }
@@ -3152,9 +3167,9 @@ fn duration_fields_from_map(m: &BTreeMap<String, Value>) -> Result<temporal::Dur
 }
 
 fn value_as_i64(v: &Value) -> Option<i64> {
-    match as_arith_num(v)? {
-        ArithNum::Int(i) => Some(i),
-        ArithNum::Float(f) => Some(f as i64),
+    match v {
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(*i),
+        _ => None,
     }
 }
 

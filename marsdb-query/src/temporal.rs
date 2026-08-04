@@ -74,6 +74,12 @@ pub fn format_date(epoch_day: i32) -> String {
 /// correctly returns `None` rather than a wrong date.
 pub fn parse_date(s: &str) -> Option<i32> {
     let s = s.trim();
+    // The compact forms below use byte offsets because their grammar is
+    // ASCII-only. Reject non-ASCII input before slicing so malformed user
+    // input can never put an offset in the middle of a UTF-8 code point.
+    if !s.is_ascii() {
+        return None;
+    }
     let (year, month, day) = if let Some((y, rest)) = s.split_once('-') {
         let year: i32 = y.parse().ok()?;
         match rest.split_once('-') {
@@ -391,8 +397,17 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
         Some((d, t)) => (d, Some(t)),
         None => (s, None),
     };
+    let date_pairs = scan_number_unit_pairs(date_part)?;
+    let time_pairs = match time_part {
+        Some(part) => scan_number_unit_pairs(part)?,
+        None => Vec::new(),
+    };
+    if date_pairs.is_empty() && time_pairs.is_empty() {
+        return None;
+    }
+
     let mut f = DurationFields::default();
-    for (value, unit) in scan_number_unit_pairs(date_part) {
+    for (value, unit) in date_pairs {
         match unit {
             'Y' => f.years = value,
             'M' => f.months = value,
@@ -401,14 +416,12 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
             _ => return None,
         }
     }
-    if let Some(time_part) = time_part {
-        for (value, unit) in scan_number_unit_pairs(time_part) {
-            match unit {
-                'H' => f.hours = value,
-                'M' => f.minutes = value,
-                'S' => f.seconds = value,
-                _ => return None,
-            }
+    for (value, unit) in time_pairs {
+        match unit {
+            'H' => f.hours = value,
+            'M' => f.minutes = value,
+            'S' => f.seconds = value,
+            _ => return None,
         }
     }
     Some(normalize_duration(f))
@@ -418,17 +431,10 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
 /// -- no regex dependency for a grammar this small (a sign, digits, an
 /// optional `.digits`, then exactly one unit letter), matching this
 /// codebase's other hand-rolled small parsers (e.g. `marsdb-tck`'s
-/// `CellParser`). Returns whatever prefix of `s` parses cleanly; a
-/// trailing chunk that doesn't fit this shape (e.g. this function being
-/// handed the alternate combined date-time duration syntax) silently
-/// stops short rather than panicking -- for the combined date-time
-/// syntax specifically this means `parse_duration` silently produces a
-/// too-short/all-zero result instead of `None`. Not observed in practice
-/// (nothing in MarsDB's test suite exercises that syntax, since it's an
-/// explicit unsupported gap -- see `parse_duration`'s docs), but a real,
-/// narrower correctness edge than the rest of this module's "reject,
-/// don't guess" stance; documented here rather than silently relied on.
-fn scan_number_unit_pairs(s: &str) -> Vec<(f64, char)> {
+/// `CellParser`). The entire input must match: returning a successfully
+/// parsed prefix would make malformed text such as `P1Ygarbage` silently
+/// construct a one-year duration.
+fn scan_number_unit_pairs(s: &str) -> Option<Vec<(f64, char)>> {
     let mut out = Vec::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -442,14 +448,14 @@ fn scan_number_unit_pairs(s: &str) -> Vec<(f64, char)> {
             i += 1;
         }
         if i == digits_start {
-            break; // no number here -- stop, don't loop forever
+            return None;
         }
-        let Some(&unit) = chars.get(i) else { break };
-        let Ok(value) = chars[start..i].iter().collect::<String>().parse::<f64>() else { break };
+        let &unit = chars.get(i)?;
+        let value = chars[start..i].iter().collect::<String>().parse::<f64>().ok()?;
         out.push((value, unit));
         i += 1;
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -516,6 +522,14 @@ mod tests {
     #[test]
     fn parse_string_pt0_75m() {
         assert_eq!(format_duration_parts(parse_duration("PT0.75M").unwrap()), "PT45S");
+    }
+
+    #[test]
+    fn malformed_temporal_strings_are_rejected_without_panicking() {
+        assert_eq!(parse_date("123é4"), None);
+        for malformed in ["P", "PT", "Pgarbage", "P1Ygarbage", "P1Y2", "P1.2.3Y"] {
+            assert_eq!(parse_duration(malformed), None, "{malformed} must be rejected");
+        }
     }
 
     #[test]

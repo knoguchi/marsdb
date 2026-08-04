@@ -2176,6 +2176,35 @@ fn date_string_week_date_form_is_rejected_not_misparsed() {
 }
 
 #[test]
+fn temporal_constructors_reject_malformed_inputs_and_wrong_arity() {
+    let store = GraphStore::open_memory().unwrap();
+    for query in [
+        "RETURN date('123é4')",
+        "RETURN duration('Pgarbage')",
+        "RETURN duration('P1Ygarbage')",
+        "RETURN date('2020', '2021')",
+        "RETURN duration('P1D', 'P2D')",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+}
+
+#[test]
+fn date_map_requires_in_range_integer_fields() {
+    let store = GraphStore::open_memory().unwrap();
+    for query in [
+        "RETURN date({year: 2020.9, month: 1, day: 2})",
+        "RETURN date({year: 4294969280, month: 1, day: 1})",
+        "RETURN date({year: 2020, month: 4294967297, day: 1})",
+        "RETURN date({year: 2020, month: 1, day: 4294967297})",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+}
+
+#[test]
 fn date_comparison() {
     let store = GraphStore::open_memory().unwrap();
     let result = run(
