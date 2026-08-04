@@ -368,6 +368,40 @@ impl<'a> Executor<'a> {
         // anything carried into it.
         let mut carried_vars: HashSet<String> = HashSet::new();
         let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
+        // LIMIT push-down: when the *entire* statement is nothing but one
+        // un-filtered, non-optional, single-node MATCH (no hops, no WHERE,
+        // no WITH, at most the one label a NodeByLabelScan already narrows
+        // by) feeding straight into a LIMIT with no ORDER BY, the scan
+        // itself never needs to look past the first `limit` nodes -- there
+        // is *nothing* downstream (no Filter/Expand/aggregation) that
+        // could still drop a row, so capping the raw storage scan can't
+        // change the result. Every more complex shape falls through to the
+        // general path below unchanged, which doesn't short-circuit --
+        // this executor materializes a `Vec<BindingRow>` at every step
+        // rather than pulling lazily, so pushing LIMIT further (past a
+        // Filter, an Expand, more than one clause, ...) would need a real
+        // streaming executor to stay correct, not just a deeper check here.
+        let scan_limit_shortcut = order_by.is_none()
+            && limit.is_some()
+            && matches!(clauses, [QueryClause::Match(part)] if
+                !part.shortest_path
+                    && part.path_var.is_none()
+                    && !part.optional
+                    && part.with.is_none()
+                    && part.pattern.hops.is_empty()
+                    && part.where_clause.is_none()
+                    && part.pattern.start.labels.len() <= 1
+                    && part.pattern.start.props.is_empty()
+                    && part.pattern.start.var.is_some());
+        if scan_limit_shortcut {
+            let [QueryClause::Match(part)] = clauses else {
+                unreachable!("scan_limit_shortcut's own matches! already checked this shape");
+            };
+            let var = part.pattern.start.var.as_deref().expect("checked by scan_limit_shortcut");
+            let label = part.pattern.start.labels.first().map(String::as_str);
+            let limit_usize = limit.expect("checked by scan_limit_shortcut").max(0) as usize;
+            current_rows = self.scan(txn, var, label, &current_rows, Some(limit_usize))?;
+        } else {
         for clause in clauses {
             match clause {
                 QueryClause::Match(part) => {
@@ -436,6 +470,7 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+        }
         // ORDER BY must see every matching row before LIMIT truncates —
         // sort, then take N, not the other way around. Only pre-truncate
         // (the v1 "doesn't short-circuit" path) when there's no ORDER BY to
@@ -478,7 +513,7 @@ impl<'a> Executor<'a> {
                 if let Some(ob) = order_by {
                     if !has_aggregate(items) {
                         order_by_pre_applied = true;
-                        self.apply_order_by_with_scope(txn, &current_rows, projected, ob)?
+                        self.apply_order_by_with_scope(txn, &current_rows, projected, ob, limit)?
                     } else {
                         projected
                     }
@@ -500,10 +535,7 @@ impl<'a> Executor<'a> {
         };
         if let Some(order_by) = order_by {
             if !order_by_pre_applied {
-                result.rows = apply_order_by(result.rows, &result.columns, order_by)?;
-            }
-            if let Some(count) = limit {
-                result.rows.truncate(count.max(0) as usize);
+                result.rows = apply_order_by(result.rows, &result.columns, order_by, limit)?;
             }
         }
         Ok(result)
@@ -529,9 +561,8 @@ impl<'a> Executor<'a> {
         };
         let mut rows = self.materialize_with(txn, with, &rows)?;
         if let Some(with_order_by) = &with.order_by {
-            rows = self.apply_order_by_bindings(txn, rows, with_order_by)?;
-        }
-        if let Some(with_limit) = with.limit {
+            rows = self.apply_order_by_bindings(txn, rows, with_order_by, with.limit)?;
+        } else if let Some(with_limit) = with.limit {
             rows.truncate(with_limit.max(0) as usize);
         }
         *carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
@@ -785,6 +816,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         rows: Vec<BindingRow>,
         order_by: &[(ReturnExpr, SortDir)],
+        limit: Option<i64>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
         for row in rows {
@@ -795,16 +827,7 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        keyed.sort_by(|(ka, _), (kb, _)| {
-            for (i, (_, dir)) in order_by.iter().enumerate() {
-                let ord = compare_with_dir(&ka[i], &kb[i], *dir);
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-        Ok(keyed.into_iter().map(|(_, row)| row).collect())
+        Ok(top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect())
     }
 
     /// Sorts an already-`materialize_return`d result for a non-aggregating
@@ -822,6 +845,7 @@ impl<'a> Executor<'a> {
         binding_rows: &[BindingRow],
         result: QueryResult,
         order_by: &[(ReturnExpr, SortDir)],
+        limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
         let QueryResult { columns, rows } = result;
         let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
@@ -836,16 +860,8 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        keyed.sort_by(|(ka, _), (kb, _)| {
-            for (i, (_, dir)) in order_by.iter().enumerate() {
-                let ord = compare_with_dir(&ka[i], &kb[i], *dir);
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-        Ok(QueryResult { columns, rows: keyed.into_iter().map(|(_, row)| row).collect() })
+        let rows = top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect();
+        Ok(QueryResult { columns, rows })
     }
 
     fn binding_row_to_value_map(
@@ -1135,8 +1151,8 @@ impl<'a> Executor<'a> {
                 );
                 Ok(seed.to_vec())
             }
-            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed),
-            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label), seed),
+            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed, None),
+            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label), seed, None),
             LogicalPlan::Expand {
                 input,
                 from_var,
@@ -1257,8 +1273,25 @@ impl<'a> Executor<'a> {
     /// dropped. This is a real cost, not just a correctness fix: a scan
     /// against N carried rows does N × (scanned rows) work, same as any
     /// cross join.
-    fn scan(&self, txn: Txn, var: &str, label: Option<&str>, seed: &[BindingRow]) -> Result<Vec<BindingRow>, QueryError> {
-        let nodes = GraphStore::all_nodes_in_txn(txn, label)?;
+    /// `row_limit` bounds the underlying storage scan itself (see
+    /// `GraphStore::all_nodes_limited_in_txn`) -- only ever `Some` from the
+    /// dedicated shortcut in `execute_match` for a plan that's *just* this
+    /// one scan feeding straight into `LIMIT`, nothing else (no `Filter`,
+    /// no `Expand`, no `ORDER BY`). Every other caller (the general
+    /// `eval_plan` recursion) passes `None`, since capping the raw scan is
+    /// only safe when nothing downstream could still drop a row.
+    fn scan(
+        &self,
+        txn: Txn,
+        var: &str,
+        label: Option<&str>,
+        seed: &[BindingRow],
+        row_limit: Option<usize>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let nodes = match row_limit {
+            Some(limit) => GraphStore::all_nodes_limited_in_txn(txn, label, limit)?,
+            None => GraphStore::all_nodes_in_txn(txn, label)?,
+        };
         let mut out = Vec::with_capacity(seed.len() * nodes.len());
         for base_row in seed {
             for n in &nodes {
@@ -2158,6 +2191,7 @@ fn apply_order_by(
     rows: Vec<Vec<Value>>,
     columns: &[String],
     order_by: &[(ReturnExpr, SortDir)],
+    limit: Option<i64>,
 ) -> Result<Vec<Vec<Value>>, QueryError> {
     // An ORDER BY expression that repeats a returned expression verbatim
     // (`RETURN n.name, count(*) AS foo ORDER BY n.name`) names a real
@@ -2182,16 +2216,7 @@ fn apply_order_by(
             .collect::<Result<Vec<_>, _>>()?;
         keyed.push((keys, row));
     }
-    keyed.sort_by(|(ka, _), (kb, _)| {
-        for (i, (_, dir)) in order_by.iter().enumerate() {
-            let ord = compare_with_dir(&ka[i], &kb[i], *dir);
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-    Ok(keyed.into_iter().map(|(_, row)| row).collect())
+    Ok(top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect())
 }
 
 /// Same expression shape as `eval_return_expr`, but resolves `Var`/`Prop`
@@ -2265,6 +2290,49 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             }
         }
     }
+}
+
+/// Sorts `keyed` (each entry paired with its precomputed per-column sort
+/// keys) by `order_by`'s directions, keeping only the first `limit` items
+/// when one is given and smaller than the row count. When it is, uses
+/// `select_nth_unstable_by` to partition around the k-th smallest element
+/// (O(n) average) and sorts only that k-sized prefix (O(k log k)), instead
+/// of a full O(n log n) sort of every row just to immediately discard all
+/// but the first few -- the "ORDER BY + LIMIT -> TOP-K" rewrite real query
+/// engines apply. Shared by all three ORDER BY sites (`WITH`'s own,
+/// non-aggregating `RETURN`'s, and aggregating `RETURN`'s), which otherwise
+/// each build the identical `keyed`-then-sort shape around a different row
+/// type.
+fn top_k_by<T>(
+    mut keyed: Vec<(Vec<Value>, T)>,
+    order_by: &[(ReturnExpr, SortDir)],
+    limit: Option<i64>,
+) -> Vec<(Vec<Value>, T)> {
+    let cmp = |a: &(Vec<Value>, T), b: &(Vec<Value>, T)| -> std::cmp::Ordering {
+        for (i, (_, dir)) in order_by.iter().enumerate() {
+            let ord = compare_with_dir(&a.0[i], &b.0[i], *dir);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    match limit {
+        Some(n) => {
+            let k = n.max(0) as usize;
+            if k == 0 {
+                keyed.clear();
+            } else if k < keyed.len() {
+                keyed.select_nth_unstable_by(k - 1, cmp);
+                keyed.truncate(k);
+                keyed.sort_by(cmp);
+            } else {
+                keyed.sort_by(cmp);
+            }
+        }
+        None => keyed.sort_by(cmp),
+    }
+    keyed
 }
 
 /// NULLs sort last regardless of ASC/DESC (matches Neo4j's documented
