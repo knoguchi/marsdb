@@ -230,6 +230,17 @@ as a residual filter) without running it — always against a read-only
 snapshot, even for a statement that would otherwise write. No `CREATE
 CONSTRAINT`/composite indexes/range scans yet.
 
+`QueryError` is a typed taxonomy, not one flat string bucket: `Syntax`
+(the query text itself never parsed), `Semantic` (it parsed fine but is
+structurally invalid — an unsupported pattern shape, a misplaced
+aggregate — knowable from the query alone, no data needed), `Type` (only
+knowable once a real value from stored data or a `$parameter` turns out
+to be the wrong shape — arithmetic on a non-number, indexing a non-list),
+plus `Graph`/`UnboundVariable`/`MissingParam`/`Cancelled`/`Timeout`/
+`ResourceLimit`. `ExecutionOutcome` (the `ExecutionObserver` telemetry
+enum) mirrors the same split (`SyntaxError`/`SemanticError`/`TypeError`/
+...) instead of one undifferentiated `ParseOrSemanticError`.
+
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length

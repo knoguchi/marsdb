@@ -154,7 +154,7 @@ fn run_scenario(scenario: &Scenario) -> (Outcome, Option<String>) {
 }
 
 fn classify_setup_error(e: marsdb::Error) -> (Outcome, Option<String>) {
-    if let marsdb::Error::Query(QueryError::Parse(msg)) = &e {
+    if let marsdb::Error::Query(QueryError::Semantic(msg)) = &e {
         if msg.starts_with("__unsupported__") {
             return (
                 Outcome::RunnerUnsupported,
@@ -166,15 +166,22 @@ fn classify_setup_error(e: marsdb::Error) -> (Outcome, Option<String>) {
 }
 
 fn unsupported(reason: String) -> marsdb::Error {
-    // Piggybacks on QueryError::Parse purely as a carrier so this closure
-    // can return one Result type -- classify_setup_error() unwraps the
-    // sentinel prefix back out. Not a real parse error.
-    marsdb::Error::Query(QueryError::Parse(format!("__unsupported__{reason}")))
+    // Piggybacks on QueryError::Semantic purely as a carrier so this
+    // closure can return one Result type -- classify_setup_error() unwraps
+    // the sentinel prefix back out. Not a real semantic error.
+    marsdb::Error::Query(QueryError::Semantic(format!("__unsupported__{reason}")))
 }
 
 fn classify_query_error(e: marsdb::Error) -> (Outcome, Option<String>) {
     match &e {
-        marsdb::Error::Query(QueryError::Parse(_)) => (Outcome::ParseRejected, Some(e.to_string())),
+        // Both "never parsed" and "parsed but structurally rejected"
+        // read as the same known-gap signal from the TCK harness's own
+        // point of view (see `Outcome::ParseRejected`'s doc comment) --
+        // only a `Type` error (a real value turned out the wrong shape)
+        // is different enough to fall through to `UnexpectedBehavior`.
+        marsdb::Error::Query(QueryError::Syntax(_) | QueryError::Semantic(_)) => {
+            (Outcome::ParseRejected, Some(e.to_string()))
+        }
         _ => (Outcome::UnexpectedBehavior, Some(e.to_string())),
     }
 }

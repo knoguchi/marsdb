@@ -579,5 +579,5 @@ fn kind_name(kind: &Kind) -> &'static str {
 }
 
 fn semantic(message: impl Into<String>) -> QueryError {
-    QueryError::Parse(format!("semantic error: {}", message.into()))
+    QueryError::Semantic(message.into())
 }
