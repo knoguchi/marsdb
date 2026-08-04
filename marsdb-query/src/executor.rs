@@ -1645,9 +1645,10 @@ impl<'a> Executor<'a> {
                 self.eval_with_expr(txn, r, row)?,
             ),
             WithExpr::Not(e) => self.eval_with_expr(txn, e, row)?.map(|b| !b),
-            WithExpr::Compare(lhs, op, lit) => {
-                let value = self.eval_return_expr(txn, lhs, row)?;
-                compare_value(&value, *op, lit)
+            WithExpr::Compare(lhs, op, rhs) => {
+                let lv = self.eval_return_expr(txn, lhs, row)?;
+                let rv = self.eval_return_expr(txn, rhs, row)?;
+                compare_values(&lv, *op, &rv)
             }
         })
     }
@@ -3180,20 +3181,6 @@ fn reconstruct_path(
         elems.push(PathBinding::Node(node));
     }
     elems
-}
-
-/// `WithExpr::Compare`'s value-vs-literal comparison — reuses `compare()`
-/// (below) by reducing a `Value` down to the `Option<PropertyValue>` shape
-/// it expects; `Node`/`Edge`/`List` have no meaningful comparison against
-/// a `Literal` and fall back to "absent", same as a missing property does.
-fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> Option<bool> {
-    let prop = match value {
-        Value::Null => None,
-        Value::Property(pv) => Some(pv.clone()),
-        Value::Literal(l) => Some(literal_to_value(l)),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => None,
-    };
-    compare(&prop, op, lit)
 }
 
 /// Coerces a materialized `Value` down to a `PropertyValue` for storing in

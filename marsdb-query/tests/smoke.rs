@@ -3748,3 +3748,47 @@ fn create_with_bracketless_arrow_makes_an_anonymous_untyped_relationship() {
     assert_eq!(out.rows.len(), 1);
     assert_eq!(int_value(&out.rows[0][0]), 1);
 }
+
+#[test]
+fn with_where_compares_two_variables_not_just_a_variable_against_a_literal() {
+    // `WithExpr::Compare`'s RHS used to be `Literal`-only -- `WHERE a = b`
+    // (comparing two bound node/property values against each other)
+    // couldn't parse at all. A self-loop is the only fixed-pattern shape
+    // that produces two identical node bindings without needing the
+    // unsupported comma-separated cross-join `MATCH (a), (b)` the real
+    // TCK scenario for this uses.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:S)-[:R]->(n)"); // self-loop: a == b
+    run(&store, "CREATE (:S)-[:R]->(:S)"); // not a self-loop: a != b
+
+    let result = run(&store, "MATCH (a)-->(b) WITH a, b WHERE a = b RETURN a, b");
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn with_where_compares_two_property_accesses() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X {id: 1})-[:R]->(:Y {id: 1})");
+    run(&store, "CREATE (:X {id: 2})-[:R]->(:Y {id: 3})");
+
+    let result = run(
+        &store,
+        "MATCH (a:X)-->(b:Y) WITH a, b WHERE a.id = b.id RETURN a.id, b.id",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+    assert_eq!(int_value(&result.rows[0][1]), 1);
+}
+
+#[test]
+fn with_where_variable_against_literal_still_works() {
+    // Regression guard: widening the RHS from `Literal` to `ReturnExpr`
+    // must not break the far more common `WITH ... WHERE x.prop = 1` shape.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {id: 1})");
+    run(&store, "CREATE (:N {id: 2})");
+
+    let result = run(&store, "MATCH (n) WITH n WHERE n.id = 1 RETURN n.id");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+}

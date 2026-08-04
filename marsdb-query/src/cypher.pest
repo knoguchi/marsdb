@@ -229,15 +229,19 @@ with_expr         = { with_or_expr }
 with_or_expr      = { with_and_expr ~ (^"OR" ~ with_and_expr)* }
 with_and_expr     = { with_unary_expr ~ (^"AND" ~ with_unary_expr)* }
 with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_comparison | ("(" ~ with_expr ~ ")") }
-// `add_expr`, not `return_expr` -- `return_expr` now includes its own
-// optional trailing comparison (`compare_expr`), so using it here would
-// let it greedily consume the whole `lhs op literal` shape itself
-// (`y > 10` fully parses as one `return_expr`), leaving nothing for this
-// rule's own trailing `compare_op ~ literal` to match. `add_expr` is the
-// same arithmetic-only layer real Cypher's own grammar puts on a
-// comparison's LHS anyway (a comparison's operand is never itself
-// another comparison without explicit parens).
-with_comparison   = { add_expr ~ compare_op ~ literal }
+// `add_expr` on both sides, not `return_expr` -- `return_expr` now
+// includes its own optional trailing comparison (`compare_expr`), so
+// using it here would let either side greedily consume the whole
+// `lhs op rhs` shape itself (`y > 10` fully parses as one `return_expr`),
+// leaving nothing for this rule's own `compare_op` to match. `add_expr`
+// is the same arithmetic-only layer real Cypher's own grammar puts on a
+// comparison's operands anyway (a comparison's operand is never itself
+// another comparison without explicit parens). RHS used to be a plain
+// `literal` -- too narrow for real Cypher's `WITH ... WHERE a = b`
+// (comparing two bound variables/properties, not one against a constant),
+// so it's `add_expr` too now, same as pattern-level `Expr::Compare` needed
+// widening for chained comparisons.
+with_comparison   = { add_expr ~ compare_op ~ add_expr }
 
 detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }

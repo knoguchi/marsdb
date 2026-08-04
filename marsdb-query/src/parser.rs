@@ -456,11 +456,11 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
 
 fn parse_with_comparison(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let lhs = parse_add_expr(inner.next().expect("with_comparison has an add_expr"))?;
+    let lhs = parse_add_expr(inner.next().expect("with_comparison has a lhs add_expr"))?;
     let op_pair = inner.next().expect("with_comparison has a compare_op");
     let op = parse_compare_op(op_pair);
-    let literal = parse_literal(inner.next().expect("with_comparison has a literal"))?;
-    Ok(WithExpr::Compare(lhs, op, literal))
+    let rhs = parse_add_expr(inner.next().expect("with_comparison has a rhs add_expr"))?;
+    Ok(WithExpr::Compare(lhs, op, rhs))
 }
 
 fn parse_order_by_clause(pair: Pair<Rule>) -> Result<Vec<(ReturnExpr, SortDir)>, QueryError> {
