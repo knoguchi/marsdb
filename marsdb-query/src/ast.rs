@@ -162,11 +162,13 @@ pub enum ReturnExpr {
     Xor(Box<ReturnExpr>, Box<ReturnExpr>),
     Not(Box<ReturnExpr>),
     /// `lhs op rhs` — a single comparison between two arbitrary
-    /// expressions (unlike `WithExpr::Compare`'s `ReturnExpr`-vs-`Literal`
-    /// shape, `rhs` here can itself be a variable/property/arithmetic
-    /// expression). A chain (`1 < x < 10`) parses into nested `And`s of
+    /// expressions (both operands can be a variable/property/arithmetic
+    /// expression, same as `WithExpr::Compare`'s two `ReturnExpr`
+    /// operands). A chain (`1 < x < 10`) parses into nested `And`s of
     /// each adjacent pair (`(1 < x) AND (x < 10)`), same as real Cypher's
     /// own chained-comparison semantics — not a separate AST shape.
+    /// `WithExpr::Compare` doesn't chain this way (its own grammar level
+    /// doesn't recurse into itself), just a single comparison per node.
     Compare(Box<ReturnExpr>, CompareOp, Box<ReturnExpr>),
     /// `x IS NULL` — always a definite `true`/`false`, never "unknown"
     /// (that's the whole point of the check). `IS NOT NULL` parses to
@@ -317,19 +319,21 @@ pub enum RemoveItem {
 }
 
 /// WITH's HAVING-equivalent: filters on the already-projected/aggregated
-/// row (e.g. `WITH p, count(f) AS c WHERE c > 10`). Same And/Or/Not/
-/// Compare shape as `Expr`, but the comparison's LHS is a `ReturnExpr`
-/// (a WITH alias or raw expression) instead of a raw-property
-/// `PropAccess` — deliberately a separate type from `Expr` rather than a
-/// widened reuse of it, since `Expr::Compare` is what the planner pushes
-/// into pre-projection `Filter`/`Expand` nodes, and this filter
-/// fundamentally belongs *post*-projection instead (see `materialize_with`).
+/// row (e.g. `WITH p, count(f) AS c WHERE c > 10`, or `WITH a, b WHERE
+/// a = b`). Same And/Or/Not/Compare shape as `Expr`, but both comparison
+/// operands are a `ReturnExpr` (a WITH alias or raw expression, so either
+/// side can be a bound variable/property, not just the LHS against a
+/// constant) instead of a raw-property `PropAccess`/`Literal` pair —
+/// deliberately a separate type from `Expr` rather than a widened reuse
+/// of it, since `Expr::Compare` is what the planner pushes into
+/// pre-projection `Filter`/`Expand` nodes, and this filter fundamentally
+/// belongs *post*-projection instead (see `materialize_with`).
 #[derive(Debug, Clone)]
 pub enum WithExpr {
     And(Box<WithExpr>, Box<WithExpr>),
     Or(Box<WithExpr>, Box<WithExpr>),
     Not(Box<WithExpr>),
-    Compare(ReturnExpr, CompareOp, Literal),
+    Compare(ReturnExpr, CompareOp, ReturnExpr),
 }
 
 /// A `WITH` clause: projects/renames the current bindings, optionally

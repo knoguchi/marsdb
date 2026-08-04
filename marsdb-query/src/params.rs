@@ -136,9 +136,9 @@ fn substitute_with_expr(
             substitute_with_expr(r, params)?;
         }
         WithExpr::Not(e) => substitute_with_expr(e, params)?,
-        WithExpr::Compare(lhs, _, lit) => {
+        WithExpr::Compare(lhs, _, rhs) => {
             substitute_return_expr(lhs, params)?;
-            substitute_literal(lit, params)?;
+            substitute_return_expr(rhs, params)?;
         }
     }
     Ok(())

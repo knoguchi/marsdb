@@ -289,8 +289,9 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
             validate_with_expr(right, scope)
         }
         WithExpr::Not(inner) => validate_with_expr(inner, scope),
-        WithExpr::Compare(left, _, _) => {
+        WithExpr::Compare(left, _, right) => {
             infer_expr(left, scope)?;
+            infer_expr(right, scope)?;
             Ok(())
         }
     }
