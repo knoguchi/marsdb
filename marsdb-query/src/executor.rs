@@ -336,6 +336,12 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
+        if let Statement::Explain(inner) = stmt {
+            // Never opens a WriteTransaction, regardless of what `inner`
+            // itself would otherwise mutate -- EXPLAIN describes a plan,
+            // it never runs one.
+            return self.execute_explain(inner);
+        }
         if is_read_only(stmt) {
             let read_txn = self.store.begin_read()?;
             let Statement::Match {
@@ -410,7 +416,30 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
+        if let Statement::Explain(inner) = stmt {
+            // Same "never mutates" contract as the top-level path -- opens
+            // its own ReadTransaction rather than touching the caller's
+            // already-open `write_txn`, even when this runs inside an
+            // explicit multi-statement transaction.
+            return self.execute_explain(inner);
+        }
         self.execute_in_write_transaction_validated(stmt, write_txn, guard)
+    }
+
+    /// `EXPLAIN <statement>` — always opens its own `ReadTransaction`
+    /// (never the caller's write transaction, never a fresh write
+    /// transaction of its own) so describing a plan can never itself
+    /// mutate anything, no matter what `inner` would otherwise do.
+    fn execute_explain(&self, inner: &Statement) -> Result<QueryResult, QueryError> {
+        let read_txn = self.store.begin_read()?;
+        let lines = crate::explain::explain_statement(inner, Txn::Read(&read_txn))?;
+        Ok(QueryResult {
+            columns: vec!["plan".to_string()],
+            rows: lines
+                .into_iter()
+                .map(|line| vec![Value::Literal(Literal::String(line))])
+                .collect(),
+        })
     }
 
     fn notify_observer(
@@ -472,6 +501,15 @@ impl<'a> Executor<'a> {
                 *limit,
                 guard,
             ),
+            Statement::Explain(inner) => {
+                // Only reachable if a future caller invokes this directly,
+                // bypassing `execute_in_write_transaction_with_guard`'s own
+                // interception above -- kept as a real (not `unreachable!`)
+                // fallback so that stays true even if this function's
+                // caller set ever changes, rather than becoming a latent
+                // panic.
+                self.execute_explain(inner)
+            }
         }
     }
 
@@ -2820,7 +2858,9 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
 
 /// The name a `WITH`/`RETURN` item is known by afterward — its alias, or
 /// a name derived from the expression (its bare var name, `col{i}`, etc).
-fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
+/// `pub(crate)` so `explain.rs` can compute the same post-`WITH`
+/// `carried_vars` set EXPLAIN needs without executing any rows.
+pub(crate) fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
     item.alias
         .clone()
         .unwrap_or_else(|| default_column_name(&item.expr, i))

@@ -3608,3 +3608,79 @@ fn limit_on_a_non_unique_index_seek_stops_at_the_right_count() {
     );
     assert_eq!(result.rows.len(), 2);
 }
+
+fn plan_lines(result: &marsdb_query::QueryResult) -> Vec<String> {
+    result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Literal(marsdb_query::Literal::String(s)) => s.clone(),
+            other => panic!("expected an EXPLAIN plan line, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn explain_shows_index_seek_and_residual_filter() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com', age: 30})");
+    run(&store, "CREATE INDEX ON :Person(email)");
+
+    let result = run(
+        &store,
+        "EXPLAIN MATCH (n:Person) WHERE n.email = 'alice@x.com' AND n.age > 20 RETURN n",
+    );
+    let lines = plan_lines(&result);
+    assert!(lines.iter().any(|l| l.contains("IndexSeek(n:Person")
+        && l.contains("email")
+        && l.contains("alice@x.com")));
+    assert!(lines.iter().any(|l| l.contains("Filter n.age > 20")));
+}
+
+#[test]
+fn explain_falls_back_to_scan_when_no_index_declared() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com'})");
+
+    let result = run(
+        &store,
+        "EXPLAIN MATCH (n:Person {email: 'alice@x.com'}) RETURN n",
+    );
+    let lines = plan_lines(&result);
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("NodeByLabelScan(n:Person)")));
+    assert!(!lines.iter().any(|l| l.contains("IndexSeek")));
+}
+
+#[test]
+fn explain_never_mutates_even_a_write_statement() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'a'})");
+
+    let explained = run(&store, "EXPLAIN CREATE (:Person {name: 'b'})");
+    assert_eq!(plan_lines(&explained).len(), 1);
+    assert!(plan_lines(&explained)[0].contains("no query plan"));
+
+    let count = run(&store, "MATCH (n:Person) RETURN count(n)");
+    assert_eq!(int_value(&count.rows[0][0]), 1);
+}
+
+#[test]
+fn explain_shows_expand_between_two_scans() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Person {name: 'a'})-[:KNOWS]->(:Person {name: 'b'})",
+    );
+
+    let result = run(
+        &store,
+        "EXPLAIN MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b",
+    );
+    let lines = plan_lines(&result);
+    assert!(lines.iter().any(|l| l.contains("Expand(a)-[:KNOWS]->(b)")));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("NodeByLabelScan(a:Person)")));
+}

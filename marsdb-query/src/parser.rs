@@ -37,11 +37,31 @@ pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let inner = pair.into_inner().next().expect("statement has one child");
     match inner.as_rule() {
+        Rule::explain_stmt => parse_explain_stmt(inner),
         Rule::create_index_stmt => parse_create_index_stmt(inner),
         Rule::create_stmt => parse_create_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected statement child rule {r:?}"),
     }
+}
+
+/// `explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt |
+/// match_stmt) }` -- one child, the wrapped statement, dispatched through
+/// the same per-rule parsers `parse_statement` itself uses (not a second
+/// copy of `parse_statement`, since `explain_stmt` can't recurse into
+/// another `explain_stmt`).
+fn parse_explain_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("explain_stmt wraps exactly one statement");
+    let wrapped = match inner.as_rule() {
+        Rule::create_index_stmt => parse_create_index_stmt(inner),
+        Rule::create_stmt => parse_create_stmt(inner),
+        Rule::match_stmt => parse_match_stmt(inner),
+        r => unreachable!("unexpected explain_stmt child rule {r:?}"),
+    }?;
+    Ok(Statement::Explain(Box::new(wrapped)))
 }
 
 fn parse_create_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {

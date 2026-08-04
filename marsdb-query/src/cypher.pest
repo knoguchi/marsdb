@@ -11,8 +11,15 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
 
 // `create_index_stmt` tried before `create_stmt` -- both start with
 // `^"CREATE"`, but `pattern` always starts with `(`, never `INDEX`, so
-// ordered choice backtracks cleanly on a plain `CREATE (...)`.
-statement = { create_index_stmt | create_stmt | match_stmt }
+// ordered choice backtracks cleanly on a plain `CREATE (...)`. `explain_stmt`
+// tried first of all -- it's the only rule starting with `EXPLAIN`, so there's
+// no backtracking concern, just an ordinary prefix check.
+statement = { explain_stmt | create_index_stmt | create_stmt | match_stmt }
+
+// `EXPLAIN <statement>` -- never wraps another `explain_stmt` (real Cypher's
+// own `EXPLAIN EXPLAIN ...` isn't valid either), so the inner alternative
+// list deliberately excludes it rather than reusing `statement` itself.
+explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt | match_stmt) }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
