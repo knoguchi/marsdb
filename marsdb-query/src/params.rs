@@ -195,6 +195,10 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
                 substitute_return_expr(e, params)?;
             }
         }
+        ReturnExpr::Arith(l, _, r) => {
+            substitute_return_expr(l, params)?;
+            substitute_return_expr(r, params)?;
+        }
     }
     Ok(())
 }

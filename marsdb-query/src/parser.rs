@@ -536,14 +536,54 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 }
 
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("return_expr has one child");
+    let inner = pair.into_inner().next().expect("return_expr has one child (add_expr)");
+    parse_add_expr(inner)
+}
+
+fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let mut lhs = parse_mul_expr(inner.next().expect("add_expr has at least one mul_expr"))?;
+    while let Some(op_pair) = inner.next() {
+        let op = match op_pair.as_str() {
+            "+" => ArithOp::Add,
+            "-" => ArithOp::Sub,
+            other => unreachable!("unexpected add_op {other:?}"),
+        };
+        let rhs = parse_mul_expr(inner.next().expect("add_op has a following mul_expr"))?;
+        lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
+    }
+    Ok(lhs)
+}
+
+fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let mut lhs = parse_atom_expr(inner.next().expect("mul_expr has at least one atom_expr"))?;
+    while let Some(op_pair) = inner.next() {
+        let op = match op_pair.as_str() {
+            "*" => ArithOp::Mul,
+            "/" => ArithOp::Div,
+            "%" => ArithOp::Mod,
+            other => unreachable!("unexpected mul_op {other:?}"),
+        };
+        let rhs = parse_atom_expr(inner.next().expect("mul_op has a following atom_expr"))?;
+        lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
+    }
+    Ok(lhs)
+}
+
+fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let inner = pair.into_inner().next().expect("atom_expr has one child");
     match inner.as_rule() {
         Rule::case_expr => parse_case_expr(inner),
         Rule::function_call => parse_function_call(inner),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
-        r => unreachable!("unexpected return_expr child rule {r:?}"),
+        // Parenthesized grouping -- `atom_expr`'s own `"(" ~ return_expr ~
+        // ")"` alternative isn't a named sub-rule, so `return_expr` shows
+        // up as a direct child here.
+        Rule::return_expr => parse_return_expr(inner),
+        r => unreachable!("unexpected atom_expr child rule {r:?}"),
     }
 }
 
