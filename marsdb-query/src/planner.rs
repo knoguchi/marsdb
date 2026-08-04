@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 
+use marsdb_graph::{GraphStore, Txn};
+
 use crate::ast::{
     CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr,
 };
 use crate::error::QueryError;
+use crate::executor::literal_to_value;
 use crate::ir::{ExpandDirection, LogicalPlan};
 
 struct VarNamer {
@@ -355,4 +358,144 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
         .into_iter()
         .filter(|v| !carried_vars.contains(v))
         .collect()
+}
+
+/// Post-processing pass over an already-built plan: fuses a
+/// `Filter(Compare(var.prop = literal))` sitting directly over a
+/// `NodeByLabelScan{var, label}` into a single `IndexSeek`, if a real
+/// index happens to be declared on `(label, prop)` — checked against
+/// `txn`, since `build_match_plan` itself has no storage access and can't
+/// know. Deliberately narrow for this first pass: only the *exact* shape
+/// a `MATCH (n:Label {prop: literal})` pattern property compiles to (see
+/// `wrap_labels_and_props`) is recognized — a `WHERE`-clause equality
+/// predicate reaching the same shape through a different path, or an
+/// index candidate buried under an `Expand`, is `rule-based pushdown`'s
+/// job (a separate, later change), not this fusion's.
+pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, QueryError> {
+    Ok(match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let input = apply_index_seeks(*input, txn)?;
+            match (&predicate, &input) {
+                (
+                    Expr::Compare(pa, CompareOp::Eq, lit),
+                    LogicalPlan::NodeByLabelScan { var, label },
+                ) if pa.var == *var && !matches!(lit, Literal::Param(_)) => {
+                    if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_some() {
+                        LogicalPlan::IndexSeek {
+                            var: var.clone(),
+                            label: label.clone(),
+                            prop: pa.prop.clone(),
+                            value: literal_to_value(lit),
+                        }
+                    } else {
+                        LogicalPlan::Filter {
+                            input: Box::new(input),
+                            predicate,
+                        }
+                    }
+                }
+                _ => LogicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate,
+                },
+            }
+        }
+        LogicalPlan::Expand {
+            input,
+            from_var,
+            to_var,
+            rel_var,
+            rel_label,
+            direction,
+        } => LogicalPlan::Expand {
+            input: Box::new(apply_index_seeks(*input, txn)?),
+            from_var,
+            to_var,
+            rel_var,
+            rel_label,
+            direction,
+        },
+        LogicalPlan::VarExpand {
+            input,
+            from_var,
+            to_var,
+            rel_label,
+            direction,
+            min_hops,
+            max_hops,
+        } => LogicalPlan::VarExpand {
+            input: Box::new(apply_index_seeks(*input, txn)?),
+            from_var,
+            to_var,
+            rel_label,
+            direction,
+            min_hops,
+            max_hops,
+        },
+        leaf @ (LogicalPlan::AllNodesScan { .. }
+        | LogicalPlan::NodeByLabelScan { .. }
+        | LogicalPlan::Seed { .. }
+        | LogicalPlan::IndexSeek { .. }) => leaf,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use marsdb_graph::{GraphStore, PropertyValue, Txn};
+
+    use super::*;
+    use crate::ast::{QueryClause, Statement};
+
+    fn pattern_from(cypher: &str) -> crate::ast::Pattern {
+        let Statement::Match { clauses, .. } = crate::parser::parse(cypher).unwrap() else {
+            panic!("expected a Match statement");
+        };
+        let QueryClause::Match(part) = clauses.into_iter().next().unwrap() else {
+            panic!("expected a Match clause");
+        };
+        part.pattern
+    }
+
+    #[test]
+    fn fuses_node_pattern_property_into_index_seek_when_an_index_exists() {
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        let pattern = pattern_from("MATCH (n:Person {email: 'alice@x.com'}) RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan = build_match_plan(&pattern, &None, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::IndexSeek {
+                var,
+                label,
+                prop,
+                value,
+            } => {
+                assert_eq!(var, "n");
+                assert_eq!(label, "Person");
+                assert_eq!(prop, "email");
+                assert_eq!(value, PropertyValue::String("alice@x.com".to_string()));
+            }
+            other => panic!("expected an IndexSeek, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_filter_over_scan_when_no_index_exists() {
+        let store = GraphStore::open_memory().unwrap();
+        let pattern = pattern_from("MATCH (n:Person {email: 'alice@x.com'}) RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan = build_match_plan(&pattern, &None, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::NodeByLabelScan { .. }));
+            }
+            other => panic!("expected a Filter over a scan, got {other:?}"),
+        }
+    }
 }

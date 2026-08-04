@@ -12,6 +12,8 @@
 //! either: `execute_match` bounds consumption of a non-blocking plan stream
 //! for LIMIT, while ORDER BY explicitly materializes before sorting.
 
+use marsdb_graph::PropertyValue;
+
 use crate::ast::Expr;
 
 /// Traversal direction for `Expand`. Distinct from `marsdb_graph::Direction`
@@ -34,6 +36,20 @@ pub enum LogicalPlan {
     NodeByLabelScan {
         var: String,
         label: String,
+    },
+    /// A direct lookup against a declared property index — `label`'s nodes
+    /// with `prop == value`, without walking `NODE_LABEL_INDEX` or reading
+    /// every candidate node's record to check the property. Never produced
+    /// by `build_match_plan` directly (which has no storage access, so no
+    /// way to know which indexes exist) — `planner::apply_index_seeks`
+    /// rewrites a `Filter(Compare(var.prop = literal))` over a
+    /// `NodeByLabelScan` into this, post-build, once a real `Txn` is
+    /// available to check `GraphStore::index_def_in_txn`.
+    IndexSeek {
+        var: String,
+        label: String,
+        prop: String,
+        value: PropertyValue,
     },
     /// "Start from the rows already bound coming into this statement" —
     /// used when a `QueryPart`'s pattern start-variable was already bound

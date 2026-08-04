@@ -215,6 +215,15 @@ instead of a full sort of every row.
 
 ### Cypher coverage
 
+`CREATE INDEX ON :Label(prop)` (optionally `UNIQUE`) declares a property
+index, backfilled immediately from existing nodes. A `MATCH (n:Label
+{prop: literal})` pattern (or, once a later change extracts `WHERE`
+equality predicates too, `WHERE n.prop = literal`) against an indexed
+`(label, prop)` compiles to a direct index seek instead of a label scan
++ filter — only the single-property, node-pattern-literal shape is
+recognized so far; a `WHERE`-clause equality predicate doesn't fuse yet.
+No `CREATE CONSTRAINT`/composite indexes/range scans yet.
+
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length

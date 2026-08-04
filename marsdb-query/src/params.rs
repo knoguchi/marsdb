@@ -22,6 +22,9 @@ pub fn substitute_params(
                 substitute_pattern(pattern, params)?;
             }
         }
+        // No `$param`-able position -- label/prop are identifiers, not
+        // expressions.
+        Statement::CreateIndex { .. } => {}
         Statement::Match {
             clauses,
             tail,

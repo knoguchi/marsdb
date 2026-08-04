@@ -581,9 +581,23 @@ impl GraphStore {
     /// for the exact semantics (idempotency, unique-violation behavior).
     pub fn create_index(&self, label: &str, prop: &str, unique: bool) -> Result<(), GraphError> {
         let write_txn = self.begin_write()?;
-        crate::index::create_index(&write_txn, label, prop, unique)?;
+        Self::create_index_in_txn(&write_txn, label, prop, unique)?;
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Same as `create_index`, but against an already-open
+    /// `WriteTransaction` — for a caller (`CREATE INDEX` as a Cypher
+    /// statement) that's already inside one transaction and must commit
+    /// or abort it as a whole, not open a second one (redb allows only one
+    /// writer at a time; opening a second would deadlock).
+    pub fn create_index_in_txn(
+        write_txn: &WriteTransaction,
+        label: &str,
+        prop: &str,
+        unique: bool,
+    ) -> Result<(), GraphError> {
+        crate::index::create_index(write_txn, label, prop, unique)
     }
 
     /// `None` means no index is declared on `(label, prop)`.
@@ -594,6 +608,27 @@ impl GraphStore {
     ) -> Result<Option<crate::IndexDef>, GraphError> {
         let read_txn = self.begin_read()?;
         crate::index::lookup_index_def(Txn::Read(&read_txn), label, prop)
+    }
+
+    /// Same as `index_def`, but against an already-open `Txn` — for a
+    /// caller (the query planner/executor) that's already inside one
+    /// transaction and needs a consistent view, not a fresh snapshot.
+    pub fn index_def_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+    ) -> Result<Option<crate::IndexDef>, GraphError> {
+        crate::index::lookup_index_def(txn, label, prop)
+    }
+
+    /// Same as `lookup_by_index`, but against an already-open `Txn`.
+    pub fn lookup_by_index_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        value: &PropertyValue,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        crate::index::lookup_exact(txn, label, prop, value)
     }
 
     /// Every node currently indexed under `(label, prop) = value`. Empty

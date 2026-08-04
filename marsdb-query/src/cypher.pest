@@ -9,9 +9,21 @@ query = { SOI ~ statement ~ ";"? ~ EOI }
 // no special-casing is needed to avoid splitting inside a string.
 queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
 
-statement = { create_stmt | match_stmt }
+// `create_index_stmt` tried before `create_stmt` -- both start with
+// `^"CREATE"`, but `pattern` always starts with `(`, never `INDEX`, so
+// ordered choice backtracks cleanly on a plain `CREATE (...)`.
+statement = { create_index_stmt | create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
+
+// `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE` -- deliberately the
+// older, simpler single-property syntax (not the newer `CREATE INDEX FOR
+// (n:Label) ON (n.prop)` form, and not real Cypher's separate `CREATE
+// CONSTRAINT ... IS UNIQUE`) -- narrowly enough scoped to declare exactly
+// what `GraphStore::create_index` supports today (one label, one
+// property), not a general multi-property/constraint DDL surface.
+create_index_stmt = { ^"CREATE" ~ ^"INDEX" ~ ^"ON" ~ ":" ~ identifier ~ "(" ~ identifier ~ ")" ~ unique_kw? }
+unique_kw = { ^"UNIQUE" }
 
 // `clause*`, not `clause+` -- a bare `RETURN <expr>` with no MATCH/UNWIND/
 // MERGE at all (e.g. `RETURN 1 + 1`) is valid real Cypher, needing no
