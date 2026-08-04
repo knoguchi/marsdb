@@ -2471,6 +2471,53 @@ fn merge_unconstrained_node_pattern_errors() {
     assert!(err.to_string().to_lowercase().contains("ambiguous"));
 }
 
+/// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
+/// relationship at all doesn't search for or create anything, so real
+/// Cypher rejects it, the same rule `materialize_create` already
+/// applies to standalone `CREATE (a)`.
+#[test]
+fn merge_rejects_bare_already_bound_node_with_no_relationship() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item)");
+    let stmt = parse("MATCH (a:Item) MERGE (a)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
+}
+
+/// `MATCH (a)-[r]->(b) MERGE (a)-[r]->(b)` -- reusing an already-bound
+/// relationship as MERGE's own pattern token is always an error; unlike
+/// a node endpoint, MERGE has no "search using this specific existing
+/// edge" mode.
+#[test]
+fn merge_rejects_reusing_an_already_bound_relationship() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:R]->(:B)");
+    let stmt = parse("MATCH (a)-[r]->(b) MERGE (a)-[r]->(b)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
+}
+
+/// `MERGE ({num: null})` -- a null-valued property in MERGE's own
+/// pattern can never be searched-or-created consistently (null never
+/// matches on search, but storing null is the same as not storing the
+/// property at all).
+#[test]
+fn merge_rejects_a_null_valued_pattern_property() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MERGE ({num: null})").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("null"),
+        "expected a null-property error, got: {err}"
+    );
+}
+
 #[test]
 fn merge_two_hop_pattern_errors_at_parse_time() {
     let err = parse("MERGE (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)").unwrap_err();

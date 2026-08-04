@@ -762,6 +762,35 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
+    /// Whether any property expression across `clause.pattern` (the
+    /// start node, and every hop's relationship + node) evaluates to
+    /// null for this row -- see `merge_one_row`'s call site for why
+    /// that's always a real error, never a value MERGE can act on.
+    fn merge_pattern_has_null_property(
+        &self,
+        txn: Txn,
+        clause: &MergeClause,
+        row: &BindingRow,
+    ) -> Result<bool, QueryError> {
+        let any_null = |props: &[(String, ReturnExpr)]| -> Result<bool, QueryError> {
+            for (_, expr) in props {
+                if matches!(self.eval_return_expr(txn, expr, row)?, Value::Null) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        if any_null(&clause.pattern.start.props)? {
+            return Ok(true);
+        }
+        for (rel, node) in &clause.pattern.hops {
+            if any_null(&rel.props)? || any_null(&node.props)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn merge_one_row(
         &self,
         write_txn: &WriteTransaction,
@@ -775,13 +804,67 @@ impl<'a> Executor<'a> {
         // node in the graph (AllNodesScan, no Filter), which is a
         // wrong-answer footgun, not a helpful default.
         require_mergeable(&clause.pattern.start, row)?;
+        // A bare already-bound node with no relationship at all
+        // (`MATCH (a) MERGE (a)`) does nothing real -- it's not
+        // searching for or creating anything, just re-stating a var
+        // that already exists. Real Cypher rejects it outright, the
+        // same reasoning `materialize_create`'s own already-bound check
+        // applies to standalone `CREATE (a)`. A bound start node used as
+        // a relationship endpoint (`MATCH (a) MERGE (a)-[:T]->(b)`)
+        // stays legitimate -- only checked when there are no hops at all.
+        if clause.pattern.hops.is_empty() {
+            if let Some(var) = &clause.pattern.start.var {
+                if clause.pattern.start.labels.is_empty()
+                    && clause.pattern.start.props.is_empty()
+                    && row.contains_key(var)
+                {
+                    return Err(QueryError::Semantic(format!(
+                        "'{var}' is already bound — MERGE ({var}) with no relationship and no \
+                         labels/properties doesn't search for or create anything"
+                    )));
+                }
+            }
+        }
         for (rel, node) in &clause.pattern.hops {
             if rel.hop_range.is_some() {
                 return Err(QueryError::Semantic(
                     "MERGE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                 ));
             }
+            // Unlike a node endpoint (which can legitimately reference an
+            // already-bound node to search/create from), MERGE never
+            // reuses an already-bound relationship as its own pattern
+            // token -- there's no "search using this specific existing
+            // edge" mode, MERGE always searches *for* a relationship
+            // matching the pattern shape, or creates one.
+            if let Some(var) = &rel.var {
+                if row.contains_key(var) {
+                    return Err(QueryError::Semantic(format!(
+                        "'{var}' is already bound — MERGE can't reuse an existing relationship \
+                         variable as its own pattern token"
+                    )));
+                }
+            }
             require_mergeable(node, row)?;
+        }
+        // A MERGE pattern's own inline `{...}` property evaluating to
+        // null can never be searched-or-created consistently: a null
+        // property is never equal to anything (so the search half can
+        // never find a node/edge that "has" it), but storing a
+        // property as null is equivalent to not storing it at all (see
+        // `apply_set_item`'s own SET-to-null convention) -- so the
+        // create half would silently produce something that doesn't
+        // structurally match the pattern that created it. Real Cypher's
+        // MergeReadOwnWrites error, checked once per row (a property
+        // expression can reference this row's other bindings, e.g.
+        // `MERGE (n {x: m.missing})`).
+        if self.merge_pattern_has_null_property(Txn::Write(write_txn), clause, row)? {
+            return Err(QueryError::Semantic(
+                "MERGE pattern property is null — a MERGE's own {...} properties can never be \
+                 null (searching for null never matches anything, but storing null is the same \
+                 as not storing the property at all)"
+                    .into(),
+            ));
         }
 
         // Try the pattern as an ordinary MATCH first. Whatever's already
