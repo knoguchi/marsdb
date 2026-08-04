@@ -759,6 +759,48 @@ impl GraphStore {
         Self::all_nodes_in_txn(Txn::Read(&read_txn), label_filter)
     }
 
+    /// Scan only graph identities, without decoding node records. Query
+    /// pipelines use this to defer record/property loading until a filter or
+    /// projection actually needs it.
+    pub fn all_node_ids_limited_in_txn(
+        txn: Txn,
+        label_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        let Some(label_filter) = label_filter else {
+            let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+            return nodes
+                .iter()?
+                .take(limit)
+                .map(|entry| {
+                    entry
+                        .map(|(key, _)| NodeId(key.value()))
+                        .map_err(Into::into)
+                })
+                .collect();
+        };
+        let Some(label_id) = lookup_label_id(txn, label_filter)? else {
+            return Ok(Vec::new());
+        };
+        let label_index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        let ids = label_index
+            .get(label_id)?
+            .take(limit)
+            .map(|entry| entry.map(|value| NodeId(value.value())).map_err(Into::into))
+            .collect::<Result<Vec<_>, GraphError>>()?;
+        drop(label_index);
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        for id in &ids {
+            if nodes.get(id.0)?.is_none() {
+                return Err(GraphError::CorruptData(format!(
+                    "node label index references missing node {}",
+                    id.0
+                )));
+            }
+        }
+        Ok(ids)
+    }
+
     pub fn all_nodes_in_txn(txn: Txn, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
         Self::all_nodes_limited_in_txn(txn, label_filter, usize::MAX)
     }

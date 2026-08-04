@@ -53,11 +53,9 @@ fn bench_execute_match_1hop(c: &mut Criterion) {
     group.finish();
 }
 
-/// `MATCH (n:Label) RETURN ... LIMIT k` with no hops/WHERE/ORDER BY is the
-/// one shape `execute_match` pushes the LIMIT into the storage scan for
-/// (see `README.md`'s Architecture section) -- this isolates that case
-/// from `bench_execute_match_1hop` above, which has a hop and so never
-/// qualifies for the same push-down.
+/// A direct scan can push LIMIT through the row stream into storage itself.
+/// The 1-hop benchmark above also stops its streamed expansion early, but
+/// its input scan still has to discover the candidate starting-node ids.
 fn bench_execute_scan_limit_pushdown(c: &mut Criterion) {
     let mut group = c.benchmark_group("execute_scan_limit_pushdown_by_dataset_size");
     for n in [100usize, 1_000, 10_000, 100_000] {

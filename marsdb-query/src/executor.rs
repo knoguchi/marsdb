@@ -267,7 +267,17 @@ struct ShortestPathSpec<'a> {
     max_hops: Option<u32>,
 }
 
+struct VarExpandSpec<'a> {
+    from_var: &'a str,
+    to_var: &'a str,
+    rel_label: Option<&'a str>,
+    direction: ExpandDirection,
+    min_hops: u32,
+    max_hops: Option<u32>,
+}
+
 type BindingRow = HashMap<String, Binding>;
+type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
 /// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
 /// Hitting it errors rather than silently truncating — see `VarExpand`
@@ -754,157 +764,112 @@ impl<'a> Executor<'a> {
         // anything carried into it.
         let mut carried_vars: HashSet<String> = HashSet::new();
         let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
-        // LIMIT push-down: when the *entire* statement is nothing but one
-        // un-filtered, non-optional, single-node MATCH (no hops, no WHERE,
-        // no WITH, at most the one label a NodeByLabelScan already narrows
-        // by) feeding straight into a LIMIT with no ORDER BY, the scan
-        // itself never needs to look past the first `limit` nodes -- there
-        // is *nothing* downstream (no Filter/Expand/aggregation) that
-        // could still drop a row, so capping the raw storage scan can't
-        // change the result. Every more complex shape falls through to the
-        // general path below unchanged, which doesn't short-circuit --
-        // this executor materializes a `Vec<BindingRow>` at every step
-        // rather than pulling lazily, so pushing LIMIT further (past a
-        // Filter, an Expand, more than one clause, ...) would need a real
-        // streaming executor to stay correct, not just a deeper check here.
-        // A DISTINCT RETURN can also drop rows -- capping the raw scan at
-        // `limit` before dedup could return fewer than `limit` *distinct*
-        // rows even when more exist past what got scanned, so this shape
-        // is excluded the same way a WHERE/Filter already is.
-        let scan_limit_shortcut = order_by.is_none()
-            && limit.is_some()
-            && !tail_is_distinct_return(tail)
-            && matches!(clauses, [QueryClause::Match(part)] if
-                !part.shortest_path
-                    && part.path_var.is_none()
-                    && !part.optional
-                    && part.with.is_none()
-                    && part.pattern.hops.is_empty()
-                    && part.where_clause.is_none()
-                    && part.pattern.start.labels.len() <= 1
-                    && part.pattern.start.props.is_empty()
-                    && part.pattern.start.var.is_some());
-        if scan_limit_shortcut {
-            let [QueryClause::Match(part)] = clauses else {
-                unreachable!("scan_limit_shortcut's own matches! already checked this shape");
-            };
-            let var = part
-                .pattern
-                .start
-                .var
-                .as_deref()
-                .expect("checked by scan_limit_shortcut");
-            let label = part.pattern.start.labels.first().map(String::as_str);
-            let limit_usize = limit.expect("checked by scan_limit_shortcut").max(0) as usize;
-            current_rows = self.scan(txn, var, label, &current_rows, Some(limit_usize), guard)?;
-        } else {
-            for clause in clauses {
-                match clause {
-                    QueryClause::Match(part) => {
-                        current_rows = if part.shortest_path {
-                            // Not a LogicalPlan/eval_plan traversal at all —
-                            // see eval_shortest_path's docs.
-                            self.eval_shortest_path(txn, part, &current_rows)?
-                        } else if let Some(path_var) = &part.path_var {
-                            let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
-                            let plan = build_match_plan(
-                                &named_pattern,
-                                &part.where_clause,
-                                &carried_vars,
-                            )?;
-                            let mut rows = if part.optional {
-                                let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
-                                self.eval_optional_part(
-                                    txn,
-                                    &plan,
-                                    &current_rows,
-                                    &new_vars,
-                                    guard,
-                                )?
-                            } else {
-                                self.eval_plan(txn, &plan, &current_rows, guard)?
-                            };
-                            for row in &mut rows {
-                                let path_binding = assemble_path(&named_pattern, row);
-                                for key in &synthesized {
-                                    row.remove(key);
-                                }
-                                row.insert(path_var.clone(), path_binding);
-                            }
-                            rows
-                        } else {
-                            let plan =
-                                build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
-                            if part.optional {
-                                let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                                self.eval_optional_part(
-                                    txn,
-                                    &plan,
-                                    &current_rows,
-                                    &new_vars,
-                                    guard,
-                                )?
-                            } else {
-                                self.eval_plan(txn, &plan, &current_rows, guard)?
-                            }
-                        };
-                        let mut new_vars = pattern_all_vars(&part.pattern);
-                        if let Some(path_var) = &part.path_var {
-                            new_vars.insert(path_var.clone());
-                        }
-                        current_rows = self.apply_with_or_carry(
-                            txn,
-                            &part.with,
-                            current_rows,
-                            new_vars,
-                            &mut carried_vars,
-                        )?;
-                    }
-                    QueryClause::Unwind(u) => {
-                        current_rows = self.eval_unwind(txn, u, &current_rows)?;
-                        current_rows = self.apply_with_or_carry(
-                            txn,
-                            &u.with,
-                            current_rows,
-                            HashSet::from([u.var.clone()]),
-                            &mut carried_vars,
-                        )?;
-                    }
-                    QueryClause::Merge(m) => {
-                        // MERGE always needs real `.insert`-capable write
-                        // access, whether or not the rest of the statement
-                        // would otherwise be read-only (e.g. `MERGE (n) RETURN
-                        // n`) — see `is_read_only`, which already accounts for
-                        // this by checking `clauses` too, so `txn` is
-                        // guaranteed to be `Txn::Write` here.
-                        let write_txn = require_write_txn(txn);
-                        current_rows = self.eval_merge(write_txn, m, &current_rows, guard)?;
-                        current_rows = self.apply_with_or_carry(
-                            txn,
-                            &m.with,
-                            current_rows,
-                            pattern_all_vars(&m.pattern),
-                            &mut carried_vars,
-                        )?;
-                    }
-                    // A statement-leading WITH -- no pattern was matched, so
-                    // there's nothing to seed `new_vars` with beyond what the
-                    // WITH clause itself projects (`apply_with_or_carry`
-                    // always takes the `Some(with)` branch here, never the
-                    // "no WITH, just extend carried_vars" one, since `with` is
-                    // always present on this variant by construction).
-                    QueryClause::With(with) => {
-                        current_rows = self.apply_with_or_carry(
-                            txn,
-                            &Some(with.clone()),
-                            current_rows,
-                            HashSet::new(),
-                            &mut carried_vars,
-                        )?;
-                    }
-                }
-                guard.check_intermediate_rows(current_rows.len())?;
+        // A plain, non-blocking RETURN can stop the final MATCH pipeline as
+        // soon as LIMIT rows have arrived. ORDER BY, DISTINCT, aggregation,
+        // mutations, and WITH must still consume/materialize their complete
+        // input before applying a final limit.
+        let final_stream_limit = match (order_by, limit, tail) {
+            (None, Some(limit), Some(Tail::Return(items, false))) if !has_aggregate(items) => {
+                Some(limit.max(0) as usize)
             }
+            _ => None,
+        };
+        for (clause_index, clause) in clauses.iter().enumerate() {
+            let is_final_clause = clause_index + 1 == clauses.len();
+            match clause {
+                QueryClause::Match(part) => {
+                    let plan_limit = is_final_clause
+                        .then_some(final_stream_limit)
+                        .flatten()
+                        .filter(|_| !part.shortest_path && !part.optional && part.with.is_none());
+                    current_rows = if part.shortest_path {
+                        // Not a LogicalPlan/eval_plan traversal at all —
+                        // see eval_shortest_path's docs.
+                        self.eval_shortest_path(txn, part, &current_rows)?
+                    } else if let Some(path_var) = &part.path_var {
+                        let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
+                        let plan =
+                            build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?;
+                        let mut rows = if part.optional {
+                            let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
+                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
+                        } else {
+                            self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
+                        };
+                        for row in &mut rows {
+                            let path_binding = assemble_path(&named_pattern, row);
+                            for key in &synthesized {
+                                row.remove(key);
+                            }
+                            row.insert(path_var.clone(), path_binding);
+                        }
+                        rows
+                    } else {
+                        let plan =
+                            build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+                        if part.optional {
+                            let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
+                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
+                        } else {
+                            self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
+                        }
+                    };
+                    let mut new_vars = pattern_all_vars(&part.pattern);
+                    if let Some(path_var) = &part.path_var {
+                        new_vars.insert(path_var.clone());
+                    }
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &part.with,
+                        current_rows,
+                        new_vars,
+                        &mut carried_vars,
+                    )?;
+                }
+                QueryClause::Unwind(u) => {
+                    current_rows = self.eval_unwind(txn, u, &current_rows)?;
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &u.with,
+                        current_rows,
+                        HashSet::from([u.var.clone()]),
+                        &mut carried_vars,
+                    )?;
+                }
+                QueryClause::Merge(m) => {
+                    // MERGE always needs real `.insert`-capable write
+                    // access, whether or not the rest of the statement
+                    // would otherwise be read-only (e.g. `MERGE (n) RETURN
+                    // n`) — see `is_read_only`, which already accounts for
+                    // this by checking `clauses` too, so `txn` is
+                    // guaranteed to be `Txn::Write` here.
+                    let write_txn = require_write_txn(txn);
+                    current_rows = self.eval_merge(write_txn, m, &current_rows, guard)?;
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &m.with,
+                        current_rows,
+                        pattern_all_vars(&m.pattern),
+                        &mut carried_vars,
+                    )?;
+                }
+                // A statement-leading WITH -- no pattern was matched, so
+                // there's nothing to seed `new_vars` with beyond what the
+                // WITH clause itself projects (`apply_with_or_carry`
+                // always takes the `Some(with)` branch here, never the
+                // "no WITH, just extend carried_vars" one, since `with` is
+                // always present on this variant by construction).
+                QueryClause::With(with) => {
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &Some(with.clone()),
+                        current_rows,
+                        HashSet::new(),
+                        &mut carried_vars,
+                    )?;
+                }
+            }
+            guard.check_intermediate_rows(current_rows.len())?;
         }
         // ORDER BY must see every matching row before LIMIT truncates —
         // sort, then take N, not the other way around. Only pre-truncate
@@ -1687,18 +1652,49 @@ impl<'a> Executor<'a> {
         seed: &[BindingRow],
         guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
+        self.eval_plan_with_limit(txn, plan, seed, guard, None)
+    }
+
+    fn eval_plan_with_limit(
+        &self,
+        txn: Txn,
+        plan: &LogicalPlan,
+        seed: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
+        limit: Option<usize>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let stream = self.stream_plan(txn, plan, seed, guard, limit);
+        match limit {
+            Some(limit) => stream.take(limit).collect(),
+            None => stream.collect(),
+        }
+    }
+
+    /// Build a pull-based row pipeline. Each iterator owns only its current
+    /// row (plus one relationship fan-out at an Expand), so scan/filter/
+    /// expand chains no longer allocate a Vec at every logical-plan node.
+    /// Blocking clause boundaries still collect this stream explicitly.
+    fn stream_plan<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        plan: &'s LogicalPlan,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+        scan_limit: Option<usize>,
+    ) -> RowStream<'s> {
         match plan {
             LogicalPlan::Seed { var } => {
                 debug_assert!(
                     seed.first().is_none_or(|row| row.contains_key(var)),
                     "Seed{{var: {var:?}}} planned for a var not present in the carried-forward rows"
                 );
-                guard.check_intermediate_rows(seed.len())?;
-                Ok(seed.to_vec())
+                Self::count_stream(Box::new(seed.iter().cloned().map(Ok)), guard)
             }
-            LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed, None, guard),
+            LogicalPlan::AllNodesScan { var } => {
+                self.stream_scan(txn, var, None, seed, guard, scan_limit)
+            }
             LogicalPlan::NodeByLabelScan { var, label } => {
-                self.scan(txn, var, Some(label), seed, None, guard)
+                self.stream_scan(txn, var, Some(label), seed, guard, scan_limit)
             }
             LogicalPlan::Expand {
                 input,
@@ -1708,33 +1704,56 @@ impl<'a> Executor<'a> {
                 rel_label,
                 direction,
             } => {
-                let base_rows = self.eval_plan(txn, input, seed, guard)?;
-                let mut out = Vec::new();
-                for row in base_rows {
+                let mut input = self.stream_plan(txn, input, seed, guard, None);
+                let mut current: Option<(BindingRow, std::vec::IntoIter<AdjEntry>)> = None;
+                let mut done = false;
+                let stream = std::iter::from_fn(move || loop {
+                    if done {
+                        return None;
+                    }
+                    if let Some((row, entries)) = &mut current {
+                        if let Some(entry) = entries.next() {
+                            if let Err(error) = guard.relationship_expansion() {
+                                done = true;
+                                return Some(Err(error));
+                            }
+                            let mut new_row = row.clone();
+                            new_row.insert(to_var.clone(), Binding::Node(entry.other));
+                            if let Some(rel_var) = rel_var {
+                                new_row.insert(rel_var.clone(), Binding::Edge(entry.edge_id));
+                            }
+                            return Some(Ok(new_row));
+                        }
+                        current = None;
+                    }
+
+                    let row = match input.next()? {
+                        Ok(row) => row,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    };
                     let from_id = match row.get(from_var) {
                         Some(Binding::Node(id)) => *id,
-                        // A null `from_var` (padded by an outer, already-
-                        // resolved `OPTIONAL MATCH` that didn't match) has
-                        // no neighbors, same as any other traversal from
-                        // null -- contributes zero rows, not an error. A
-                        // truly missing/wrong-typed binding still is one.
+                        // A null binding has no neighbors and contributes
+                        // no rows. Missing or structurally invalid bindings
+                        // remain errors.
                         Some(Binding::Value(PropertyValue::Null)) => continue,
-                        _ => return Err(QueryError::UnboundVariable(from_var.clone())),
-                    };
-                    let entries =
-                        neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
-                    for entry in entries {
-                        guard.relationship_expansion()?;
-                        let mut new_row = row.clone();
-                        new_row.insert(to_var.clone(), Binding::Node(entry.other));
-                        if let Some(rv) = rel_var {
-                            new_row.insert(rv.clone(), Binding::Edge(entry.edge_id));
+                        _ => {
+                            done = true;
+                            return Some(Err(QueryError::UnboundVariable(from_var.clone())));
                         }
-                        out.push(new_row);
-                        guard.check_intermediate_rows(out.len())?;
+                    };
+                    match neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref()) {
+                        Ok(entries) => current = Some((row, entries.into_iter())),
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
                     }
-                }
-                Ok(out)
+                });
+                Self::count_stream(Box::new(stream), guard)
             }
             LogicalPlan::VarExpand {
                 input,
@@ -1745,150 +1764,216 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
             } => {
-                let base_rows = self.eval_plan(txn, input, seed, guard)?;
-                let mut out = Vec::new();
-                let unbounded = max_hops.is_none();
-                let effective_max = max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
-                for row in base_rows {
-                    let start_id = match row.get(from_var) {
-                        Some(Binding::Node(id)) => *id,
-                        // Same null-propagation as `Expand` above.
-                        Some(Binding::Value(PropertyValue::Null)) => continue,
-                        _ => return Err(QueryError::UnboundVariable(from_var.clone())),
+                let mut input = self.stream_plan(txn, input, seed, guard, None);
+                let mut pending = Vec::new().into_iter();
+                let mut done = false;
+                let stream = std::iter::from_fn(move || loop {
+                    if done {
+                        return None;
+                    }
+                    if let Some(row) = pending.next() {
+                        return Some(Ok(row));
+                    }
+                    let row = match input.next()? {
+                        Ok(row) => row,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
                     };
-                    if *min_hops == 0 {
-                        let mut new_row = row.clone();
-                        new_row.insert(to_var.clone(), Binding::Node(start_id));
-                        out.push(new_row);
-                        guard.check_intermediate_rows(out.len())?;
-                    }
-                    // Keep relationship usage on each frontier entry rather
-                    // than a global node-visited set. Cypher variable-length
-                    // patterns enumerate relationship-unique paths, so a
-                    // diamond must yield both routes to its shared endpoint.
-                    let mut frontier = vec![(start_id, HashSet::<EdgeId>::new())];
-                    let mut depth = 0u32;
-                    while depth < effective_max && !frontier.is_empty() {
-                        depth += 1;
-                        let mut next_frontier = Vec::new();
-                        for (node, used_edges) in frontier {
-                            let entries = neighbors_for_direction(
-                                txn,
-                                node,
-                                *direction,
-                                rel_label.as_deref(),
-                            )?;
-                            for entry in entries {
-                                guard.relationship_expansion()?;
-                                if used_edges.contains(&entry.edge_id) {
-                                    continue;
-                                }
-                                let mut next_used_edges = used_edges.clone();
-                                next_used_edges.insert(entry.edge_id);
-                                next_frontier.push((entry.other, next_used_edges));
-                                guard.check_intermediate_rows(next_frontier.len())?;
-                                if depth >= *min_hops {
-                                    let mut new_row = row.clone();
-                                    new_row.insert(to_var.clone(), Binding::Node(entry.other));
-                                    out.push(new_row);
-                                    guard.check_intermediate_rows(out.len())?;
-                                }
-                            }
-                        }
-                        frontier = next_frontier;
-                        if depth == effective_max && unbounded && !frontier.is_empty() {
-                            // Unbounded (`*N..`) traversal hit the safety
-                            // cap with more still reachable — error rather
-                            // than silently truncate results, which would
-                            // be a wrong-answer failure mode for a
-                            // correctness-benchmark tool.
-                            return Err(QueryError::Parse(format!(
-                                "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
-                                 hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
-                                 add an explicit upper bound (e.g. *0..10)"
-                            )));
+                    match self.expand_variable_row(
+                        txn,
+                        row,
+                        VarExpandSpec {
+                            from_var,
+                            to_var,
+                            rel_label: rel_label.as_deref(),
+                            direction: *direction,
+                            min_hops: *min_hops,
+                            max_hops: *max_hops,
+                        },
+                        guard,
+                    ) {
+                        Ok(rows) => pending = rows.into_iter(),
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
                         }
                     }
-                }
-                Ok(out)
+                });
+                Self::count_stream(Box::new(stream), guard)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let rows = self.eval_plan(txn, input, seed, guard)?;
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    guard.checkpoint()?;
-                    if self.eval_expr(txn, predicate, &row)? == Some(true) {
-                        out.push(row);
-                        guard.check_intermediate_rows(out.len())?;
+                let mut input = self.stream_plan(txn, input, seed, guard, None);
+                let mut done = false;
+                let stream = std::iter::from_fn(move || loop {
+                    if done {
+                        return None;
                     }
-                }
-                Ok(out)
+                    let row = match input.next()? {
+                        Ok(row) => row,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    };
+                    if let Err(error) = guard.checkpoint() {
+                        done = true;
+                        return Some(Err(error));
+                    }
+                    match self.eval_expr(txn, predicate, &row) {
+                        Ok(Some(true)) => return Some(Ok(row)),
+                        Ok(_) => continue,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    }
+                });
+                Self::count_stream(Box::new(stream), guard)
             }
         }
     }
 
-    /// Cross-joins the scan against `seed` — for the first `QueryPart` in a
-    /// statement, `seed` is always exactly one empty row (see
-    /// `execute_match`), so this reduces to "one row per scanned node,"
-    /// the same as before this scan ever needed a `seed` parameter at
-    /// all. It matters for a later `QueryPart` (after a `WITH` boundary)
-    /// whose pattern doesn't chain from an already-bound variable — e.g.
-    /// `MATCH (a) WITH a MATCH (b) ...` — real Cypher's cross-join
-    /// semantics require every carried-forward binding (`a`) to survive
-    /// alongside every row this scan produces (`b`), not get silently
-    /// dropped. This is a real cost, not just a correctness fix: a scan
-    /// against N carried rows does N × (scanned rows) work, same as any
-    /// cross join.
-    /// `row_limit` bounds the underlying storage scan itself (see
-    /// `GraphStore::all_nodes_limited_in_txn`) -- only ever `Some` from the
-    /// dedicated shortcut in `execute_match` for a plan that's *just* this
-    /// one scan feeding straight into `LIMIT`, nothing else (no `Filter`,
-    /// no `Expand`, no `ORDER BY`). Every other caller (the general
-    /// `eval_plan` recursion) passes `None`, since capping the raw scan is
-    /// only safe when nothing downstream could still drop a row.
-    fn scan(
+    fn count_stream<'s>(mut stream: RowStream<'s>, guard: &'s ExecutionGuard<'_>) -> RowStream<'s> {
+        let mut produced = 0usize;
+        let mut done = false;
+        Box::new(std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            let item = stream.next()?;
+            if item.is_ok() {
+                produced = match produced.checked_add(1) {
+                    Some(produced) => produced,
+                    None => {
+                        done = true;
+                        return Some(Err(QueryError::ResourceLimit(
+                            "stream row counter overflow".into(),
+                        )));
+                    }
+                };
+                if let Err(error) = guard.check_intermediate_rows(produced) {
+                    done = true;
+                    return Some(Err(error));
+                }
+            } else {
+                done = true;
+            }
+            Some(item)
+        }))
+    }
+
+    fn stream_scan<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        var: &'s str,
+        label: Option<&'s str>,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+        row_limit: Option<usize>,
+    ) -> RowStream<'s> {
+        let mut initialized = false;
+        let mut node_ids = Vec::new();
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            if !initialized {
+                initialized = true;
+                let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+                    max_rows
+                        .checked_div(seed.len())
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                });
+                let storage_limit = match (row_limit, budget_node_limit) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let storage_limit = storage_limit.unwrap_or(usize::MAX);
+                match GraphStore::all_node_ids_limited_in_txn(txn, label, storage_limit) {
+                    Ok(ids) => node_ids = ids,
+                    Err(error) => {
+                        done = true;
+                        return Some(Err(error.into()));
+                    }
+                }
+            }
+            if node_ids.is_empty() || seed_index >= seed.len() {
+                return None;
+            }
+            if let Err(error) = guard.checkpoint() {
+                done = true;
+                return Some(Err(error));
+            }
+            let mut row = seed[seed_index].clone();
+            row.insert(var.to_string(), Binding::Node(node_ids[node_index]));
+            node_index += 1;
+            if node_index == node_ids.len() {
+                node_index = 0;
+                seed_index += 1;
+            }
+            Some(Ok(row))
+        });
+        Self::count_stream(Box::new(stream), guard)
+    }
+
+    fn expand_variable_row(
         &self,
         txn: Txn,
-        var: &str,
-        label: Option<&str>,
-        seed: &[BindingRow],
-        row_limit: Option<usize>,
+        row: BindingRow,
+        spec: VarExpandSpec<'_>,
         guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
-        if seed.is_empty() {
-            return Ok(Vec::new());
+        let start_id = match row.get(spec.from_var) {
+            Some(Binding::Node(id)) => *id,
+            Some(Binding::Value(PropertyValue::Null)) => return Ok(Vec::new()),
+            _ => return Err(QueryError::UnboundVariable(spec.from_var.to_string())),
+        };
+        let mut out = Vec::new();
+        if spec.min_hops == 0 {
+            let mut new_row = row.clone();
+            new_row.insert(spec.to_var.to_string(), Binding::Node(start_id));
+            out.push(new_row);
         }
-        // Ask storage for at most one row beyond the configured budget so
-        // an oversized scan is rejected without first materializing the
-        // entire table. The +1 is what distinguishes "exactly at limit"
-        // from "more rows exist".
-        let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
-            max_rows
-                .checked_div(seed.len())
-                .unwrap_or(0)
-                .saturating_add(1)
-        });
-        let storage_limit = match (row_limit, budget_node_limit) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        let nodes = match storage_limit {
-            Some(limit) => GraphStore::all_nodes_limited_in_txn(txn, label, limit)?,
-            None => GraphStore::all_nodes_in_txn(txn, label)?,
-        };
-        let row_count = seed.len().checked_mul(nodes.len()).ok_or_else(|| {
-            QueryError::ResourceLimit("scan cross-join row count overflow".into())
-        })?;
-        guard.check_intermediate_rows(row_count)?;
-        let mut out = Vec::with_capacity(row_count);
-        for base_row in seed {
-            for n in &nodes {
-                guard.checkpoint()?;
-                let mut row = base_row.clone();
-                row.insert(var.to_string(), Binding::Node(n.id));
-                out.push(row);
+        let unbounded = spec.max_hops.is_none();
+        let effective_max = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
+        let mut frontier = vec![(start_id, HashSet::<EdgeId>::new())];
+        let mut depth = 0u32;
+        while depth < effective_max && !frontier.is_empty() {
+            depth += 1;
+            let mut next_frontier = Vec::new();
+            for (node, used_edges) in frontier {
+                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_label)? {
+                    guard.relationship_expansion()?;
+                    if used_edges.contains(&entry.edge_id) {
+                        continue;
+                    }
+                    let mut next_used_edges = used_edges.clone();
+                    next_used_edges.insert(entry.edge_id);
+                    next_frontier.push((entry.other, next_used_edges));
+                    guard.check_intermediate_rows(next_frontier.len())?;
+                    if depth >= spec.min_hops {
+                        let mut new_row = row.clone();
+                        new_row.insert(spec.to_var.to_string(), Binding::Node(entry.other));
+                        out.push(new_row);
+                        guard.check_intermediate_rows(out.len())?;
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if depth == effective_max && unbounded && !frontier.is_empty() {
+                return Err(QueryError::Parse(format!(
+                    "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
+                     hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
+                     add an explicit upper bound (e.g. *0..10)"
+                )));
             }
         }
         Ok(out)

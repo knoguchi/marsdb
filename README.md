@@ -195,21 +195,23 @@ to open a database written by a newer unsupported format.
 
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 
-Execution materializes a `Vec` of bindings at every step rather than
-pulling rows lazily — there's no general query optimizer or streaming
-iterator model. Use `ExecutionOptions` to put hard ceilings on intermediate
-rows, result rows, relationship expansions, and elapsed time. Two narrow,
-hand-written optimizations: a `MATCH (n[:Label])
-RETURN ... LIMIT k` with no `WHERE`/hops/`ORDER BY` pushes the `LIMIT`
-straight into the storage scan (`GraphStore::all_nodes_limited_in_txn`
-stops once it has `k` nodes, whether or not a label narrows it first —
-correct only because nothing downstream could still drop a row); and
-every `ORDER BY ... LIMIT k` site (`WITH`'s own, non-aggregating
+The logical read plan runs as a pull-based row stream through node-ID scans,
+filters, and relationship expansions. A non-aggregating, non-distinct
+`RETURN ... LIMIT k` without `ORDER BY` stops that pipeline after `k` rows,
+so downstream limits avoid unnecessary expansions. Clause boundaries and
+inherently blocking operations still materialize: `WITH`, optional-match
+reconciliation, variable-length traversal results for each input row,
+aggregation, `DISTINCT`, mutations, and the public `QueryResult`. Use
+`ExecutionOptions` to put hard ceilings on intermediate rows, result rows,
+relationship expansions, and elapsed time.
+
+There is not yet a general cost-based optimizer. Two targeted optimizations
+complement streaming: a direct `MATCH (n[:Label]) RETURN ... LIMIT k` scan
+pushes the limit into storage; and every `ORDER BY ... LIMIT k` site
+(`WITH`'s own, non-aggregating
 `RETURN`'s, aggregating `RETURN`'s) uses a top-k partial selection
 (`slice::select_nth_unstable_by` + a sort of just the k-sized prefix)
-instead of a full sort of every row. Both are real, targeted wins, not a
-general "push predicates/limits through the plan" framework — see the
-Roadmap.
+instead of a full sort of every row.
 
 ### Cypher coverage
 
@@ -374,11 +376,8 @@ variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain
 needed to reconstruct a path over `*`-traversal), or `shortestPath()` with
 a minimum hop count greater than 1 (a plain visited-set BFS can't
 correctly answer "shortest path of at least N hops" for N > 1 without a
-different algorithm). One more gap the TCK surfaced directly: no
-compile-time semantic validation (an undefined variable/function, or a
-wrong-type function argument, is only caught while evaluating an actual
-row — a query whose `MATCH` matches zero rows never gets checked at all).
-`WHERE` does have real three-valued NULL logic (`AND`/`OR`/`NOT` and every
+different algorithm). `WHERE` has real three-valued NULL logic
+(`AND`/`OR`/`NOT` and every
 comparison correctly propagate "unknown" rather than collapsing it to
 `false`) — CASE's `WHEN` and DISTINCT dedup deliberately don't, since they
 need a definite yes/no, not "unknown".
@@ -401,9 +400,9 @@ need a definite yes/no, not "unknown".
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
-- Real query optimizer (cost-based join ordering, a semantic-validation
-  binder pass) — the two targeted wins below (LIMIT push-down, ORDER
-  BY+LIMIT top-k) are hand-special-cased, not a general framework
+- Property and composite indexes with transactional maintenance
+- Real query optimizer: index selection, cardinality estimates, and
+  cost-based join/traversal ordering
 
 ## Testing
 

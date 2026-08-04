@@ -9,8 +9,8 @@
 //! CREATE has no traversal/filtering semantics (it only ever produces new
 //! rows), so it's executed directly from the AST rather than through this
 //! IR — see `executor::execute_create`. `LIMIT`/`ORDER BY` aren't IR nodes
-//! either — they're executor-level post-processing over the materialized
-//! row set (see `execute_match`), not something the plan tree represents.
+//! either: `execute_match` bounds consumption of a non-blocking plan stream
+//! for LIMIT, while ORDER BY explicitly materializes before sorting.
 
 use crate::ast::Expr;
 

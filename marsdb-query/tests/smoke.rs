@@ -578,6 +578,68 @@ fn execution_options_enforce_rows_expansions_cancellation_and_timeout() {
 }
 
 #[test]
+fn streaming_limit_stops_expansion_but_blocking_order_by_consumes_input() {
+    use std::collections::BTreeMap;
+
+    use marsdb_graph::PropertyValue;
+    use marsdb_query::{ExecutionOptions, QueryError};
+
+    let store = GraphStore::open_memory().unwrap();
+    let hub = store.create_node(&["Hub"], BTreeMap::new()).unwrap();
+    for id in 0..50 {
+        let leaf = store
+            .create_node(
+                &["Leaf"],
+                BTreeMap::from([("id".to_string(), PropertyValue::Int(id))]),
+            )
+            .unwrap();
+        store.create_edge("R", hub, leaf, BTreeMap::new()).unwrap();
+    }
+    let executor = Executor::new(&store);
+
+    // The pull pipeline requests just one expanded row, so the second
+    // relationship is never touched.
+    let limited = parse("MATCH (:Hub)-[:R]->(b) RETURN b LIMIT 1").unwrap();
+    let result = executor
+        .execute_with_options(
+            &limited,
+            &ExecutionOptions {
+                max_relationship_expansions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+
+    // ORDER BY is a blocking operator and must inspect all 50 candidates
+    // before it can know which row belongs first.
+    let ordered = parse("MATCH (:Hub)-[:R]->(b) RETURN b.id ORDER BY b.id LIMIT 1").unwrap();
+    let error = executor
+        .execute_with_options(
+            &ordered,
+            &ExecutionOptions {
+                max_relationship_expansions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, QueryError::ResourceLimit(_)));
+
+    // LIMIT 0 never polls the expansion operator at all.
+    let zero = parse("MATCH (:Hub)-[:R]->(b) RETURN b LIMIT 0").unwrap();
+    let result = executor
+        .execute_with_options(
+            &zero,
+            &ExecutionOptions {
+                max_relationship_expansions: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
 fn semantic_validation_rejects_invalid_names_and_structural_types() {
     let store = GraphStore::open_memory().unwrap();
     for (cypher, expected) in [
