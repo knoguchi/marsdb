@@ -594,6 +594,28 @@ impl<'a> Executor<'a> {
             // instead of just consulting the original incoming `row`.
             let mut row = row.clone();
             for pattern in patterns {
+                // A bare already-bound node token with no relationship at
+                // all (`MATCH (a) CREATE (a)`) does nothing real -- it's
+                // not creating a node (that var already exists) and it's
+                // not connecting anything either, so real Cypher rejects
+                // it outright rather than silently no-op'ing. A token
+                // that *is* a relationship endpoint (`MATCH (a) CREATE
+                // (a)-[:T]->(b)`) is the legitimate reuse case and stays
+                // allowed -- only the zero-hops, whole-pattern-is-just-
+                // this-one-bare-token shape is rejected.
+                if pattern.hops.is_empty() {
+                    if let Some(var) = &pattern.start.var {
+                        if pattern.start.labels.is_empty()
+                            && pattern.start.props.is_empty()
+                            && row.contains_key(var)
+                        {
+                            return Err(QueryError::Semantic(format!(
+                                "'{var}' is already bound — CREATE ({var}) with no relationship \
+                                 and no new labels/properties doesn't create or connect anything"
+                            )));
+                        }
+                    }
+                }
                 let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, &row)?;
                 if let Some(var) = &pattern.start.var {
                     row.insert(var.clone(), Binding::Node(prev_id));
