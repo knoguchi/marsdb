@@ -392,6 +392,82 @@ impl GraphStore {
         Ok(true)
     }
 
+    pub fn remove_node_prop_in_txn(write_txn: &WriteTransaction, id: NodeId, key: &str) -> Result<bool, GraphError> {
+        let bytes_opt: Option<Vec<u8>> = {
+            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
+            found
+        };
+        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let mut record: NodeRecord = decode(&bytes)?;
+        record.props.remove(key);
+        let new_bytes = encode(&record)?;
+        let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+        nodes.insert(id.0, new_bytes.as_slice())?;
+        Ok(true)
+    }
+
+    pub fn remove_edge_prop_in_txn(write_txn: &WriteTransaction, id: EdgeId, key: &str) -> Result<bool, GraphError> {
+        let bytes_opt: Option<Vec<u8>> = {
+            let edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
+            let found = edges.get(id.0)?.map(|g| g.value().to_vec());
+            found
+        };
+        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let mut record: EdgeRecord = decode(&bytes)?;
+        record.props.remove(key);
+        let new_bytes = encode(&record)?;
+        let mut edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
+        edges.insert(id.0, new_bytes.as_slice())?;
+        Ok(true)
+    }
+
+    /// Adds `label` to `id`'s label set -- a no-op (not an error) if it's
+    /// already there, same idempotent-add semantics real Cypher's `SET
+    /// n:Label` has.
+    pub fn add_node_label_in_txn(write_txn: &WriteTransaction, id: NodeId, label: &str) -> Result<bool, GraphError> {
+        let bytes_opt: Option<Vec<u8>> = {
+            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
+            found
+        };
+        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let mut record: NodeRecord = decode(&bytes)?;
+        let label_id = intern_label(write_txn, label)?;
+        if !record.label_ids.contains(&label_id) {
+            record.label_ids.push(label_id);
+            let new_bytes = encode(&record)?;
+            let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            nodes.insert(id.0, new_bytes.as_slice())?;
+            let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            label_index.insert(label_id, id.0)?;
+        }
+        Ok(true)
+    }
+
+    /// Removes `label` from `id`'s label set -- a no-op (not an error) if
+    /// it's not there (label unknown entirely, or known but not on this
+    /// node), same as real Cypher's `REMOVE n:Label`.
+    pub fn remove_node_label_in_txn(write_txn: &WriteTransaction, id: NodeId, label: &str) -> Result<bool, GraphError> {
+        let bytes_opt: Option<Vec<u8>> = {
+            let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
+            found
+        };
+        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(label_id) = lookup_label_id(Txn::Write(write_txn), label)? else { return Ok(true) };
+        let mut record: NodeRecord = decode(&bytes)?;
+        if let Some(pos) = record.label_ids.iter().position(|&l| l == label_id) {
+            record.label_ids.remove(pos);
+            let new_bytes = encode(&record)?;
+            let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
+            nodes.insert(id.0, new_bytes.as_slice())?;
+            let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            label_index.remove(label_id, id.0)?;
+        }
+        Ok(true)
+    }
+
     /// Full scan of all nodes, optionally filtered by label. v1 has no
     /// secondary index on label, so this is a linear scan of the table.
     pub fn all_nodes(&self, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {

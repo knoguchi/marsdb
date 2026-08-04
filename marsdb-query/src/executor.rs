@@ -5,8 +5,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess, QueryClause,
-    QueryPart, RelDirection, ReturnExpr, ReturnItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
-    WithClause, WithExpr,
+    QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir, Statement, Tail, UnwindClause,
+    UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -346,23 +346,8 @@ impl<'a> Executor<'a> {
                 other => unreachable!("{MERGE_CREATED_KEY} tagged internally as Binding::Value(Bool), got {other:?}"),
             };
             let items = if created { &clause.on_create } else { &clause.on_match };
-            for (pa, lit) in items {
-                let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
-                let value = literal_to_value(lit);
-                match binding {
-                    Binding::Node(id) => {
-                        GraphStore::set_node_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                    }
-                    Binding::Edge(id) => {
-                        GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                    }
-                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
-                        return Err(QueryError::UnboundVariable(format!(
-                            "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
-                            pa.var
-                        )))
-                    }
-                }
+            for item in items {
+                apply_set_item(write_txn, row, item)?;
             }
         }
         Ok(())
@@ -508,6 +493,7 @@ impl<'a> Executor<'a> {
                 self.materialize_delete(require_write_txn(txn), vars, &current_rows, true)?
             }
             Some(Tail::Set(items)) => self.materialize_set(require_write_txn(txn), items, &current_rows)?,
+            Some(Tail::Remove(items)) => self.materialize_remove(require_write_txn(txn), items, &current_rows)?,
             Some(Tail::Create(patterns)) => {
                 self.materialize_create(require_write_txn(txn), patterns, &current_rows)?
             }
@@ -1500,27 +1486,12 @@ impl<'a> Executor<'a> {
     fn materialize_set(
         &self,
         write_txn: &WriteTransaction,
-        items: &[(PropAccess, Literal)],
+        items: &[SetItem],
         rows: &[BindingRow],
     ) -> Result<QueryResult, QueryError> {
         for row in rows {
-            for (pa, lit) in items {
-                let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
-                let value = literal_to_value(lit);
-                match binding {
-                    Binding::Node(id) => {
-                        GraphStore::set_node_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                    }
-                    Binding::Edge(id) => {
-                        GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                    }
-                    Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
-                        return Err(QueryError::UnboundVariable(format!(
-                            "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
-                            pa.var
-                        )))
-                    }
-                }
+            for item in items {
+                apply_set_item(write_txn, row, item)?;
             }
         }
         Ok(QueryResult {
@@ -1528,6 +1499,92 @@ impl<'a> Executor<'a> {
             rows: vec![],
         })
     }
+
+    fn materialize_remove(
+        &self,
+        write_txn: &WriteTransaction,
+        items: &[RemoveItem],
+        rows: &[BindingRow],
+    ) -> Result<QueryResult, QueryError> {
+        for row in rows {
+            for item in items {
+                apply_remove_item(write_txn, row, item)?;
+            }
+        }
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
+    }
+}
+
+fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem) -> Result<(), QueryError> {
+    match item {
+        SetItem::Prop(pa, lit) => {
+            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            let value = literal_to_value(lit);
+            match binding {
+                Binding::Node(id) => {
+                    GraphStore::set_node_prop_in_txn(write_txn, *id, &pa.prop, value)?;
+                }
+                Binding::Edge(id) => {
+                    GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
+                }
+                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
+                        pa.var
+                    )))
+                }
+            }
+        }
+        SetItem::Labels(var, labels) => {
+            let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+            let Binding::Node(id) = binding else {
+                return Err(QueryError::UnboundVariable(format!(
+                    "'{var}' isn't a node — SET can only add labels to a node"
+                )));
+            };
+            for label in labels {
+                GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &RemoveItem) -> Result<(), QueryError> {
+    match item {
+        RemoveItem::Prop(pa) => {
+            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            match binding {
+                Binding::Node(id) => {
+                    GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
+                }
+                Binding::Edge(id) => {
+                    GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
+                }
+                Binding::Value(_) | Binding::List(_) | Binding::Path(_) => {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{}' is a WITH-projected scalar, not a node/edge — REMOVE needs a graph binding",
+                        pa.var
+                    )))
+                }
+            }
+        }
+        RemoveItem::Labels(var, labels) => {
+            let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+            let Binding::Node(id) = binding else {
+                return Err(QueryError::UnboundVariable(format!(
+                    "'{var}' isn't a node — REMOVE can only remove labels from a node"
+                )));
+            };
+            for label in labels {
+                GraphStore::remove_node_label_in_txn(write_txn, *id, label)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A statement never mutates anything iff it's a `MATCH ... RETURN` with no
@@ -1945,7 +2002,12 @@ fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {
         (PropertyValue::Int(a), Literal::Float(b)) => cmp_f64(op, *a as f64, *b),
         (PropertyValue::Float(a), Literal::Float(b)) => cmp_f64(op, *a, *b),
         (PropertyValue::Float(a), Literal::Int(b)) => cmp_f64(op, *a, *b as f64),
-        (PropertyValue::String(a), Literal::String(b)) => cmp_ord(op, a.as_str(), b.as_str()),
+        (PropertyValue::String(a), Literal::String(b)) => match op {
+            CompareOp::StartsWith => a.starts_with(b.as_str()),
+            CompareOp::EndsWith => a.ends_with(b.as_str()),
+            CompareOp::Contains => a.contains(b.as_str()),
+            _ => cmp_ord(op, a.as_str(), b.as_str()),
+        },
         (PropertyValue::Bool(a), Literal::Bool(b)) => match op {
             CompareOp::Eq => a == b,
             CompareOp::Ne => a != b,
@@ -1964,6 +2026,10 @@ fn cmp_f64(op: CompareOp, a: f64, b: f64) -> bool {
         CompareOp::Le => a <= b,
         CompareOp::Gt => a > b,
         CompareOp::Ge => a >= b,
+        // Only meaningful for String/String, handled separately in
+        // `compare()` before reaching here -- a numeric operand with one
+        // of these ops is a type mismatch, same as any other.
+        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => false,
     }
 }
 
@@ -1975,6 +2041,7 @@ fn cmp_ord<T: PartialOrd>(op: CompareOp, a: T, b: T) -> bool {
         CompareOp::Le => a <= b,
         CompareOp::Gt => a > b,
         CompareOp::Ge => a >= b,
+        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => false,
     }
 }
 

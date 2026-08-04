@@ -70,7 +70,11 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
             continue;
         }
         if trimmed.starts_with("Scenario:") || trimmed.starts_with("Scenario Outline:") {
-            out.push(parse_scenario(&mut cursor, &feature_name));
+            match parse_scenario(&mut cursor, &feature_name) {
+                Ok((scenario, Some(examples))) => out.extend(expand_outline(scenario, &examples)),
+                Ok((scenario, None)) => out.push(Ok(scenario)),
+                Err(e) => out.push(Err(e)),
+            }
             continue;
         }
         // Anything else at this level (e.g. a Background: block, not used
@@ -147,7 +151,14 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<Scenario, String> {
+/// Parses one `Scenario:`/`Scenario Outline:` block. For an outline, the
+/// returned `Scenario` is a *template* -- `query`/`setup_cypher`/`expected`
+/// still contain literal `<placeholder>` tokens -- paired with the
+/// `Examples:` table (header + data rows) needed to expand it into real
+/// scenarios; see `expand_outline`, called by `parse_feature`.
+type Examples = (Vec<String>, Vec<Vec<String>>);
+
+fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, Option<Examples>), String> {
     let header = cursor.peek_trimmed().expect("caller checked this is a Scenario: line");
     let name = header.trim_start_matches("Scenario Outline:").trim_start_matches("Scenario:").trim().to_string();
     cursor.pos += 1;
@@ -157,6 +168,7 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<Scenario, S
     let mut params = Vec::new();
     let mut query = None;
     let mut expected = None;
+    let mut examples: Option<Examples> = None;
     let mut seen_first_then = false;
 
     loop {
@@ -244,6 +256,12 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<Scenario, S
             if cursor.peek_trimmed().is_some_and(|l| l.starts_with('|')) {
                 cursor.read_table();
             }
+        } else if line.starts_with("Examples:") {
+            cursor.pos += 1;
+            let table = cursor.read_table();
+            let mut iter = table.into_iter();
+            let header = iter.next().unwrap_or_default();
+            examples = Some((header, iter.collect()));
         } else {
             // An unrecognized step -- don't loop forever or misparse the
             // rest of the file; skip just this one line.
@@ -254,7 +272,47 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<Scenario, S
     let initial_graph = initial_graph.ok_or("scenario has no Given ... graph step")?;
     let query = query.ok_or("scenario has no primary When executing query: step")?;
     let expected = expected.ok_or("scenario has no Then ... assertion")?;
-    Ok(Scenario { feature_name: feature_name.to_string(), name, initial_graph, setup_cypher, params, query, expected })
+    let scenario = Scenario { feature_name: feature_name.to_string(), name, initial_graph, setup_cypher, params, query, expected };
+    Ok((scenario, examples))
+}
+
+/// Expands a `Scenario Outline:` template into one real `Scenario` per
+/// `Examples:` data row -- real Cucumber semantics: every `<col>` token
+/// anywhere in the scenario's steps is a literal find-and-replace against
+/// that row's value for `col`, not just in the query text (an expected-
+/// result cell or a parameter value could reference one too, even if no
+/// vendored file currently does).
+fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenario, String>> {
+    let (header, rows) = examples;
+    rows.iter()
+        .map(|row| {
+            let subst = |s: &str| -> String {
+                let mut out = s.to_string();
+                for (col, val) in header.iter().zip(row) {
+                    out = out.replace(&format!("<{col}>"), val);
+                }
+                out
+            };
+            let expected = match &template.expected {
+                Expected::Rows { row_order_matters, list_order_matters, header, rows } => Expected::Rows {
+                    row_order_matters: *row_order_matters,
+                    list_order_matters: *list_order_matters,
+                    header: header.iter().map(|s| subst(s)).collect(),
+                    rows: rows.iter().map(|r| r.iter().map(|c| subst(c)).collect()).collect(),
+                },
+                other => other.clone(),
+            };
+            Ok(Scenario {
+                feature_name: template.feature_name.clone(),
+                name: template.name.clone(),
+                initial_graph: template.initial_graph.clone(),
+                setup_cypher: template.setup_cypher.iter().map(|s| subst(s)).collect(),
+                params: template.params.iter().map(|(k, v)| (k.clone(), subst(v))).collect(),
+                query: subst(&template.query),
+                expected,
+            })
+        })
+        .collect()
 }
 
 fn strip_given(line: &str) -> Option<&str> {
