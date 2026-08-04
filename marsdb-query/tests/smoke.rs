@@ -1260,6 +1260,27 @@ fn str_value(v: &Value) -> String {
     }
 }
 
+fn float_value(v: &Value) -> f64 {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => *f,
+        other => panic!("expected a float, got {other:?}"),
+    }
+}
+
+fn bool_value(v: &Value) -> bool {
+    match v {
+        Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+        other => panic!("expected a bool, got {other:?}"),
+    }
+}
+
+fn list_str_values(v: &Value) -> Vec<String> {
+    match v {
+        Value::List(items) => items.iter().map(str_value).collect(),
+        other => panic!("expected a list, got {other:?}"),
+    }
+}
+
 #[test]
 fn count_star_over_all_rows() {
     let store = GraphStore::open_memory().unwrap();
@@ -3847,4 +3868,223 @@ fn set_property_to_a_param_still_works() {
     marsdb_query::substitute_params(&mut stmt, &params).unwrap();
     let result = Executor::new(&store).execute(&stmt).unwrap();
     assert_eq!(int_value(&result.rows[0][0]), 99);
+}
+
+#[test]
+fn builtin_keys_labels_properties_on_a_node() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:L1:L2 {a: 1, b: 'x'})");
+
+    let keys = run(&store, "MATCH (n) RETURN keys(n)");
+    assert_eq!(list_str_values(&keys.rows[0][0]), vec!["a", "b"]);
+
+    let labels = run(&store, "MATCH (n) RETURN labels(n)");
+    assert_eq!(list_str_values(&labels.rows[0][0]), vec!["L1", "L2"]);
+
+    let props = run(&store, "MATCH (n) RETURN properties(n)");
+    let Value::Map(m) = &props.rows[0][0] else {
+        panic!("expected a map");
+    };
+    assert_eq!(m.len(), 2);
+}
+
+#[test]
+fn builtin_type_on_a_relationship() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:KNOWS]->(:B)");
+    let result = run(&store, "MATCH ()-[r]->() RETURN type(r)");
+    assert_eq!(str_value(&result.rows[0][0]), "KNOWS");
+}
+
+#[test]
+fn builtin_nodes_and_relationships_over_a_path() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:KNOWS]->(:B)");
+    let result = run(
+        &store,
+        "MATCH p = (a:A)-[:KNOWS]->(b:B) RETURN nodes(p), relationships(p)",
+    );
+    let Value::List(nodes) = &result.rows[0][0] else {
+        panic!("expected a list");
+    };
+    assert_eq!(nodes.len(), 2);
+    let Value::List(rels) = &result.rows[0][1] else {
+        panic!("expected a list");
+    };
+    assert_eq!(rels.len(), 1);
+}
+
+#[test]
+fn builtin_size_list_and_string() {
+    let store = GraphStore::open_memory().unwrap();
+    assert_eq!(
+        int_value(&run(&store, "RETURN size([1,2,3])").rows[0][0]),
+        3
+    );
+    assert_eq!(
+        int_value(&run(&store, "RETURN size('hello')").rows[0][0]),
+        5
+    );
+}
+
+#[test]
+fn builtin_range_inclusive_both_ends_and_negative_step() {
+    let store = GraphStore::open_memory().unwrap();
+    let up = run(&store, "RETURN range(1, 5)");
+    let Value::List(items) = &up.rows[0][0] else {
+        panic!("expected a list");
+    };
+    assert_eq!(
+        items.iter().map(int_value).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+
+    let down = run(&store, "RETURN range(10, 0, -2)");
+    let Value::List(items) = &down.rows[0][0] else {
+        panic!("expected a list");
+    };
+    assert_eq!(
+        items.iter().map(int_value).collect::<Vec<_>>(),
+        vec![10, 8, 6, 4, 2, 0]
+    );
+
+    let stmt = parse("RETURN range(1, 5, 0)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("step"));
+}
+
+#[test]
+fn builtin_head_tail_last_on_a_list() {
+    // List literal elements are `Value::Literal`, not `Value::Property`
+    // (they're never round-tripped through storage) -- a local extractor,
+    // not the shared `int_value` (which is deliberately strict about
+    // that distinction for its other callers).
+    fn any_int(v: &Value) -> i64 {
+        match v {
+            Value::Literal(marsdb_query::Literal::Int(i)) => *i,
+            other => panic!("expected an int, got {other:?}"),
+        }
+    }
+
+    let store = GraphStore::open_memory().unwrap();
+    assert_eq!(any_int(&run(&store, "RETURN head([1,2,3])").rows[0][0]), 1);
+    assert_eq!(any_int(&run(&store, "RETURN last([1,2,3])").rows[0][0]), 3);
+    let tail = run(&store, "RETURN tail([1,2,3])");
+    let Value::List(items) = &tail.rows[0][0] else {
+        panic!("expected a list");
+    };
+    assert_eq!(items.iter().map(any_int).collect::<Vec<_>>(), vec![2, 3]);
+
+    // Empty list is null, not an error -- same out-of-bounds convention
+    // as list indexing elsewhere in this codebase.
+    let empty_head = run(&store, "RETURN head([])");
+    assert!(matches!(empty_head.rows[0][0], Value::Null));
+}
+
+#[test]
+fn builtin_string_functions() {
+    let store = GraphStore::open_memory().unwrap();
+    assert_eq!(
+        str_value(&run(&store, "RETURN toUpper('hi')").rows[0][0]),
+        "HI"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN toLower('HI')").rows[0][0]),
+        "hi"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN trim('  hi  ')").rows[0][0]),
+        "hi"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN reverse('abc')").rows[0][0]),
+        "cba"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN replace('hello world', 'world', 'there')").rows[0][0]),
+        "hello there"
+    );
+    let split = run(&store, "RETURN split('a,b,c', ',')");
+    assert_eq!(list_str_values(&split.rows[0][0]), vec!["a", "b", "c"]);
+    assert_eq!(
+        str_value(&run(&store, "RETURN substring('hello', 1, 3)").rows[0][0]),
+        "ell"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN left('hello', 3)").rows[0][0]),
+        "hel"
+    );
+    assert_eq!(
+        str_value(&run(&store, "RETURN right('hello', 3)").rows[0][0]),
+        "llo"
+    );
+}
+
+#[test]
+fn builtin_math_functions() {
+    let store = GraphStore::open_memory().unwrap();
+    assert_eq!(int_value(&run(&store, "RETURN abs(-5)").rows[0][0]), 5);
+    assert_eq!(
+        float_value(&run(&store, "RETURN abs(-5.5)").rows[0][0]),
+        5.5
+    );
+    assert_eq!(
+        float_value(&run(&store, "RETURN ceil(4.1)").rows[0][0]),
+        5.0
+    );
+    assert_eq!(
+        float_value(&run(&store, "RETURN floor(4.9)").rows[0][0]),
+        4.0
+    );
+    assert_eq!(
+        float_value(&run(&store, "RETURN sqrt(16.0)").rows[0][0]),
+        4.0
+    );
+    assert_eq!(int_value(&run(&store, "RETURN sign(-7)").rows[0][0]), -1);
+    assert_eq!(int_value(&run(&store, "RETURN sign(0)").rows[0][0]), 0);
+}
+
+#[test]
+fn builtin_to_float_and_to_boolean() {
+    let store = GraphStore::open_memory().unwrap();
+    assert_eq!(
+        float_value(&run(&store, "RETURN toFloat('12.5')").rows[0][0]),
+        12.5
+    );
+    assert!(bool_value(
+        &run(&store, "RETURN toBoolean('true')").rows[0][0]
+    ));
+    assert!(!bool_value(
+        &run(&store, "RETURN toBoolean('false')").rows[0][0]
+    ));
+}
+
+#[test]
+fn builtin_exists_checks_property_presence() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {num: 42})");
+    assert!(bool_value(
+        &run(&store, "MATCH (n) RETURN exists(n.num)").rows[0][0]
+    ));
+    assert!(!bool_value(
+        &run(&store, "MATCH (n) RETURN exists(n.missing)").rows[0][0]
+    ));
+}
+
+#[test]
+fn builtin_id_returns_an_integer() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N)");
+    let result = run(&store, "MATCH (n) RETURN id(n)");
+    // Just needs to be a real, non-negative integer -- the exact value is
+    // an internal id, not something callers should depend on.
+    assert!(int_value(&result.rows[0][0]) >= 0);
+}
+
+#[test]
+fn unknown_function_name_is_a_semantic_error_not_a_panic() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN totallyMadeUpFunction(1)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
 }

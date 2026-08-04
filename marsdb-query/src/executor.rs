@@ -3801,8 +3801,518 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
                 )))
             }
         }),
+        "keys" => keys_builtin(args.first()),
+        "labels" => labels_builtin(args.first()),
+        "type" => type_builtin(args.first()),
+        "properties" => properties_builtin(args.first()),
+        "id" => id_builtin(args.first()),
+        "size" => size_builtin(args.first()),
+        "nodes" => nodes_builtin(args.first()),
+        "relationships" => relationships_builtin(args.first()),
+        "head" => list_edge_builtin(args.first(), "head", |items| items.first().cloned()),
+        "last" => list_edge_builtin(args.first(), "last", |items| items.last().cloned()),
+        "tail" => match args.first() {
+            Some(Value::List(items)) => Ok(Value::List(
+                items.iter().skip(1).cloned().collect::<Vec<_>>(),
+            )),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => Err(QueryError::Type(format!(
+                "tail() expects a list, got {other:?}"
+            ))),
+        },
+        "range" => range_builtin(args),
+        "exists" => Ok(Value::Literal(Literal::Bool(!matches!(
+            args.first(),
+            None | Some(Value::Null)
+        )))),
+        "toupper" | "upper" => string_transform(args.first(), "toUpper", str::to_uppercase),
+        "tolower" | "lower" => string_transform(args.first(), "toLower", str::to_lowercase),
+        "trim" => string_transform(args.first(), "trim", |s| s.trim().to_string()),
+        "ltrim" => string_transform(args.first(), "ltrim", |s| s.trim_start().to_string()),
+        "rtrim" => string_transform(args.first(), "rtrim", |s| s.trim_end().to_string()),
+        "reverse" => reverse_builtin(args.first()),
+        "replace" => replace_builtin(args),
+        "split" => split_builtin(args),
+        "substring" => substring_builtin(args),
+        "left" => left_right_builtin(args, true),
+        "right" => left_right_builtin(args, false),
+        "tofloat" => match args.first() {
+            Some(v) => to_float(v),
+            None => Ok(Value::Null),
+        },
+        "toboolean" => match args.first() {
+            Some(v) => to_boolean(v),
+            None => Ok(Value::Null),
+        },
+        "abs" => match args.first() {
+            Some(Value::Property(PropertyValue::Int(i)))
+            | Some(Value::Literal(Literal::Int(i))) => {
+                Ok(Value::Property(PropertyValue::Int(i.abs())))
+            }
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => match value_as_f64(other) {
+                Some(f) => Ok(Value::Property(PropertyValue::Float(f.abs()))),
+                None => Err(QueryError::Type(format!(
+                    "abs() expects a number, got {other:?}"
+                ))),
+            },
+        },
+        "ceil" => float_math_fn(args.first(), "ceil", f64::ceil),
+        "floor" => float_math_fn(args.first(), "floor", f64::floor),
+        "round" => float_math_fn(args.first(), "round", f64::round),
+        "sqrt" => float_math_fn(args.first(), "sqrt", f64::sqrt),
+        "sign" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => match value_as_f64(other) {
+                Some(f) => Ok(Value::Property(PropertyValue::Int(if f > 0.0 {
+                    1
+                } else if f < 0.0 {
+                    -1
+                } else {
+                    0
+                }))),
+                None => Err(QueryError::Type(format!(
+                    "sign() expects a number, got {other:?}"
+                ))),
+            },
+        },
         other => Err(QueryError::Semantic(format!("unknown function: {other}"))),
     }
+}
+
+fn keys_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Node(n)) => Value::List(
+            n.props
+                .keys()
+                .map(|k| Value::Property(PropertyValue::String(k.clone())))
+                .collect(),
+        ),
+        Some(Value::Edge(e)) => Value::List(
+            e.props
+                .keys()
+                .map(|k| Value::Property(PropertyValue::String(k.clone())))
+                .collect(),
+        ),
+        Some(Value::Map(m)) => Value::List(
+            m.keys()
+                .map(|k| Value::Property(PropertyValue::String(k.clone())))
+                .collect(),
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "keys() expects a node, relationship, or map, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn labels_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Node(n)) => Value::List(
+            n.labels
+                .iter()
+                .map(|l| Value::Property(PropertyValue::String(l.clone())))
+                .collect(),
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "labels() expects a node, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn type_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Edge(e)) => Value::Property(PropertyValue::String(e.label.clone())),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "type() expects a relationship, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn properties_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Node(n)) => Value::Map(
+            n.props
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::Property(v.clone())))
+                .collect(),
+        ),
+        Some(Value::Edge(e)) => Value::Map(
+            e.props
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::Property(v.clone())))
+                .collect(),
+        ),
+        Some(Value::Map(m)) => Value::Map(m.clone()),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "properties() expects a node, relationship, or map, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn id_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Node(n)) => Value::Property(PropertyValue::Int(n.id.0 as i64)),
+        Some(Value::Edge(e)) => Value::Property(PropertyValue::Int(e.id.0 as i64)),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "id() expects a node or relationship, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn size_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::List(items)) => Value::Property(PropertyValue::Int(items.len() as i64)),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => match as_arith_str(other) {
+            Some(s) => Value::Property(PropertyValue::Int(s.chars().count() as i64)),
+            None => {
+                return Err(QueryError::Type(format!(
+                    "size() expects a list or string, got {other:?}"
+                )))
+            }
+        },
+    })
+}
+
+fn nodes_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Path(elems)) => Value::List(
+            elems
+                .iter()
+                .filter_map(|e| match e {
+                    PathElem::Node(n) => Some(Value::Node(n.clone())),
+                    PathElem::Edge(_) => None,
+                })
+                .collect(),
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "nodes() expects a path, got {other:?}"
+            )))
+        }
+    })
+}
+
+fn relationships_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Path(elems)) => Value::List(
+            elems
+                .iter()
+                .filter_map(|e| match e {
+                    PathElem::Edge(e) => Some(Value::Edge(e.clone())),
+                    PathElem::Node(_) => None,
+                })
+                .collect(),
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "relationships() expects a path, got {other:?}"
+            )))
+        }
+    })
+}
+
+/// Shared shape for `head()`/`last()` -- `[]` (an empty list) is `null`,
+/// same as any other out-of-bounds list access in this codebase
+/// (`apply_index`'s docs), not an error.
+fn list_edge_builtin(
+    arg: Option<&Value>,
+    fn_name: &str,
+    pick: impl Fn(&[Value]) -> Option<Value>,
+) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::List(items)) => pick(items).unwrap_or(Value::Null),
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "{fn_name}() expects a list, got {other:?}"
+            )))
+        }
+    })
+}
+
+/// `range(start, end[, step])` -- both bounds inclusive (real Cypher's own
+/// convention, unlike Rust's exclusive-end ranges), `step` defaults to 1
+/// and may be negative for a descending range. A zero step has no
+/// sensible iteration direction -- a real error, not an infinite/empty
+/// silent result.
+fn range_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let int_arg = |v: &Value, which: &str| -> Result<i64, QueryError> {
+        value_as_i64(v).ok_or_else(|| {
+            QueryError::Type(format!("range()'s {which} must be an integer, got {v:?}"))
+        })
+    };
+    let start = int_arg(
+        args.first()
+            .ok_or_else(|| QueryError::Semantic("range() requires at least 2 arguments".into()))?,
+        "start",
+    )?;
+    let end = int_arg(
+        args.get(1)
+            .ok_or_else(|| QueryError::Semantic("range() requires at least 2 arguments".into()))?,
+        "end",
+    )?;
+    let step = match args.get(2) {
+        Some(v) => int_arg(v, "step")?,
+        None => 1,
+    };
+    if step == 0 {
+        return Err(QueryError::Type("range()'s step can't be 0".into()));
+    }
+    let mut out = Vec::new();
+    let mut i = start;
+    if step > 0 {
+        while i <= end {
+            out.push(Value::Property(PropertyValue::Int(i)));
+            i += step;
+        }
+    } else {
+        while i >= end {
+            out.push(Value::Property(PropertyValue::Int(i)));
+            i += step;
+        }
+    }
+    Ok(Value::List(out))
+}
+
+fn string_transform(
+    arg: Option<&Value>,
+    fn_name: &str,
+    f: impl FnOnce(&str) -> String,
+) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => match as_arith_str(other) {
+            Some(s) => Value::Property(PropertyValue::String(f(s))),
+            None => {
+                return Err(QueryError::Type(format!(
+                    "{fn_name}() expects a string, got {other:?}"
+                )))
+            }
+        },
+    })
+}
+
+fn reverse_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Null) | None => Value::Null,
+        Some(Value::List(items)) => Value::List(items.iter().rev().cloned().collect()),
+        Some(other) => match as_arith_str(other) {
+            Some(s) => Value::Property(PropertyValue::String(s.chars().rev().collect())),
+            None => {
+                return Err(QueryError::Type(format!(
+                    "reverse() expects a string or list, got {other:?}"
+                )))
+            }
+        },
+    })
+}
+
+/// A closure can't express `str_arg`'s independent-lifetimes signature
+/// (the returned `&str` borrows from `v`, not `which`) the way a real
+/// `fn` item can -- see `replace_builtin`'s only caller of this.
+fn replace_str_arg<'a>(v: &'a Value, which: &str) -> Result<&'a str, QueryError> {
+    as_arith_str(v)
+        .ok_or_else(|| QueryError::Type(format!("replace()'s {which} must be a string, got {v:?}")))
+}
+
+fn replace_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let original = replace_str_arg(
+        args.first()
+            .ok_or_else(|| QueryError::Semantic("replace() requires 3 arguments".into()))?,
+        "original",
+    )?;
+    let search = replace_str_arg(
+        args.get(1)
+            .ok_or_else(|| QueryError::Semantic("replace() requires 3 arguments".into()))?,
+        "search",
+    )?;
+    let replacement = replace_str_arg(
+        args.get(2)
+            .ok_or_else(|| QueryError::Semantic("replace() requires 3 arguments".into()))?,
+        "replacement",
+    )?;
+    Ok(Value::Property(PropertyValue::String(
+        original.replace(search, replacement),
+    )))
+}
+
+fn split_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = args
+        .first()
+        .and_then(as_arith_str)
+        .ok_or_else(|| QueryError::Type("split()'s first argument must be a string".into()))?;
+    let delim = args
+        .get(1)
+        .and_then(as_arith_str)
+        .ok_or_else(|| QueryError::Type("split()'s second argument must be a string".into()))?;
+    let parts = if delim.is_empty() {
+        s.split("").filter(|p| !p.is_empty()).collect::<Vec<_>>()
+    } else {
+        s.split(delim).collect::<Vec<_>>()
+    };
+    Ok(Value::List(
+        parts
+            .into_iter()
+            .map(|p| Value::Property(PropertyValue::String(p.to_string())))
+            .collect(),
+    ))
+}
+
+/// `substring(s, start[, length])` -- 0-indexed, both `start` and
+/// `length` clamp to the string's bounds rather than erroring (matches
+/// real Cypher: an out-of-range `substring` call is well-defined, not a
+/// failure). Indexes by Unicode scalar (`char`), not byte offset, so a
+/// multi-byte character never gets split.
+fn substring_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if matches!(args.first(), Some(Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let s = args
+        .first()
+        .and_then(as_arith_str)
+        .ok_or_else(|| QueryError::Type("substring()'s first argument must be a string".into()))?;
+    let chars: Vec<char> = s.chars().collect();
+    let start = args
+        .get(1)
+        .and_then(value_as_i64)
+        .ok_or_else(|| QueryError::Type("substring()'s start must be an integer".into()))?
+        .max(0) as usize;
+    let start = start.min(chars.len());
+    let end = match args.get(2) {
+        Some(v) => {
+            let len = value_as_i64(v)
+                .ok_or_else(|| QueryError::Type("substring()'s length must be an integer".into()))?
+                .max(0) as usize;
+            (start + len).min(chars.len())
+        }
+        None => chars.len(),
+    };
+    Ok(Value::Property(PropertyValue::String(
+        chars[start..end].iter().collect(),
+    )))
+}
+
+/// `left(s, n)`/`right(s, n)` -- the first/last `n` characters, clamped
+/// to the string's length rather than erroring on an over-long `n`.
+fn left_right_builtin(args: &[Value], from_left: bool) -> Result<Value, QueryError> {
+    if matches!(args.first(), Some(Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let fn_name = if from_left { "left" } else { "right" };
+    let s = args.first().and_then(as_arith_str).ok_or_else(|| {
+        QueryError::Type(format!("{fn_name}()'s first argument must be a string"))
+    })?;
+    let n = args
+        .get(1)
+        .and_then(value_as_i64)
+        .ok_or_else(|| {
+            QueryError::Type(format!("{fn_name}()'s second argument must be an integer"))
+        })?
+        .max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    let n = n.min(chars.len());
+    let slice = if from_left {
+        &chars[..n]
+    } else {
+        &chars[chars.len() - n..]
+    };
+    Ok(Value::Property(PropertyValue::String(
+        slice.iter().collect(),
+    )))
+}
+
+fn float_math_fn(
+    arg: Option<&Value>,
+    fn_name: &str,
+    f: impl FnOnce(f64) -> f64,
+) -> Result<Value, QueryError> {
+    Ok(match arg {
+        Some(Value::Null) | None => Value::Null,
+        Some(other) => match value_as_f64(other) {
+            Some(x) => Value::Property(PropertyValue::Float(f(x))),
+            None => {
+                return Err(QueryError::Type(format!(
+                    "{fn_name}() expects a number, got {other:?}"
+                )))
+            }
+        },
+    })
+}
+
+fn to_float(v: &Value) -> Result<Value, QueryError> {
+    Ok(match v {
+        Value::Property(PropertyValue::Int(i)) => Value::Property(PropertyValue::Float(*i as f64)),
+        Value::Property(PropertyValue::Float(f)) => Value::Property(PropertyValue::Float(*f)),
+        Value::Literal(Literal::Int(i)) => Value::Property(PropertyValue::Float(*i as f64)),
+        Value::Literal(Literal::Float(f)) => Value::Property(PropertyValue::Float(*f)),
+        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => {
+            match s.trim().parse::<f64>() {
+                Ok(f) => Value::Property(PropertyValue::Float(f)),
+                Err(_) => Value::Null,
+            }
+        }
+        Value::Property(PropertyValue::Bool(_) | PropertyValue::Null)
+        | Value::Literal(Literal::Bool(_) | Literal::Null)
+        | Value::Null => Value::Null,
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        other => {
+            return Err(QueryError::Type(format!(
+                "toFloat() cannot convert {other:?} to a float"
+            )))
+        }
+    })
+}
+
+fn to_boolean(v: &Value) -> Result<Value, QueryError> {
+    Ok(match v {
+        Value::Property(PropertyValue::Bool(b)) | Value::Literal(Literal::Bool(b)) => {
+            Value::Literal(Literal::Bool(*b))
+        }
+        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Value::Literal(Literal::Bool(true)),
+                "false" => Value::Literal(Literal::Bool(false)),
+                _ => Value::Null,
+            }
+        }
+        Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
+            Value::Null
+        }
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        other => {
+            return Err(QueryError::Type(format!(
+                "toBoolean() cannot convert {other:?} to a boolean"
+            )))
+        }
+    })
 }
 
 /// A quantifier's own per-element truthiness check when it has no `WHERE`
