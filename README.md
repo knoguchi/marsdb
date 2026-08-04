@@ -196,14 +196,14 @@ variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain
 needed to reconstruct a path over `*`-traversal), or `shortestPath()` with
 a minimum hop count greater than 1 (a plain visited-set BFS can't
 correctly answer "shortest path of at least N hops" for N > 1 without a
-different algorithm). Two more gaps the TCK surfaced directly: no
-three-valued NULL logic in `WHERE` (a comparison against a missing/null
-property or a literal `null` evaluates to plain `false`, not "unknown" —
-so `NOT (x STARTS WITH null)` is `true` instead of also unknown/excluded,
-same simplification `value_eq`'s docs already call out for equality); and
-no compile-time semantic validation (an undefined variable/function, or a
+different algorithm). One more gap the TCK surfaced directly: no
+compile-time semantic validation (an undefined variable/function, or a
 wrong-type function argument, is only caught while evaluating an actual
 row — a query whose `MATCH` matches zero rows never gets checked at all).
+`WHERE` does have real three-valued NULL logic (`AND`/`OR`/`NOT` and every
+comparison correctly propagate "unknown" rather than collapsing it to
+`false`) — CASE's `WHEN` and DISTINCT dedup deliberately don't, since they
+need a definite yes/no, not "unknown".
 
 ## Roadmap
 
