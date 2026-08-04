@@ -99,6 +99,18 @@ pub enum ReturnExpr {
     /// out-of-range bounds clamp instead of nulling out, and a start at or
     /// past the (clamped) end yields `[]` rather than erroring.
     Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
+    /// `[x IN <source> WHERE <cond> | <project>]` — `WHERE`/`| project` are
+    /// each independently optional (`[x IN list]` is a legal no-op
+    /// identity-filter comprehension). `where_clause` reuses `WithExpr`
+    /// (not pattern-level `Expr`) for the same reason `UnwindClause`'s own
+    /// filter does — `var` is very often a bare scalar/node/edge, not
+    /// something `Expr::Compare`'s `prop_access`-only LHS can express.
+    ListComp {
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<WithExpr>>,
+        project: Option<Box<ReturnExpr>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

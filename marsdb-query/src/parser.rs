@@ -626,9 +626,13 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     match inner.as_rule() {
         Rule::case_expr => parse_case_expr(inner),
         Rule::function_call => parse_function_call(inner),
-        Rule::list_expr => Ok(ReturnExpr::ListLit(
-            inner.into_inner().map(parse_return_expr).collect::<Result<Vec<_>, _>>()?,
-        )),
+        Rule::list_expr => {
+            let mut items = inner.into_inner().peekable();
+            match items.peek().map(|p| p.as_rule()) {
+                Some(Rule::list_comprehension) => parse_list_comprehension(items.next().unwrap()),
+                _ => Ok(ReturnExpr::ListLit(items.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?)),
+            }
+        }
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
@@ -638,6 +642,32 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         Rule::return_expr => parse_return_expr(inner),
         r => unreachable!("unexpected atom_expr child rule {r:?}"),
     }
+}
+
+/// `list_comprehension = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~
+/// with_expr)? ~ ("|" ~ return_expr)? }` -- the `WHERE`/`|` clauses are
+/// each independently optional, so the remaining children (after the
+/// mandatory bound-variable identifier and source `return_expr`) are
+/// distinguished by rule, not position.
+fn parse_list_comprehension(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let var = inner.next().expect("list_comprehension has a bound variable").as_str().to_string();
+    let source = parse_return_expr(inner.next().expect("list_comprehension has a source return_expr"))?;
+    let mut where_clause = None;
+    let mut project = None;
+    for p in inner {
+        match p.as_rule() {
+            Rule::with_expr => where_clause = Some(Box::new(parse_with_expr(p)?)),
+            Rule::return_expr => project = Some(Box::new(parse_return_expr(p)?)),
+            r => unreachable!("unexpected list_comprehension child rule {r:?}"),
+        }
+    }
+    Ok(ReturnExpr::ListComp {
+        var,
+        source: Box::new(source),
+        where_clause,
+        project,
+    })
 }
 
 fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
