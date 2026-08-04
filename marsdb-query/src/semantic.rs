@@ -206,6 +206,17 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
     crate::executor::validate_return_items(&with.items)?;
     let mut projected = Scope::new();
     for (index, item) in with.items.iter().enumerate() {
+        // Unlike RETURN (where an unaliased expression just gets an
+        // auto-generated column name, e.g. `RETURN 1+1`), every WITH
+        // item that isn't a bare variable reference must have an
+        // explicit `AS alias` -- real Cypher's `NoExpressionAlias`
+        // error. A bare `Var` needs none since its own name already is
+        // the alias (`WITH a` carries `a` forward as itself).
+        if item.alias.is_none() && !matches!(item.expr, ReturnExpr::Var(_)) {
+            return Err(semantic(
+                "WITH requires an alias (AS ...) for every item except a bare variable reference",
+            ));
+        }
         let kind = infer_expr(&item.expr, input)?;
         let name = item_output_name(index, item);
         if projected.insert(name.clone(), kind).is_some() {
@@ -329,10 +340,26 @@ fn project_return(items: &[ReturnItem], scope: &Scope) -> Result<Scope, QueryErr
     crate::executor::validate_return_items(items)?;
     let mut projected = Scope::new();
     for (index, item) in items.iter().enumerate() {
-        projected.insert(
-            item_output_name(index, item),
-            infer_expr(&item.expr, scope)?,
-        );
+        let name = item_output_name(index, item);
+        let kind = infer_expr(&item.expr, scope)?;
+        // Only a real name collision -- an explicit alias reused, or a
+        // bare variable/property-access name repeated -- is a genuine
+        // conflict. An *unaliased* function call/`count(*)` falls back
+        // to a generic placeholder name (`"date(...)"`,`"count(*)"`,
+        // not argument-aware -- see `default_output_name`), so two
+        // different unaliased calls to the same function legitimately
+        // collide there without being a real duplicate (real Cypher
+        // auto-names each by its full source text instead, which
+        // MarsDB's AST-only naming can't reproduce) -- skip the check
+        // for that specific case rather than reject valid queries.
+        let name_is_real =
+            item.alias.is_some() || matches!(item.expr, ReturnExpr::Var(_) | ReturnExpr::Prop(_));
+        let existing = projected.insert(name.clone(), kind);
+        if name_is_real && existing.is_some() {
+            return Err(semantic(format!(
+                "RETURN projects duplicate column name '{name}'"
+            )));
+        }
     }
     Ok(projected)
 }

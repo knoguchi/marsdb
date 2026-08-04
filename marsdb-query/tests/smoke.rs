@@ -2518,6 +2518,52 @@ fn merge_rejects_a_null_valued_pattern_property() {
     );
 }
 
+/// `WITH a, count(*)` -- every WITH item except a bare variable
+/// reference needs an explicit `AS alias`, real Cypher's
+/// `NoExpressionAlias` error. RETURN has no such requirement (an
+/// unaliased expression there just gets an auto-generated column
+/// name).
+#[test]
+fn with_requires_an_alias_for_non_bare_variable_items() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X)");
+    let stmt = parse("MATCH (a) WITH a, count(*) RETURN a").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("alias"),
+        "expected a missing-alias error, got: {err}"
+    );
+
+    // Bare variables need no alias, still works.
+    let result = run(&store, "MATCH (a) WITH a RETURN a");
+    assert_eq!(result.rows.len(), 1);
+    // An explicitly aliased aggregate is fine too.
+    let result = run(&store, "MATCH (a) WITH count(*) AS c RETURN c");
+    assert_eq!(result.rows.len(), 1);
+}
+
+/// `RETURN 1 AS a, 2 AS a` -- reusing the same explicit alias for two
+/// columns is a real error (`ColumnNameConflict`). An unaliased
+/// expression repeated (`RETURN date(x), date(y)`) is *not* a
+/// conflict, even though both currently fall back to the same generic
+/// placeholder column name (`"date(...)"`, not argument-aware) --
+/// only a genuinely meaningful name (an alias, or a bare variable/
+/// property-access name) can actually collide.
+#[test]
+fn return_rejects_duplicate_explicit_column_names() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 AS a, 2 AS a").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("duplicate"),
+        "expected a duplicate-column error, got: {err}"
+    );
+
+    let result = run(&store, "RETURN date('2015-07-21'), date('2015-07-22')");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.columns, vec!["date(...)", "date(...)"]);
+}
+
 #[test]
 fn merge_two_hop_pattern_errors_at_parse_time() {
     let err = parse("MERGE (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)").unwrap_err();
