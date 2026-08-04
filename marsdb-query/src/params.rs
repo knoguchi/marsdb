@@ -66,8 +66,8 @@ fn substitute_merge_clause(
 ) -> Result<(), QueryError> {
     substitute_pattern(&mut m.pattern, params)?;
     for item in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
-        if let SetItem::Prop(_, lit) = item {
-            substitute_literal(lit, params)?;
+        if let SetItem::Prop(_, value) = item {
+            substitute_return_expr(value, params)?;
         }
     }
     if let Some(with) = &mut m.with {
@@ -201,8 +201,8 @@ fn substitute_tail(
         }
         Tail::Set(items, ret) => {
             for item in items {
-                if let SetItem::Prop(_, lit) = item {
-                    substitute_literal(lit, params)?;
+                if let SetItem::Prop(_, value) = item {
+                    substitute_return_expr(value, params)?;
                 }
             }
             substitute_return_tail(ret, params)?;

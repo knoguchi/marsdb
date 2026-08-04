@@ -618,12 +618,12 @@ fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
     let first = inner.next().expect("set_item has at least one child");
     match first.as_rule() {
         Rule::prop_access => {
-            let literal_pair = inner
+            let value_pair = inner
                 .next()
-                .expect("set_item's prop_access form has a literal");
+                .expect("set_item's prop_access form has a return_expr");
             Ok(SetItem::Prop(
                 parse_prop_access(first),
-                parse_literal(literal_pair)?,
+                parse_return_expr(value_pair)?,
             ))
         }
         Rule::set_label_item => {
