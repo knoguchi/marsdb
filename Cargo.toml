@@ -9,7 +9,6 @@ members = [
     "marsdb-crash-harness",
     "marsdb-nl2cypher",
     "marsdb-tck",
-    "marsdb-capi",
 ]
 # marsdb-python builds as a PyO3 extension-module (no libpython link, no
 # runnable test binary) via maturin, not plain `cargo build`/`cargo test` —
