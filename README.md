@@ -73,6 +73,18 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install maturin && maturin develop
 ```
 
+**Go**: not published yet — no `go get`-able module path. Bindings live in
+[`marsdb-go`](./marsdb-go) (cgo, via a C ABI crate,
+[`marsdb-capi`](./marsdb-capi)); see that README for the two-step build
+(Rust cdylib, then `go build`) and a full example.
+
+```go
+db, _ := marsdb.InMemory() // or marsdb.Open(path)
+db.Execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+rows, _ := db.Execute("MATCH (n:Person) RETURN n.name AS name")
+// rows -> []map[string]any{{"name": "Alice"}, {"name": "Bob"}}
+```
+
 ## CLI usage
 
 ```
@@ -125,6 +137,8 @@ marsdb-query     openCypher subset: pest grammar -> AST -> IR -> executor
 marsdb           embeddable public Rust API (Database::open/in_memory/execute)
 marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
+marsdb-capi      C ABI (opaque handle + JSON results), basis for non-Rust bindings
+marsdb-go        Go bindings, via cgo against marsdb-capi
 marsdb-nl2cypher natural-language -> Cypher: schema introspection, prompt building, validate-and-repair
 ```
 
@@ -185,6 +199,12 @@ two strings; an aggregate can't be nested inside a wrapping arithmetic
 expression (`1 + count(x)` is rejected, not silently wrong — `count(x)`
 alone as a whole return item is fine); not yet usable inside a `WHERE`
 clause's comparison operands, only in `RETURN`/`WITH`/`ORDER BY`.
+List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
+from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
+open-ended `list[2..]`/`list[..3]` — unlike indexing, out-of-range slice
+bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
+A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
+list[1]`) is also valid on its own.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`

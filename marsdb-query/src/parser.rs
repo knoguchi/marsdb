@@ -124,6 +124,10 @@ fn clause_with(clause: &QueryClause) -> Option<&WithClause> {
         QueryClause::Match(part) => part.with.as_ref(),
         QueryClause::Unwind(u) => u.with.as_ref(),
         QueryClause::Merge(m) => m.with.as_ref(),
+        // A standalone leading WITH *is* a WITH boundary itself, not a
+        // trailing suffix of one -- still counts toward the "at most one
+        // WITH boundary per statement" cap the same way.
+        QueryClause::With(with) => Some(with),
     }
 }
 
@@ -133,6 +137,7 @@ fn parse_clause(pair: Pair<Rule>) -> Result<QueryClause, QueryError> {
         Rule::match_part => Ok(QueryClause::Match(parse_match_part(inner)?)),
         Rule::unwind_clause => Ok(QueryClause::Unwind(parse_unwind_clause(inner)?)),
         Rule::merge_clause => Ok(QueryClause::Merge(parse_merge_clause(inner)?)),
+        Rule::with_clause => Ok(QueryClause::With(parse_with_clause(inner)?)),
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
 }
@@ -557,7 +562,7 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let mut lhs = parse_atom_expr(inner.next().expect("mul_expr has at least one atom_expr"))?;
+    let mut lhs = parse_postfix_expr(inner.next().expect("mul_expr has at least one postfix_expr"))?;
     while let Some(op_pair) = inner.next() {
         let op = match op_pair.as_str() {
             "*" => ArithOp::Mul,
@@ -565,10 +570,55 @@ fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
             "%" => ArithOp::Mod,
             other => unreachable!("unexpected mul_op {other:?}"),
         };
-        let rhs = parse_atom_expr(inner.next().expect("mul_op has a following atom_expr"))?;
+        let rhs = parse_postfix_expr(inner.next().expect("mul_op has a following postfix_expr"))?;
         lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
     }
     Ok(lhs)
+}
+
+fn parse_postfix_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let mut base = parse_atom_expr(inner.next().expect("postfix_expr has one atom_expr"))?;
+    for postfix in inner {
+        // index_or_slice = { "[" ~ (slice_range | return_expr) ~ "]" }
+        let child = postfix.into_inner().next().expect("index_or_slice has one child");
+        base = match child.as_rule() {
+            Rule::slice_range => {
+                let (start, end) = parse_slice_bounds(child)?;
+                ReturnExpr::Slice(Box::new(base), start, end)
+            }
+            Rule::return_expr => ReturnExpr::Index(Box::new(base), Box::new(parse_return_expr(child)?)),
+            r => unreachable!("unexpected index_or_slice child rule {r:?}"),
+        };
+    }
+    Ok(base)
+}
+
+/// `slice_range = { return_expr? ~ ".." ~ return_expr? }` -- pest omits
+/// the literal `..` (not a named rule), so its parsed children alone
+/// don't say whether a single `return_expr` child is the start or the end
+/// half of `start..`/`..end`. The pair's own source text (captured before
+/// `.into_inner()` consumes it) does: split on the first `..`, and
+/// whichever side is non-blank is present.
+fn parse_slice_bounds(
+    slice_range_pair: Pair<Rule>,
+) -> Result<(Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>), QueryError> {
+    let raw = slice_range_pair.as_str().to_string();
+    let dotdot_at = raw.find("..").expect("slice_range always contains ..");
+    let has_start = !raw[..dotdot_at].trim().is_empty();
+    let has_end = !raw[dotdot_at + 2..].trim().is_empty();
+    let mut bounds = slice_range_pair.into_inner();
+    let start = if has_start {
+        Some(Box::new(parse_return_expr(bounds.next().expect("slice has a start return_expr"))?))
+    } else {
+        None
+    };
+    let end = if has_end {
+        Some(Box::new(parse_return_expr(bounds.next().expect("slice has an end return_expr"))?))
+    } else {
+        None
+    };
+    Ok((start, end))
 }
 
 fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
@@ -576,6 +626,9 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     match inner.as_rule() {
         Rule::case_expr => parse_case_expr(inner),
         Rule::function_call => parse_function_call(inner),
+        Rule::list_expr => Ok(ReturnExpr::ListLit(
+            inner.into_inner().map(parse_return_expr).collect::<Result<Vec<_>, _>>()?,
+        )),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),

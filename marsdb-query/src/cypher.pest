@@ -22,7 +22,12 @@ create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 // correctly as-is: no clauses means no MERGE among them, so a tail is
 // required, exactly as it should be).
 match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ limit_clause? }
-clause        = { unwind_clause | merge_clause | match_part }
+// `with_clause` here (not just as `match_part`'s own trailing suffix) is
+// what lets a statement *start* with `WITH <expr> AS x ...` -- real
+// Cypher allows this (e.g. `WITH [1,2,3] AS list RETURN list[1..3]`, the
+// exact shape most of the TCK's list scenarios use), needing no MATCH at
+// all since it's just projecting/aliasing values, not reading the graph.
+clause        = { unwind_clause | merge_clause | with_clause | match_part }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 
@@ -76,15 +81,30 @@ return_item   = { return_expr ~ (^"AS" ~ identifier)? }
 return_expr = { add_expr }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
-mul_expr    = { atom_expr ~ (mul_op ~ atom_expr)* }
+mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }
 mul_op      = { "*" | "/" | "%" }
+// `[...]` binds tighter than `*`/`/`/`%` -- `list[0] * 2` indexes first,
+// then multiplies -- and chains (`[[1]][0][0]`), via the `*` repeat.
+// `index_or_slice`'s two forms (`slice_range` vs a single index
+// `return_expr`) share one `[...]` wrapper: PEG ordered choice tries
+// `slice_range` first, which requires an actual `..` to match at all, so
+// a plain `list[i]` cleanly falls through to the `return_expr` (single
+// index) alternative instead.
+postfix_expr    = { atom_expr ~ index_or_slice* }
+index_or_slice  = { "[" ~ (slice_range | return_expr) ~ "]" }
+slice_range     = { return_expr? ~ ".." ~ return_expr? }
 // Order matters: case_expr/function_call/prop_access need their extra
 // syntax tried before the bare `identifier` fallback, and `literal` must
 // come before `identifier` too — otherwise the keywords true/false/null
 // would parse as plain variable references instead of literals. The
 // parenthesized form (`(` ~ return_expr ~ `)`) is the only way to
 // override precedence explicitly, e.g. `(a + b) * c`.
-atom_expr   = { case_expr | function_call | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
+// `list_expr` (a general expression list, `[a, b+1, f(x)]`) is tried
+// before `literal`/`identifier` -- unambiguous either way since it starts
+// with `[`, which nothing else here can, but keeping the ordering
+// consistent with this rule's own "more specific syntax first" pattern.
+atom_expr   = { case_expr | function_call | list_expr | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
+list_expr   = { "[" ~ (return_expr ~ ("," ~ return_expr)*)? ~ "]" }
 
 case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }

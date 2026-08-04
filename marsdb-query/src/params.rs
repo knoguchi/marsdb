@@ -46,6 +46,7 @@ fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, Pr
         QueryClause::Match(part) => substitute_query_part(part, params),
         QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
         QueryClause::Merge(m) => substitute_merge_clause(m, params),
+        QueryClause::With(with) => substitute_with_clause(with, params),
     }
 }
 
@@ -198,6 +199,24 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
         ReturnExpr::Arith(l, _, r) => {
             substitute_return_expr(l, params)?;
             substitute_return_expr(r, params)?;
+        }
+        ReturnExpr::ListLit(items) => {
+            for item in items {
+                substitute_return_expr(item, params)?;
+            }
+        }
+        ReturnExpr::Index(base, index) => {
+            substitute_return_expr(base, params)?;
+            substitute_return_expr(index, params)?;
+        }
+        ReturnExpr::Slice(base, start, end) => {
+            substitute_return_expr(base, params)?;
+            if let Some(s) = start {
+                substitute_return_expr(s, params)?;
+            }
+            if let Some(e) = end {
+                substitute_return_expr(e, params)?;
+            }
         }
     }
     Ok(())

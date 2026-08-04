@@ -86,6 +86,19 @@ pub enum ReturnExpr {
     /// widening that is a separate, larger change to the planner's
     /// pre-projection `Filter` pushdown.
     Arith(Box<ReturnExpr>, ArithOp, Box<ReturnExpr>),
+    /// `[a, b, c]` — a general expression list, not `UnwindSource::List`'s
+    /// literal-only cousin (that one's deliberately scoped to right after
+    /// `UNWIND`; this one is a real `ReturnExpr`, usable anywhere one is).
+    ListLit(Vec<ReturnExpr>),
+    /// `list[index]` — a negative index counts from the end
+    /// (`list[-1]` is the last element); out of bounds either way is
+    /// `Null`, not an error (matches real Cypher).
+    Index(Box<ReturnExpr>, Box<ReturnExpr>),
+    /// `list[start..end]` — either bound omitted means "from/to the edge
+    /// of the list". Same negative-counts-from-end rule as `Index`, but
+    /// out-of-range bounds clamp instead of nulling out, and a start at or
+    /// past the (clamped) end yields `[]` rather than erroring.
+    Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +320,12 @@ pub enum QueryClause {
     Match(QueryPart),
     Unwind(UnwindClause),
     Merge(MergeClause),
+    /// A statement-leading `WITH` -- no pattern to match, just projects/
+    /// aliases values (`WITH [1,2,3] AS list ...`). Distinct from the
+    /// trailing `with: Option<WithClause>` every other clause kind
+    /// already carries (that one follows a real pattern match; this one
+    /// has nothing preceding it at all).
+    With(WithClause),
 }
 
 #[derive(Debug, Clone)]
