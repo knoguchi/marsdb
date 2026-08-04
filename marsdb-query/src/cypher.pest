@@ -104,7 +104,17 @@ slice_range     = { return_expr? ~ ".." ~ return_expr? }
 // with `[`, which nothing else here can, but keeping the ordering
 // consistent with this rule's own "more specific syntax first" pattern.
 atom_expr   = { case_expr | function_call | list_expr | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
-list_expr   = { "[" ~ (return_expr ~ ("," ~ return_expr)*)? ~ "]" }
+// `list_comprehension` (`[x IN list WHERE cond | expr]`) is tried before
+// the plain comma-separated form -- ordered choice backtracks cleanly:
+// a plain list's first element only looks like a comprehension's bound
+// variable if it's a bare identifier immediately followed by `IN`, which
+// a plain element list (`[a, b]`, `[a.name]`, `[f(x)]`, ...) never is.
+list_expr           = { "[" ~ (list_comprehension | (return_expr ~ ("," ~ return_expr)*)?) ~ "]" }
+// WHERE reuses `with_expr` (not the pattern-level `where_clause`/`expr`)
+// for the same reason `unwind_clause` does -- the bound variable is a
+// bare scalar/node/edge, not necessarily something `comparison`'s
+// `prop_access`-only LHS can express.
+list_comprehension  = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~ with_expr)? ~ ("|" ~ return_expr)? }
 
 case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }

@@ -203,6 +203,10 @@ List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
 from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
 open-ended `list[2..]`/`list[..3]` — unlike indexing, out-of-range slice
 bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
+List comprehensions (`[x IN list WHERE cond | expr]`, both `WHERE` and
+`| expr` independently optional — `[x IN list]` is a legal no-op filter),
+whose `WHERE` reuses the same expression shape as `WITH ... WHERE`
+(comparisons + `AND`/`OR`/`NOT`, not yet arbitrary boolean expressions).
 A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
 list[1]`) is also valid on its own.
 Two independent `MATCH` parts

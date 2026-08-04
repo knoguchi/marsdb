@@ -1552,6 +1552,43 @@ impl<'a> Executor<'a> {
                 let end_v = end.as_deref().map(|e| self.eval_return_expr(txn, e, row)).transpose()?;
                 apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
             }
+            ReturnExpr::ListComp {
+                var,
+                source,
+                where_clause,
+                project,
+            } => {
+                let source_v = self.eval_return_expr(txn, source, row)?;
+                let items = match source_v {
+                    Value::List(items) => items,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(QueryError::Parse(format!(
+                            "list comprehension source must be a list, got {other:?}"
+                        )))
+                    }
+                };
+                let mut result = Vec::with_capacity(items.len());
+                for item in items {
+                    // A fresh overlay per element -- `var` shadows any
+                    // outer binding of the same name for the duration of
+                    // this one element, same scoping UNWIND already uses.
+                    let mut scoped_row = row.clone();
+                    scoped_row.insert(var.clone(), value_to_binding_restore(&item));
+                    let keep = match where_clause {
+                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)? == Some(true),
+                        None => true,
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    result.push(match project {
+                        Some(p) => self.eval_return_expr(txn, p, &scoped_row)?,
+                        None => item,
+                    });
+                }
+                Ok(Value::List(result))
+            }
         }
     }
 
@@ -1749,7 +1786,9 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
         ReturnExpr::Arith(..) => format!("col{idx}"),
-        ReturnExpr::ListLit(..) | ReturnExpr::Index(..) | ReturnExpr::Slice(..) => format!("col{idx}"),
+        ReturnExpr::ListLit(..) | ReturnExpr::Index(..) | ReturnExpr::Slice(..) | ReturnExpr::ListComp { .. } => {
+            format!("col{idx}")
+        }
     }
 }
 
@@ -1791,6 +1830,13 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
             contains_aggregate(base)
                 || start.as_deref().is_some_and(contains_aggregate)
                 || end.as_deref().is_some_and(contains_aggregate)
+        }
+        // `where_clause` isn't checked -- same scope limitation as
+        // `UnwindClause`'s own filter, which never routes through this
+        // check either; the source/project halves are the ones a real
+        // TCK scenario nests an aggregate in (`size([x IN collect(r) ...])`).
+        ReturnExpr::ListComp { source, project, .. } => {
+            contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate)
         }
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
@@ -2384,7 +2430,10 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             .find(|v| !matches!(v, Value::Null))
             .cloned()
             .unwrap_or(Value::Null)),
-        "tointeger" => Ok(args.first().map(to_integer).unwrap_or(Value::Null)),
+        "tointeger" => match args.first() {
+            Some(v) => to_integer(v),
+            None => Ok(Value::Null),
+        },
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -2400,20 +2449,39 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
     }
 }
 
-fn to_integer(v: &Value) -> Value {
+fn to_integer(v: &Value) -> Result<Value, QueryError> {
+    // A float-formatted string ('1.7', '2.9') isn't an i64, but real
+    // Cypher's toInteger() still accepts it -- parse as a float and
+    // truncate, same as the Float arm below, rather than failing straight
+    // to null the way a bare `i64::parse` would (found via a real TCK
+    // scenario: `toInteger('1.7')` must be `1`, not `null`).
     let as_str_parse = |s: &str| match s.trim().parse::<i64>() {
         Ok(i) => Value::Property(PropertyValue::Int(i)),
-        Err(_) => Value::Null,
+        Err(_) => match s.trim().parse::<f64>() {
+            Ok(f) => Value::Property(PropertyValue::Int(f as i64)),
+            Err(_) => Value::Null,
+        },
     };
-    match v {
+    Ok(match v {
         Value::Property(PropertyValue::Int(i)) => Value::Property(PropertyValue::Int(*i)),
         Value::Property(PropertyValue::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
         Value::Property(PropertyValue::String(s)) => as_str_parse(s),
         Value::Literal(Literal::Int(i)) => Value::Property(PropertyValue::Int(*i)),
         Value::Literal(Literal::Float(f)) => Value::Property(PropertyValue::Int(*f as i64)),
         Value::Literal(Literal::String(s)) => as_str_parse(s),
-        _ => Value::Null,
-    }
+        Value::Property(PropertyValue::Bool(_) | PropertyValue::Null)
+        | Value::Literal(Literal::Bool(_) | Literal::Null)
+        | Value::Null => Value::Null,
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        // A node/edge/list/path has no numeric conversion at all -- a real
+        // error (found via a real TCK scenario expecting exactly this),
+        // not a silent null the way an out-of-range/unparseable scalar is.
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Path(_) => {
+            return Err(QueryError::Parse(format!("toInteger() cannot convert {v:?} to an integer")))
+        }
+    })
 }
 
 /// Sorts `rows` (already-projected `RETURN`/`WITH` output, `columns`
@@ -2541,7 +2609,59 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let end_v = end.as_deref().map(|e| eval_projected_expr(e, row)).transpose()?;
             apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
         }
+        ReturnExpr::ListComp {
+            var,
+            source,
+            where_clause,
+            project,
+        } => {
+            let source_v = eval_projected_expr(source, row)?;
+            let items = match source_v {
+                Value::List(items) => items,
+                Value::Null => return Ok(Value::Null),
+                other => {
+                    return Err(QueryError::Parse(format!(
+                        "list comprehension source must be a list, got {other:?}"
+                    )))
+                }
+            };
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                let mut scoped_row = row.clone();
+                scoped_row.insert(var.clone(), item.clone());
+                let keep = match where_clause {
+                    Some(w) => eval_with_expr_projected(w, &scoped_row)? == Some(true),
+                    None => true,
+                };
+                if !keep {
+                    continue;
+                }
+                result.push(match project {
+                    Some(p) => eval_projected_expr(p, &scoped_row)?,
+                    None => item,
+                });
+            }
+            Ok(Value::List(result))
+        }
     }
+}
+
+/// `eval_with_expr`'s post-projection counterpart -- ORDER BY (the only
+/// caller of `eval_projected_expr`) needs a list comprehension's own
+/// `WHERE` evaluated against already-projected `Value`s, not a graph-bound
+/// `BindingRow`, so this can't reuse the method version (which also needs
+/// a `Txn` to resolve `Node`/`Edge` property lookups the projected values
+/// already carry inline).
+fn eval_with_expr_projected(expr: &WithExpr, row: &HashMap<String, Value>) -> Result<Option<bool>, QueryError> {
+    Ok(match expr {
+        WithExpr::And(l, r) => and3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
+        WithExpr::Or(l, r) => or3(eval_with_expr_projected(l, row)?, eval_with_expr_projected(r, row)?),
+        WithExpr::Not(e) => eval_with_expr_projected(e, row)?.map(|b| !b),
+        WithExpr::Compare(lhs, op, lit) => {
+            let value = eval_projected_expr(lhs, row)?;
+            compare_value(&value, *op, lit)
+        }
+    })
 }
 
 /// `RETURN DISTINCT`'s result-set-level dedup -- structural equality of

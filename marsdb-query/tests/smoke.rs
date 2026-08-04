@@ -234,6 +234,37 @@ fn to_integer_parses_string_and_passes_through_int() {
 }
 
 #[test]
+fn to_integer_parses_a_float_formatted_string_by_truncating() {
+    // Regression: `toInteger('1.7')` used to fail straight to null since
+    // the string-parse path only ever tried an i64 parse.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [2, 2.9, '1.7'] AS things RETURN [n IN things | toInteger(n)] AS x");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 2, 1]);
+}
+
+#[test]
+fn to_integer_on_an_unparseable_string_is_null_not_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH ['2', '2.9', 'foo'] AS numbers RETURN [n IN numbers | toInteger(n)] AS x");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(int(&items[0]), 2);
+            assert_eq!(int(&items[1]), 2);
+            assert!(matches!(items[2], Value::Null));
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_integer_on_a_list_errors_instead_of_silently_nulling() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN toInteger([1, 2])").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("tointeger"));
+}
+
+#[test]
 fn case_when_then_else() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {age: 30})");
@@ -1719,6 +1750,65 @@ fn list_slice_basic_and_open_ended() {
     assert_eq!(list_ints(&result.rows[0][0]), vec![2, 3]);
     assert_eq!(list_ints(&result.rows[0][1]), vec![1, 2]);
     assert_eq!(list_ints(&result.rows[0][2]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_filter_and_project() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x % 2 = 0 | x * 10] AS y",
+    );
+    assert_eq!(list_ints(&result.rows[0][0]), vec![20, 40]);
+}
+
+#[test]
+fn list_comprehension_project_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list | x * 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 4, 6]);
+}
+
+#[test]
+fn list_comprehension_filter_only() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x > 2] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_comprehension_bare_identity() {
+    // No WHERE, no projection -- a legal no-op comprehension.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list] AS y");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
+}
+
+#[test]
+fn list_comprehension_over_collected_nodes_extracts_a_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'original'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN [x IN nodes | x.name] AS oldNames",
+    );
+    match &result.rows[0][0] {
+        Value::List(items) => match &items[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "original"),
+            other => panic!("expected a String property, got {other:?}"),
+        },
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_comprehension_plain_list_with_bare_identifier_is_not_misparsed_as_a_comprehension() {
+    // `x` alone in a list (no `IN` following) must fall through to the
+    // ordinary comma-separated list_expr alternative, not be swallowed
+    // partway through a failed list_comprehension attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH 1 AS x, 2 AS y RETURN [x, y]");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2]);
 }
 
 #[test]
