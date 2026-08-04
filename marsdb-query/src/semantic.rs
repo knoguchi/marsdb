@@ -102,7 +102,44 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
             if let Some(order_by) = order_by {
                 let mut order_scope = input_scope;
                 order_scope.extend(output_scope);
+                // Real Cypher: an aggregate in RETURN's ORDER BY is only
+                // legal when RETURN itself is aggregating (the ORDER BY
+                // then runs against the already-collapsed grouped rows,
+                // same as its own WITH/RETURN items would) -- otherwise
+                // it's a compile-time `InvalidAggregation` error (TCK's
+                // ReturnOrderBy2 [14]), not a runtime one.
+                let tail_items: Option<&[ReturnItem]> = match tail {
+                    Some(Tail::Return(items, _)) => Some(items),
+                    _ => None,
+                };
+                let tail_aggregates = tail_items.is_some_and(crate::executor::has_aggregate);
                 for (expr, _) in order_by {
+                    if tail_aggregates {
+                        // An ORDER BY item that repeats a RETURN item's
+                        // expression verbatim (`RETURN sum(x) AS s ORDER
+                        // BY sum(x)`) refers to that already-aggregated
+                        // item, not a fresh expression -- its kind is
+                        // already known from `output_scope`, and
+                        // re-running `infer_expr` on it would need
+                        // pre-aggregation bindings (like `x`'s row) that
+                        // no longer exist post-grouping (TCK's
+                        // WithOrderBy4 [11]/`ReturnOrderBy3`). Only an
+                        // aggregate that *doesn't* match any RETURN item
+                        // is rejected here.
+                        if tail_items.unwrap().iter().any(|item| item.expr == *expr) {
+                            continue;
+                        }
+                        if crate::executor::contains_aggregate(expr) {
+                            return Err(semantic(
+                                "ORDER BY aggregate does not match any RETURN item",
+                            ));
+                        }
+                    } else if crate::executor::contains_aggregate(expr) {
+                        return Err(semantic(
+                            "ORDER BY cannot use an aggregate function unless RETURN itself \
+                             is aggregating",
+                        ));
+                    }
                     infer_expr(expr, &order_scope)?;
                 }
             }
@@ -240,7 +277,26 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         }
     }
     if let Some(order_by) = &with.order_by {
+        // Same `InvalidAggregation` rule as RETURN's own ORDER BY (see the
+        // `Statement::Match` arm above) -- TCK's WithOrderBy2 [25].
+        let with_aggregates = crate::executor::has_aggregate(&with.items);
         for (expr, _) in order_by {
+            if with_aggregates {
+                // Repeating a WITH item's expression verbatim (see the
+                // matching comment on the RETURN side) -- WithOrderBy4
+                // [11].
+                if with.items.iter().any(|item| item.expr == *expr) {
+                    continue;
+                }
+                if crate::executor::contains_aggregate(expr) {
+                    return Err(semantic("ORDER BY aggregate does not match any WITH item"));
+                }
+            } else if crate::executor::contains_aggregate(expr) {
+                return Err(semantic(
+                    "ORDER BY cannot use an aggregate function unless WITH itself is \
+                     aggregating",
+                ));
+            }
             infer_expr(expr, &projected)?;
         }
     }
