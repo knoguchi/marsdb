@@ -372,7 +372,7 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
 
 fn parse_with_comparison(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let lhs = parse_return_expr(inner.next().expect("with_comparison has a return_expr"))?;
+    let lhs = parse_add_expr(inner.next().expect("with_comparison has an add_expr"))?;
     let op_pair = inner.next().expect("with_comparison has a compare_op");
     let op = parse_compare_op(op_pair);
     let literal = parse_literal(inner.next().expect("with_comparison has a literal"))?;
@@ -569,8 +569,72 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 }
 
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("return_expr has one child (add_expr)");
-    parse_add_expr(inner)
+    let inner = pair.into_inner().next().expect("return_expr has one child (bool_or_expr)");
+    parse_bool_or_expr(inner)
+}
+
+/// `kw_or`/`kw_xor`/`kw_and`/`kw_not` are atomic (see their grammar
+/// comments -- word-boundary lookahead needs no implicit whitespace
+/// inserted), so unlike the pre-existing inline-literal operators
+/// elsewhere in this grammar, they DO produce their own `Pair` and show
+/// up in `.into_inner()`. Filtered out here rather than relied on for
+/// structure -- only the operand rule (`bool_xor_expr`/etc) matters for
+/// building the left-fold.
+fn parse_bool_or_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_xor_expr);
+    let mut lhs = parse_bool_xor_expr(inner.next().expect("bool_or_expr has at least one bool_xor_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::Or(Box::new(lhs), Box::new(parse_bool_xor_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+fn parse_bool_xor_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_and_expr);
+    let mut lhs = parse_bool_and_expr(inner.next().expect("bool_xor_expr has at least one bool_and_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::Xor(Box::new(lhs), Box::new(parse_bool_and_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+fn parse_bool_and_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_not_expr);
+    let mut lhs = parse_bool_not_expr(inner.next().expect("bool_and_expr has at least one bool_not_expr"))?;
+    for rhs_pair in inner {
+        lhs = ReturnExpr::And(Box::new(lhs), Box::new(parse_bool_not_expr(rhs_pair)?));
+    }
+    Ok(lhs)
+}
+
+/// `bool_not_expr = { (kw_not ~ bool_not_expr) | compare_expr }` -- right-
+/// recursive, so (ignoring the atomic `kw_not` token when present) this
+/// either has one `bool_not_expr` child (peel one `NOT`, recurse) or one
+/// `compare_expr` child (base case).
+fn parse_bool_not_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() != Rule::kw_not)
+        .expect("bool_not_expr has a bool_not_expr or compare_expr child");
+    match inner.as_rule() {
+        Rule::bool_not_expr => Ok(ReturnExpr::Not(Box::new(parse_bool_not_expr(inner)?))),
+        Rule::compare_expr => parse_compare_expr(inner),
+        r => unreachable!("unexpected bool_not_expr child rule {r:?}"),
+    }
+}
+
+fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let lhs = parse_add_expr(inner.next().expect("compare_expr has at least one add_expr"))?;
+    match (inner.next(), inner.next()) {
+        (Some(op_pair), Some(rhs_pair)) => {
+            let op = parse_compare_op(op_pair);
+            let rhs = parse_add_expr(rhs_pair)?;
+            Ok(ReturnExpr::Compare(Box::new(lhs), op, Box::new(rhs)))
+        }
+        (None, None) => Ok(lhs),
+        _ => unreachable!("compare_expr's compare_op/add_expr pair must appear together"),
+    }
 }
 
 fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
@@ -693,14 +757,11 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// with_expr)? }` -- shared by `list_comprehension` and `quantifier_expr`,
 /// so this returns the three parsed pieces rather than an `Expr` directly;
 /// each caller wraps them into its own `ReturnExpr` variant.
-fn parse_filter_expr(pair: Pair<Rule>) -> Result<(String, Box<ReturnExpr>, Option<Box<WithExpr>>), QueryError> {
+fn parse_filter_expr(pair: Pair<Rule>) -> Result<(String, Box<ReturnExpr>, Option<Box<ReturnExpr>>), QueryError> {
     let mut inner = pair.into_inner();
     let var = inner.next().expect("filter_expr has a bound variable").as_str().to_string();
     let source = parse_return_expr(inner.next().expect("filter_expr has a source return_expr"))?;
-    let where_clause = inner
-        .next()
-        .map(|w| Ok::<_, QueryError>(Box::new(parse_with_expr(w)?)))
-        .transpose()?;
+    let where_clause = inner.next().map(|w| parse_return_expr(w).map(Box::new)).transpose()?;
     Ok((var, Box::new(source), where_clause))
 }
 

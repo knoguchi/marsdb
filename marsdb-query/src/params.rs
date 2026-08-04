@@ -243,7 +243,7 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
         } => {
             substitute_return_expr(source, params)?;
             if let Some(w) = where_clause {
-                substitute_with_expr(w, params)?;
+                substitute_return_expr(w, params)?;
             }
             if let Some(p) = project {
                 substitute_return_expr(p, params)?;
@@ -254,13 +254,22 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
         } => {
             substitute_return_expr(source, params)?;
             if let Some(w) = where_clause {
-                substitute_with_expr(w, params)?;
+                substitute_return_expr(w, params)?;
             }
         }
         ReturnExpr::MapLit(entries) => {
             for (_, v) in entries {
                 substitute_return_expr(v, params)?;
             }
+        }
+        ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
+            substitute_return_expr(l, params)?;
+            substitute_return_expr(r, params)?;
+        }
+        ReturnExpr::Not(e) => substitute_return_expr(e, params)?,
+        ReturnExpr::Compare(l, _, r) => {
+            substitute_return_expr(l, params)?;
+            substitute_return_expr(r, params)?;
         }
     }
     Ok(())

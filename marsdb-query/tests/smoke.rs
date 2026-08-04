@@ -1935,6 +1935,172 @@ fn map_literal_property_access_on_null_is_null() {
 }
 
 #[test]
+fn boolean_expr_and_or_xor_not() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN true AND false AS a, true OR false AS b, true XOR true AS c, NOT true AS d",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(!bool_val(&result.rows[0][2]));
+    assert!(!bool_val(&result.rows[0][3]));
+}
+
+#[test]
+fn boolean_expr_comparison_as_return_value() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN 1 = 1 AS a, 1 < 2 AS b, 2 > 3 AS c, 'ab' STARTS WITH 'a' AS d");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(!bool_val(&result.rows[0][2]));
+    assert!(bool_val(&result.rows[0][3]));
+}
+
+#[test]
+fn boolean_expr_precedence_and_binds_tighter_than_or() {
+    let store = GraphStore::open_memory().unwrap();
+    // AND binds tighter than OR: false AND false = false, then true OR
+    // false = true -- if OR bound tighter this would instead need to
+    // evaluate (true OR false) AND false = false.
+    let result = run(&store, "RETURN true OR false AND false AS x");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn boolean_expr_not_binds_looser_than_comparison() {
+    let store = GraphStore::open_memory().unwrap();
+    // NOT (1 = 2), not (NOT 1) = 2 -- comparison binds tighter.
+    let result = run(&store, "RETURN NOT 1 = 2 AS x");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn boolean_expr_three_valued_null_propagation() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN null AND false AS a, null AND true AS b, null OR true AS c, null OR false AS d",
+    );
+    assert!(!bool_val(&result.rows[0][0])); // false wins over unknown
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert!(bool_val(&result.rows[0][2])); // true wins over unknown
+    assert!(matches!(result.rows[0][3], Value::Null));
+}
+
+#[test]
+fn boolean_expr_non_bool_operand_errors() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 AND true").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("boolean"));
+}
+
+#[test]
+fn with_where_comparison_followed_by_order_by_still_parses() {
+    // Regression: widening `return_expr` to include an optional trailing
+    // comparison broke `with_comparison`'s own separate `return_expr ~
+    // compare_op ~ literal` shape (used by WITH's own WHERE) -- the
+    // return_expr operand greedily swallowed the whole `y > 10` itself,
+    // leaving nothing for with_comparison's own trailing compare_op to
+    // match. Fixed by narrowing with_comparison's LHS to add_expr.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {idx: 20})");
+    run(&store, "CREATE (:Item {idx: 5})");
+    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 20);
+}
+
+#[test]
+fn return_expr_or_immediately_before_order_by_does_not_swallow_order() {
+    // Regression: a bare `^"OR"` keyword has no word-boundary check, so
+    // it happily matched the first two letters of `ORDER`, mis-parsing
+    // `RETURN x OR y ORDER BY z` as `RETURN (x OR y OR DER) BY z` --
+    // caught because `y ORDER BY y` (nothing between the boolean
+    // expression and the ORDER BY clause) is exactly what a `RETURN`
+    // item's own trailing structure looks like.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {idx: 2})");
+    run(&store, "CREATE (:Item {idx: 1})");
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx = 1 OR n.idx = 2 AS x, n.idx ORDER BY n.idx DESC");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(int(&result.rows[0][1]), 2);
+    assert_eq!(int(&result.rows[1][1]), 1);
+}
+
+#[test]
+fn list_equality_is_structural_not_null() {
+    // Regression: compare_values used to reduce List/Map operands
+    // through value_to_property_value, which collapses both to
+    // PropertyValue::Null -- every list/map `=`/`<>` comparison silently
+    // became `null` regardless of actual content.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN [1, 2] = [1, 2] AS a, [1, 2] = [1, 3] AS b, [null] = [1] AS c");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+}
+
+#[test]
+fn list_ordering_is_lexicographic() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN [1, 0] >= [1] AS a, [1, null] >= [1] AS b, [1, 2] >= [1, null] AS c");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+}
+
+#[test]
+fn boolean_ordering_false_less_than_true() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN false <= true AS x, false > true AS y");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn type_mismatch_comparison_semantics_differ_by_operator() {
+    // Regression: a single blanket "type mismatch -> false" was wrong for
+    // three different operator families -- confirmed against real TCK
+    // scenarios: `=` on mismatched types is false, `<>` is true (never
+    // equal, so "not equal" holds), ordering is null (no defined order),
+    // and STARTS WITH/ENDS WITH/CONTAINS on a non-string operand is also
+    // null, not false.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN (1 = 'a') AS a, (1 <> 'a') AS b, ('1.0' < 1.0) AS c, ('abc' STARTS WITH true) AS d");
+    assert!(!bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+    assert!(matches!(result.rows[0][2], Value::Null));
+    assert!(matches!(result.rows[0][3], Value::Null));
+}
+
+#[test]
+fn list_comprehension_bare_where_now_parses() {
+    // Regression: previously `filter_expr`'s WHERE reused WithExpr, which
+    // only ever wrapped a single Compare -- a bare boolean value (`WHERE
+    // x`/`WHERE true`) failed to parse. Now that boolean logic is a real
+    // ReturnExpr, this works.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [true, false, true] AS list RETURN [x IN list WHERE x] AS y");
+    match &result.rows[0][0] {
+        Value::List(items) => assert_eq!(items.len(), 2),
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn quantifier_bare_where_now_parses() {
+    // Just the parsing gap this task fixes -- none() on an empty list is
+    // vacuously true regardless of the WHERE condition (real Cypher
+    // semantics, already covered by quantifier_none_on_empty_list_is_true).
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN none(x IN [] WHERE true) AS a, none(x IN [] WHERE false) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(bool_val(&result.rows[0][1]));
+}
+
+#[test]
 fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     // Regression guard: unlike single-element indexing, out-of-range slice
     // bounds clamp to [0, len] rather than producing null.
