@@ -2865,6 +2865,26 @@ fn duration_plus_minus_scale() {
 }
 
 #[test]
+fn temporal_arithmetic_overflow_returns_errors_instead_of_panicking() {
+    let store = GraphStore::open_memory().unwrap();
+    let cases = [
+        "RETURN duration({months: 9223372036854775807}) + duration({months: 1})",
+        "RETURN duration({months: 9223372036854775807}) - duration({months: -1})",
+        "RETURN date('9999-12-31') + duration({days: 9223372036854775807})",
+        "RETURN date('9999-12-31') - duration({days: -9223372036854775808})",
+    ];
+
+    for cypher in cases {
+        let stmt = parse(cypher).unwrap();
+        let err = Executor::new(&store).execute(&stmt).unwrap_err();
+        assert!(
+            err.to_string().contains("overflow") || err.to_string().contains("out-of-range"),
+            "unexpected error for {cypher:?}: {err}"
+        );
+    }
+}
+
+#[test]
 fn duration_component_access() {
     // Temporal5 scenario [7].
     let store = GraphStore::open_memory().unwrap();
