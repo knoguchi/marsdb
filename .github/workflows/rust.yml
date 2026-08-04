@@ -62,6 +62,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: marsdb-go/go.mod
+          # marsdb-go has zero external dependencies (stdlib + cgo only) --
+          # no go.sum ever exists to key module caching against, which
+          # otherwise prints a harmless but noisy "Restore cache failed"
+          # warning on every run.
+          cache: false
       - name: Build Rust workspace
         run: cargo build --workspace --verbose
       - name: Build and test Python binding

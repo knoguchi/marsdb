@@ -3759,12 +3759,22 @@ fn bracketless_relationship_arrows_match_the_bracketed_forms() {
 }
 
 #[test]
-fn create_with_bracketless_arrow_makes_an_anonymous_untyped_relationship() {
-    // `resolve_or_create_node`/`materialize_create` default an unnamed
-    // relationship type to "REL" -- confirms `CREATE (:A)-->(:B)` reaches
-    // that same path, not some special-cased no-op.
+fn create_with_bracketless_arrow_requires_a_relationship_type() {
+    // Unlike MATCH (where an untyped hop just means "any relationship"),
+    // CREATE always makes exactly one new relationship -- real Cypher
+    // requires an explicit `:TYPE` there, never defaults/infers one, and
+    // that's true for `-->` the same as `-[]->` (TCK's Create2 scenario
+    // [18], "Fail when creating a relationship without a type").
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (:A)-->(:B)");
+    let stmt = parse("CREATE (:A)-->(:B)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
+}
+
+#[test]
+fn create_with_a_typed_relationship_still_works() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:REL]->(:B)");
     let out = run(&store, "MATCH ()-[:REL]->() RETURN count(*)");
     assert_eq!(out.rows.len(), 1);
     assert_eq!(int_value(&out.rows[0][0]), 1);

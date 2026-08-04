@@ -7,7 +7,8 @@ numbers aren't a competitive comparison, they're here to track regressions
 and show where the current architecture's cost is.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
-`cypher_ops`, `ldbc_ops`, `aggregate_ops`, and `concurrency_ops`).
+`cypher_ops`, `ldbc_ops`, `aggregate_ops`, `concurrency_ops`, and
+`index_ops`).
 
 ## Storage layer (`marsdb-graph/benches/graph_ops.rs`)
 
@@ -145,6 +146,61 @@ truncating, so it can't be measured at the same dataset sizes as the rest
 of this table without tripping that guard.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
+
+## Property indexes (`marsdb/benches/index_ops.rs`)
+
+Measured 2026-08-04. `MATCH (n:Item {idx: N}) RETURN n.idx` with and
+without `CREATE INDEX ON :Item(idx)` declared — the direct payoff of
+`IndexSeek` (`marsdb-query/src/planner.rs::apply_index_seeks`) over a
+label scan + filter:
+
+| Dataset size | Unindexed scan | Index seek | Speedup |
+|---|---|---|---|
+| 100 | 78.6 µs | 7.36 µs | 10.7x |
+| 1,000 | 828 µs | 7.52 µs | 110x |
+| 10,000 | 8.43 ms | 7.87 µs | 1,071x |
+| 100,000 | 92.4 ms | 7.72 µs | ~12,000x |
+
+The index seek stays flat (7.4-7.9 µs) regardless of dataset size — it
+reads exactly the matching entries via `PROPERTY_INDEX`, never touches
+the other 99,999 rows — while the unindexed scan grows linearly, since
+every row has to be decoded and filtered. This is the whole reason the
+index exists; the gap widens with table size, not stays constant.
+
+Cardinality-based index selection (choosing the most selective of
+several indexed `WHERE` conjuncts, `GraphStore::index_match_count_in_txn`
+— see `marsdb-query/src/planner.rs::apply_index_seeks`'s candidate
+selection): 50,000 `Person` nodes, `country = 'US'` matching ~100% of
+rows and `email` matching exactly one, both compared against
+`WHERE n.country = 'US' AND n.email = '...'`:
+
+| Indexes declared | Result |
+|---|---|
+| Only `country` (low selectivity — no better option exists) | 44.1 ms |
+| Both `country` and `email` (planner picks `email`) | 12.0 µs |
+
+~3,675x — this is the real, measured version of the same comparison
+originally done ad hoc while building the feature (44ms → microseconds),
+now a real, repeatable `criterion` benchmark instead of a one-off
+scratch measurement.
+
+`LIMIT` pushed into a non-unique index seek's own storage lookup
+(`stream_index_seek`'s budget-aware `storage_limit`, stops the multimap
+walk itself rather than materializing every match first): 1,000 `Tokyo`-
+valued rows out of N total, `MATCH (n:Item {city: 'Tokyo'}) RETURN n.idx`
+with and without `LIMIT 1`:
+
+| Dataset size | `LIMIT 1` | Unbounded | Speedup |
+|---|---|---|---|
+| 1,000 | 8.53 µs | 831 µs | 97x |
+| 10,000 | 8.54 µs | 8.68 ms | 1,016x |
+| 100,000 | 8.74 µs | 88.2 ms | ~10,100x |
+
+Same flat-vs-linear shape as the first table, for the same reason:
+`LIMIT 1` stops after the first storage-level match instead of
+collecting all 1,000 `Tokyo` rows before truncating.
+
+Reproduce: `cargo bench -p marsdb --bench index_ops`.
 
 ## Aggregation (`marsdb/benches/aggregate_ops.rs`)
 
