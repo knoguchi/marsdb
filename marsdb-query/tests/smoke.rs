@@ -2401,6 +2401,27 @@ fn to_string_and_round_trip() {
 }
 
 #[test]
+fn to_string_rejects_invalid_types() {
+    // TypeConversion4 scenario [10]'s five examples: list, map, node,
+    // relationship, and path values are runtime type errors, not null.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n)-[:T]->(m)");
+    for query in [
+        "RETURN toString([])",
+        "RETURN toString({})",
+        "MATCH (n) RETURN toString(n)",
+        "MATCH ()-[r:T]->() RETURN toString(r)",
+        "MATCH p = ()-[:T]->() RETURN toString(p)",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+
+    let result = run(&store, "RETURN toString(null)");
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
 fn stored_date_survives_the_storage_round_trip() {
     // Temporal4 scenario [1] -- a Date stored as a node property comes
     // back as the same Date (not degraded to a plain Int/String), the

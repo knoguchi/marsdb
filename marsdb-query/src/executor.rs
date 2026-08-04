@@ -2889,7 +2889,10 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             Some(v) => to_integer(v),
             None => Ok(Value::Null),
         },
-        "tostring" => Ok(args.first().map(to_string_value).unwrap_or(Value::Null)),
+        "tostring" => match args.first() {
+            Some(v) => to_string_value(v),
+            None => Ok(Value::Null),
+        },
         "date" => date_builtin(args),
         "duration" => duration_builtin(args),
         // The dominant real-world use of shortestPath() is measuring it
@@ -3018,10 +3021,10 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
 /// `toString(...)` — Int/Float/Bool render the same as their `Display`
 /// impl already does elsewhere (`marsdb-cli`'s `format_property`/
 /// `format_literal`); `Date`/`Duration` go through `temporal::format_*`.
-/// An unconvertible argument (a node, a list, ...) falls back to `Null`
-/// rather than erroring, matching `to_integer`'s existing convention for
-/// the same situation, not a new pattern introduced here.
-fn to_string_value(v: &Value) -> Value {
+/// Null propagates, while graph, collection, map, and path values are a
+/// runtime type error rather than silently becoming null (TypeConversion4
+/// scenario [10]).
+fn to_string_value(v: &Value) -> Result<Value, QueryError> {
     let s = match v {
         Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => s.clone(),
         Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => i.to_string(),
@@ -3031,9 +3034,17 @@ fn to_string_value(v: &Value) -> Value {
         Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => {
             temporal::format_duration(*months, *days, *seconds, *nanos)
         }
-        _ => return Value::Null,
+        Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
+            return Ok(Value::Null);
+        }
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+            return Err(QueryError::Parse(format!("toString() cannot convert {v:?} to a string")))
+        }
     };
-    Value::Property(PropertyValue::String(s))
+    Ok(Value::Property(PropertyValue::String(s)))
 }
 
 /// `date()` — zero args (today, UTC — see `temporal::today_epoch_day`'s
