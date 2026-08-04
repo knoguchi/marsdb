@@ -5076,23 +5076,126 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
 
 /// `date({year, month, day})` — the calendar construction form only (see
 /// `date_builtin`'s docs for what's deliberately missing).
+/// Pulls `(year, month, day)` out of a `Date`/`LocalDateTime`/`DateTime`
+/// value -- the "base" a `date`/`datetime`/`localdatetime` map key
+/// projects its calendar fields from (`date({date: other, day: 5})`,
+/// `localdatetime({date: other, hour: 10, ...})`, ...). `DateTime` uses
+/// its *local* (offset-adjusted) reading, matching every other
+/// `DateTime` calendar-component access (see `date_time_component`'s
+/// docs).
+fn extract_date_base(key: &str, v: &Value) -> Result<(i32, u32, u32), QueryError> {
+    let ymd = |epoch_day: i32| {
+        (
+            temporal::date_component(epoch_day, "year").unwrap() as i32,
+            temporal::date_component(epoch_day, "month").unwrap() as u32,
+            temporal::date_component(epoch_day, "day").unwrap() as u32,
+        )
+    };
+    match v {
+        Value::Property(PropertyValue::Date(d)) => Ok(ymd(*d)),
+        Value::Property(PropertyValue::LocalDateTime { epoch_seconds, .. }) => Ok((
+            temporal::date_time_calendar_component(*epoch_seconds, "year").unwrap() as i32,
+            temporal::date_time_calendar_component(*epoch_seconds, "month").unwrap() as u32,
+            temporal::date_time_calendar_component(*epoch_seconds, "day").unwrap() as u32,
+        )),
+        Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            offset_seconds,
+            ..
+        }) => {
+            let local = epoch_seconds + *offset_seconds as i64;
+            Ok((
+                temporal::date_time_calendar_component(local, "year").unwrap() as i32,
+                temporal::date_time_calendar_component(local, "month").unwrap() as u32,
+                temporal::date_time_calendar_component(local, "day").unwrap() as u32,
+            ))
+        }
+        other => Err(QueryError::Type(format!(
+            "'{key}' must be a Date, LocalDateTime, or DateTime, got {other:?}"
+        ))),
+    }
+}
+
+/// Pulls `(hour, minute, second, nanos, offset_seconds)` out of a
+/// `LocalTime`/`Time`/`LocalDateTime`/`DateTime` value -- the "base" a
+/// `time`/`datetime` map key projects its clock fields from. `nanos`
+/// here is just the nanosecond-of-second remainder (not the whole
+/// nanos-of-day), matching the map constructors' own `nanosecond` field.
+/// `offset_seconds` is `Some` only for `Time`/`DateTime` -- callers use
+/// it as the *default* offset when building a `Time`/`DateTime`, unless
+/// overridden by an explicit `timezone` key.
+fn extract_time_base(
+    key: &str,
+    v: &Value,
+) -> Result<(i64, i64, i64, i64, Option<i32>), QueryError> {
+    let hms_nanos = |nanos_of_day: i64| {
+        (
+            temporal::local_time_component(nanos_of_day, "hour").unwrap(),
+            temporal::local_time_component(nanos_of_day, "minute").unwrap(),
+            temporal::local_time_component(nanos_of_day, "second").unwrap(),
+            temporal::local_time_component(nanos_of_day, "nanosecond").unwrap(),
+        )
+    };
+    match v {
+        Value::Property(PropertyValue::LocalTime(n)) => {
+            let (h, m, s, ns) = hms_nanos(*n);
+            Ok((h, m, s, ns, None))
+        }
+        Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }) => {
+            let (h, m, s, ns) = hms_nanos(*nanos_of_day);
+            Ok((h, m, s, ns, Some(*offset_seconds)))
+        }
+        Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }) => {
+            let (_, nanos_of_day) = temporal::split_epoch_seconds(*epoch_seconds);
+            let (h, m, s, _) = hms_nanos(nanos_of_day);
+            Ok((h, m, s, *nanos as i64, None))
+        }
+        Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }) => {
+            let local = epoch_seconds + *offset_seconds as i64;
+            let (_, nanos_of_day) = temporal::split_epoch_seconds(local);
+            let (h, m, s, _) = hms_nanos(nanos_of_day);
+            Ok((h, m, s, *nanos as i64, Some(*offset_seconds)))
+        }
+        other => Err(QueryError::Type(format!(
+            "'{key}' must be a LocalTime, Time, LocalDateTime, or DateTime, got {other:?}"
+        ))),
+    }
+}
+
 fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
-    const ALLOWED: &[&str] = &["year", "month", "day"];
+    const ALLOWED: &[&str] = &["year", "month", "day", "date"];
     if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
         return Err(QueryError::Type(format!(
             "date({{...}}) key '{bad}' isn't supported -- MarsDB only builds a Date from a calendar {{year, month, \
-             day}} map, not week-date/quarter/ordinal-day construction"
+             day}} map (optionally projected from another temporal value via a 'date' key), not week-date/\
+             quarter/ordinal-day construction"
         )));
     }
+    let base = m
+        .get("date")
+        .map(|v| extract_date_base("date", v))
+        .transpose()?;
     let integer_field = |key: &str, value: &Value| {
         value_as_i64(value)
             .ok_or_else(|| QueryError::Type(format!("date({{...}})'s '{key}' must be an integer")))
     };
-    let year_raw = integer_field(
-        "year",
-        m.get("year")
-            .ok_or_else(|| QueryError::Type("date({...}) requires a 'year' key".into()))?,
-    )?;
+    let year_raw = match m.get("year") {
+        Some(v) => integer_field("year", v)?,
+        None => match base {
+            Some((y, _, _)) => y as i64,
+            None => return Err(QueryError::Type("date({...}) requires a 'year' key".into())),
+        },
+    };
     let year = i32::try_from(year_raw).map_err(|_| {
         QueryError::Type(format!(
             "date({{...}})'s 'year' is out of range: {year_raw}"
@@ -5100,7 +5203,7 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
     })?;
     let month_raw = match m.get("month") {
         Some(v) => integer_field("month", v)?,
-        None => 1,
+        None => base.map_or(1, |(_, m, _)| m as i64),
     };
     let month = u32::try_from(month_raw).map_err(|_| {
         QueryError::Type(format!(
@@ -5109,7 +5212,7 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
     })?;
     let day_raw = match m.get("day") {
         Some(v) => integer_field("day", v)?,
-        None => 1,
+        None => base.map_or(1, |(_, _, d)| d as i64),
     };
     let day = u32::try_from(day_raw).map_err(|_| {
         QueryError::Type(format!("date({{...}})'s 'day' is out of range: {day_raw}"))
@@ -5226,8 +5329,73 @@ fn int_field(m: &BTreeMap<String, Value>, key: &str, default: i64) -> Result<i64
     }
 }
 
+/// Computes `(hour, minute, second, nanos, offset_seconds)` for a
+/// `localtime`/`time`/`localdatetime`/`datetime` map constructor -- a
+/// `time`/`datetime` key (if present) projects its clock fields as the
+/// default, explicit `hour`/`minute`/`second`/`millisecond`/
+/// `microsecond`/`nanosecond` keys override individual fields on top of
+/// that (`{time: other, second: 42}` keeps everything from `other`
+/// except `second`). No base key falls back to all-zero defaults,
+/// matching the plain (non-projecting) map form.
+///
+/// If the base carries an offset (`Time`/`DateTime`) and an explicit
+/// `timezone` key names a *different* one, the wall-clock is shifted
+/// first to preserve the same instant (`{time: other, timezone:
+/// '+05:00'}` on a `+01:00` base advances the hour by 4) -- real
+/// Cypher's rule, confirmed against Temporal3's own examples -- and
+/// only *then* do explicit hour/minute/second overrides apply, on top
+/// of the shifted result, not the original.
+fn clock_fields_from_map(
+    m: &BTreeMap<String, Value>,
+) -> Result<(i64, i64, i64, i64, Option<i32>), QueryError> {
+    let (base_h, base_m, base_s, base_ns, base_offset) = if let Some(v) = m.get("time") {
+        extract_time_base("time", v)?
+    } else if let Some(v) = m.get("datetime") {
+        extract_time_base("datetime", v)?
+    } else {
+        (0, 0, 0, 0, None)
+    };
+    let effective_offset = match m.get("timezone") {
+        Some(v) => Some(offset_from_timezone_value(v)?),
+        None => base_offset,
+    };
+    let (base_h, base_m, base_s, base_ns) = match (base_offset, effective_offset) {
+        (Some(from), Some(to)) if from != to => {
+            let nanos_of_day = base_h * 3_600_000_000_000
+                + base_m * 60_000_000_000
+                + base_s * 1_000_000_000
+                + base_ns;
+            let shifted =
+                (nanos_of_day + (to - from) as i64 * 1_000_000_000).rem_euclid(86_400_000_000_000);
+            (
+                shifted / 3_600_000_000_000,
+                (shifted / 60_000_000_000) % 60,
+                (shifted / 1_000_000_000) % 60,
+                shifted % 1_000_000_000,
+            )
+        }
+        _ => (base_h, base_m, base_s, base_ns),
+    };
+    let sub_second_given = m.contains_key("millisecond")
+        || m.contains_key("microsecond")
+        || m.contains_key("nanosecond");
+    let nanos = if sub_second_given {
+        sub_second_nanos_from_map(m)?
+    } else {
+        base_ns
+    };
+    Ok((
+        int_field(m, "hour", base_h)?,
+        int_field(m, "minute", base_m)?,
+        int_field(m, "second", base_s)?,
+        nanos,
+        effective_offset,
+    ))
+}
+
 /// `localtime(...)` -- zero args (now, UTC), a string (`temporal::
-/// parse_local_time`), a map (`localtime({hour: 21, minute: 40, ...})`),
+/// parse_local_time`), a map (`localtime({hour: 21, minute: 40, ...})`,
+/// optionally projected from another temporal value via a `time` key),
 /// or another `LocalTime` (identity, e.g. round-tripping through
 /// `toString`).
 fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
@@ -5262,20 +5430,16 @@ fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
             "millisecond",
             "microsecond",
             "nanosecond",
+            "time",
         ];
         if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
             return Err(QueryError::Type(format!(
                 "localtime({{...}}) key '{bad}' isn't a recognized field"
             )));
         }
-        let nanos = sub_second_nanos_from_map(m)?;
-        let t = temporal::local_time_nanos_from_fields(
-            int_field(m, "hour", 0)?,
-            int_field(m, "minute", 0)?,
-            int_field(m, "second", 0)?,
-            nanos,
-        )
-        .ok_or_else(|| QueryError::Type("localtime({...}) has an out-of-range field".into()))?;
+        let (hour, minute, second, nanos, _) = clock_fields_from_map(m)?;
+        let t = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
+            .ok_or_else(|| QueryError::Type("localtime({...}) has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::LocalTime(t)));
     }
     Err(QueryError::Type(format!(
@@ -5340,24 +5504,17 @@ fn time_builtin(args: &[Value]) -> Result<Value, QueryError> {
             "microsecond",
             "nanosecond",
             "timezone",
+            "time",
         ];
         if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
             return Err(QueryError::Type(format!(
                 "time({{...}}) key '{bad}' isn't a recognized field"
             )));
         }
-        let offset_seconds = match m.get("timezone") {
-            Some(v) => offset_from_timezone_value(v)?,
-            None => 0,
-        };
-        let nanos = sub_second_nanos_from_map(m)?;
-        let nanos_of_day = temporal::local_time_nanos_from_fields(
-            int_field(m, "hour", 0)?,
-            int_field(m, "minute", 0)?,
-            int_field(m, "second", 0)?,
-            nanos,
-        )
-        .ok_or_else(|| QueryError::Type("time({...}) has an out-of-range field".into()))?;
+        let (hour, minute, second, nanos, offset_seconds) = clock_fields_from_map(m)?;
+        let offset_seconds = offset_seconds.unwrap_or(0);
+        let nanos_of_day = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
+            .ok_or_else(|| QueryError::Type("time({...}) has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::Time {
             nanos_of_day,
             offset_seconds,
@@ -5427,16 +5584,16 @@ fn local_date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     if let Value::Map(m) = arg {
         let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
-        let nanos_field = sub_second_nanos_from_map(m)?;
+        let (hour, minute, second, nanos, _) = clock_fields_from_map(m)?;
         let (epoch_seconds, nanos) =
             temporal::local_date_time_from_fields(temporal::CalendarDateTime {
                 year,
                 month,
                 day,
-                hour: int_field(m, "hour", 0)?,
-                minute: int_field(m, "minute", 0)?,
-                second: int_field(m, "second", 0)?,
-                nanos: nanos_field,
+                hour,
+                minute,
+                second,
+                nanos,
             })
             .ok_or_else(|| {
                 QueryError::Type("localdatetime({...}) has an out-of-range field".into())
@@ -5462,11 +5619,30 @@ const DATE_TIME_ALLOWED_KEYS: &[&str] = &[
     "microsecond",
     "nanosecond",
     "timezone",
+    "date",
+    "time",
+    "datetime",
 ];
+
+/// A `date`/`datetime` map key's projected `(year, month, day)`
+/// default -- `date` takes priority if both are somehow present, else
+/// `datetime` (which carries both date and time fields at once, see
+/// `extract_date_base`/`extract_time_base`'s shared acceptance of
+/// `LocalDateTime`/`DateTime`).
+fn date_base_from_map(m: &BTreeMap<String, Value>) -> Result<Option<(i32, u32, u32)>, QueryError> {
+    if let Some(v) = m.get("date") {
+        return Ok(Some(extract_date_base("date", v)?));
+    }
+    if let Some(v) = m.get("datetime") {
+        return Ok(Some(extract_date_base("datetime", v)?));
+    }
+    Ok(None)
+}
 
 /// `year`/`month`/`day` extraction shared by `localdatetime`/`datetime`'s
 /// map form -- same defaulting rule `date_from_map` uses (month/day
-/// default to `1`), factored out since both callers need it alongside
+/// default to `1`, or to a `date`/`datetime` base's own value when one
+/// was projected), factored out since both callers need it alongside
 /// their own extra fields.
 fn date_ymd_from_map(
     m: &BTreeMap<String, Value>,
@@ -5477,17 +5653,22 @@ fn date_ymd_from_map(
             "'{bad}' isn't a recognized field"
         )));
     }
-    let Some(year_val) = m.get("year") else {
-        return Err(QueryError::Type("requires a 'year' key".into()));
+    let base = date_base_from_map(m)?;
+    let year_raw = match m.get("year") {
+        Some(v) => {
+            value_as_i64(v).ok_or_else(|| QueryError::Type("'year' must be an integer".into()))?
+        }
+        None => match base {
+            Some((y, _, _)) => y as i64,
+            None => return Err(QueryError::Type("requires a 'year' key".into())),
+        },
     };
-    let year_raw = value_as_i64(year_val)
-        .ok_or_else(|| QueryError::Type("'year' must be an integer".into()))?;
     let year = i32::try_from(year_raw)
         .map_err(|_| QueryError::Type(format!("'year' is out of range: {year_raw}")))?;
-    let month_raw = int_field(m, "month", 1)?;
+    let month_raw = int_field(m, "month", base.map_or(1, |(_, mo, _)| mo as i64))?;
     let month = u32::try_from(month_raw)
         .map_err(|_| QueryError::Type(format!("'month' is out of range: {month_raw}")))?;
-    let day_raw = int_field(m, "day", 1)?;
+    let day_raw = int_field(m, "day", base.map_or(1, |(_, _, d)| d as i64))?;
     let day = u32::try_from(day_raw)
         .map_err(|_| QueryError::Type(format!("'day' is out of range: {day_raw}")))?;
     Ok((year, month, day))
@@ -5548,20 +5729,17 @@ fn date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     if let Value::Map(m) = arg {
         let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
-        let offset_seconds = match m.get("timezone") {
-            Some(v) => offset_from_timezone_value(v)?,
-            None => 0,
-        };
-        let nanos_field = sub_second_nanos_from_map(m)?;
+        let (hour, minute, second, nanos, offset_seconds) = clock_fields_from_map(m)?;
+        let offset_seconds = offset_seconds.unwrap_or(0);
         let (epoch_seconds, nanos) = temporal::date_time_from_fields(
             temporal::CalendarDateTime {
                 year,
                 month,
                 day,
-                hour: int_field(m, "hour", 0)?,
-                minute: int_field(m, "minute", 0)?,
-                second: int_field(m, "second", 0)?,
-                nanos: nanos_field,
+                hour,
+                minute,
+                second,
+                nanos,
             },
             offset_seconds,
         )
