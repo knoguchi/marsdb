@@ -16,7 +16,7 @@
 //! README's "Cypher coverage" section for the exact list of what that
 //! leaves out of TCK's `expressions/temporal` suite.
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -49,32 +49,33 @@ fn date_from_epoch_day(epoch_day: i32) -> NaiveDate {
     epoch() + chrono::Duration::days(epoch_day as i64)
 }
 
-/// `date()` with no arguments -- today's date in UTC. There's no timezone
-/// support at all (see this module's top-of-file docs), so "today" can
-/// only mean one fixed instant's date rather than "today where the caller
-/// is" -- UTC, the same zero-configuration choice every timezone-naive
-/// part of this module already makes.
-pub fn today_epoch_day() -> i32 {
-    let today = chrono::Utc::now().date_naive();
-    epoch_day_from_ymd(today.year(), today.month(), today.day())
-        .expect("today is always a valid date")
+/// A single captured instant, pre-derived into every shape a no-arg
+/// `date()`/`localtime()`/`time()`/`localdatetime()`/`datetime()` call
+/// needs -- real Cypher guarantees every such call *within the same
+/// query* returns the same value (so `duration.between(date(), date())`
+/// is always `PT0S`, never a few-microseconds-off nonzero duration from
+/// two independent `now()` reads); capturing one `chrono::Utc::now()`
+/// and deriving every field from it (not one `now()` call per field)
+/// is what makes that guarantee hold even within a single construction.
+#[derive(Clone, Copy)]
+pub struct NowSnapshot {
+    pub epoch_day: i32,
+    pub nanos_of_day: i64,
+    pub epoch_seconds: i64,
+    pub nanos: i32,
 }
 
-/// `localtime()`/`time()` with no arguments -- the current UTC time-of-
-/// day, same zero-configuration "no timezone support, so 'now' can only
-/// mean one fixed instant" stance as `today_epoch_day`.
-pub fn now_utc_nanos_of_day() -> i64 {
-    use chrono::Timelike;
+pub fn capture_now() -> NowSnapshot {
     let now = chrono::Utc::now();
-    now.num_seconds_from_midnight() as i64 * 1_000_000_000 + now.nanosecond() as i64
-}
-
-/// `localdatetime()`/`datetime()` with no arguments -- the current UTC
-/// instant, as `(epoch_seconds, nanos)`.
-pub fn now_utc_epoch_seconds_and_nanos() -> (i64, i32) {
-    use chrono::Timelike;
-    let now = chrono::Utc::now();
-    (now.timestamp(), now.nanosecond() as i32)
+    let epoch_seconds = now.timestamp();
+    let nanos = now.nanosecond() as i32;
+    let (epoch_day, nanos_of_day) = split_epoch_seconds(epoch_seconds);
+    NowSnapshot {
+        epoch_day,
+        nanos_of_day: nanos_of_day + nanos as i64,
+        epoch_seconds,
+        nanos,
+    }
 }
 
 pub fn format_date(epoch_day: i32) -> String {
@@ -994,6 +995,232 @@ pub fn format_date_time(epoch_seconds: i64, nanos: i32, offset_seconds: i32) -> 
         "{}{}",
         format_local_date_time(local_epoch_seconds, nanos),
         format_offset(offset_seconds)
+    )
+}
+
+// ---------------------------------------------------------------------
+// duration.between / .inMonths / .inDays / .inSeconds
+// ---------------------------------------------------------------------
+
+const NANOS_PER_DAY_I64: i64 = SECONDS_PER_DAY * 1_000_000_000;
+
+fn naive_datetime_from(epoch_day: i32, nanos_of_day: i64) -> NaiveDateTime {
+    let secs = (nanos_of_day / 1_000_000_000) as u32;
+    let nanos = (nanos_of_day % 1_000_000_000) as u32;
+    NaiveDateTime::new(
+        date_from_epoch_day(epoch_day),
+        NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+            .expect("nanos_of_day is always in 0..NANOS_PER_DAY by construction"),
+    )
+}
+
+/// `java.time`'s `LocalDate`-difference-in-whole-months primitive
+/// (`ChronoUnit.MONTHS.between`, which Neo4j's own `duration.between`
+/// mirrors exactly): pack each date into a single sortable
+/// `proleptic_month * 32 + day_of_month` value (32 safely exceeds any
+/// month's real day count) so one integer division gives the exact
+/// whole-month count, day-of-month aware, without a real calendar walk.
+fn proleptic_month(d: NaiveDate) -> i64 {
+    d.year() as i64 * 12 + d.month() as i64 - 1
+}
+
+fn months_between_dates(a: NaiveDate, b: NaiveDate) -> i64 {
+    let packed_a = proleptic_month(a) * 32 + a.day() as i64;
+    let packed_b = proleptic_month(b) * 32 + b.day() as i64;
+    (packed_b - packed_a) / 32
+}
+
+/// Adds `months` to `dt`'s *date* only (real calendar month arithmetic,
+/// clamping to the shorter month's last day, same as
+/// `add_duration_to_date`), keeping the time-of-day unchanged.
+fn shift_months(dt: NaiveDateTime, months: i64) -> NaiveDateTime {
+    let d = dt.date();
+    let shifted = if months >= 0 {
+        d.checked_add_months(chrono::Months::new(months as u32))
+    } else {
+        d.checked_sub_months(chrono::Months::new((-months) as u32))
+    }
+    .expect("TCK-scale month shifts stay well within NaiveDate's range");
+    NaiveDateTime::new(shifted, dt.time())
+}
+
+/// Shared core of `duration.between`/`.inMonths`/`.inDays`/
+/// `.inSeconds`: `(months, shifted_remaining_ns, raw_total_ns)`.
+///
+/// If *either* operand has no calendar date (`a_date`/`b_date` is
+/// `None` -- a bare `LocalTime`/`Time`), both operands' dates are
+/// disregarded entirely (not even treated as a shared reference day --
+/// verified against the TCK's own `date(...)` vs `localtime(...)`
+/// examples, which produce a plain small time-of-day difference, never
+/// a huge multi-year value derived from the date side's real calendar
+/// date) -- `months` is always `0` in that case, and both the "raw" and
+/// "month-shifted" totals collapse to the same plain time-of-day delta.
+///
+/// Otherwise: `months` is the real calendar month count between the two
+/// full date-times (`months_between_datetimes_offset_aware`); `shifted_remaining_ns`
+/// is the exact elapsed time between `from` *shifted forward by that
+/// many months* and `to` (what `duration.between` bucket-splits into
+/// days/seconds/nanos on top of `months` -- verified against the TCK to
+/// NOT be a further calendar-date subtraction, just total elapsed time
+/// re-divided by a day's worth of nanoseconds); `raw_total_ns` is the
+/// plain, unshifted elapsed time between the two original instants
+/// (what `.inDays`/`.inSeconds` use instead, discarding the month
+/// optimization entirely -- confirmed by the TCK: `.inDays` on a
+/// date+time target still reports a bare whole-day count with the
+/// sub-day remainder silently truncated away, not carried as a
+/// remaining `T...` component).
+/// Converts a local `NaiveDateTime` + its offset (east of UTC, seconds)
+/// to the UTC instant it represents.
+fn to_utc_instant(dt: NaiveDateTime, offset_seconds: i32) -> NaiveDateTime {
+    dt - chrono::Duration::seconds(offset_seconds as i64)
+}
+
+/// The elapsed time between two local readings -- UTC-instant-aware
+/// (accounts for the offset difference) *only* when **both** operands
+/// carry a real offset (`Time`/`DateTime`); if either lacks one
+/// (`Date`/`LocalTime`/`LocalDateTime`), any offset the *other* operand
+/// happens to carry is disregarded entirely and this is plain local-to-
+/// local subtraction -- confirmed against the TCK: mixing a `Date`
+/// with a `DateTime` produces the same result as mixing it with the
+/// equivalent `LocalDateTime`, offset ignored, but two `DateTime`s at
+/// *different* offsets need the real instant gap (see this module's
+/// own between_components docs and the `duration.between` TCK example
+/// that specifically tests two different offsets one year apart --
+/// naive local subtraction there is off by exactly the offset delta).
+fn elapsed_ns(
+    from: NaiveDateTime,
+    from_offset: Option<i32>,
+    to: NaiveDateTime,
+    to_offset: Option<i32>,
+) -> i64 {
+    let delta = match (from_offset, to_offset) {
+        (Some(fo), Some(to_o)) => to_utc_instant(to, to_o) - to_utc_instant(from, fo),
+        _ => to - from,
+    };
+    delta
+        .num_nanoseconds()
+        .expect("TCK-scale gaps stay well within i64 nanoseconds")
+}
+
+/// `months_between_datetimes`'s refinement step, made offset-aware the
+/// same way `elapsed_ns` is (see its docs).
+fn months_between_datetimes_offset_aware(
+    from: NaiveDateTime,
+    from_offset: Option<i32>,
+    to: NaiveDateTime,
+    to_offset: Option<i32>,
+) -> i64 {
+    let mut months = months_between_dates(from.date(), to.date());
+    let shifted = shift_months(from, months);
+    let overshot = match (from_offset, to_offset) {
+        (Some(fo), Some(to_o)) => to_utc_instant(shifted, fo) > to_utc_instant(to, to_o),
+        _ => shifted > to,
+    };
+    let undershot = match (from_offset, to_offset) {
+        (Some(fo), Some(to_o)) => to_utc_instant(shifted, fo) < to_utc_instant(to, to_o),
+        _ => shifted < to,
+    };
+    if months > 0 && overshot {
+        months -= 1;
+    } else if months < 0 && undershot {
+        months += 1;
+    }
+    months
+}
+
+fn between_components(
+    a_date: Option<i32>,
+    a_time: Option<i64>,
+    a_offset: Option<i32>,
+    b_date: Option<i32>,
+    b_time: Option<i64>,
+    b_offset: Option<i32>,
+) -> (i64, i64, i64) {
+    match (a_date, b_date) {
+        (Some(ad), Some(bd)) => {
+            let from = naive_datetime_from(ad, a_time.unwrap_or(0));
+            let to = naive_datetime_from(bd, b_time.unwrap_or(0));
+            let months = months_between_datetimes_offset_aware(from, a_offset, to, b_offset);
+            let shifted = shift_months(from, months);
+            let shifted_remaining_ns = elapsed_ns(shifted, a_offset, to, b_offset);
+            let raw_total_ns = elapsed_ns(from, a_offset, to, b_offset);
+            (months, shifted_remaining_ns, raw_total_ns)
+        }
+        // Time-only degrade mode still reconciles the offset difference
+        // when *both* operands carry a real one (`Time`/`DateTime`) --
+        // confirmed by the TCK's own `datetime(...+02:00)` vs
+        // `time(...+01:00)` example, off by exactly the 1h offset delta
+        // if compared as raw local time-of-day. Same "only when both
+        // sides have one" condition `elapsed_ns` uses.
+        _ => {
+            let diff = match (a_offset, b_offset) {
+                (Some(ao), Some(bo)) => {
+                    let at = a_time.unwrap_or(0) - ao as i64 * 1_000_000_000;
+                    let bt = b_time.unwrap_or(0) - bo as i64 * 1_000_000_000;
+                    bt - at
+                }
+                _ => b_time.unwrap_or(0) - a_time.unwrap_or(0),
+            };
+            (0, diff, diff)
+        }
+    }
+}
+
+pub fn duration_between(
+    a_date: Option<i32>,
+    a_time: Option<i64>,
+    a_offset: Option<i32>,
+    b_date: Option<i32>,
+    b_time: Option<i64>,
+    b_offset: Option<i32>,
+) -> DurationParts {
+    let (months, shifted_ns, _) =
+        between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    let days = shifted_ns / NANOS_PER_DAY_I64;
+    let rem = shifted_ns % NANOS_PER_DAY_I64;
+    let seconds = rem / NANOS_PER_SEC as i64;
+    let nanos = (rem % NANOS_PER_SEC as i64) as i32;
+    (months, days, seconds, nanos)
+}
+
+pub fn duration_in_months(
+    a_date: Option<i32>,
+    a_time: Option<i64>,
+    a_offset: Option<i32>,
+    b_date: Option<i32>,
+    b_time: Option<i64>,
+    b_offset: Option<i32>,
+) -> DurationParts {
+    let (months, _, _) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    (months, 0, 0, 0)
+}
+
+pub fn duration_in_days(
+    a_date: Option<i32>,
+    a_time: Option<i64>,
+    a_offset: Option<i32>,
+    b_date: Option<i32>,
+    b_time: Option<i64>,
+    b_offset: Option<i32>,
+) -> DurationParts {
+    let (_, _, raw) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    (0, raw / NANOS_PER_DAY_I64, 0, 0)
+}
+
+pub fn duration_in_seconds(
+    a_date: Option<i32>,
+    a_time: Option<i64>,
+    a_offset: Option<i32>,
+    b_date: Option<i32>,
+    b_time: Option<i64>,
+    b_offset: Option<i32>,
+) -> DurationParts {
+    let (_, _, raw) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    (
+        0,
+        0,
+        raw / NANOS_PER_SEC as i64,
+        (raw % NANOS_PER_SEC as i64) as i32,
     )
 }
 

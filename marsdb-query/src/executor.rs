@@ -315,11 +315,30 @@ const VAR_EXPAND_DEPTH_CAP: u32 = 30;
 
 pub struct Executor<'a> {
     store: &'a GraphStore,
+    /// Lazily captured on first use, then reused for every no-arg
+    /// `date()`/`localtime()`/`time()`/`localdatetime()`/`datetime()`
+    /// call for the rest of this `Executor`'s lifetime (one per
+    /// statement execution, see `Executor::new`'s callers) -- real
+    /// Cypher's guarantee that every such call *within one query*
+    /// returns the same value (see `temporal::NowSnapshot`'s docs).
+    now: Cell<Option<temporal::NowSnapshot>>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(store: &'a GraphStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            now: Cell::new(None),
+        }
+    }
+
+    fn now_snapshot(&self) -> temporal::NowSnapshot {
+        if let Some(n) = self.now.get() {
+            return n;
+        }
+        let n = temporal::capture_now();
+        self.now.set(Some(n));
+        n
     }
 
     /// Dispatches on whether `stmt` ever mutates anything. A read-only
@@ -2456,7 +2475,7 @@ impl<'a> Executor<'a> {
                     .iter()
                     .map(|a| self.eval_return_expr(txn, a, row))
                     .collect::<Result<Vec<_>, _>>()?;
-                call_builtin(name, &arg_values)
+                call_builtin(name, &arg_values, self.now_snapshot())
             }
             ReturnExpr::CountStar => Err(QueryError::Semantic(
                 "count(*) can only be used as a return item's top-level expression".into(),
@@ -4309,7 +4328,11 @@ fn apply_slice(
     ))
 }
 
-fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
+fn call_builtin(
+    name: &str,
+    args: &[Value],
+    now: temporal::NowSnapshot,
+) -> Result<Value, QueryError> {
     match name.to_ascii_lowercase().as_str() {
         "coalesce" => Ok(args
             .iter()
@@ -4324,12 +4347,24 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             Some(v) => to_string_value(v),
             None => Ok(Value::Null),
         },
-        "date" => date_builtin(args),
+        "date" => date_builtin(args, now),
         "duration" => duration_builtin(args),
-        "localtime" => local_time_builtin(args),
-        "time" => time_builtin(args),
-        "localdatetime" => local_date_time_builtin(args),
-        "datetime" => date_time_builtin(args),
+        "localtime" => local_time_builtin(args, now),
+        "time" => time_builtin(args, now),
+        "localdatetime" => local_date_time_builtin(args, now),
+        "datetime" => date_time_builtin(args, now),
+        "duration.between" => {
+            duration_between_builtin("duration.between", args, temporal::duration_between)
+        }
+        "duration.inmonths" => {
+            duration_between_builtin("duration.inMonths", args, temporal::duration_in_months)
+        }
+        "duration.indays" => {
+            duration_between_builtin("duration.inDays", args, temporal::duration_in_days)
+        }
+        "duration.inseconds" => {
+            duration_between_builtin("duration.inSeconds", args, temporal::duration_in_seconds)
+        }
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -5028,8 +5063,10 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
     Ok(Value::Property(PropertyValue::String(s)))
 }
 
-/// `date()` — zero args (today, UTC — see `temporal::today_epoch_day`'s
-/// docs), a string (`date('2015-07-21')`, the calendar forms `temporal::
+/// `date()` — zero args (today, UTC, from the `Executor`-cached
+/// `temporal::NowSnapshot` — see its docs for why every no-arg temporal
+/// call within one query shares the same captured instant), a string
+/// (`date('2015-07-21')`, the calendar forms `temporal::
 /// parse_date` supports), a map (`date({year: 1984, month: 10, day:
 /// 11})`, calendar construction only), or another `Date` (identity —
 /// `date(d)` where `d` is already a `Date`, e.g. from `toString`
@@ -5039,7 +5076,7 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
 /// `date('2015-W30-2')`, ...) — a real, documented gap (see the README),
 /// not a silent wrong answer: both `parse_date` and `date_from_map`
 /// return a clear error/`None` for those rather than guessing.
-fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
+fn date_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
             "date() expects zero or one argument, got {}",
@@ -5047,9 +5084,7 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
         )));
     }
     let Some(arg) = args.first() else {
-        return Ok(Value::Property(PropertyValue::Date(
-            temporal::today_epoch_day(),
-        )));
+        return Ok(Value::Property(PropertyValue::Date(now.epoch_day)));
     };
     if matches!(arg, Value::Null) {
         return Ok(Value::Null);
@@ -5398,7 +5433,7 @@ fn clock_fields_from_map(
 /// optionally projected from another temporal value via a `time` key),
 /// or another `LocalTime` (identity, e.g. round-tripping through
 /// `toString`).
-fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+fn local_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
             "localtime() expects zero or one argument, got {}",
@@ -5406,9 +5441,7 @@ fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
         )));
     }
     let Some(arg) = args.first() else {
-        return Ok(Value::Property(PropertyValue::LocalTime(
-            temporal::now_utc_nanos_of_day(),
-        )));
+        return Ok(Value::Property(PropertyValue::LocalTime(now.nanos_of_day)));
     };
     if matches!(arg, Value::Null) {
         return Ok(Value::Null);
@@ -5453,7 +5486,7 @@ fn local_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
 /// specific "not supported" error rather than the generic parse-failure
 /// message, since that's a real (if out of scope) Cypher form, not
 /// malformed input.
-fn time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+fn time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
             "time() expects zero or one argument, got {}",
@@ -5462,7 +5495,7 @@ fn time_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     let Some(arg) = args.first() else {
         return Ok(Value::Property(PropertyValue::Time {
-            nanos_of_day: temporal::now_utc_nanos_of_day(),
+            nanos_of_day: now.nanos_of_day,
             offset_seconds: 0,
         }));
     };
@@ -5544,7 +5577,10 @@ fn offset_from_timezone_value(v: &Value) -> Result<i32, QueryError> {
 /// `localdatetime(...)` -- zero args (now, UTC), a string, a map
 /// (`localdatetime({year, month, day, hour, minute, second, ...})`), or
 /// another `LocalDateTime` (identity).
-fn local_date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+fn local_date_time_builtin(
+    args: &[Value],
+    now: temporal::NowSnapshot,
+) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
             "localdatetime() expects zero or one argument, got {}",
@@ -5552,10 +5588,9 @@ fn local_date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
         )));
     }
     let Some(arg) = args.first() else {
-        let (epoch_seconds, nanos) = temporal::now_utc_epoch_seconds_and_nanos();
         return Ok(Value::Property(PropertyValue::LocalDateTime {
-            epoch_seconds,
-            nanos,
+            epoch_seconds: now.epoch_seconds,
+            nanos: now.nanos,
         }));
     };
     if matches!(arg, Value::Null) {
@@ -5679,7 +5714,7 @@ fn date_ymd_from_map(
 /// (identity). Requires a `timezone` for every constructed form except
 /// identity (defaults to UTC, `offset_seconds: 0`, if the map omits it
 /// -- matches `date()`'s own "no timezone info -> UTC" convention).
-fn date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
+fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
             "datetime() expects zero or one argument, got {}",
@@ -5687,10 +5722,9 @@ fn date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
         )));
     }
     let Some(arg) = args.first() else {
-        let (epoch_seconds, nanos) = temporal::now_utc_epoch_seconds_and_nanos();
         return Ok(Value::Property(PropertyValue::DateTime {
-            epoch_seconds,
-            nanos,
+            epoch_seconds: now.epoch_seconds,
+            nanos: now.nanos,
             offset_seconds: 0,
         }));
     };
@@ -5752,6 +5786,84 @@ fn date_time_builtin(args: &[Value]) -> Result<Value, QueryError> {
     }
     Err(QueryError::Type(format!(
         "datetime() doesn't support this argument: {arg:?}"
+    )))
+}
+
+/// Reduces any of the 5 non-`Duration` temporal types to `(epoch_day,
+/// nanos_of_day, offset_seconds)`, each independently `None` when that
+/// value has no such component -- e.g. `LocalTime` is `(None, Some(_),
+/// None)`, bare `Date` is `(Some(_), None, None)`. `DateTime`'s
+/// date/time components use its *local* (offset-adjusted) reading,
+/// matching every other `DateTime` component access (see
+/// `date_time_component`'s docs); its real offset is *also* returned
+/// (not disregarded) since `duration.between`'s own instant-aware
+/// reconciliation needs it when both operands carry one -- see
+/// `temporal::between_components`'s docs for exactly when it applies.
+fn between_operand(name: &str, v: &Value) -> Result<BetweenOperand, QueryError> {
+    match v {
+        Value::Property(PropertyValue::Date(d)) => Ok((Some(*d), None, None)),
+        Value::Property(PropertyValue::LocalTime(n)) => Ok((None, Some(*n), None)),
+        Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }) => Ok((None, Some(*nanos_of_day), Some(*offset_seconds))),
+        Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }) => {
+            let (d, n) = temporal::split_epoch_seconds(*epoch_seconds);
+            Ok((Some(d), Some(n + *nanos as i64), None))
+        }
+        Value::Property(PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }) => {
+            let local = epoch_seconds + *offset_seconds as i64;
+            let (d, n) = temporal::split_epoch_seconds(local);
+            Ok((Some(d), Some(n + *nanos as i64), Some(*offset_seconds)))
+        }
+        other => Err(QueryError::Type(format!(
+            "{name}() needs a Date, LocalTime, Time, LocalDateTime, or DateTime, got {other:?}"
+        ))),
+    }
+}
+
+/// `(epoch_day, nanos_of_day, offset_seconds)`, see `between_operand`'s
+/// docs.
+type BetweenOperand = (Option<i32>, Option<i64>, Option<i32>);
+
+/// `(a_epoch_day, a_nanos_of_day, a_offset_seconds, b_epoch_day,
+/// b_nanos_of_day, b_offset_seconds) -> DurationParts` -- the shape
+/// every `temporal::duration_between`/`duration_in_months`/
+/// `duration_in_days`/`duration_in_seconds` function shares.
+type BetweenFn = fn(
+    Option<i32>,
+    Option<i64>,
+    Option<i32>,
+    Option<i32>,
+    Option<i64>,
+    Option<i32>,
+) -> temporal::DurationParts;
+
+/// Shared dispatch for `duration.between`/`.inMonths`/`.inDays`/
+/// `.inSeconds` -- all 4 take exactly 2 temporal args and differ only
+/// in which `temporal.rs` decomposition function turns the pair into a
+/// `Duration`.
+fn duration_between_builtin(name: &str, args: &[Value], f: BetweenFn) -> Result<Value, QueryError> {
+    if args.len() != 2 {
+        return Err(QueryError::Semantic(format!(
+            "{name}() expects exactly two arguments, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (a_date, a_time, a_offset) = between_operand(name, &args[0])?;
+    let (b_date, b_time, b_offset) = between_operand(name, &args[1])?;
+    Ok(duration_value(f(
+        a_date, a_time, a_offset, b_date, b_time, b_offset,
     )))
 }
 
@@ -5968,7 +6080,14 @@ fn eval_projected_expr(
                 .iter()
                 .map(|a| eval_projected_expr(a, row))
                 .collect::<Result<Vec<_>, _>>()?;
-            call_builtin(name, &arg_values)
+            // No `Executor` (and so no cached `now_snapshot()`) reachable
+            // from this post-projection/ORDER BY path -- a fresh capture
+            // here is a real, narrow inconsistency (a no-arg `date()`/
+            // etc re-evaluated from *inside* an ORDER BY expression could
+            // in principle read a different instant than the same call
+            // during `RETURN`'s own projection), but reaching this
+            // specific shape at all is a rare, arguably degenerate query.
+            call_builtin(name, &arg_values, temporal::capture_now())
         }
         ReturnExpr::CountStar => Err(QueryError::Semantic(
             "count(*) can only be used as a return item's top-level expression".into(),
