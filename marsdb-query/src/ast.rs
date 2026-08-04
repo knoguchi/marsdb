@@ -77,6 +77,24 @@ pub enum ReturnExpr {
         whens: Vec<(ReturnExpr, ReturnExpr)>,
         else_: Option<Box<ReturnExpr>>,
     },
+    /// `lhs op rhs` — `+ - * / %`, real precedence (`*`/`/`/`%` bind
+    /// tighter than `+`/`-`), usable anywhere a `ReturnExpr` is (RETURN/
+    /// WITH items, `CASE` branches, function args, `ORDER BY` keys).
+    /// Deliberately not threaded into pattern-level `WHERE` (`Expr`) or
+    /// `WITH ... WHERE` (`WithExpr`)'s comparison operands in this pass --
+    /// both currently take a bare `PropAccess`/`Literal` on each side, and
+    /// widening that is a separate, larger change to the planner's
+    /// pre-projection `Filter` pushdown.
+    Arith(Box<ReturnExpr>, ArithOp, Box<ReturnExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }
 
 /// Case-insensitive aggregate-function recognition, shared by `parser.rs`

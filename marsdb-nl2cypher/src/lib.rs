@@ -149,6 +149,11 @@ MarsDB supports a subset of openCypher. Rules that matter for generating valid q
   GROUP BY -- every non-aggregating RETURN/WITH item automatically becomes a grouping key,
   there is no GROUP BY keyword. DISTINCT also works inside an aggregate call, e.g.
   count(DISTINCT x).
+- Arithmetic: + - * / % with real precedence (* / % bind tighter than + -), usable in RETURN/
+  WITH items, ORDER BY keys, and function arguments -- but never nested inside an aggregate's
+  surrounding expression, e.g. 1 + count(x) is rejected (count(x) itself is fine as one whole
+  return item). + also concatenates two strings. Not usable inside a WHERE clause's comparison
+  operands yet -- only in RETURN/WITH/ORDER BY.
 - Named path capture: MATCH p = (a)-[:TYPE]->(b) RETURN p -- fixed-hop patterns only, never
   a variable-length (*) hop inside a named path.
 - shortestPath((a)-[:TYPE*..N]-(b)): both endpoints must already be matched by a preceding

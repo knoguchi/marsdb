@@ -4,9 +4,9 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess, QueryClause,
-    QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir, Statement, Tail, UnwindClause,
-    UnwindSource, WithClause, WithExpr,
+    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess,
+    QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir, Statement, Tail,
+    UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -1507,6 +1507,11 @@ impl<'a> Executor<'a> {
                     None => Ok(Value::Null),
                 }
             }
+            ReturnExpr::Arith(l, op, r) => {
+                let lv = self.eval_return_expr(txn, l, row)?;
+                let rv = self.eval_return_expr(txn, r, row)?;
+                apply_arith(*op, &lv, &rv)
+            }
         }
     }
 
@@ -1703,6 +1708,7 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Call { name, .. } => format!("{name}(...)"),
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
+        ReturnExpr::Arith(..) => format!("col{idx}"),
     }
 }
 
@@ -1737,6 +1743,7 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
                 || whens.iter().any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
                 || else_.as_deref().is_some_and(contains_aggregate)
         }
+        ReturnExpr::Arith(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -1747,7 +1754,16 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
 /// completely unchanged (zero perf/behavior impact on non-aggregating
 /// queries).
 fn has_aggregate(items: &[ReturnItem]) -> bool {
-    items.iter().any(|item| is_top_level_aggregate(&item.expr))
+    // `contains_aggregate`, not `is_top_level_aggregate` -- an aggregate
+    // nested inside a wrapping expression (`1 + count(x)`, now parseable
+    // since ReturnExpr::Arith exists) still needs to route to the
+    // grouping path so `validate_return_items` gets a chance to reject it
+    // with a clear error. With the narrower top-level-only check, such a
+    // query silently took the ordinary per-row path instead (iterating
+    // `rows` directly, which is empty for an empty MATCH) and produced
+    // the wrong row count instead of erroring -- a real bug this exact
+    // widening fixed, not just future-proofing.
+    items.iter().any(|item| contains_aggregate(&item.expr))
 }
 
 /// Validates a RETURN/WITH item list before any row is processed: every
@@ -2170,6 +2186,86 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// A number coerced out of a `Value`, for `apply_arith` below -- separate
+/// from `PropertyValue`/`Literal` since either could hold the operand
+/// (`n.price + 1` mixes a stored property with a literal).
+enum ArithNum {
+    Int(i64),
+    Float(f64),
+}
+
+fn as_arith_num(v: &Value) -> Option<ArithNum> {
+    match v {
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(ArithNum::Int(*i)),
+        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => Some(ArithNum::Float(*f)),
+        _ => None,
+    }
+}
+
+fn as_arith_str(v: &Value) -> Option<&str> {
+    match v {
+        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// `lhs op rhs` for `ReturnExpr::Arith`. Null propagates (matches every
+/// other operator's null-handling convention in this file). `+` also
+/// concatenates two strings, real Cypher's other overload for that
+/// operator; every other combination of non-numeric operands is a real
+/// type error, not a silent `Null`/`false` fallback -- an arithmetic
+/// expression that can't be evaluated should say so, not produce a
+/// plausible-looking wrong answer.
+fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if op == ArithOp::Add {
+        if let (Some(sa), Some(sb)) = (as_arith_str(a), as_arith_str(b)) {
+            return Ok(Value::Property(PropertyValue::String(format!("{sa}{sb}"))));
+        }
+    }
+    let (Some(na), Some(nb)) = (as_arith_num(a), as_arith_num(b)) else {
+        return Err(QueryError::Parse(format!(
+            "arithmetic needs two numbers (or, for +, two strings) -- got {a:?} and {b:?}"
+        )));
+    };
+    // Int/Int stays Int (truncating division/modulo, matching Rust's `/`/
+    // `%` on integers) -- any Float operand promotes the whole expression
+    // to Float, same numeric-promotion rule `compare()` already follows.
+    Ok(match (na, nb) {
+        (ArithNum::Int(x), ArithNum::Int(y)) => {
+            if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0 {
+                return Err(QueryError::Parse("division by zero".into()));
+            }
+            Value::Property(PropertyValue::Int(match op {
+                ArithOp::Add => x + y,
+                ArithOp::Sub => x - y,
+                ArithOp::Mul => x * y,
+                ArithOp::Div => x / y,
+                ArithOp::Mod => x % y,
+            }))
+        }
+        (x, y) => {
+            let x = match x {
+                ArithNum::Int(i) => i as f64,
+                ArithNum::Float(f) => f,
+            };
+            let y = match y {
+                ArithNum::Int(i) => i as f64,
+                ArithNum::Float(f) => f,
+            };
+            Value::Property(PropertyValue::Float(match op {
+                ArithOp::Add => x + y,
+                ArithOp::Sub => x - y,
+                ArithOp::Mul => x * y,
+                ArithOp::Div => x / y,
+                ArithOp::Mod => x % y,
+            }))
+        }
+    })
+}
+
 fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
     match name.to_ascii_lowercase().as_str() {
         "coalesce" => Ok(args
@@ -2314,6 +2410,11 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
                 Some(e) => eval_projected_expr(e, row),
                 None => Ok(Value::Null),
             }
+        }
+        ReturnExpr::Arith(l, op, r) => {
+            let lv = eval_projected_expr(l, row)?;
+            let rv = eval_projected_expr(r, row)?;
+            apply_arith(*op, &lv, &rv)
         }
     }
 }

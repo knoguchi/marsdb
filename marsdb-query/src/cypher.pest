@@ -63,11 +63,24 @@ tail_clause = { return_clause | detach_delete_clause | delete_clause | remove_cl
 
 return_clause = { ^"RETURN" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }
+// Real arithmetic precedence: `*`/`/`/`%` (add_expr's `mul_expr` operand)
+// bind tighter than `+`/`-` (add_expr itself). `return_expr` stays the
+// name every other rule threads an expression through (call_args,
+// case_when, sort_item, ...) -- only its own production changed, from a
+// flat list of atom alternatives to this precedence chain bottoming out
+// at the same atoms (now in atom_expr).
+return_expr = { add_expr }
+add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
+add_op      = { "+" | "-" }
+mul_expr    = { atom_expr ~ (mul_op ~ atom_expr)* }
+mul_op      = { "*" | "/" | "%" }
 // Order matters: case_expr/function_call/prop_access need their extra
 // syntax tried before the bare `identifier` fallback, and `literal` must
 // come before `identifier` too — otherwise the keywords true/false/null
-// would parse as plain variable references instead of literals.
-return_expr   = { case_expr | function_call | prop_access | literal | identifier }
+// would parse as plain variable references instead of literals. The
+// parenthesized form (`(` ~ return_expr ~ `)`) is the only way to
+// override precedence explicitly, e.g. `(a + b) * c`.
+atom_expr   = { case_expr | function_call | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
 
 case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }

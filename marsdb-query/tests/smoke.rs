@@ -350,6 +350,55 @@ fn order_by_with_function_call_key() {
     assert_eq!(values, vec!["3".to_string(), "20".to_string()]);
 }
 
+fn as_int(v: &Value) -> i64 {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+        other => panic!("expected an int, got {other:?}"),
+    }
+}
+
+fn as_float(v: &Value) -> f64 {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => *f,
+        other => panic!("expected a float, got {other:?}"),
+    }
+}
+
+#[test]
+fn arithmetic_precedence_and_grouping() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:Item {price: 10, qty: 3})");
+    // * binds tighter than + without parens; parens override it.
+    let a = run(&store, "MATCH (n:Item) RETURN 2 + 3 * n.qty AS x");
+    let b = run(&store, "MATCH (n:Item) RETURN (2 + 3) * n.qty AS x");
+    assert_eq!(as_int(&a.rows[0][0]), 11);
+    assert_eq!(as_int(&b.rows[0][0]), 15);
+    // Int/Int division truncates; a Float operand promotes the result.
+    let div_int = run(&store, "MATCH (n:Item) RETURN n.price / n.qty AS x");
+    assert_eq!(as_int(&div_int.rows[0][0]), 3);
+    let div_float = run(&store, "MATCH (n:Item) RETURN n.price / 2.0 AS x");
+    assert_eq!(as_float(&div_float.rows[0][0]), 5.0);
+}
+
+/// A nested aggregate inside an arithmetic expression (`1 + count(x)`) is
+/// a real, deliberate rejection, not a silent wrong answer -- `Arith`
+/// existing at all made this reachable for the first time (previously
+/// `count(x)` could only ever be a return item's entire expression, so
+/// there was nothing to wrap it in), and it needs `has_aggregate` to
+/// route the query to the grouping path at all before
+/// `validate_return_items` gets a chance to reject it; a narrower check
+/// (only detecting an aggregate as the item's *entire* top-level
+/// expression) silently returned the wrong row count instead of erroring
+/// -- see `has_aggregate`'s own doc comment for the real scenario this
+/// caught.
+#[test]
+fn nested_aggregate_inside_arithmetic_is_rejected_not_silently_wrong() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = marsdb_query::parse("MATCH (n) RETURN 1 + count(n)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("entire expression"), "unexpected error: {err}");
+}
+
 #[test]
 fn undirected_pattern_matches_either_direction() {
     let store = GraphStore::open_memory().unwrap();

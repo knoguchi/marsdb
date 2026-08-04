@@ -178,6 +178,13 @@ Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 dedup of the whole projected row, applied after grouping for an
 aggregating `RETURN` — a separate mechanism from `DISTINCT` inside one
 aggregate call, which only affects that aggregate's own accumulation).
+Arithmetic (`+ - * / %`, real precedence — `* / %` bind tighter than
+`+ -`, explicit `(...)` grouping to override it) in `RETURN`/`WITH`
+items, `ORDER BY` keys, and function arguments — `+` also concatenates
+two strings; an aggregate can't be nested inside a wrapping arithmetic
+expression (`1 + count(x)` is rejected, not silently wrong — `count(x)`
+alone as a whole return item is fine); not yet usable inside a `WHERE`
+clause's comparison operands, only in `RETURN`/`WITH`/`ORDER BY`.
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`
@@ -279,8 +286,9 @@ cargo run --release -p marsdb-tck
 
 Attempts every scenario, including the ~75% that use Cypher features MarsDB
 doesn't implement at all (temporal/spatial types, list comprehensions,
-`CALL`, arithmetic expressions, ...) — those report as a distinct
-"rejected at parse time" outcome, not lumped in with genuine wrong answers.
+`CALL`, `ALL()`/`ANY()`/`NONE()` quantifiers, ...) — those report as a
+distinct "rejected at parse time" outcome, not lumped in with genuine
+wrong answers.
 Of the scenarios MarsDB's grammar accepts at all, it gets the *right*
 answer in the large majority — the real, checked-for-real signal this
 exists to produce, not the flat pass-rate over the whole suite. Side-effect
