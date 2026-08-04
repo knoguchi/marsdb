@@ -49,16 +49,29 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 240 | 0 | 285 | 479 | 0 | 23.9% |
+| expressions/temporal | 1004 | 344 | 1 | 311 | 348 | 0 | 34.3% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2168** | **0** | **316** | **1327** | **69** | **55.9%** |
+| **TOTAL** | **3880** | **2272** | **1** | **342** | **1196** | **69** | **58.6%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
 - **wrong** — ran successfully but returned the wrong rows. **The category
-  that means a real bug**, not a coverage gap — currently zero everywhere.
+  that means a real bug**, not a coverage gap — zero everywhere except one
+  known case (`expressions/temporal`'s `Temporal10 [1]`): `duration.
+  between`'s result correctly renders as the same ISO-8601 text real Cypher
+  produces, but its raw `.seconds`/`.nanosecondsOfSecond` component fields
+  can differ from Java's exact internal split for a negative, sub-second-
+  remainder duration specifically (`seconds: -86400, nanosecondsOfSecond:
+  100000000` there vs MarsDB's `-86399, -900000000`) — MarsDB's `Duration`
+  always keeps `nanos`'s sign matching `seconds`' (a real, deliberately
+  enforced invariant every other Duration operation in this codebase
+  depends on), so matching Java's split here would mean either breaking
+  that invariant or letting two different internal representations of the
+  same duration coexist (silently wrong equality/hashing) — not worth it
+  for one accessor pair on one edge case. See `duration_between`'s docs in
+  `marsdb-query/src/temporal.rs`.
 - **unexp** — errored when success was expected, or vice versa. As of the
   typed `QueryError` taxonomy, this specifically means MarsDB *ran* the
   query and hit a real, data-dependent type mismatch (not just "never
@@ -292,6 +305,23 @@ same instant (real Cypher's rule — `{time: t, timezone: '+05:00'}` on a
 `+01:00` source advances the hour by 4), and any further explicit
 hour/minute/second override applies *after* that shift, not before.
 
+`duration.between(a, b)`/`.inMonths(a, b)`/`.inDays(a, b)`/
+`.inSeconds(a, b)` — a real calendar-aware duration between any two of
+the 5 non-`Duration` temporal types (25 cross-type combinations),
+matching real Cypher's own rules: real calendar month arithmetic
+(`.between`/`.inMonths`), instant-aware reconciliation when both
+operands carry a UTC offset (`Time`/`DateTime` at *different* offsets),
+and — when either operand has no calendar date at all (`LocalTime`/
+`Time`) — the whole calculation degrades to a plain time-of-day
+difference, disregarding any date the *other* operand happens to have.
+`.inDays`/`.inSeconds` discard the month optimization and use the raw,
+un-optimized elapsed time instead (so `.inDays` on a date+time target
+truncates away any sub-day remainder rather than carrying it). Every
+no-arg `date()`/`localtime()`/`time()`/`localdatetime()`/`datetime()`
+call within one query shares a single captured instant (real Cypher's
+guarantee — `duration.between(date(), date())` is always exactly
+`PT0S`).
+
 **Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
 `DateTime` — needs a real IANA timezone database (DST transition rules,
 zone-name lookup), deliberately out of scope, no dependency pulled in
@@ -299,10 +329,9 @@ for it; week-date/ordinal-date/quarter construction (`date({year: 2015,
 week: 1})`, `date('2015-W30-2')`, `date('2015-202')` — only the calendar
 year/month/day forms, for the date half of every type, including as a
 projection override key, e.g. `date({date: d, week: 1})` still isn't
-supported even though `date({date: d, day: 5})` is);
-`duration.between(...)`/`.inDays(...)`/etc, `.truncate(...)`, and the
-alternate ISO-8601 combined date-time duration syntax
-(`duration('P2012-02-02T14:37:21.545')`). See `marsdb-query/src/
+supported even though `date({date: d, day: 5})` is); `<temporal>.
+truncate(...)`, and the alternate ISO-8601 combined date-time duration
+syntax (`duration('P2012-02-02T14:37:21.545')`). See `marsdb-query/src/
 temporal.rs`'s module doc comment for the same list in code.
 
 ## Indexes & EXPLAIN

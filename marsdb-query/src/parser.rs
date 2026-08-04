@@ -957,6 +957,7 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         Rule::case_expr => parse_case_expr(inner),
         Rule::quantifier_expr => parse_quantifier_expr(inner),
         Rule::function_call => parse_function_call(inner),
+        Rule::qualified_function_call => parse_qualified_function_call(inner),
         Rule::list_expr => {
             let mut items = inner.into_inner().peekable();
             match items.peek().map(|p| p.as_rule()) {
@@ -1122,6 +1123,47 @@ fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         name,
         args,
         distinct,
+    })
+}
+
+/// `duration.between(a, b)`-shaped calls -- `name` becomes the joined
+/// `"namespace.function"` text (`ReturnExpr::Call` has no separate
+/// namespace field, just one `name: String`, so `"duration.between"`
+/// dispatches in `executor.rs`/`semantic.rs` the same way any other
+/// function name string does). No `*`/`DISTINCT` support -- no
+/// namespaced function is an aggregate.
+fn parse_qualified_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let ns = inner
+        .next()
+        .expect("qualified_function_call has a namespace")
+        .as_str();
+    let func = inner
+        .next()
+        .expect("qualified_function_call has a function name")
+        .as_str();
+    let name = format!("{ns}.{func}");
+    let call_args = inner.next().expect("qualified_function_call has call_args");
+    if call_args.as_str().trim() == "*" {
+        return Err(QueryError::Syntax(format!(
+            "'{name}(*)' isn't valid — '*' is only meaningful for count(*)"
+        )));
+    }
+    let mut args = Vec::new();
+    for p in call_args.into_inner() {
+        match p.as_rule() {
+            Rule::distinct_kw => {
+                return Err(QueryError::Syntax(format!(
+                    "'{name}(DISTINCT ...)' isn't valid — DISTINCT is only meaningful inside an aggregate function"
+                )))
+            }
+            _ => args.push(parse_return_expr(p)?),
+        }
+    }
+    Ok(ReturnExpr::Call {
+        name,
+        args,
+        distinct: false,
     })
 }
 

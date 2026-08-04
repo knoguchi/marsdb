@@ -219,8 +219,10 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 2168/3880 TCK scenarios pass (55.9%), 0 wrong-result
-scenarios (no known silent-correctness bugs in the supported surface).
+Short version: 2272/3880 TCK scenarios pass (58.6%), 1 wrong-result
+scenario (a `Duration` internal-representation edge case, not a wrong
+answer — see [CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact
+explanation).
 
 ## Roadmap
 
@@ -228,9 +230,8 @@ scenarios (no known silent-correctness bugs in the supported surface).
 - Named-timezone support (`'Europe/Stockholm'`) for `Time`/`DateTime` —
   needs a real IANA timezone database (DST transition rules), only a
   fixed UTC offset (`'+01:00'`) is supported today
-- `duration.between(...)`/`.inDays(...)`/`.inSeconds(...)` and
-  `<temporal>.truncate(unit, ...)` — the TCK's two single largest
-  remaining `expressions/temporal` gaps by scenario count
+- `<temporal>.truncate(unit, ...)` — `duration.between(...)`/
+  `.inMonths(...)`/`.inDays(...)`/`.inSeconds(...)` are already supported
 - Week-date/ordinal-date/quarter temporal construction
   (`date({year: 2015, week: 1})`, `date('2015-W30-2')`) — projecting one
   temporal value's *calendar*/*year/month/day* fields from another
@@ -293,11 +294,11 @@ cargo run --release -p marsdb-tck
 
 Attempts every scenario, including the majority that use Cypher features
 MarsDB doesn't implement at all or only partially (spatial types; most of
-`expressions/temporal` — `Date`/`Duration` exist, `TIME`/`DATETIME` and
-`.truncate()`/`duration.between(...)` don't, see "Cypher coverage" above;
-list comprehensions; `CALL`; `ALL()`/`ANY()`/`NONE()` quantifiers, ...) —
-those report as a distinct "rejected at parse time" outcome, not lumped in
-with genuine wrong answers.
+`expressions/temporal` — all six temporal types and `duration.between(...)`
+exist, named timezones and `.truncate()` don't, see "Cypher coverage"
+above; list comprehensions; `CALL`, ...) — those report as a distinct
+"rejected at parse time" outcome, not lumped in with genuine wrong
+answers.
 Of the scenarios MarsDB's grammar accepts at all, it gets the *right*
 answer in the large majority — the real, checked-for-real signal this
 exists to produce, not the flat pass-rate over the whole suite. Side-effect

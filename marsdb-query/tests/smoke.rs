@@ -3818,6 +3818,141 @@ fn time_plus_duration_wraps_at_midnight() {
     assert_eq!(temporal_str(&result.rows[0][0]), "01:00Z");
 }
 
+/// `duration.between(a, b)` -- real calendar month arithmetic plus a
+/// day/second/nanos remainder, mixing every pair of the 5 non-Duration
+/// temporal types. Temporal10 [1]/[2].
+#[test]
+fn duration_between_mixed_types() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(duration.between(date('1984-10-11'), date('2015-06-24'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P30Y8M13D");
+
+    // Either side lacking a date degrades to a plain time-of-day
+    // difference -- the date side's real calendar date never enters
+    // the calculation at all.
+    let result = run(
+        &store,
+        "RETURN toString(duration.between(date('1984-10-11'), localtime('16:30'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT16H30M");
+
+    let result = run(
+        &store,
+        "RETURN toString(duration.between(localdatetime('2015-07-21T21:40:32.142'), date('2015-06-24'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P-27DT-21H-40M-32.142S");
+}
+
+/// Two `DateTime`s at *different* offsets -- the month/day/second
+/// breakdown must account for the real offset delta, not just the raw
+/// local wall-clock digits (found as a real bug: naive local-to-local
+/// subtraction here gave `P11M29DT23H59M55.999S` instead of the
+/// correct `P1YT59M55.999S`, off by exactly the 1h offset difference).
+/// Temporal10 [2].
+#[test]
+fn duration_between_two_datetimes_with_different_offsets_accounts_for_the_offset_delta() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(duration.between(datetime('2014-07-21T21:40:36.143+0200'), \
+                                           datetime('2015-07-21T21:40:32.142+0100'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P1YT59M55.999S");
+}
+
+/// The same offset-reconciliation rule applies even in the time-only
+/// "degrade" mode (one side has no date) when *both* operands still
+/// carry a real offset (`Time`/`DateTime`) -- found as a second real
+/// bug alongside the one above.
+#[test]
+fn duration_between_time_only_mode_still_accounts_for_offset_when_both_sides_have_one() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(duration.inSeconds(datetime('2014-07-21T21:40:36.143+0200'), \
+                                             time('16:30+0100'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT-4H-10M-36.143S");
+}
+
+/// `.inMonths`/`.inDays`/`.inSeconds` collapse the same underlying
+/// computation into a single bucket -- `.inMonths` keeps just the
+/// calendar month count, `.inDays`/`.inSeconds` discard the month
+/// optimization entirely and use the *raw* total elapsed time (so
+/// `.inDays` on a date+time target truncates away any sub-day
+/// remainder rather than carrying it as leftover seconds). Temporal10
+/// [3]/[4]/[5].
+#[test]
+fn duration_in_months_days_seconds_collapse_to_a_single_bucket() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(duration.inMonths(date('1984-10-11'), date('2015-06-24'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P30Y8M");
+
+    let result = run(
+        &store,
+        "RETURN toString(duration.inDays(date('1984-10-11'), localdatetime('2016-07-21T21:45:22.142'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P11606D");
+
+    let result = run(
+        &store,
+        "RETURN toString(duration.inSeconds(date('1984-10-11'), date('2015-06-24'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT269112H");
+}
+
+/// `duration.between`'s own remainder-decomposition edge case: a
+/// negative sub-second-only difference must still round-trip through
+/// `toString` correctly (a real pre-existing invariant --
+/// `format_seconds_fraction`'s `(0, -500_000_000) -> "-0.5"` case --
+/// exercised here via the actual `duration.between` code path, not a
+/// hand-built `Duration`). Temporal10 [6].
+#[test]
+fn duration_in_seconds_negative_sub_second_only_difference() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(duration.inSeconds(localdatetime('2014-07-21T21:40:36.143'), \
+                                             localdatetime('2014-07-21T21:40:36.142'))) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT-0.001S");
+}
+
+/// Every no-arg `date()`/`localtime()`/`time()`/`localdatetime()`/
+/// `datetime()` call within *one* query must return the same value --
+/// real Cypher's guarantee, and the reason `duration.between(date(),
+/// date())` is always exactly `PT0S`, never a few-microseconds-off
+/// nonzero duration from two independent `now()` reads (found as a
+/// real, if narrow, bug: each call was originally reading `chrono::
+/// Utc::now()` fresh). Temporal10 [12].
+#[test]
+fn repeated_now_calls_within_one_query_return_the_same_instant() {
+    let store = GraphStore::open_memory().unwrap();
+    for value in [
+        "localtime()",
+        "time()",
+        "date()",
+        "localdatetime()",
+        "datetime()",
+    ] {
+        let result = run(
+            &store,
+            &format!("RETURN toString(duration.inSeconds({value}, {value})) AS r"),
+        );
+        assert_eq!(
+            temporal_str(&result.rows[0][0]),
+            "PT0S",
+            "{value} called twice in one query must be exactly PT0S"
+        );
+    }
+}
+
 #[test]
 fn stored_time_and_date_time_survive_the_storage_round_trip() {
     let store = GraphStore::open_memory().unwrap();
