@@ -4365,6 +4365,11 @@ fn call_builtin(
         "duration.inseconds" => {
             duration_between_builtin("duration.inSeconds", args, temporal::duration_in_seconds)
         }
+        "date.truncate" => date_truncate_builtin(args),
+        "localtime.truncate" => local_time_truncate_builtin(args),
+        "time.truncate" => time_truncate_builtin(args),
+        "localdatetime.truncate" => local_date_time_truncate_builtin(args),
+        "datetime.truncate" => date_time_truncate_builtin(args),
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -5341,18 +5346,33 @@ fn duration_fields_from_map(
 
 /// Sums the 3 sub-second map keys (`millisecond`/`microsecond`/
 /// `nanosecond`) shared by every one-of-day-or-later temporal map
-/// constructor into one nanosecond count -- separate from `duration`'s
-/// own `nanoseconds` field of the same name, but the same "each unit is
-/// independent, they don't cascade into each other at this layer" idea.
-fn sub_second_nanos_from_map(m: &BTreeMap<String, Value>) -> Result<i64, QueryError> {
-    let field = |key: &str| -> Result<i64, QueryError> {
-        match m.get(key) {
-            None => Ok(0),
-            Some(v) => value_as_i64(v)
-                .ok_or_else(|| QueryError::Type(format!("'{key}' must be an integer"))),
-        }
-    };
-    Ok(field("millisecond")? * 1_000_000 + field("microsecond")? * 1_000 + field("nanosecond")?)
+/// constructor into one nanosecond count -- each key independently
+/// *additive* (matching real Cypher's own construction semantics,
+/// e.g. `{millisecond: 645, nanosecond: 123}` is `645ms + 123ns`, not
+/// "645ms, ignore the usual nanosecond digit position"), separate from
+/// `duration`'s own `nanoseconds` field of the same name.
+///
+/// `base_fraction_ns` (`0..1_000_000_000`) is the fractional-second
+/// part of whatever this map is *overriding* (a `time`/`datetime`
+/// projection key, or a `.truncate()` call's already-truncated value)
+/// -- `0` for plain from-scratch construction, where there's no base to
+/// inherit from. Any of the 3 keys the map doesn't set defaults to that
+/// *digit group* of the base (millisecond/microsecond/nanosecond each
+/// their own `0..999` slice), not to `0` outright -- found as a real
+/// bug: `{nanosecond: 2}` alone on a base with a real millisecond value
+/// was silently dropping that millisecond instead of keeping it, only
+/// the nanosecond digit was meant to change.
+fn sub_second_nanos_from_map(
+    base_fraction_ns: i64,
+    m: &BTreeMap<String, Value>,
+) -> Result<i64, QueryError> {
+    let base_ms = base_fraction_ns / 1_000_000;
+    let base_us = (base_fraction_ns / 1_000) % 1000;
+    let base_ns = base_fraction_ns % 1000;
+    let ms = int_field(m, "millisecond", base_ms)?;
+    let us = int_field(m, "microsecond", base_us)?;
+    let ns = int_field(m, "nanosecond", base_ns)?;
+    Ok(ms * 1_000_000 + us * 1_000 + ns)
 }
 
 fn int_field(m: &BTreeMap<String, Value>, key: &str, default: i64) -> Result<i64, QueryError> {
@@ -5411,19 +5431,11 @@ fn clock_fields_from_map(
         }
         _ => (base_h, base_m, base_s, base_ns),
     };
-    let sub_second_given = m.contains_key("millisecond")
-        || m.contains_key("microsecond")
-        || m.contains_key("nanosecond");
-    let nanos = if sub_second_given {
-        sub_second_nanos_from_map(m)?
-    } else {
-        base_ns
-    };
     Ok((
         int_field(m, "hour", base_h)?,
         int_field(m, "minute", base_m)?,
         int_field(m, "second", base_s)?,
-        nanos,
+        sub_second_nanos_from_map(base_ns, m)?,
         effective_offset,
     ))
 }
@@ -5865,6 +5877,330 @@ fn duration_between_builtin(name: &str, args: &[Value], f: BetweenFn) -> Result<
     Ok(duration_value(f(
         a_date, a_time, a_offset, b_date, b_time, b_offset,
     )))
+}
+
+/// `<type>.truncate(unit, value, map?)`'s first two/three args -- `unit`
+/// is a string literal, `value` the source temporal value, and the
+/// trailing map (if present and non-null) carries field overrides
+/// applied *after* truncation.
+type TruncateArgs<'a> = (&'a str, &'a Value, Option<&'a BTreeMap<String, Value>>);
+
+fn parse_truncate_args<'a>(name: &str, args: &'a [Value]) -> Result<TruncateArgs<'a>, QueryError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(QueryError::Semantic(format!(
+            "{name}() expects 2 or 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    let unit = as_arith_str(&args[0]).ok_or_else(|| {
+        QueryError::Type(format!("{name}()'s first argument must be a unit string"))
+    })?;
+    let map = match args.get(2) {
+        None | Some(Value::Null) => None,
+        Some(Value::Map(m)) => Some(m),
+        Some(other) => {
+            return Err(QueryError::Type(format!(
+                "{name}()'s third argument must be a map, got {other:?}"
+            )))
+        }
+    };
+    Ok((unit, &args[1], map))
+}
+
+/// `year`/`month`/`day`/`dayOfWeek` overrides shared by every
+/// `.truncate()` builtin's optional trailing map -- any key the map
+/// doesn't set keeps the truncated base's own value (`date.truncate(
+/// 'month', d, {day: 5})` keeps the truncated year/month, only `day`
+/// is overridden). `dayOfWeek` applies *after* year/month/day (moving
+/// within the resulting date's own ISO week, see `set_iso_weekday`'s
+/// docs) -- other week/quarter/ordinal-day override keys stay
+/// unsupported, the same pre-existing construction gap as `date_from_map`.
+fn apply_date_overrides(
+    base_epoch_day: i32,
+    map: Option<&BTreeMap<String, Value>>,
+) -> Result<i32, QueryError> {
+    let base_y = temporal::date_component(base_epoch_day, "year").unwrap();
+    let base_m = temporal::date_component(base_epoch_day, "month").unwrap();
+    let base_d = temporal::date_component(base_epoch_day, "day").unwrap();
+    let Some(m) = map else {
+        return Ok(base_epoch_day);
+    };
+    let year_raw = int_field(m, "year", base_y)?;
+    let year = i32::try_from(year_raw)
+        .map_err(|_| QueryError::Type(format!("'year' is out of range: {year_raw}")))?;
+    let month_raw = int_field(m, "month", base_m)?;
+    let month = u32::try_from(month_raw)
+        .map_err(|_| QueryError::Type(format!("'month' is out of range: {month_raw}")))?;
+    let day_raw = int_field(m, "day", base_d)?;
+    let day = u32::try_from(day_raw)
+        .map_err(|_| QueryError::Type(format!("'day' is out of range: {day_raw}")))?;
+    let result = temporal::epoch_day_from_ymd(year, month, day).ok_or_else(|| {
+        QueryError::Type(format!(
+            "{year:04}-{month:02}-{day:02} isn't a valid calendar date"
+        ))
+    })?;
+    match m.get("dayOfWeek") {
+        None => Ok(result),
+        Some(v) => {
+            let dow = value_as_i64(v)
+                .ok_or_else(|| QueryError::Type("'dayOfWeek' must be an integer".into()))?;
+            temporal::set_iso_weekday(result, dow).ok_or_else(|| {
+                QueryError::Type(format!(
+                    "'dayOfWeek' must be 1..7 (Monday..Sunday), got {dow}"
+                ))
+            })
+        }
+    }
+}
+
+/// `hour`/`minute`/`second`/`millisecond`/`microsecond`/`nanosecond`
+/// overrides shared by every `.truncate()` builtin's optional trailing
+/// map -- same "unset key keeps the truncated base's value" rule as
+/// `apply_date_overrides`.
+fn apply_time_overrides(
+    base_nanos_of_day: i64,
+    map: Option<&BTreeMap<String, Value>>,
+) -> Result<i64, QueryError> {
+    let base_h = temporal::local_time_component(base_nanos_of_day, "hour").unwrap();
+    let base_min = temporal::local_time_component(base_nanos_of_day, "minute").unwrap();
+    let base_s = temporal::local_time_component(base_nanos_of_day, "second").unwrap();
+    let base_ns = temporal::local_time_component(base_nanos_of_day, "nanosecond").unwrap();
+    let Some(m) = map else {
+        return Ok(base_nanos_of_day);
+    };
+    let nanos = sub_second_nanos_from_map(base_ns, m)?;
+    let hour = int_field(m, "hour", base_h)?;
+    let minute = int_field(m, "minute", base_min)?;
+    let second = int_field(m, "second", base_s)?;
+    temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
+        .ok_or_else(|| QueryError::Type("truncate(...)'s map has an out-of-range field".into()))
+}
+
+/// Rejects a `.truncate()` map key that this specific target type has
+/// no field for (e.g. `hour` on `date.truncate`'s result, which is a
+/// bare `Date`) -- each of the 5 truncate builtins passes its own real
+/// field list, since `apply_date_overrides`/`apply_time_overrides`
+/// themselves are shared and don't know which caller's result shape
+/// makes a given key meaningful.
+fn validate_truncate_map_keys(
+    name: &str,
+    map: Option<&BTreeMap<String, Value>>,
+    allowed: &[&str],
+) -> Result<(), QueryError> {
+    let Some(m) = map else { return Ok(()) };
+    if let Some(bad) = m.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(QueryError::Type(format!(
+            "{name}(...)'s map has an unrecognized field '{bad}'"
+        )));
+    }
+    Ok(())
+}
+
+fn date_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let (unit, other, map) = parse_truncate_args("date.truncate", args)?;
+    validate_truncate_map_keys("date.truncate", map, &["year", "month", "day", "dayOfWeek"])?;
+    if matches!(other, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (base_date, _, _) = between_operand("date.truncate", other)?;
+    let base_date = base_date.ok_or_else(|| {
+        QueryError::Type(
+            "date.truncate() needs a value with a calendar date (Date, LocalDateTime, or DateTime)"
+                .into(),
+        )
+    })?;
+    let truncated = temporal::truncate_date_unit(base_date, unit).ok_or_else(|| {
+        QueryError::Type(format!(
+            "date.truncate(): '{unit}' isn't a recognized date unit"
+        ))
+    })?;
+    Ok(Value::Property(PropertyValue::Date(apply_date_overrides(
+        truncated, map,
+    )?)))
+}
+
+const TIME_TRUNCATE_MAP_KEYS: &[&str] = &[
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+];
+
+fn local_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let (unit, other, map) = parse_truncate_args("localtime.truncate", args)?;
+    validate_truncate_map_keys("localtime.truncate", map, TIME_TRUNCATE_MAP_KEYS)?;
+    if matches!(other, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (_, base_time, _) = between_operand("localtime.truncate", other)?;
+    let base_time = base_time.ok_or_else(|| {
+        QueryError::Type(
+            "localtime.truncate() needs a value with a time-of-day (LocalTime, Time, \
+             LocalDateTime, or DateTime)"
+                .into(),
+        )
+    })?;
+    let truncated = temporal::truncate_time_unit(base_time, unit).ok_or_else(|| {
+        QueryError::Type(format!(
+            "localtime.truncate(): '{unit}' isn't a recognized time unit"
+        ))
+    })?;
+    Ok(Value::Property(PropertyValue::LocalTime(
+        apply_time_overrides(truncated, map)?,
+    )))
+}
+
+fn time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let (unit, other, map) = parse_truncate_args("time.truncate", args)?;
+    validate_truncate_map_keys(
+        "time.truncate",
+        map,
+        &[
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "timezone",
+        ],
+    )?;
+    if matches!(other, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (_, base_time, base_offset) = between_operand("time.truncate", other)?;
+    let base_time = base_time.ok_or_else(|| {
+        QueryError::Type(
+            "time.truncate() needs a value with a time-of-day (LocalTime, Time, LocalDateTime, \
+             or DateTime)"
+                .into(),
+        )
+    })?;
+    let truncated = temporal::truncate_time_unit(base_time, unit).ok_or_else(|| {
+        QueryError::Type(format!(
+            "time.truncate(): '{unit}' isn't a recognized time unit"
+        ))
+    })?;
+    let nanos_of_day = apply_time_overrides(truncated, map)?;
+    let offset_seconds = match map.and_then(|m| m.get("timezone")) {
+        Some(v) => offset_from_timezone_value(v)?,
+        None => base_offset.unwrap_or(0),
+    };
+    Ok(Value::Property(PropertyValue::Time {
+        nanos_of_day,
+        offset_seconds,
+    }))
+}
+
+/// Shared by `localdatetime.truncate`/`datetime.truncate`: a calendar-
+/// scale `unit` (`year`, `month`, ...) truncates the date and resets
+/// the time-of-day to midnight; a clock-scale `unit` (`hour`,
+/// `minute`, ...) leaves the date untouched and truncates just the
+/// time. `day` is both at once (`truncate_date_unit`'s own `day` arm
+/// already returns the date unchanged), so trying the date-unit path
+/// first handles it correctly without a separate case.
+fn truncate_date_time(base_date: i32, base_time: i64, unit: &str) -> Option<(i32, i64)> {
+    if let Some(d) = temporal::truncate_date_unit(base_date, unit) {
+        Some((d, 0))
+    } else {
+        temporal::truncate_time_unit(base_time, unit).map(|t| (base_date, t))
+    }
+}
+
+fn local_date_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let (unit, other, map) = parse_truncate_args("localdatetime.truncate", args)?;
+    validate_truncate_map_keys(
+        "localdatetime.truncate",
+        map,
+        &[
+            "year",
+            "month",
+            "day",
+            "dayOfWeek",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+        ],
+    )?;
+    if matches!(other, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (base_date, base_time, _) = between_operand("localdatetime.truncate", other)?;
+    let base_date = base_date.ok_or_else(|| {
+        QueryError::Type(
+            "localdatetime.truncate() needs a value with a calendar date (Date, LocalDateTime, \
+             or DateTime)"
+                .into(),
+        )
+    })?;
+    let (trunc_date, trunc_time) = truncate_date_time(base_date, base_time.unwrap_or(0), unit)
+        .ok_or_else(|| {
+            QueryError::Type(format!(
+                "localdatetime.truncate(): '{unit}' isn't a recognized unit"
+            ))
+        })?;
+    let final_date = apply_date_overrides(trunc_date, map)?;
+    let final_time = apply_time_overrides(trunc_time, map)?;
+    let (epoch_seconds, nanos) = temporal::combine_date_and_time(final_date, final_time);
+    Ok(Value::Property(PropertyValue::LocalDateTime {
+        epoch_seconds,
+        nanos,
+    }))
+}
+
+fn date_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    let (unit, other, map) = parse_truncate_args("datetime.truncate", args)?;
+    validate_truncate_map_keys(
+        "datetime.truncate",
+        map,
+        &[
+            "year",
+            "month",
+            "day",
+            "dayOfWeek",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "timezone",
+        ],
+    )?;
+    if matches!(other, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (base_date, base_time, base_offset) = between_operand("datetime.truncate", other)?;
+    let base_date = base_date.ok_or_else(|| {
+        QueryError::Type(
+            "datetime.truncate() needs a value with a calendar date (Date, LocalDateTime, or \
+             DateTime)"
+                .into(),
+        )
+    })?;
+    let (trunc_date, trunc_time) = truncate_date_time(base_date, base_time.unwrap_or(0), unit)
+        .ok_or_else(|| {
+            QueryError::Type(format!(
+                "datetime.truncate(): '{unit}' isn't a recognized unit"
+            ))
+        })?;
+    let final_date = apply_date_overrides(trunc_date, map)?;
+    let final_time = apply_time_overrides(trunc_time, map)?;
+    let offset_seconds = match map.and_then(|m| m.get("timezone")) {
+        Some(v) => offset_from_timezone_value(v)?,
+        None => base_offset.unwrap_or(0),
+    };
+    let (local_epoch_seconds, nanos) = temporal::combine_date_and_time(final_date, final_time);
+    Ok(Value::Property(PropertyValue::DateTime {
+        epoch_seconds: local_epoch_seconds - offset_seconds as i64,
+        nanos,
+        offset_seconds,
+    }))
 }
 
 fn value_as_i64(v: &Value) -> Option<i64> {
