@@ -479,6 +479,22 @@ fn arithmetic_precedence_and_grouping() {
     assert_eq!(as_float(&div_float.rows[0][0]), 5.0);
 }
 
+#[test]
+fn integer_arithmetic_overflow_returns_errors_instead_of_panicking() {
+    let store = GraphStore::open_memory().unwrap();
+    for cypher in [
+        "RETURN 9223372036854775807 + 1",
+        "RETURN -9223372036854775808 - 1",
+        "RETURN 9223372036854775807 * 2",
+        "RETURN -9223372036854775808 / -1",
+        "RETURN -9223372036854775808 % -1",
+    ] {
+        let stmt = parse(cypher).unwrap();
+        let err = Executor::new(&store).execute(&stmt).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{cypher}: {err}");
+    }
+}
+
 /// A nested aggregate inside an arithmetic expression (`1 + count(x)`) is
 /// a real, deliberate rejection, not a silent wrong answer -- `Arith`
 /// existing at all made this reachable for the first time (previously

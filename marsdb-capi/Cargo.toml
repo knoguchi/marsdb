@@ -1,0 +1,16 @@
+[package]
+name = "marsdb-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "C ABI for MarsDB, an embeddable property-graph database — the basis for non-Rust language bindings (e.g. marsdb-go)."
+
+[lib]
+name = "marsdb_capi"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+marsdb = { path = "../marsdb" }

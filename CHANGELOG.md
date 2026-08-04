@@ -3,6 +3,19 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- `marsdb-capi`, a workspace-built C ABI with opaque database handles and
+  JSON query results, plus `marsdb-go`, a cgo binding with in-memory and
+  persistent databases, exact 64-bit integer decoding, temporal values,
+  synchronized close/query access, examples, tests, and CI coverage.
+
+### Fixed
+- Integer arithmetic overflow now returns a query error instead of panicking;
+  unexpected engine panics are also contained at the C ABI boundary rather
+  than unwinding into or aborting a foreign-language host.
+
 ## [0.5.0] - 2026-08-03
 
 ### Added

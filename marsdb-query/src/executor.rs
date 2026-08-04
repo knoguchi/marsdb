@@ -2912,13 +2912,15 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
             if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0 {
                 return Err(QueryError::Parse("division by zero".into()));
             }
-            Value::Property(PropertyValue::Int(match op {
-                ArithOp::Add => x + y,
-                ArithOp::Sub => x - y,
-                ArithOp::Mul => x * y,
-                ArithOp::Div => x / y,
-                ArithOp::Mod => x % y,
-            }))
+            let value = match op {
+                ArithOp::Add => x.checked_add(y),
+                ArithOp::Sub => x.checked_sub(y),
+                ArithOp::Mul => x.checked_mul(y),
+                ArithOp::Div => x.checked_div(y),
+                ArithOp::Mod => x.checked_rem(y),
+            }
+            .ok_or_else(|| QueryError::Parse("integer arithmetic overflow".into()))?;
+            Value::Property(PropertyValue::Int(value))
         }
         (x, y) => {
             let x = match x {
