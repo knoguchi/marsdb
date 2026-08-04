@@ -2128,6 +2128,22 @@ fn match_create_rejects_relabeling_bound_node() {
     );
 }
 
+/// `MATCH (a) CREATE (a)` -- a bare already-bound node token with no
+/// relationship at all doesn't create anything (that var already
+/// exists) and doesn't connect anything either, so real Cypher rejects
+/// it outright rather than silently no-op'ing.
+#[test]
+fn match_create_rejects_bare_already_bound_node_with_no_relationship() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Item)");
+    let stmt = parse("MATCH (a:Item) CREATE (a)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
+}
+
 #[test]
 fn match_create_rejects_variable_length_pattern() {
     let store = GraphStore::open_memory().unwrap();
