@@ -362,6 +362,11 @@ pub struct WithClause {
     pub items: Vec<ReturnItem>,
     pub where_clause: Option<WithExpr>,
     pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
+    /// Always applied *after* `order_by` (real Cypher's own rule — skip N,
+    /// then take the following `limit`, against the sorted sequence when
+    /// one exists), regardless of which field a caller happens to read
+    /// first.
+    pub skip: Option<i64>,
     pub limit: Option<i64>,
 }
 
@@ -503,6 +508,9 @@ pub enum Statement {
         /// every ORDER BY key in practice is a RETURN alias, not a bare
         /// pattern variable.
         order_by: Option<Vec<(ReturnExpr, SortDir)>>,
+        /// Applied after `order_by`, before `limit` — same convention as
+        /// `WithClause::skip`.
+        skip: Option<i64>,
         limit: Option<i64>,
     },
     /// `<match_stmt> UNION [ALL] <match_stmt> (UNION [ALL] <match_stmt>)*`

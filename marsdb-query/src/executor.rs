@@ -292,6 +292,17 @@ struct IndexSeekSpec<'a> {
     value: &'a PropertyValue,
 }
 
+/// `ORDER BY`/`SKIP`/`LIMIT` bundled into one argument for
+/// `execute_match` (clippy's `too_many_arguments`, capped at 7) --
+/// mirrors `Statement::Match`'s own trailing fields, always applied in
+/// this order regardless of which fields are actually present (`SKIP`
+/// after `ORDER BY`, `LIMIT` after `SKIP`).
+struct ResultModifiers<'a> {
+    order_by: &'a Option<Vec<(ReturnExpr, SortDir)>>,
+    skip: Option<i64>,
+    limit: Option<i64>,
+}
+
 type BindingRow = HashMap<String, Binding>;
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
@@ -363,10 +374,19 @@ impl<'a> Executor<'a> {
                     clauses,
                     tail,
                     order_by,
+                    skip,
                     limit,
-                } => {
-                    self.execute_match(Txn::Read(&read_txn), clauses, tail, order_by, *limit, guard)
-                }
+                } => self.execute_match(
+                    Txn::Read(&read_txn),
+                    clauses,
+                    tail,
+                    ResultModifiers {
+                        order_by,
+                        skip: *skip,
+                        limit: *limit,
+                    },
+                    guard,
+                ),
                 _ => unreachable!("is_read_only only returns true for Statement::Match/Union"),
             };
         }
@@ -498,13 +518,17 @@ impl<'a> Executor<'a> {
                 clauses,
                 tail,
                 order_by,
+                skip,
                 limit,
             } => self.execute_match(
                 Txn::Write(write_txn),
                 clauses,
                 tail,
-                order_by,
-                *limit,
+                ResultModifiers {
+                    order_by,
+                    skip: *skip,
+                    limit: *limit,
+                },
                 guard,
             ),
             Statement::Explain(inner) => {
@@ -822,10 +846,14 @@ impl<'a> Executor<'a> {
         txn: Txn,
         clauses: &[QueryClause],
         tail: &Option<Tail>,
-        order_by: &Option<Vec<(ReturnExpr, SortDir)>>,
-        limit: Option<i64>,
+        modifiers: ResultModifiers<'_>,
         guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
+        let ResultModifiers {
+            order_by,
+            skip,
+            limit,
+        } = modifiers;
         // Threads bindings through each MATCH/UNWIND/WITH clause.
         // `carried_vars` tells the planner which of the next MATCH clause's
         // pattern variables are already bound (-> LogicalPlan::Seed) rather
@@ -834,12 +862,15 @@ impl<'a> Executor<'a> {
         let mut carried_vars: HashSet<String> = HashSet::new();
         let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
         // A plain, non-blocking RETURN can stop the final MATCH pipeline as
-        // soon as LIMIT rows have arrived. ORDER BY, DISTINCT, aggregation,
-        // mutations, and WITH must still consume/materialize their complete
-        // input before applying a final limit.
+        // soon as SKIP+LIMIT rows have arrived (SKIP rows still have to
+        // physically flow through the pipeline to be counted and dropped
+        // below -- only the *count* the stream stops at grows, not
+        // anything about what SKIP itself does). ORDER BY, DISTINCT,
+        // aggregation, mutations, and WITH must still consume/materialize
+        // their complete input before applying a final limit.
         let final_stream_limit = match (order_by, limit, tail) {
             (None, Some(limit), Some(Tail::Return(items, false))) if !has_aggregate(items) => {
-                Some(limit.max(0) as usize)
+                Some(skip.unwrap_or(0).max(0) as usize + limit.max(0) as usize)
             }
             _ => None,
         };
@@ -956,6 +987,10 @@ impl<'a> Executor<'a> {
         // applied after dedup instead, below.
         let distinct_return = tail_is_distinct_return(tail);
         if order_by.is_none() && !distinct_return {
+            let skip_n = skip.unwrap_or(0).max(0) as usize;
+            if skip_n > 0 {
+                current_rows.drain(0..skip_n.min(current_rows.len()));
+            }
             if let Some(count) = limit {
                 current_rows.truncate(count.max(0) as usize);
             }
@@ -1000,7 +1035,14 @@ impl<'a> Executor<'a> {
                     // aggregating case just below.
                     if !has_aggregate(items) && !distinct {
                         order_by_pre_applied = true;
-                        self.apply_order_by_with_scope(txn, &current_rows, projected, ob, limit)?
+                        self.apply_order_by_with_scope(
+                            txn,
+                            &current_rows,
+                            projected,
+                            ob,
+                            skip,
+                            limit,
+                        )?
                     } else {
                         projected
                     }
@@ -1034,11 +1076,16 @@ impl<'a> Executor<'a> {
         };
         if let Some(order_by) = order_by {
             if !order_by_pre_applied {
-                result.rows = apply_order_by(result.rows, &result.columns, order_by, limit)?;
+                result.rows = apply_order_by(result.rows, &result.columns, order_by, skip, limit)?;
             }
         } else if distinct_return {
             // The pre-truncate above was skipped for exactly this case --
-            // apply LIMIT now, after materialize_return's dedup, instead.
+            // apply SKIP/LIMIT now, after materialize_return's dedup,
+            // instead.
+            let skip_n = skip.unwrap_or(0).max(0) as usize;
+            if skip_n > 0 {
+                result.rows.drain(0..skip_n.min(result.rows.len()));
+            }
             if let Some(count) = limit {
                 result.rows.truncate(count.max(0) as usize);
             }
@@ -1067,9 +1114,15 @@ impl<'a> Executor<'a> {
         };
         let mut rows = self.materialize_with(txn, with, &rows)?;
         if let Some(with_order_by) = &with.order_by {
-            rows = self.apply_order_by_bindings(txn, rows, with_order_by, with.limit)?;
-        } else if let Some(with_limit) = with.limit {
-            rows.truncate(with_limit.max(0) as usize);
+            rows = self.apply_order_by_bindings(txn, rows, with_order_by, with.skip, with.limit)?;
+        } else {
+            let skip_n = with.skip.unwrap_or(0).max(0) as usize;
+            if skip_n > 0 {
+                rows.drain(0..skip_n.min(rows.len()));
+            }
+            if let Some(with_limit) = with.limit {
+                rows.truncate(with_limit.max(0) as usize);
+            }
         }
         *carried_vars = with
             .items
@@ -1362,6 +1415,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         rows: Vec<BindingRow>,
         order_by: &[(ReturnExpr, SortDir)],
+        skip: Option<i64>,
         limit: Option<i64>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
@@ -1373,7 +1427,7 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        Ok(top_k_by(keyed, order_by, limit)
+        Ok(top_k_by(keyed, order_by, skip, limit)
             .into_iter()
             .map(|(_, row)| row)
             .collect())
@@ -1394,6 +1448,7 @@ impl<'a> Executor<'a> {
         binding_rows: &[BindingRow],
         result: QueryResult,
         order_by: &[(ReturnExpr, SortDir)],
+        skip: Option<i64>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
         let QueryResult { columns, rows } = result;
@@ -1409,7 +1464,7 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        let rows = top_k_by(keyed, order_by, limit)
+        let rows = top_k_by(keyed, order_by, skip, limit)
             .into_iter()
             .map(|(_, row)| row)
             .collect();
@@ -2682,6 +2737,7 @@ impl<'a> Executor<'a> {
                 clauses,
                 tail,
                 order_by,
+                skip,
                 limit,
             } = part
             else {
@@ -2689,7 +2745,17 @@ impl<'a> Executor<'a> {
                     "union_stmt parts are always Statement::Match -- see parser::parse_union_stmt"
                 )
             };
-            let result = self.execute_match(txn, clauses, tail, order_by, *limit, guard)?;
+            let result = self.execute_match(
+                txn,
+                clauses,
+                tail,
+                ResultModifiers {
+                    order_by,
+                    skip: *skip,
+                    limit: *limit,
+                },
+                guard,
+            )?;
             combined = Some(match combined {
                 None => result,
                 Some(mut acc) => {
@@ -4869,6 +4935,7 @@ fn apply_order_by(
     rows: Vec<Vec<Value>>,
     columns: &[String],
     order_by: &[(ReturnExpr, SortDir)],
+    skip: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<Vec<Value>>, QueryError> {
     // An ORDER BY expression that repeats a returned expression verbatim
@@ -4899,7 +4966,7 @@ fn apply_order_by(
             .collect::<Result<Vec<_>, _>>()?;
         keyed.push((keys, row));
     }
-    Ok(top_k_by(keyed, order_by, limit)
+    Ok(top_k_by(keyed, order_by, skip, limit)
         .into_iter()
         .map(|(_, row)| row)
         .collect())
@@ -5162,9 +5229,15 @@ fn dedup_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, QueryError> {
 /// non-aggregating `RETURN`'s, and aggregating `RETURN`'s), which otherwise
 /// each build the identical `keyed`-then-sort shape around a different row
 /// type.
+/// Selects the top `skip + limit` elements by `order_by` (the
+/// `select_nth_unstable_by` partial-selection optimization still applies
+/// to that combined bound, not just `limit` alone), sorts just that
+/// prefix, then drops the first `skip` of it — real Cypher's own
+/// "SKIP applies after ORDER BY, LIMIT applies after SKIP" rule.
 fn top_k_by<T>(
     mut keyed: Vec<(Vec<Value>, T)>,
     order_by: &[(ReturnExpr, SortDir)],
+    skip: Option<i64>,
     limit: Option<i64>,
 ) -> Vec<(Vec<Value>, T)> {
     let cmp = |a: &(Vec<Value>, T), b: &(Vec<Value>, T)| -> std::cmp::Ordering {
@@ -5176,9 +5249,10 @@ fn top_k_by<T>(
         }
         std::cmp::Ordering::Equal
     };
+    let skip_n = skip.unwrap_or(0).max(0) as usize;
     match limit {
         Some(n) => {
-            let k = n.max(0) as usize;
+            let k = skip_n + n.max(0) as usize;
             if k == 0 {
                 keyed.clear();
             } else if k < keyed.len() {
@@ -5190,6 +5264,9 @@ fn top_k_by<T>(
             }
         }
         None => keyed.sort_by(cmp),
+    }
+    if skip_n > 0 {
+        keyed.drain(0..skip_n.min(keyed.len()));
     }
     keyed
 }

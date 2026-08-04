@@ -17,28 +17,28 @@ scope.
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
-| clauses/create | 78 | 41 | 0 | 2 | 35 | 0 | 52.6% |
-| clauses/delete | 41 | 15 | 0 | 0 | 26 | 0 | 36.6% |
+| clauses/create | 78 | 45 | 0 | 2 | 31 | 0 | 57.7% |
+| clauses/delete | 41 | 20 | 0 | 0 | 21 | 0 | 48.8% |
 | clauses/match | 381 | 272 | 0 | 0 | 74 | 35 | 71.4% |
 | clauses/match-where | 34 | 8 | 0 | 0 | 26 | 0 | 23.5% |
 | clauses/merge | 75 | 25 | 0 | 3 | 47 | 0 | 33.3% |
-| clauses/remove | 33 | 15 | 0 | 0 | 18 | 0 | 45.5% |
-| clauses/return | 63 | 29 | 0 | 2 | 32 | 0 | 46.0% |
-| clauses/return-orderby | 35 | 23 | 0 | 2 | 10 | 0 | 65.7% |
-| clauses/return-skip-limit | 31 | 22 | 0 | 0 | 9 | 0 | 71.0% |
-| clauses/set | 53 | 20 | 0 | 0 | 33 | 0 | 37.7% |
-| clauses/union | 12 | 4 | 0 | 0 | 8 | 0 | 33.3% |
-| clauses/unwind | 14 | 7 | 0 | 0 | 5 | 2 | 50.0% |
+| clauses/remove | 33 | 18 | 0 | 0 | 15 | 0 | 54.5% |
+| clauses/return | 63 | 31 | 0 | 2 | 30 | 0 | 49.2% |
+| clauses/return-orderby | 35 | 25 | 0 | 2 | 6 | 2 | 71.4% |
+| clauses/return-skip-limit | 31 | 25 | 0 | 0 | 6 | 0 | 80.6% |
+| clauses/set | 53 | 23 | 0 | 0 | 30 | 0 | 43.4% |
+| clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
+| clauses/unwind | 14 | 9 | 0 | 0 | 3 | 2 | 64.3% |
 | clauses/with | 29 | 10 | 0 | 1 | 17 | 1 | 34.5% |
-| clauses/with-orderBy | 292 | 139 | 0 | 1 | 152 | 0 | 47.6% |
-| clauses/with-skip-limit | 9 | 2 | 0 | 0 | 7 | 0 | 22.2% |
+| clauses/with-orderBy | 292 | 143 | 0 | 1 | 146 | 2 | 49.0% |
+| clauses/with-skip-limit | 9 | 4 | 0 | 0 | 5 | 0 | 44.4% |
 | clauses/with-where | 19 | 2 | 0 | 0 | 17 | 0 | 10.5% |
-| expressions/aggregation | 35 | 20 | 0 | 0 | 15 | 0 | 57.1% |
+| expressions/aggregation | 35 | 21 | 0 | 4 | 10 | 0 | 60.0% |
 | expressions/boolean | 150 | 140 | 0 | 0 | 10 | 0 | 93.3% |
 | expressions/comparison | 72 | 52 | 0 | 0 | 20 | 0 | 72.2% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
-| expressions/graph | 61 | 28 | 0 | 7 | 26 | 0 | 45.9% |
+| expressions/graph | 61 | 35 | 0 | 7 | 19 | 0 | 57.4% |
 | expressions/list | 185 | 121 | 0 | 2 | 55 | 7 | 65.4% |
 | expressions/literals | 131 | 71 | 0 | 0 | 51 | 9 | 54.2% |
 | expressions/map | 44 | 16 | 0 | 6 | 17 | 5 | 36.4% |
@@ -48,12 +48,12 @@ scope.
 | expressions/pattern | 50 | 19 | 0 | 0 | 31 | 0 | 38.0% |
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
-| expressions/string | 32 | 28 | 0 | 0 | 4 | 0 | 87.5% |
+| expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
 | expressions/temporal | 1004 | 55 | 0 | 37 | 912 | 0 | 5.5% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **1901** | **0** | **64** | **1850** | **65** | **49.0%** |
+| **TOTAL** | **3880** | **1948** | **0** | **68** | **1795** | **69** | **50.2%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -109,7 +109,9 @@ overwhelmingly use. Not yet supported: chaining more than one mutating
 clause before the final `RETURN`, or a `WITH` between the mutating
 clause and that `RETURN`.
 
-Multi-key `ORDER BY`, `LIMIT`, `CASE`, and implicit-GROUP-BY aggregation
+Multi-key `ORDER BY`, `SKIP`/`LIMIT` (on both `RETURN` and `WITH`; `SKIP`
+always applies after `ORDER BY` and before `LIMIT` regardless of clause
+order in the query text, matching real Cypher), `CASE`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
 `DISTINCT` inside an aggregate call). `RETURN DISTINCT` (result-set-level
 dedup of the whole projected row, applied after grouping for an
