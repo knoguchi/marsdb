@@ -750,6 +750,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "marsdb-capi"
+version = "0.5.0"
+dependencies = [
+ "marsdb",
+]
+
+[[package]]
 name = "marsdb-cli"
 version = "0.5.0"
 dependencies = [
