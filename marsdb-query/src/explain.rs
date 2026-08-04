@@ -56,6 +56,16 @@ pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, Quer
             }
             Ok(out)
         }
+        Statement::Union { parts, all } => {
+            let mut out = Vec::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push(if *all { "UNION ALL".to_string() } else { "UNION".to_string() });
+                }
+                out.extend(explain_statement(part, txn)?);
+            }
+            Ok(out)
+        }
     }
 }
 

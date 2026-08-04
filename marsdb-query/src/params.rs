@@ -44,6 +44,11 @@ pub fn substitute_params(
                 }
             }
         }
+        Statement::Union { parts, .. } => {
+            for part in parts {
+                substitute_params(part, params)?;
+            }
+        }
     }
     Ok(())
 }
