@@ -1685,6 +1685,14 @@ fn list_ints(v: &Value) -> Vec<i64> {
     }
 }
 
+fn bool_val(v: &Value) -> bool {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Bool(b)) => *b,
+        Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
 #[test]
 fn standalone_with_no_preceding_match() {
     let store = GraphStore::open_memory().unwrap();
@@ -1809,6 +1817,89 @@ fn list_comprehension_plain_list_with_bare_identifier_is_not_misparsed_as_a_comp
     let store = GraphStore::open_memory().unwrap();
     let result = run(&store, "WITH 1 AS x, 2 AS y RETURN [x, y]");
     assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2]);
+}
+
+#[test]
+fn quantifier_all_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS a, all(x IN [1, 2, 3] WHERE x > 1) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_any_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN any(x IN [1, 2, 3] WHERE x > 2) AS a, any(x IN [1, 2, 3] WHERE x > 5) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_none_on_empty_list_is_true() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN none(x IN [] WHERE x > 0) AS a");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_single_counts_exact_matches() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS a, single(x IN [1, 2, 2] WHERE x = 2) AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
+fn quantifier_over_collected_nodes_scopes_the_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Label1 {name: 'a'})");
+    let result = run(
+        &store,
+        "MATCH (a:Label1) WITH collect(a) AS nodes RETURN none(x IN nodes WHERE x.name = 'a') AS result",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
+}
+
+#[test]
+fn quantifier_three_valued_null_propagation() {
+    // Regression: a first version collapsed a null predicate straight to
+    // false, which happened to pass every non-null-list scenario but was
+    // wrong on lists containing nulls -- a definite true/false among the
+    // elements still decides the answer even with nulls present; only
+    // "no definite answer, but at least one unknown" is null.
+    let store = GraphStore::open_memory().unwrap();
+
+    let all = run(&store, "RETURN all(x IN [null] WHERE x = 2) AS a, all(x IN [0, null] WHERE x = 2) AS b, all(x IN [2, null] WHERE x = 2) AS c");
+    assert!(matches!(all.rows[0][0], Value::Null));
+    assert!(!bool_val(&all.rows[0][1]));
+    assert!(matches!(all.rows[0][2], Value::Null));
+
+    let any = run(&store, "RETURN any(x IN [null] WHERE x = 2) AS a, any(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(any.rows[0][0], Value::Null));
+    assert!(bool_val(&any.rows[0][1]));
+
+    let none = run(&store, "RETURN none(x IN [null] WHERE x = 2) AS a, none(x IN [2, null] WHERE x = 2) AS b");
+    assert!(matches!(none.rows[0][0], Value::Null));
+    assert!(!bool_val(&none.rows[0][1]));
+
+    let single = run(
+        &store,
+        "RETURN single(x IN [2, null] WHERE x = 2) AS a, single(x IN [34, 0, null, 5, 900] WHERE x < 10) AS b",
+    );
+    assert!(matches!(single.rows[0][0], Value::Null));
+    assert!(!bool_val(&single.rows[0][1]));
+}
+
+#[test]
+fn quantifier_does_not_break_ordinary_function_calls() {
+    // Regression: `ALL(...)` etc share `identifier ~ "("` with an ordinary
+    // function_call -- an unrelated call like coalesce(...) must still
+    // fall through to function_call, not get swallowed by a failed
+    // quantifier_expr attempt.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN coalesce(null, 5) AS x");
+    assert_eq!(int(&result.rows[0][0]), 5);
 }
 
 #[test]

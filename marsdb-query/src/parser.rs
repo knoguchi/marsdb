@@ -625,6 +625,7 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let inner = pair.into_inner().next().expect("atom_expr has one child");
     match inner.as_rule() {
         Rule::case_expr => parse_case_expr(inner),
+        Rule::quantifier_expr => parse_quantifier_expr(inner),
         Rule::function_call => parse_function_call(inner),
         Rule::list_expr => {
             let mut items = inner.into_inner().peekable();
@@ -649,24 +650,50 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// each independently optional, so the remaining children (after the
 /// mandatory bound-variable identifier and source `return_expr`) are
 /// distinguished by rule, not position.
+/// `filter_expr = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~
+/// with_expr)? }` -- shared by `list_comprehension` and `quantifier_expr`,
+/// so this returns the three parsed pieces rather than an `Expr` directly;
+/// each caller wraps them into its own `ReturnExpr` variant.
+fn parse_filter_expr(pair: Pair<Rule>) -> Result<(String, Box<ReturnExpr>, Option<Box<WithExpr>>), QueryError> {
+    let mut inner = pair.into_inner();
+    let var = inner.next().expect("filter_expr has a bound variable").as_str().to_string();
+    let source = parse_return_expr(inner.next().expect("filter_expr has a source return_expr"))?;
+    let where_clause = inner
+        .next()
+        .map(|w| Ok::<_, QueryError>(Box::new(parse_with_expr(w)?)))
+        .transpose()?;
+    Ok((var, Box::new(source), where_clause))
+}
+
 fn parse_list_comprehension(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let var = inner.next().expect("list_comprehension has a bound variable").as_str().to_string();
-    let source = parse_return_expr(inner.next().expect("list_comprehension has a source return_expr"))?;
-    let mut where_clause = None;
-    let mut project = None;
-    for p in inner {
-        match p.as_rule() {
-            Rule::with_expr => where_clause = Some(Box::new(parse_with_expr(p)?)),
-            Rule::return_expr => project = Some(Box::new(parse_return_expr(p)?)),
-            r => unreachable!("unexpected list_comprehension child rule {r:?}"),
-        }
-    }
+    let (var, source, where_clause) =
+        parse_filter_expr(inner.next().expect("list_comprehension has a filter_expr"))?;
+    let project = inner.next().map(parse_return_expr).transpose()?.map(Box::new);
     Ok(ReturnExpr::ListComp {
         var,
-        source: Box::new(source),
+        source,
         where_clause,
         project,
+    })
+}
+
+fn parse_quantifier_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let kind = match inner.next().expect("quantifier_expr has a quantifier_kw").as_str().to_ascii_uppercase().as_str()
+    {
+        "ALL" => QuantifierKind::All,
+        "ANY" => QuantifierKind::Any,
+        "NONE" => QuantifierKind::None,
+        "SINGLE" => QuantifierKind::Single,
+        other => unreachable!("unexpected quantifier_kw {other:?}"),
+    };
+    let (var, source, where_clause) = parse_filter_expr(inner.next().expect("quantifier_expr has a filter_expr"))?;
+    Ok(ReturnExpr::Quantifier {
+        kind,
+        var,
+        source,
+        where_clause,
     })
 }
 
