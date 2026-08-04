@@ -2,6 +2,7 @@ mod aggregate;
 mod ast;
 mod error;
 mod executor;
+mod explain;
 mod ir;
 mod params;
 mod parser;

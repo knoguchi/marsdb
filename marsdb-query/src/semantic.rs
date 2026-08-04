@@ -38,6 +38,7 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
         // No pattern/expression scoping to validate -- label/prop are
         // plain identifiers.
         Statement::CreateIndex { .. } => Ok(()),
+        Statement::Explain(inner) => validate_statement(inner),
         Statement::Match {
             clauses,
             tail,

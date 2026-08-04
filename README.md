@@ -216,13 +216,19 @@ instead of a full sort of every row.
 ### Cypher coverage
 
 `CREATE INDEX ON :Label(prop)` (optionally `UNIQUE`) declares a property
-index, backfilled immediately from existing nodes. A `MATCH (n:Label
-{prop: literal})` pattern (or, once a later change extracts `WHERE`
-equality predicates too, `WHERE n.prop = literal`) against an indexed
-`(label, prop)` compiles to a direct index seek instead of a label scan
-+ filter — only the single-property, node-pattern-literal shape is
-recognized so far; a `WHERE`-clause equality predicate doesn't fuse yet.
-No `CREATE CONSTRAINT`/composite indexes/range scans yet.
+index, backfilled immediately from existing nodes. An equality against an
+indexed `(label, prop)` compiles to a direct index seek instead of a label
+scan + filter, whether it's a node-pattern property (`MATCH (n:Label
+{prop: literal})`) or a `WHERE n.prop = literal` predicate — including one
+buried in a `WHERE a = 1 AND b = 2`-shaped conjunction, where only the
+indexed side seeks and the rest survives as a residual filter. When
+several conjuncts each have a declared index, the planner picks the most
+selective one by cheap, exact cardinality (a redb per-key entry count, not
+an estimate) rather than whichever appears first. `EXPLAIN <statement>`
+prints the compiled plan (scan vs seek, which conjunct fused, what's left
+as a residual filter) without running it — always against a read-only
+snapshot, even for a statement that would otherwise write. No `CREATE
+CONSTRAINT`/composite indexes/range scans yet.
 
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),

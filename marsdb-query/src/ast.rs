@@ -449,6 +449,11 @@ pub enum Statement {
         prop: String,
         unique: bool,
     },
+    /// `EXPLAIN <statement>` — describes the plan `<statement>` would run
+    /// (scan vs seek, pushdown applied) without executing any of it. Never
+    /// nests (the parser only ever wraps a `create_index_stmt`/
+    /// `create_stmt`/`match_stmt`, not another `explain_stmt`).
+    Explain(Box<Statement>),
     Match {
         /// One or more `MATCH`/`UNWIND`/`MERGE ... [WITH ...]` clauses. The
         /// parser enforces every `Match` clause except the statement's
