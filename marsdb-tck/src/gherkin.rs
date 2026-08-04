@@ -143,12 +143,49 @@ impl<'a> Cursor<'a> {
             if !l.starts_with('|') {
                 break;
             }
-            let cells: Vec<String> = l.trim_matches('|').split('|').map(|c| c.trim().to_string()).collect();
-            rows.push(cells);
+            rows.push(split_table_row(l));
             self.pos += 1;
         }
         rows
     }
+}
+
+/// Splits one `| a | b |` table row into cells, honoring Cucumber's own
+/// cell-level escaping (`\|` -> a literal `|`, `\\` -> a literal `\`, `\n`
+/// -> a literal newline) -- a separate escape layer *underneath* the
+/// Cypher string-literal escaping `tck_value::parse_cell` does on a
+/// cell's content afterward. Without this, a cell like `'a\\bcn5t...'`
+/// (Cucumber-escaped `\\` for one real backslash) reached `parse_cell`
+/// still double-escaped, corrupting the expected value it parsed to --
+/// caught the same way the earlier `\n`/`\t` fix in `tck_value.rs` was:
+/// a real query's actual output was correct, but structurally didn't
+/// match the (mis-parsed) expected value.
+fn split_table_row(line: &str) -> Vec<String> {
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('|') => current.push('|'),
+                Some('\\') => current.push('\\'),
+                Some('n') => current.push('\n'),
+                Some(other) => {
+                    current.push('\\');
+                    current.push(other);
+                }
+                None => current.push('\\'),
+            },
+            '|' => {
+                cells.push(current.trim().to_string());
+                current = String::new();
+            }
+            other => current.push(other),
+        }
+    }
+    cells.push(current.trim().to_string());
+    cells
 }
 
 /// Parses one `Scenario:`/`Scenario Outline:` block. For an outline, the

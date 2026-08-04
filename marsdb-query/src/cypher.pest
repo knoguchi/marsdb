@@ -13,11 +13,15 @@ statement = { create_stmt | match_stmt }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 
-// tail_clause is optional -- a bare `MERGE (...)` with nothing after it
-// is valid, same as standalone CREATE (see parser.rs::parse_match_stmt
-// for the "tail required unless a MERGE clause is present" check this
-// still enforces for MATCH/UNWIND-only statements).
-match_stmt    = { clause+ ~ tail_clause? ~ order_by_clause? ~ limit_clause? }
+// `clause*`, not `clause+` -- a bare `RETURN <expr>` with no MATCH/UNWIND/
+// MERGE at all (e.g. `RETURN 1 + 1`) is valid real Cypher, needing no
+// graph access. tail_clause is separately optional -- a bare `MERGE (...)`
+// with nothing after it is valid, same as standalone CREATE (see
+// parser.rs::parse_match_stmt for the "tail required unless a MERGE
+// clause is present" check, which already handles the zero-clause case
+// correctly as-is: no clauses means no MERGE among them, so a tail is
+// required, exactly as it should be).
+match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ limit_clause? }
 clause        = { unwind_clause | merge_clause | match_part }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }

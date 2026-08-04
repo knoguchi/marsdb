@@ -127,6 +127,21 @@ fn return_distinct_then_limit_counts_distinct_rows_not_raw_rows() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// A bare `RETURN <expr>` with no `MATCH`/`UNWIND`/`MERGE` at all is real
+/// Cypher (`match_stmt`'s `clause*`, not `clause+`) -- needs no graph
+/// access, just the one synthetic empty row `execute_match` already seeds
+/// `current_rows` with by default.
+#[test]
+fn bare_return_needs_no_match_clause() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN 1 + 2 * 3 AS x");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => assert_eq!(*i, 7),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
 #[test]
 fn detach_delete() {
     let store = GraphStore::open_memory().unwrap();
