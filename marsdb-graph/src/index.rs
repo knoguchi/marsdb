@@ -265,25 +265,33 @@ fn indexes_for_labels(
     Ok(out)
 }
 
-fn insert_entry(
-    write_txn: &WriteTransaction,
+/// Identifies one declared index, both by id (for the actual key/lookup)
+/// and by name (only needed for a `UniqueConstraintViolation`'s message).
+/// Bundled into one struct so `insert_entry` doesn't take 8 separate
+/// arguments (clippy's `too_many_arguments`, capped at 7).
+struct IndexTarget<'a> {
     label_id: u32,
     prop_id: u32,
+    label: &'a str,
+    prop: &'a str,
+}
+
+fn insert_entry(
+    write_txn: &WriteTransaction,
+    target: &IndexTarget<'_>,
     value: &PropertyValue,
     node_id: u64,
     unique: bool,
-    label: &str,
-    prop: &str,
 ) -> Result<(), GraphError> {
-    let key = index_key(label_id, prop_id, value);
+    let key = index_key(target.label_id, target.prop_id, value);
     if unique {
         let index = write_txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
         let exists = index.get(key.as_slice())?.next().is_some();
         drop(index);
         if exists {
             return Err(GraphError::UniqueConstraintViolation {
-                label: label.to_string(),
-                property: prop.to_string(),
+                label: target.label.to_string(),
+                property: target.prop.to_string(),
             });
         }
     }
@@ -321,9 +329,13 @@ pub fn on_node_created(
     {
         if let Some(value) = props.get(&prop_name) {
             let label = resolve_label(Txn::Write(write_txn), label_id)?;
-            insert_entry(
-                write_txn, label_id, prop_id, value, node_id, def.unique, &label, &prop_name,
-            )?;
+            let target = IndexTarget {
+                label_id,
+                prop_id,
+                label: &label,
+                prop: &prop_name,
+            };
+            insert_entry(write_txn, &target, value, node_id, def.unique)?;
         }
     }
     Ok(())
@@ -377,9 +389,13 @@ pub fn on_node_prop_changed(
         }
         if let Some(new) = new_value {
             let label = resolve_label(Txn::Write(write_txn), label_id)?;
-            insert_entry(
-                write_txn, label_id, prop_id, new, node_id, def.unique, &label, &prop_name,
-            )?;
+            let target = IndexTarget {
+                label_id,
+                prop_id,
+                label: &label,
+                prop: &prop_name,
+            };
+            insert_entry(write_txn, &target, new, node_id, def.unique)?;
         }
     }
     Ok(())
