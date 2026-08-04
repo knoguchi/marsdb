@@ -1737,6 +1737,7 @@ impl<'a> Executor<'a> {
                 },
                 seed,
                 guard,
+                scan_limit,
             ),
             LogicalPlan::Expand {
                 input,
@@ -1969,16 +1970,18 @@ impl<'a> Executor<'a> {
     /// `LogicalPlan::IndexSeek`'s streaming operator -- same cross-join-
     /// against-`seed` shape as `stream_scan`, but the id list comes from
     /// one exact-match `PROPERTY_INDEX` lookup instead of a label scan.
-    /// No `row_limit`/budget-based cap on the lookup itself the way
-    /// `stream_scan` has: an equality match (especially against a unique
-    /// index) is already tightly bounded by construction, not by how much
-    /// of a label's nodes happen to get scanned first.
+    /// `row_limit` bounds the lookup itself the same way `stream_scan`'s
+    /// does -- a non-unique index can still match far more nodes than a
+    /// `LIMIT` needs, so the same "ask storage for at most the budget,
+    /// not everything" reasoning applies, just against `PROPERTY_INDEX`
+    /// instead of `NODE_LABEL_INDEX`.
     fn stream_index_seek<'s>(
         &'s self,
         txn: Txn<'s>,
         spec: IndexSeekSpec<'s>,
         seed: &'s [BindingRow],
         guard: &'s ExecutionGuard<'_>,
+        row_limit: Option<usize>,
     ) -> RowStream<'s> {
         let mut initialized = false;
         let mut node_ids: Vec<NodeId> = Vec::new();
@@ -1991,7 +1994,27 @@ impl<'a> Executor<'a> {
             }
             if !initialized {
                 initialized = true;
-                match GraphStore::lookup_by_index_in_txn(txn, spec.label, spec.prop, spec.value) {
+                let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+                    max_rows
+                        .checked_div(seed.len())
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                });
+                let storage_limit = match (row_limit, budget_node_limit) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let result = match storage_limit {
+                    Some(limit) => GraphStore::lookup_by_index_limited_in_txn(
+                        txn, spec.label, spec.prop, spec.value, limit,
+                    ),
+                    None => {
+                        GraphStore::lookup_by_index_in_txn(txn, spec.label, spec.prop, spec.value)
+                    }
+                };
+                match result {
                     Ok(ids) => node_ids = ids,
                     Err(error) => {
                         done = true;

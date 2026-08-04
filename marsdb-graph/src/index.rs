@@ -194,16 +194,23 @@ pub fn lookup_index_def(txn: Txn, label: &str, prop: &str) -> Result<Option<Inde
 }
 
 /// Exact-match lookup: every node currently indexed under `(label, prop) =
-/// value`. Caller (the planner, in a later change) is responsible for
-/// checking `lookup_index_def` first — this returns an empty result, not
-/// an error, if no such index exists (matching a genuinely-empty index
-/// would look the same, and this function has no way to tell those apart
-/// itself without the same lookup its caller likely already did).
+/// value`, up to `limit` of them if given. Caller (the planner, in a
+/// later change) is responsible for checking `lookup_index_def` first —
+/// this returns an empty result, not an error, if no such index exists
+/// (matching a genuinely-empty index would look the same, and this
+/// function has no way to tell those apart itself without the same
+/// lookup its caller likely already did). `limit` bounds the underlying
+/// multimap iterator itself (`.take(limit)` before collecting, not a
+/// truncate after) — same real fix this same class of bug needed for
+/// `NODE_LABEL_INDEX` (see `GraphStore::all_nodes_limited_in_txn`'s
+/// history): truncating *after* `collect()` would still walk every
+/// matching entry first, defeating the point of a `LIMIT` push-down.
 pub fn lookup_exact(
     txn: Txn,
     label: &str,
     prop: &str,
     value: &PropertyValue,
+    limit: Option<usize>,
 ) -> Result<Vec<NodeId>, GraphError> {
     let Some(label_id) = lookup_label_id(txn, label)? else {
         return Ok(Vec::new());
@@ -213,14 +220,24 @@ pub fn lookup_exact(
     };
     let key = index_key(label_id, prop_id, value);
     let index = txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
-    let ids = index
-        .get(key.as_slice())?
-        .map(|entry| {
-            entry
-                .map(|value| NodeId(value.value()))
-                .map_err(GraphError::from)
-        })
-        .collect::<Result<Vec<_>, GraphError>>()?;
+    let iter = index.get(key.as_slice())?;
+    let ids: Vec<NodeId> = match limit {
+        Some(limit) => iter
+            .take(limit)
+            .map(|entry| {
+                entry
+                    .map(|value| NodeId(value.value()))
+                    .map_err(GraphError::from)
+            })
+            .collect::<Result<Vec<_>, GraphError>>()?,
+        None => iter
+            .map(|entry| {
+                entry
+                    .map(|value| NodeId(value.value()))
+                    .map_err(GraphError::from)
+            })
+            .collect::<Result<Vec<_>, GraphError>>()?,
+    };
     drop(index);
     Ok(ids)
 }

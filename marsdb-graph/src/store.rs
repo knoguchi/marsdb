@@ -628,7 +628,20 @@ impl GraphStore {
         prop: &str,
         value: &PropertyValue,
     ) -> Result<Vec<NodeId>, GraphError> {
-        crate::index::lookup_exact(txn, label, prop, value)
+        crate::index::lookup_exact(txn, label, prop, value, None)
+    }
+
+    /// Same as `lookup_by_index_in_txn`, but stops once `limit` nodes are
+    /// found — the storage-level end of `LIMIT` push-down through an
+    /// `IndexSeek` (see `marsdb_query::planner`/`executor::stream_index_seek`).
+    pub fn lookup_by_index_limited_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        value: &PropertyValue,
+        limit: usize,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        crate::index::lookup_exact(txn, label, prop, value, Some(limit))
     }
 
     /// Every node currently indexed under `(label, prop) = value`. Empty
@@ -641,7 +654,7 @@ impl GraphStore {
         value: &PropertyValue,
     ) -> Result<Vec<NodeId>, GraphError> {
         let read_txn = self.begin_read()?;
-        crate::index::lookup_exact(Txn::Read(&read_txn), label, prop, value)
+        crate::index::lookup_exact(Txn::Read(&read_txn), label, prop, value, None)
     }
 
     pub fn set_node_prop(

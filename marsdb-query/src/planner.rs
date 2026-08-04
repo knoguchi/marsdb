@@ -309,6 +309,35 @@ fn wrap_labels_and_props(
     Ok(plan)
 }
 
+/// Splits `expr` into a flat list of top-level `AND`-conjuncts, appended
+/// to `out` — `And(l, r)` decomposes both sides recursively; anything
+/// else (a single `Compare`, `Or`, `Not`, ...) is one conjunct as-is.
+/// Used by `apply_index_seeks` to find every equality candidate in a
+/// `WHERE a = 1 AND b = 2`-shaped predicate, not just a bare single
+/// comparison.
+fn push_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::And(l, r) => {
+            push_conjuncts(*l, out);
+            push_conjuncts(*r, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// `push_conjuncts`'s inverse — folds a conjunct list back into one `And`
+/// tree (`None` for an empty list, meaning "no predicate left to
+/// enforce" — the whole thing became one equality that's now satisfied
+/// by an `IndexSeek` instead).
+fn rebuild_and(mut exprs: Vec<Expr>) -> Option<Expr> {
+    let first = exprs.pop()?;
+    Some(
+        exprs
+            .into_iter()
+            .fold(first, |acc, e| Expr::And(Box::new(e), Box::new(acc))),
+    )
+}
+
 /// A `MATCH`/`MERGE` pattern's inline `{key: value}` must be a plain
 /// literal (real Cypher's own restriction too — `MATCH (n {x: f()})`
 /// isn't valid there either) since it compiles straight into a `Filter`
@@ -373,31 +402,74 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 /// job (a separate, later change), not this fusion's.
 pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, QueryError> {
     Ok(match plan {
-        LogicalPlan::Filter { input, predicate } => {
-            let input = apply_index_seeks(*input, txn)?;
-            match (&predicate, &input) {
-                (
-                    Expr::Compare(pa, CompareOp::Eq, lit),
-                    LogicalPlan::NodeByLabelScan { var, label },
-                ) if pa.var == *var && !matches!(lit, Literal::Param(_)) => {
+        LogicalPlan::Filter { .. } => {
+            // Peel every directly-nested `Filter` down to whatever
+            // non-`Filter` node sits underneath, flattening each level's
+            // predicate into one flat conjunct list. Both an inline
+            // pattern property (`{prop: literal}`) and a `WHERE` clause
+            // compile to the identical `Filter{predicate: Expr::Compare}`
+            // shape (see `wrap_labels_and_props`/`build_match_plan`), so
+            // an equality on either one -- or on either side of a `WHERE
+            // a = 1 AND b = 2`, which is one `Filter` with an `And`
+            // predicate, not two nested `Filter`s -- is an equally valid
+            // index-seek candidate. Only a *directly* nested chain is
+            // peeled; a conjunct sitting past an `Expand`/`VarExpand`
+            // belongs to a different node's scan, not this one's.
+            let mut node = plan;
+            let mut candidates = Vec::new();
+            let base = loop {
+                match node {
+                    LogicalPlan::Filter { input, predicate } => {
+                        push_conjuncts(predicate, &mut candidates);
+                        node = *input;
+                    }
+                    other => break other,
+                }
+            };
+            let base = apply_index_seeks(base, txn)?;
+            if let LogicalPlan::NodeByLabelScan { var, label } = &base {
+                // First candidate that's a real `var.prop = literal`
+                // equality *and* has a declared index -- not just the
+                // first syntactically, since an earlier conjunct might
+                // name an unindexed property while a later one does.
+                let mut chosen = None;
+                for (i, c) in candidates.iter().enumerate() {
+                    let Expr::Compare(pa, CompareOp::Eq, lit) = c else {
+                        continue;
+                    };
+                    if pa.var != *var || matches!(lit, Literal::Param(_)) {
+                        continue;
+                    }
                     if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_some() {
-                        LogicalPlan::IndexSeek {
-                            var: var.clone(),
-                            label: label.clone(),
-                            prop: pa.prop.clone(),
-                            value: literal_to_value(lit),
-                        }
-                    } else {
-                        LogicalPlan::Filter {
-                            input: Box::new(input),
-                            predicate,
-                        }
+                        chosen = Some(i);
+                        break;
                     }
                 }
-                _ => LogicalPlan::Filter {
-                    input: Box::new(input),
+                if let Some(i) = chosen {
+                    let Expr::Compare(pa, _, lit) = candidates.remove(i) else {
+                        unreachable!("chosen index always points at a Compare, checked above")
+                    };
+                    let seek = LogicalPlan::IndexSeek {
+                        var: var.clone(),
+                        label: label.clone(),
+                        prop: pa.prop,
+                        value: literal_to_value(&lit),
+                    };
+                    return Ok(match rebuild_and(candidates) {
+                        Some(predicate) => LogicalPlan::Filter {
+                            input: Box::new(seek),
+                            predicate,
+                        },
+                        None => seek,
+                    });
+                }
+            }
+            match rebuild_and(candidates) {
+                Some(predicate) => LogicalPlan::Filter {
+                    input: Box::new(base),
                     predicate,
                 },
+                None => base,
             }
         }
         LogicalPlan::Expand {
@@ -447,13 +519,17 @@ mod tests {
     use crate::ast::{QueryClause, Statement};
 
     fn pattern_from(cypher: &str) -> crate::ast::Pattern {
+        part_from(cypher).pattern
+    }
+
+    fn part_from(cypher: &str) -> crate::ast::QueryPart {
         let Statement::Match { clauses, .. } = crate::parser::parse(cypher).unwrap() else {
             panic!("expected a Match statement");
         };
         let QueryClause::Match(part) = clauses.into_iter().next().unwrap() else {
             panic!("expected a Match clause");
         };
-        part.pattern
+        part
     }
 
     #[test]
@@ -496,6 +572,68 @@ mod tests {
                 assert!(matches!(*input, LogicalPlan::NodeByLabelScan { .. }));
             }
             other => panic!("expected a Filter over a scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fuses_a_where_clause_equality_into_index_seek() {
+        // Unlike an inline pattern property, a WHERE-clause equality
+        // compiles to a *separate* outer Filter wrapping the scan --
+        // apply_index_seeks must still find it.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        let part = part_from("MATCH (n:Person) WHERE n.email = 'alice@x.com' RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::IndexSeek {
+                var,
+                label,
+                prop,
+                value,
+            } => {
+                assert_eq!(var, "n");
+                assert_eq!(label, "Person");
+                assert_eq!(prop, "email");
+                assert_eq!(value, PropertyValue::String("alice@x.com".to_string()));
+            }
+            other => panic!("expected an IndexSeek, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seeks_one_equality_and_keeps_the_other_conjunct_as_a_residual_filter() {
+        // `WHERE email = 'x' AND age > 35` -- only `email` has an index,
+        // so the seek must fire for it while `age > 35` survives as a
+        // Filter wrapping the seek, not get silently dropped.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        let part =
+            part_from("MATCH (n:Person) WHERE n.email = 'alice@x.com' AND n.age > 35 RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(*input, LogicalPlan::IndexSeek { .. }),
+                    "expected the seek underneath"
+                );
+                match predicate {
+                    Expr::Compare(pa, CompareOp::Gt, Literal::Int(35)) => {
+                        assert_eq!(pa.prop, "age")
+                    }
+                    other => panic!("expected the residual age > 35 predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),
         }
     }
 }
