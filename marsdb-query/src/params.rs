@@ -318,6 +318,9 @@ fn substitute_return_expr(
             substitute_return_expr(r, params)?;
         }
         ReturnExpr::IsNull(e) => substitute_return_expr(e, params)?,
+        // No `$param`-able position -- var/labels are identifiers, not
+        // expressions.
+        ReturnExpr::HasLabel(..) => {}
     }
     Ok(())
 }

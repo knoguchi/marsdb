@@ -2514,6 +2514,23 @@ impl<'a> Executor<'a> {
                 let v = self.eval_return_expr(txn, e, row)?;
                 Ok(Value::Literal(Literal::Bool(matches!(v, Value::Null))))
             }
+            ReturnExpr::HasLabel(var, labels) => {
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                match binding {
+                    Binding::Node(id) => {
+                        let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?;
+                        Ok(Value::Literal(Literal::Bool(
+                            labels.iter().all(|l| node.labels.contains(l)),
+                        )))
+                    }
+                    Binding::Value(PropertyValue::Null) => Ok(Value::Null),
+                    other => Err(QueryError::Type(format!(
+                        "'{var}' isn't a node — (n:Label) needs a node binding, got {other:?}"
+                    ))),
+                }
+            }
         }
     }
 
@@ -2875,7 +2892,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Xor(..)
         | ReturnExpr::Not(..)
         | ReturnExpr::Compare(..)
-        | ReturnExpr::IsNull(..) => format!("col{idx}"),
+        | ReturnExpr::IsNull(..)
+        | ReturnExpr::HasLabel(..) => format!("col{idx}"),
     }
 }
 
@@ -2941,7 +2959,10 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::Not(e) => contains_aggregate(e),
         ReturnExpr::Compare(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
         ReturnExpr::IsNull(e) => contains_aggregate(e),
-        ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
+        ReturnExpr::Var(_)
+        | ReturnExpr::Prop(_)
+        | ReturnExpr::Lit(_)
+        | ReturnExpr::HasLabel(..) => false,
     }
 }
 
@@ -4920,6 +4941,20 @@ fn eval_projected_expr(
             eval_projected_expr(e, row)?,
             Value::Null
         )))),
+        ReturnExpr::HasLabel(var, labels) => {
+            let binding = row
+                .get(var)
+                .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+            match binding {
+                Value::Node(n) => Ok(Value::Literal(Literal::Bool(
+                    labels.iter().all(|l| n.labels.contains(l)),
+                ))),
+                Value::Null => Ok(Value::Null),
+                other => Err(QueryError::Type(format!(
+                    "'{var}' isn't a node — (n:Label) needs a node binding, got {other:?}"
+                ))),
+            }
+        }
     }
 }
 
