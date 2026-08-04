@@ -74,6 +74,23 @@ fn limit_clause() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// `MATCH (n:Label) RETURN ... LIMIT k` (no WHERE, no hops, no ORDER BY) is
+/// the one shape `execute_match` pushes the LIMIT all the way into the
+/// storage scan for -- covers both edges that shape needs to get right:
+/// `LIMIT 0` (valid Cypher, must return nothing, not error or return
+/// everything) and a `LIMIT` past the available row count (must return
+/// what's actually there, not pad or panic).
+#[test]
+fn limit_clause_pushed_into_scan_edge_cases() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    assert_eq!(run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 0").rows.len(), 0);
+    assert_eq!(run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 100").rows.len(), 3);
+    assert_eq!(run(&store, "MATCH (n) RETURN n LIMIT 2").rows.len(), 2);
+}
+
 #[test]
 fn detach_delete() {
     let store = GraphStore::open_memory().unwrap();
@@ -238,6 +255,42 @@ fn order_by_then_limit_sorts_before_truncating() {
     // Must be the top 2 by DESC order (4, 3), not an arbitrary 2 rows
     // taken before sorting.
     assert_eq!(values, vec![4, 3]);
+}
+
+/// Exercises `top_k_by`'s aggregating path (`apply_order_by`) specifically
+/// -- the non-aggregating case above goes through a different function
+/// (`apply_order_by_with_scope`).
+#[test]
+fn order_by_then_limit_with_aggregation() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x, count(*) AS c ORDER BY x DESC LIMIT 2");
+    let values: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![4, 3]);
+}
+
+/// `LIMIT 0` combined with `ORDER BY` is valid Cypher and must return
+/// nothing, not error or return everything -- an edge case `top_k_by`'s
+/// partial-select path needs to special-case explicitly (`select_nth_
+/// unstable_by` panics on an out-of-bounds index, which `k - 1` would be
+/// for `k == 0`).
+#[test]
+fn order_by_then_limit_zero_returns_nothing() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..3 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x ORDER BY x LIMIT 0");
+    assert_eq!(result.rows.len(), 0);
 }
 
 #[test]

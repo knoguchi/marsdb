@@ -141,6 +141,20 @@ whole.
 
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 
+Execution materializes a `Vec` of bindings at every step rather than
+pulling rows lazily — there's no general query optimizer or streaming
+iterator model. Two narrow, hand-written exceptions: a `MATCH (n[:Label])
+RETURN ... LIMIT k` with no `WHERE`/hops/`ORDER BY` pushes the `LIMIT`
+straight into the storage scan (`GraphStore::all_nodes_limited_in_txn`
+stops once it has `k` nodes, whether or not a label narrows it first —
+correct only because nothing downstream could still drop a row); and
+every `ORDER BY ... LIMIT k` site (`WITH`'s own, non-aggregating
+`RETURN`'s, aggregating `RETURN`'s) uses a top-k partial selection
+(`slice::select_nth_unstable_by` + a sort of just the k-sized prefix)
+instead of a full sort of every row. Both are real, targeted wins, not a
+general "push predicates/limits through the plan" framework — see the
+Roadmap.
+
 ### Cypher coverage
 
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
@@ -207,13 +221,15 @@ need a definite yes/no, not "unknown".
 
 ## Roadmap
 
-- `LIMIT` short-circuiting
 - `RETURN DISTINCT` (result-set-level dedup; `DISTINCT` inside an
   aggregate call already works)
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
+- Real query optimizer (cost-based join ordering, a semantic-validation
+  binder pass) — the two targeted wins below (LIMIT push-down, ORDER
+  BY+LIMIT top-k) are hand-special-cased, not a general framework
 
 ## Testing
 

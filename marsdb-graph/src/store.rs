@@ -476,6 +476,20 @@ impl GraphStore {
     }
 
     pub fn all_nodes_in_txn(txn: Txn, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
+        Self::all_nodes_limited_in_txn(txn, label_filter, usize::MAX)
+    }
+
+    /// Same as `all_nodes_in_txn`, but stops once `limit` nodes are found --
+    /// the storage-level end of `LIMIT` push-down (see the executor's
+    /// `scan()`/`eval_plan` docs for the query-level half): a query whose
+    /// entire plan is a bare scan feeding straight into a `LIMIT` doesn't
+    /// need to touch rows past the first `limit`, whether or not a label
+    /// filter narrows it first.
+    pub fn all_nodes_limited_in_txn(
+        txn: Txn,
+        label_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Node>, GraphError> {
         // A label filter goes through NODE_LABEL_INDEX (label_id -> node_ids)
         // plus a point lookup per match, instead of scanning every row in
         // NODES — cost scales with the number of matching rows, not the
@@ -485,6 +499,9 @@ impl GraphStore {
             let mut result = Vec::new();
             let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
             for item in nodes.iter()? {
+                if result.len() >= limit {
+                    break;
+                }
                 let (key, value) = item?;
                 let record: NodeRecord = decode(value.value())?;
                 let labels = record
@@ -503,7 +520,7 @@ impl GraphStore {
         let Some(label_id) = lookup_label_id(txn, label_filter)? else {
             return Ok(Vec::new());
         };
-        let node_ids: Vec<u64> = {
+        let mut node_ids: Vec<u64> = {
             let label_index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             let ids: Vec<u64> = label_index
                 .get(label_id)?
@@ -511,6 +528,9 @@ impl GraphStore {
                 .collect::<Result<_, _>>()?;
             ids
         };
+        // Trim before the per-id NODES lookups below, not after -- each one
+        // is a real point-read, worth skipping entirely past `limit`.
+        node_ids.truncate(limit);
         let mut result = Vec::with_capacity(node_ids.len());
         let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
         for id in node_ids {
