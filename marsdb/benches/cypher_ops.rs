@@ -53,10 +53,29 @@ fn bench_execute_match_1hop(c: &mut Criterion) {
     group.finish();
 }
 
+/// `MATCH (n:Label) RETURN ... LIMIT k` with no hops/WHERE/ORDER BY is the
+/// one shape `execute_match` pushes the LIMIT into the storage scan for
+/// (see `README.md`'s Architecture section) -- this isolates that case
+/// from `bench_execute_match_1hop` above, which has a hop and so never
+/// qualifies for the same push-down.
+fn bench_execute_scan_limit_pushdown(c: &mut Criterion) {
+    let mut group = c.benchmark_group("execute_scan_limit_pushdown_by_dataset_size");
+    for n in [100usize, 1_000, 10_000, 100_000] {
+        let db = Database::in_memory().unwrap();
+        let create = (0..n).map(|i| format!("(:Item {{idx: {i}}})")).collect::<Vec<_>>().join(", ");
+        db.execute(&format!("CREATE {create}")).unwrap();
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(db.execute("MATCH (n:Item) RETURN n LIMIT 10").unwrap()));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_only,
     bench_execute_create,
     bench_execute_match_1hop,
+    bench_execute_scan_limit_pushdown,
 );
 criterion_main!(benches);
