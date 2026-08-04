@@ -443,6 +443,12 @@ pub enum QueryClause {
 #[derive(Debug, Clone)]
 pub enum Statement {
     Create(Vec<Pattern>),
+    /// `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE`.
+    CreateIndex {
+        label: String,
+        prop: String,
+        unique: bool,
+    },
     Match {
         /// One or more `MATCH`/`UNWIND`/`MERGE ... [WITH ...]` clauses. The
         /// parser enforces every `Match` clause except the statement's

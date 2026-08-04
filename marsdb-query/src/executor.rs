@@ -19,7 +19,7 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
-use crate::planner::{build_match_plan, pattern_all_vars, pattern_new_vars};
+use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::result::QueryResult;
 use crate::temporal;
 use crate::value::{PathElem, Value};
@@ -276,6 +276,13 @@ struct VarExpandSpec<'a> {
     max_hops: Option<u32>,
 }
 
+struct IndexSeekSpec<'a> {
+    var: &'a str,
+    label: &'a str,
+    prop: &'a str,
+    value: &'a PropertyValue,
+}
+
 type BindingRow = HashMap<String, Binding>;
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
@@ -439,6 +446,18 @@ impl<'a> Executor<'a> {
             Statement::Create(patterns) => {
                 guard.checkpoint()?;
                 self.execute_create(write_txn, patterns)
+            }
+            Statement::CreateIndex {
+                label,
+                prop,
+                unique,
+            } => {
+                guard.checkpoint()?;
+                GraphStore::create_index_in_txn(write_txn, label, prop, *unique)?;
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                })
             }
             Statement::Match {
                 clauses,
@@ -663,7 +682,10 @@ impl<'a> Executor<'a> {
         // is exactly the correctness property MERGE needs and gets for
         // free by reusing this instead of inventing bespoke search logic.
         let carried_vars: HashSet<String> = row.keys().cloned().collect();
-        let plan = build_match_plan(&clause.pattern, &None, &carried_vars)?;
+        let plan = apply_index_seeks(
+            build_match_plan(&clause.pattern, &None, &carried_vars)?,
+            Txn::Write(write_txn),
+        )?;
         let found = self.eval_plan(
             Txn::Write(write_txn),
             &plan,
@@ -788,8 +810,10 @@ impl<'a> Executor<'a> {
                         self.eval_shortest_path(txn, part, &current_rows)?
                     } else if let Some(path_var) = &part.path_var {
                         let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
-                        let plan =
-                            build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?;
+                        let plan = apply_index_seeks(
+                            build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?,
+                            txn,
+                        )?;
                         let mut rows = if part.optional {
                             let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
                             self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
@@ -805,8 +829,10 @@ impl<'a> Executor<'a> {
                         }
                         rows
                     } else {
-                        let plan =
-                            build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+                        let plan = apply_index_seeks(
+                            build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?,
+                            txn,
+                        )?;
                         if part.optional {
                             let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
                             self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
@@ -1696,6 +1722,22 @@ impl<'a> Executor<'a> {
             LogicalPlan::NodeByLabelScan { var, label } => {
                 self.stream_scan(txn, var, Some(label), seed, guard, scan_limit)
             }
+            LogicalPlan::IndexSeek {
+                var,
+                label,
+                prop,
+                value,
+            } => self.stream_index_seek(
+                txn,
+                IndexSeekSpec {
+                    var,
+                    label,
+                    prop,
+                    value,
+                },
+                seed,
+                guard,
+            ),
             LogicalPlan::Expand {
                 input,
                 from_var,
@@ -1914,6 +1956,58 @@ impl<'a> Executor<'a> {
             }
             let mut row = seed[seed_index].clone();
             row.insert(var.to_string(), Binding::Node(node_ids[node_index]));
+            node_index += 1;
+            if node_index == node_ids.len() {
+                node_index = 0;
+                seed_index += 1;
+            }
+            Some(Ok(row))
+        });
+        Self::count_stream(Box::new(stream), guard)
+    }
+
+    /// `LogicalPlan::IndexSeek`'s streaming operator -- same cross-join-
+    /// against-`seed` shape as `stream_scan`, but the id list comes from
+    /// one exact-match `PROPERTY_INDEX` lookup instead of a label scan.
+    /// No `row_limit`/budget-based cap on the lookup itself the way
+    /// `stream_scan` has: an equality match (especially against a unique
+    /// index) is already tightly bounded by construction, not by how much
+    /// of a label's nodes happen to get scanned first.
+    fn stream_index_seek<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        spec: IndexSeekSpec<'s>,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+    ) -> RowStream<'s> {
+        let mut initialized = false;
+        let mut node_ids: Vec<NodeId> = Vec::new();
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            if !initialized {
+                initialized = true;
+                match GraphStore::lookup_by_index_in_txn(txn, spec.label, spec.prop, spec.value) {
+                    Ok(ids) => node_ids = ids,
+                    Err(error) => {
+                        done = true;
+                        return Some(Err(error.into()));
+                    }
+                }
+            }
+            if node_ids.is_empty() || seed_index >= seed.len() {
+                return None;
+            }
+            if let Err(error) = guard.checkpoint() {
+                done = true;
+                return Some(Err(error));
+            }
+            let mut row = seed[seed_index].clone();
+            row.insert(spec.var.to_string(), Binding::Node(node_ids[node_index]));
             node_index += 1;
             if node_index == node_ids.len() {
                 node_index = 0;
@@ -3086,7 +3180,7 @@ fn deleted_entity_access<T>(record: Option<T>) -> Result<T, QueryError> {
     })
 }
 
-fn literal_to_value(lit: &Literal) -> PropertyValue {
+pub(crate) fn literal_to_value(lit: &Literal) -> PropertyValue {
     match lit {
         Literal::Int(i) => PropertyValue::Int(*i),
         Literal::Float(f) => PropertyValue::Float(*f),

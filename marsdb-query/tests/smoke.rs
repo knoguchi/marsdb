@@ -3516,3 +3516,45 @@ fn mutating_tail_with_no_return_is_still_terminal() {
     let result = run(&store, "MATCH (n:A) RETURN n.p");
     assert_eq!(int_value(&result.rows[0][0]), 2);
 }
+
+#[test]
+fn create_index_then_lookup_via_index_seek() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com', age: 30})");
+    run(&store, "CREATE (:Person {email: 'bob@x.com', age: 25})");
+    run(&store, "CREATE INDEX ON :Person(email)");
+
+    let result = run(
+        &store,
+        "MATCH (n:Person {email: 'alice@x.com'}) RETURN n.age",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 30);
+}
+
+#[test]
+fn create_index_unique_rejects_duplicate() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'same@x.com'})");
+    run(&store, "CREATE (:Person {email: 'same@x.com'})");
+
+    let stmt = parse("CREATE INDEX ON :Person(email) UNIQUE").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("unique"));
+}
+
+#[test]
+fn match_without_declared_index_still_works() {
+    // Regression guard: a plain node-pattern-property match with no
+    // index declared must still hit the ordinary Filter-over-scan path,
+    // not error or silently return nothing just because `apply_index_seeks`
+    // now runs over every plan.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com'})");
+    let result = run(
+        &store,
+        "MATCH (n:Person {email: 'alice@x.com'}) RETURN n.email",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "alice@x.com");
+}

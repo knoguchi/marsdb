@@ -37,6 +37,7 @@ pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
 fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let inner = pair.into_inner().next().expect("statement has one child");
     match inner.as_rule() {
+        Rule::create_index_stmt => parse_create_index_stmt(inner),
         Rule::create_stmt => parse_create_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected statement child rule {r:?}"),
@@ -45,6 +46,30 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
 
 fn parse_create_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     Ok(Statement::Create(parse_create_patterns(pair)?))
+}
+
+/// `create_index_stmt = { ^"CREATE" ~ ^"INDEX" ~ ^"ON" ~ ":" ~ identifier
+/// ~ "(" ~ identifier ~ ")" ~ unique_kw? }` -- the two `identifier`
+/// children are label then prop (in that order); `unique_kw`'s presence
+/// (a real `Pair`, not an inline literal) is what distinguishes `UNIQUE`.
+fn parse_create_index_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
+    let mut inner = pair.into_inner();
+    let label = inner
+        .next()
+        .expect("create_index_stmt has a label identifier")
+        .as_str()
+        .to_string();
+    let prop = inner
+        .next()
+        .expect("create_index_stmt has a prop identifier")
+        .as_str()
+        .to_string();
+    let unique = inner.next().is_some_and(|p| p.as_rule() == Rule::unique_kw);
+    Ok(Statement::CreateIndex {
+        label,
+        prop,
+        unique,
+    })
 }
 
 /// Shared by standalone `CREATE` (`parse_create_stmt`) and a `MATCH ...
