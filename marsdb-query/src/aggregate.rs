@@ -459,7 +459,12 @@ mod tests {
 
     #[test]
     fn min_max_on_non_orderable_errors() {
-        let node = Value::List(vec![]); // non-orderable stand-in, avoids constructing a real Node/Edge in a unit test
+        // Non-orderable stand-in, avoids constructing a real Node/Edge in
+        // a unit test -- `List` no longer qualifies (it's genuinely
+        // orderable now, element-by-element, matching real Cypher's
+        // `max()`/`min()` over a list argument), `Map` still has no
+        // defined order (see `comparable_ordering`'s docs).
+        let node = Value::Map(std::collections::BTreeMap::new());
         assert!(AggAcc::identity("min", false).fold(&node).is_err());
         assert!(AggAcc::identity("max", false).fold(&node).is_err());
     }

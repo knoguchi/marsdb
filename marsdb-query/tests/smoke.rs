@@ -1871,6 +1871,48 @@ fn min_max_on_non_orderable_errors() {
     );
 }
 
+/// `max()`/`min()` over a list argument -- real Cypher orders a list
+/// element-by-element (reusing the same `list_cmp_asc` ORDER BY
+/// already uses), found as a real bug: `comparable_ordering` had no
+/// `List` arm at all, so any list argument unconditionally errored
+/// "requires a comparable scalar argument". Aggregation2 [9]/[10].
+#[test]
+fn max_min_over_list_values() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "UNWIND [[1], [2], [2, 1]] AS x RETURN max(x), min(x)",
+    );
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (Value::List(max), Value::List(min)) => {
+            assert_eq!(max.len(), 2); // [2, 1]
+            assert_eq!(min.len(), 1); // [1]
+        }
+        other => panic!("expected two lists, got {other:?}"),
+    }
+}
+
+/// `max()`/`min()` over genuinely mixed types (numbers, strings, a
+/// list) -- real Cypher's cross-type orderability ranks `List` *below*
+/// every scalar (sorts first), the opposite of an earlier, unverified
+/// version of `type_rank` that put it last. Aggregation2 [11]/[12].
+#[test]
+fn max_min_over_mixed_types_including_a_list() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "UNWIND [1, 'a', null, [1, 2], 0.2, 'b'] AS x RETURN max(x), min(x)",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => assert_eq!(*i, 1),
+        other => panic!("expected max to be the int 1, got {other:?}"),
+    }
+    match &result.rows[0][1] {
+        Value::List(items) => assert_eq!(items.len(), 2), // [1, 2]
+        other => panic!("expected min to be the list [1, 2], got {other:?}"),
+    }
+}
+
 #[test]
 fn nested_aggregate_rejected() {
     let store = GraphStore::open_memory().unwrap();
