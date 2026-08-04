@@ -153,6 +153,16 @@ fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), Query
         if let Some(var) = &node.var {
             bind_kind(scope, var, Kind::Node, "CREATE node")?;
         }
+        // Unlike MATCH (where an untyped hop just means "any relationship"),
+        // CREATE always makes exactly one new relationship, and a brand
+        // new edge with no type is meaningless -- real Cypher requires an
+        // explicit `:TYPE` here, it's never inferred/defaulted.
+        if rel.rel_type.is_none() {
+            return Err(semantic(
+                "CREATE requires an explicit relationship type (e.g. -[:KNOWS]->) -- unlike MATCH, \
+                 an untyped relationship pattern can't be created",
+            ));
+        }
         validate_props(&rel.props, scope)?;
         if let Some(var) = &rel.var {
             bind_kind(scope, var, Kind::Edge, "CREATE relationship")?;

@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "concurrency_ops"
 harness = false
+
+[[bench]]
+name = "index_ops"
+harness = false

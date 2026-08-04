@@ -17,43 +17,43 @@ scope.
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
-| clauses/create | 78 | 40 | 0 | 3 | 35 | 0 | 51.3% |
+| clauses/create | 78 | 41 | 0 | 2 | 35 | 0 | 52.6% |
 | clauses/delete | 41 | 15 | 0 | 0 | 26 | 0 | 36.6% |
-| clauses/match | 381 | 268 | 0 | 0 | 82 | 31 | 70.3% |
+| clauses/match | 381 | 272 | 0 | 0 | 74 | 35 | 71.4% |
 | clauses/match-where | 34 | 8 | 0 | 0 | 26 | 0 | 23.5% |
-| clauses/merge | 75 | 19 | 0 | 3 | 53 | 0 | 25.3% |
-| clauses/remove | 33 | 9 | 0 | 0 | 24 | 0 | 27.3% |
-| clauses/return | 63 | 25 | 0 | 1 | 37 | 0 | 39.7% |
-| clauses/return-orderby | 35 | 21 | 0 | 1 | 13 | 0 | 60.0% |
+| clauses/merge | 75 | 25 | 0 | 3 | 47 | 0 | 33.3% |
+| clauses/remove | 33 | 15 | 0 | 0 | 18 | 0 | 45.5% |
+| clauses/return | 63 | 29 | 0 | 2 | 32 | 0 | 46.0% |
+| clauses/return-orderby | 35 | 23 | 0 | 2 | 10 | 0 | 65.7% |
 | clauses/return-skip-limit | 31 | 22 | 0 | 0 | 9 | 0 | 71.0% |
-| clauses/set | 53 | 16 | 0 | 0 | 37 | 0 | 30.2% |
+| clauses/set | 53 | 20 | 0 | 0 | 33 | 0 | 37.7% |
 | clauses/union | 12 | 4 | 0 | 0 | 8 | 0 | 33.3% |
 | clauses/unwind | 14 | 7 | 0 | 0 | 5 | 2 | 50.0% |
 | clauses/with | 29 | 10 | 0 | 1 | 17 | 1 | 34.5% |
 | clauses/with-orderBy | 292 | 139 | 0 | 1 | 152 | 0 | 47.6% |
-| clauses/with-skip-limit | 9 | 1 | 0 | 0 | 8 | 0 | 11.1% |
-| clauses/with-where | 19 | 1 | 0 | 0 | 18 | 0 | 5.3% |
+| clauses/with-skip-limit | 9 | 2 | 0 | 0 | 7 | 0 | 22.2% |
+| clauses/with-where | 19 | 2 | 0 | 0 | 17 | 0 | 10.5% |
 | expressions/aggregation | 35 | 20 | 0 | 0 | 15 | 0 | 57.1% |
 | expressions/boolean | 150 | 140 | 0 | 0 | 10 | 0 | 93.3% |
-| expressions/comparison | 72 | 50 | 0 | 0 | 22 | 0 | 69.4% |
+| expressions/comparison | 72 | 52 | 0 | 0 | 20 | 0 | 72.2% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
-| expressions/graph | 61 | 17 | 0 | 6 | 38 | 0 | 27.9% |
-| expressions/list | 185 | 79 | 0 | 0 | 99 | 7 | 42.7% |
+| expressions/graph | 61 | 28 | 0 | 7 | 26 | 0 | 45.9% |
+| expressions/list | 185 | 121 | 0 | 2 | 55 | 7 | 65.4% |
 | expressions/literals | 131 | 71 | 0 | 0 | 51 | 9 | 54.2% |
-| expressions/map | 44 | 7 | 0 | 6 | 26 | 5 | 15.9% |
-| expressions/mathematical | 6 | 4 | 0 | 0 | 2 | 0 | 66.7% |
+| expressions/map | 44 | 16 | 0 | 6 | 17 | 5 | 36.4% |
+| expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/null | 44 | 37 | 0 | 0 | 1 | 6 | 84.1% |
 | expressions/path | 7 | 2 | 0 | 0 | 5 | 0 | 28.6% |
 | expressions/pattern | 50 | 19 | 0 | 0 | 31 | 0 | 38.0% |
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
-| expressions/quantifier | 604 | 438 | 0 | 0 | 166 | 0 | 72.5% |
-| expressions/string | 32 | 26 | 0 | 0 | 6 | 0 | 81.2% |
+| expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
+| expressions/string | 32 | 28 | 0 | 0 | 4 | 0 | 87.5% |
 | expressions/temporal | 1004 | 55 | 0 | 37 | 912 | 0 | 5.5% |
-| expressions/typeConversion | 47 | 36 | 0 | 0 | 11 | 0 | 76.6% |
-| useCases/countingSubgraphMatches | 11 | 4 | 0 | 0 | 7 | 0 | 36.4% |
+| expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
+| useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **1696** | **0** | **59** | **2064** | **61** | **43.7%** |
+| **TOTAL** | **3880** | **1901** | **0** | **64** | **1850** | **65** | **49.0%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -83,8 +83,15 @@ comparison).
 
 `CREATE`, multi-label nodes (`(n:Post:Message)`), `$parameters`,
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
-`MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`) and variable-length
-(`[:TYPE*min..max]`) relationship patterns, `WHERE` (including the
+`MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`), bracketless
+(`-->`/`<--`/`--`, the anonymous-untyped-relationship shorthand — brackets
+are only needed at all to carry a var/type/range/props), and
+variable-length (`[:TYPE*min..max]`) relationship patterns. `CREATE`
+requires an explicit relationship type on every hop (`-[:KNOWS]->`,
+`-->` alone is rejected with a clear semantic error) — unlike `MATCH`,
+where an untyped hop legitimately means "any relationship," a brand new
+edge with no type is meaningless, matching real Cypher's own rule.
+`WHERE` (including the
 string predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`), one `WITH`
 boundary per statement (projection/rename, its own `WHERE`/
 `WITH...WHERE`/`ORDER BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/
