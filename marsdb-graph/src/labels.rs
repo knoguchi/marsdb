@@ -52,7 +52,9 @@ pub(crate) fn resolve_label(txn: Txn, label_id: u32) -> Result<String, GraphErro
 pub(crate) fn lookup_label_id(txn: Txn, label: &str) -> Result<Option<u32>, GraphError> {
     let l2i = match txn.open_table(marsdb_storage::tables::LABEL_TO_ID) {
         Ok(table) => table,
-        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => return Ok(None),
+        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => {
+            return Ok(None)
+        }
         Err(e) => return Err(e.into()),
     };
     let found = l2i.get(label)?.map(|g| g.value());

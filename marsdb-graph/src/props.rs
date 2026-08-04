@@ -30,9 +30,9 @@ pub(crate) fn intern_prop(write_txn: &WriteTransaction, prop: &str) -> Result<u3
 /// `labels::resolve_label`.
 pub(crate) fn resolve_prop(txn: Txn, prop_id: u32) -> Result<String, GraphError> {
     let i2p = txn.open_table(marsdb_storage::tables::ID_TO_PROP)?;
-    let value = i2p
-        .get(prop_id)?
-        .ok_or_else(|| GraphError::CorruptData(format!("prop id {prop_id} has no interned string")))?;
+    let value = i2p.get(prop_id)?.ok_or_else(|| {
+        GraphError::CorruptData(format!("prop id {prop_id} has no interned string"))
+    })?;
     Ok(value.value().to_string())
 }
 
@@ -49,7 +49,9 @@ pub(crate) fn resolve_prop(txn: Txn, prop_id: u32) -> Result<String, GraphError>
 pub(crate) fn lookup_prop_id(txn: Txn, prop: &str) -> Result<Option<u32>, GraphError> {
     let p2i = match txn.open_table(marsdb_storage::tables::PROP_TO_ID) {
         Ok(table) => table,
-        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => return Ok(None),
+        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => {
+            return Ok(None)
+        }
         Err(e) => return Err(e.into()),
     };
     let found = p2i.get(prop)?.map(|g| g.value());

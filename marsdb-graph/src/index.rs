@@ -54,7 +54,11 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
         // bit for a negative float (so more-negative sorts lower).
         PropertyValue::Float(f) => {
             let bits = f.to_bits();
-            let sortable = if bits & 0x8000_0000_0000_0000 != 0 { !bits } else { bits | 0x8000_0000_0000_0000 };
+            let sortable = if bits & 0x8000_0000_0000_0000 != 0 {
+                !bits
+            } else {
+                bits | 0x8000_0000_0000_0000
+            };
             let mut out = vec![0x03];
             out.extend_from_slice(&sortable.to_be_bytes());
             out
@@ -72,7 +76,12 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
             out.extend_from_slice(&((*days as i64 as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
             out
         }
-        PropertyValue::Duration { months, days, seconds, nanos } => {
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => {
             let mut out = vec![0x06];
             out.extend_from_slice(&months.to_be_bytes());
             out.extend_from_slice(&days.to_be_bytes());
@@ -174,7 +183,9 @@ pub fn lookup_index_def(txn: Txn, label: &str, prop: &str) -> Result<Option<Inde
     };
     let prefix = index_prefix(label_id, prop_id);
     let defs = txn.open_table(marsdb_storage::tables::INDEX_DEFS)?;
-    let found = defs.get(prefix.as_slice())?.map(|guard| guard.value().to_vec());
+    let found = defs
+        .get(prefix.as_slice())?
+        .map(|guard| guard.value().to_vec());
     drop(defs);
     match found {
         Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
@@ -188,7 +199,12 @@ pub fn lookup_index_def(txn: Txn, label: &str, prop: &str) -> Result<Option<Inde
 /// an error, if no such index exists (matching a genuinely-empty index
 /// would look the same, and this function has no way to tell those apart
 /// itself without the same lookup its caller likely already did).
-pub fn lookup_exact(txn: Txn, label: &str, prop: &str, value: &PropertyValue) -> Result<Vec<NodeId>, GraphError> {
+pub fn lookup_exact(
+    txn: Txn,
+    label: &str,
+    prop: &str,
+    value: &PropertyValue,
+) -> Result<Vec<NodeId>, GraphError> {
     let Some(label_id) = lookup_label_id(txn, label)? else {
         return Ok(Vec::new());
     };
@@ -199,7 +215,11 @@ pub fn lookup_exact(txn: Txn, label: &str, prop: &str, value: &PropertyValue) ->
     let index = txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
     let ids = index
         .get(key.as_slice())?
-        .map(|entry| entry.map(|value| NodeId(value.value())).map_err(GraphError::from))
+        .map(|entry| {
+            entry
+                .map(|value| NodeId(value.value()))
+                .map_err(GraphError::from)
+        })
         .collect::<Result<Vec<_>, GraphError>>()?;
     drop(index);
     Ok(ids)
@@ -210,21 +230,34 @@ pub fn lookup_exact(txn: Txn, label: &str, prop: &str, value: &PropertyValue) ->
 /// prefix-range query — `TableHandle` only exposes `get`/`iter`, and the
 /// number of *declared indexes* is expected to be small, unlike node
 /// counts) and filtered in memory.
-fn indexes_for_labels(txn: Txn, label_ids: &[u32]) -> Result<Vec<(u32, u32, String, IndexDef)>, GraphError> {
+fn indexes_for_labels(
+    txn: Txn,
+    label_ids: &[u32],
+) -> Result<Vec<(u32, u32, String, IndexDef)>, GraphError> {
     let defs = match txn.open_table(marsdb_storage::tables::INDEX_DEFS) {
         Ok(table) => table,
-        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => return Ok(Vec::new()),
+        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => {
+            return Ok(Vec::new())
+        }
         Err(e) => return Err(e.into()),
     };
     let mut out = Vec::new();
     for entry in defs.iter()? {
         let (key, value) = entry?;
         let key_bytes = key.value();
-        let label_id = u32::from_be_bytes(key_bytes[0..4].try_into().expect("index key prefix is 8 bytes"));
+        let label_id = u32::from_be_bytes(
+            key_bytes[0..4]
+                .try_into()
+                .expect("index key prefix is 8 bytes"),
+        );
         if !label_ids.contains(&label_id) {
             continue;
         }
-        let prop_id = u32::from_be_bytes(key_bytes[4..8].try_into().expect("index key prefix is 8 bytes"));
+        let prop_id = u32::from_be_bytes(
+            key_bytes[4..8]
+                .try_into()
+                .expect("index key prefix is 8 bytes"),
+        );
         let def: IndexDef = postcard::from_bytes(value.value())?;
         let prop_name = resolve_prop(txn, prop_id)?;
         out.push((label_id, prop_id, prop_name, def));
@@ -284,10 +317,13 @@ pub fn on_node_created(
     label_ids: &[u32],
     props: &BTreeMap<String, PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)? {
+    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)?
+    {
         if let Some(value) = props.get(&prop_name) {
             let label = resolve_label(Txn::Write(write_txn), label_id)?;
-            insert_entry(write_txn, label_id, prop_id, value, node_id, def.unique, &label, &prop_name)?;
+            insert_entry(
+                write_txn, label_id, prop_id, value, node_id, def.unique, &label, &prop_name,
+            )?;
         }
     }
     Ok(())
@@ -304,7 +340,9 @@ pub fn on_node_deleted(
     label_ids: &[u32],
     props: &BTreeMap<String, PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, _def) in indexes_for_labels(Txn::Write(write_txn), label_ids)? {
+    for (label_id, prop_id, prop_name, _def) in
+        indexes_for_labels(Txn::Write(write_txn), label_ids)?
+    {
         if let Some(value) = props.get(&prop_name) {
             remove_entry(write_txn, label_id, prop_id, value, node_id)?;
         }
@@ -329,7 +367,8 @@ pub fn on_node_prop_changed(
     old_value: Option<&PropertyValue>,
     new_value: Option<&PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)? {
+    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)?
+    {
         if prop_name != prop {
             continue;
         }
@@ -338,7 +377,9 @@ pub fn on_node_prop_changed(
         }
         if let Some(new) = new_value {
             let label = resolve_label(Txn::Write(write_txn), label_id)?;
-            insert_entry(write_txn, label_id, prop_id, new, node_id, def.unique, &label, &prop_name)?;
+            insert_entry(
+                write_txn, label_id, prop_id, new, node_id, def.unique, &label, &prop_name,
+            )?;
         }
     }
     Ok(())
