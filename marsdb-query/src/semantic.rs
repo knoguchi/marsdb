@@ -325,13 +325,52 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             } else {
                 match name.to_ascii_lowercase().as_str() {
                     "coalesce" => unify_many(&arg_kinds),
-                    "tointeger" | "tostring" | "date" | "duration" => Kind::Scalar,
+                    "tointeger" | "tostring" | "tofloat" | "toboolean" | "date" | "duration" => {
+                        Kind::Scalar
+                    }
                     "length" => {
                         if let Some(kind) = arg_kinds.first() {
                             require_compatible_kind(kind, &Kind::Path, "length() argument")?;
                         }
                         Kind::Scalar
                     }
+                    "nodes" => {
+                        if let Some(kind) = arg_kinds.first() {
+                            require_compatible_kind(kind, &Kind::Path, "nodes() argument")?;
+                        }
+                        Kind::List(Box::new(Kind::Node))
+                    }
+                    "relationships" => {
+                        if let Some(kind) = arg_kinds.first() {
+                            require_compatible_kind(kind, &Kind::Path, "relationships() argument")?;
+                        }
+                        Kind::List(Box::new(Kind::Edge))
+                    }
+                    // `keys`/`labels`/`type`/`properties`/`id`/`size`/
+                    // `exists` accept a node, relationship, or (for keys/
+                    // properties/size) a map/list/string too, depending on
+                    // the specific function -- narrower than what the
+                    // runtime (`executor::call_builtin`'s own arms) already
+                    // enforces with a clear `QueryError::Type`, so no
+                    // additional structural check is added here beyond
+                    // "the call itself is a recognized function."
+                    "keys" | "labels" | "type" | "id" | "size" | "exists" => Kind::Scalar,
+                    "properties" => Kind::Map,
+                    "head" | "last" => match arg_kinds.first() {
+                        Some(Kind::List(inner)) => (**inner).clone(),
+                        _ => Kind::Unknown,
+                    },
+                    "tail" => match arg_kinds.first() {
+                        Some(kind @ Kind::List(_)) => kind.clone(),
+                        _ => Kind::Unknown,
+                    },
+                    "range" | "split" => Kind::List(Box::new(Kind::Scalar)),
+                    "toupper" | "upper" | "tolower" | "lower" | "trim" | "ltrim" | "rtrim"
+                    | "replace" | "substring" | "left" | "right" | "abs" | "ceil" | "floor"
+                    | "round" | "sqrt" | "sign" => Kind::Scalar,
+                    // Polymorphic over string/list -- the input's own kind
+                    // (if known) is the output's kind too.
+                    "reverse" => arg_kinds.first().cloned().unwrap_or(Kind::Unknown),
                     other => return Err(semantic(format!("unknown function '{other}'"))),
                 }
             }

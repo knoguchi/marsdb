@@ -102,13 +102,26 @@ overwhelmingly use. Not yet supported: chaining more than one mutating
 clause before the final `RETURN`, or a `WITH` between the mutating
 clause and that `RETURN`.
 
-Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
-`coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
+Multi-key `ORDER BY`, `LIMIT`, `CASE`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
 `DISTINCT` inside an aggregate call). `RETURN DISTINCT` (result-set-level
 dedup of the whole projected row, applied after grouping for an
 aggregating `RETURN` — a separate mechanism from `DISTINCT` inside one
 aggregate call, which only affects that aggregate's own accumulation).
+
+Built-in scalar functions: `coalesce()`, `toInteger()`/`toFloat()`/
+`toString()`/`toBoolean()`, `keys()`/`labels()`/`type()`/`properties()`/
+`id()` (node/relationship introspection), `size()` (list length or
+string character count), `length()` (path edge count), `nodes()`/
+`relationships()` (a path's elements), `head()`/`tail()`/`last()`/
+`range(start, end[, step])` (list construction/slicing — `range` is
+both-ends-inclusive, matching real Cypher, not Rust's exclusive-end
+convention), `exists()` (property presence — the pattern-existence form,
+`exists((n)-->())`, isn't supported), string functions `toUpper()`/
+`toLower()`/`trim()`/`ltrim()`/`rtrim()`/`reverse()`/`replace()`/
+`split()`/`substring()`/`left()`/`right()`, and math functions `abs()`/
+`ceil()`/`floor()`/`round()`/`sqrt()`/`sign()`. `date()`/`duration()`
+are their own thing — see [Temporal types](#temporal-types) below.
 
 Two independent `MATCH` parts across one `WITH` boundary
 (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s pattern doesn't chain from
