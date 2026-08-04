@@ -3415,11 +3415,10 @@ fn boolean(v: &Value) -> bool {
 // -- Temporal (date/duration) -----------------------------------------
 //
 // Real shapes pulled directly from the TCK's expressions/temporal
-// feature files (Temporal1/2/4/5/6/7/8), not synthesized -- see the
+// feature files (Temporal1/2/3/4/5/6/7/8), not synthesized -- see the
 // README's "Cypher coverage" section for exactly what's covered and
-// what's deliberately out of scope (week-date/quarter/ordinal-day
-// construction, LOCAL TIME/TIME/LOCAL DATETIME/DATETIME, duration.
-// between(), truncate()).
+// what's deliberately out of scope (named time zones like
+// 'Europe/Stockholm' -- only a fixed UTC offset is supported).
 
 #[test]
 fn date_construct_from_calendar_map() {
@@ -3428,11 +3427,94 @@ fn date_construct_from_calendar_map() {
     assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11");
 }
 
+/// ISO week-date construction (`{year, week, dayOfWeek}`) -- TCK's
+/// Temporal1 [1]. `year` here is the ISO week-numbering year, which can
+/// diverge from the resulting date's calendar year near a year boundary.
+#[test]
+fn date_construct_from_week_fields() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN date({year: 1816, week: 1}), date({year: 1818, week: 53}), \
+         date({dayOfWeek: 2, year: 1817, week: 1})",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1816-01-01");
+    assert_eq!(temporal_str(&row[1]), "1818-12-28");
+    assert_eq!(temporal_str(&row[2]), "1816-12-31");
+
+    // `week`/`dayOfWeek` default from a `date` base's own weekYear/week/
+    // dayOfWeek, same as month/day already default from a base.
+    let result = run(
+        &store,
+        "RETURN date({date: date('1816-12-30'), week: 2, dayOfWeek: 3}), \
+         date({date: date('1816-12-31'), week: 2})",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1817-01-08");
+    assert_eq!(temporal_str(&row[1]), "1817-01-07");
+}
+
+/// Ordinal-date (`{year, ordinalDay}`) and quarter-date
+/// (`{year, quarter, dayOfQuarter}`) construction -- TCK's Temporal1 [4].
+#[test]
+fn date_construct_from_ordinal_and_quarter_fields() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN date({year: 1984, ordinalDay: 202}), \
+         date({year: 1984, quarter: 3, dayOfQuarter: 45}), \
+         date({year: 1984, quarter: 3})",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1984-07-20");
+    assert_eq!(temporal_str(&row[1]), "1984-08-14");
+    assert_eq!(temporal_str(&row[2]), "1984-07-01");
+}
+
+/// A bare positional temporal argument to `date()`/`localtime()`/
+/// `time()`/`localdatetime()` projects the relevant part of a
+/// *different* temporal type, same as the equivalent `{date: other}`/
+/// `{time: other}`/`{datetime: other}` map form -- TCK's Temporal3
+/// [1]/[2]/[3]/[7].
+#[test]
+fn temporal_constructors_accept_a_cross_type_positional_argument() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 11, day: 11, hour: 12, timezone: '+01:00'}) AS other \
+         RETURN date(other)",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-11-11");
+
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: '+01:00'}) AS other \
+         RETURN toString(localtime(other))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:00");
+
+    let result = run(
+        &store,
+        "WITH localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS other \
+         RETURN toString(time(other))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:31:14.645876123Z");
+
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: '+01:00'}) AS other \
+         RETURN toString(localdatetime(other))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11T12:00");
+}
+
 #[test]
 fn date_construct_from_string_forms() {
     let store = GraphStore::open_memory().unwrap();
-    // Temporal2 scenario [1] -- calendar forms only (no week-date/
-    // ordinal-date forms, see date_string_week_date_form_is_rejected).
+    // Temporal2 scenario [1] -- the plain calendar forms; week-date/
+    // ordinal-date forms are covered separately, see
+    // date_string_week_and_ordinal_date_forms_parse.
     let result = run(
         &store,
         "RETURN date('2015-07-21'), date('20150721'), date('2015-07'), date('201507'), date('2015')",
@@ -3445,17 +3527,25 @@ fn date_construct_from_string_forms() {
     assert_eq!(temporal_str(&row[4]), "2015-01-01");
 }
 
+/// ISO week-date (`YYYY-Www[-D]`/`YYYYWww[D]`) and ordinal-date
+/// (`YYYY-DDD`/`YYYYDDD`) string forms -- TCK's Date2/Date3, real Cypher
+/// parses these the same as the equivalent `{week, dayOfWeek}`/
+/// `{ordinalDay}` map construction (`temporal::parse_week_or_ordinal_date`).
 #[test]
-fn date_string_week_date_form_is_rejected_not_misparsed() {
-    // Honest gap, not a silent wrong answer -- see temporal.rs's
-    // `parse_date` docs.
+fn date_string_week_and_ordinal_date_forms_parse() {
     let store = GraphStore::open_memory().unwrap();
-    let stmt = parse("RETURN date('2015-W30-2')").unwrap();
-    let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(
-        err.to_string().contains("date"),
-        "expected a clear date-parse error, got: {err}"
+    let result = run(
+        &store,
+        "RETURN date('2015W302'), date('2015-W30-2'), date('2015W30'), date('2015-W30'), \
+         date('2015202'), date('2015-202')",
     );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "2015-07-21");
+    assert_eq!(temporal_str(&row[1]), "2015-07-21");
+    assert_eq!(temporal_str(&row[2]), "2015-07-20");
+    assert_eq!(temporal_str(&row[3]), "2015-07-20");
+    assert_eq!(temporal_str(&row[4]), "2015-07-21");
+    assert_eq!(temporal_str(&row[5]), "2015-07-21");
 }
 
 #[test]
@@ -3795,15 +3885,14 @@ fn time_construct_from_map_and_string() {
     assert_eq!(temporal_str(&result.rows[0][0]), "21:40Z");
 }
 
+/// A `time()` string argument with no offset defaults to UTC (`Z`),
+/// matching real Cypher's "statement default time zone" fallback rather
+/// than erroring -- TCK's Temporal10, `time('14:30')`.
 #[test]
-fn time_requires_a_timezone_bare_localtime_shape_is_rejected() {
-    let err = marsdb_query::parse("RETURN time('21:40:32')")
-        .and_then(|stmt| {
-            let store = GraphStore::open_memory().unwrap();
-            Executor::new(&store).execute(&stmt)
-        })
-        .expect_err("time() with no offset must be rejected");
-    assert!(format!("{err}").to_lowercase().contains("time"));
+fn time_string_with_no_offset_defaults_to_utc() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN toString(time('21:40:32'))");
+    assert_eq!(temporal_str(&result.rows[0][0]), "21:40:32Z");
 }
 
 #[test]

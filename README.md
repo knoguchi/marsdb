@@ -219,7 +219,7 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 2563/3880 TCK scenarios pass (66.1%), 1 wrong-result
+Short version: 2783/3880 TCK scenarios pass (71.7%), 1 wrong-result
 scenario (a `Duration` internal-representation edge case, not a wrong
 answer — see [CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact
 explanation).

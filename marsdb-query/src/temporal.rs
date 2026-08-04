@@ -6,8 +6,8 @@
 //! itself, matching the split `apply_arith`/`compare` already have from
 //! e.g. the planner).
 //!
-//! Scope, honestly: `DATE` (calendar year/month/day, no week-date/
-//! ordinal-date/quarter construction forms), `DURATION`, `LOCAL TIME`,
+//! Scope, honestly: `DATE` (calendar year/month/day, ISO week-date, and
+//! ordinal/quarter-date construction forms), `DURATION`, `LOCAL TIME`,
 //! `TIME`, `LOCAL DATETIME`, and `DATETIME` are all supported -- but
 //! `TIME`/`DATETIME` only accept a *fixed* UTC offset (`'+01:00'`,
 //! `{timezone: '+01:00'}`), never a named timezone (`'Europe/Stockholm'`)
@@ -89,13 +89,11 @@ pub fn format_date(epoch_day: i32) -> String {
     format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())
 }
 
-/// Parses the calendar-date string forms MarsDB supports: `YYYY-MM-DD`,
-/// `YYYYMMDD`, `YYYY-MM`, `YYYYMM`, `YYYY` (missing month/day default to
-/// `1`). Deliberately does *not* handle the ISO week-date (`2015-W30-2`)
-/// or ordinal-date (`2015-202`) string forms real Cypher also accepts --
-/// a real gap (see the README), not silently misparsed: a week-date
-/// string's `W` fails the plain-integer month/day parse below and
-/// correctly returns `None` rather than a wrong date.
+/// Parses every date string form MarsDB supports: the plain calendar
+/// forms `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY` (missing
+/// month/day default to `1`), ISO week-date `YYYY-Www[-D]`/`YYYYWww[D]`
+/// (missing day defaults to `1`), and ordinal-date `YYYY-DDD`/`YYYYDDD`
+/// (see `parse_week_or_ordinal_date`).
 pub fn parse_date(s: &str) -> Option<i32> {
     let s = s.trim();
     // The compact forms below use byte offsets because their grammar is
@@ -103,6 +101,14 @@ pub fn parse_date(s: &str) -> Option<i32> {
     // input can never put an offset in the middle of a UTF-8 code point.
     if !s.is_ascii() {
         return None;
+    }
+    // ISO week-date (`YYYY-Www[-D]` / `YYYYWww[D]`) and ordinal-date
+    // (`YYYY-DDD` / `YYYYDDD`) forms -- checked before the plain calendar
+    // forms below since a `W` unambiguously marks a week-date, and a
+    // 7-digit no-`-` run is ordinal (a plain compact calendar date is
+    // either 4, 6, or 8 digits, never 7).
+    if let Some(epoch_day) = parse_week_or_ordinal_date(s) {
+        return Some(epoch_day);
     }
     let (year, month, day) = if let Some((y, rest)) = s.split_once('-') {
         let year: i32 = y.parse().ok()?;
@@ -125,13 +131,53 @@ pub fn parse_date(s: &str) -> Option<i32> {
     epoch_day_from_ymd(year, month, day)
 }
 
+/// ISO week-date (`YYYY-Www[-D]` / `YYYYWww[D]`, day defaults to `1` when
+/// omitted) and ordinal-date (`YYYY-DDD` / `YYYYDDD`) string forms --
+/// `None` for anything not matching one of these two shapes (the plain
+/// calendar forms fall through to `parse_date`'s own parsing).
+fn parse_week_or_ordinal_date(s: &str) -> Option<i32> {
+    if let Some((y, rest)) = s.split_once('-') {
+        if let Some(w) = rest.strip_prefix('W') {
+            let week_year: i32 = y.parse().ok()?;
+            let (week, day) = match w.split_once('-') {
+                Some((w, d)) => (w.parse().ok()?, d.parse().ok()?),
+                None => (w.parse().ok()?, 1),
+            };
+            return epoch_day_from_week_fields(week_year, week, day);
+        }
+        // `YYYY-DDD` -- an ordinal date, distinguished from the plain
+        // `YYYY-MM` calendar form by `rest`'s length (3 digits, not 2).
+        if rest.len() == 3 && rest.bytes().all(|b| b.is_ascii_digit()) {
+            let year: i32 = y.parse().ok()?;
+            let ordinal: u32 = rest.parse().ok()?;
+            return epoch_day_from_ordinal_fields(year, ordinal);
+        }
+        return None;
+    }
+    if s.len() >= 5 {
+        if let Some(w) = s[4..].strip_prefix('W') {
+            let week_year: i32 = s[0..4].parse().ok()?;
+            let (week, day) = match w.len() {
+                2 => (w.parse().ok()?, 1),
+                3 => (w[0..2].parse().ok()?, w[2..3].parse().ok()?),
+                _ => return None,
+            };
+            return epoch_day_from_week_fields(week_year, week, day);
+        }
+    }
+    if s.len() == 7 && s.bytes().all(|b| b.is_ascii_digit()) {
+        let year: i32 = s[0..4].parse().ok()?;
+        let ordinal: u32 = s[4..7].parse().ok()?;
+        return epoch_day_from_ordinal_fields(year, ordinal);
+    }
+    None
+}
+
 /// `d.<prop>` component access for a `Date` -- the "forward" (date ->
-/// components) half of ISO week/quarter calendar math, which is much
-/// simpler than the "backward" half (`date({week: ..., dayOfWeek: ...})`
-/// construction, deliberately not supported -- see `Executor::
-/// call_builtin`'s `"date"` arm, which only builds a `Date` from
-/// `year`/`month`/`day` map keys) since it's pure arithmetic on an
-/// already-valid date, no ambiguity to resolve. Returns `None` for any
+/// components) half of ISO week/quarter calendar math; the "backward"
+/// half (`week`/`dayOfWeek`/`quarter`/`dayOfQuarter`/`ordinalDay` ->
+/// date) lives in `epoch_day_from_week_fields`/`epoch_day_from_ordinal_
+/// fields`/`epoch_day_from_quarter_fields` below. Returns `None` for any
 /// property name this doesn't recognize (the caller treats that the same
 /// as a missing property, matching every other `.prop` access in this
 /// codebase).
@@ -153,6 +199,54 @@ pub fn date_component(epoch_day: i32, prop: &str) -> Option<i64> {
         }
         _ => return None,
     })
+}
+
+/// ISO week-date's `1..=7` (Monday=1) -> chrono's `Weekday`, the inverse
+/// of `date_component`'s `"dayOfWeek"` (`number_from_monday`).
+fn weekday_from_iso_number(n: i64) -> Option<chrono::Weekday> {
+    use chrono::Weekday::*;
+    Some(match n {
+        1 => Mon,
+        2 => Tue,
+        3 => Wed,
+        4 => Thu,
+        5 => Fri,
+        6 => Sat,
+        7 => Sun,
+        _ => return None,
+    })
+}
+
+/// Constructs an epoch-day from ISO week-date fields -- the inverse of
+/// `date_component`'s `"weekYear"`/`"week"`/`"dayOfWeek"` accessors.
+/// `week_year` is the ISO week-numbering year, not necessarily the
+/// calendar year of the resulting date (they diverge near a year
+/// boundary -- e.g. week-year 1817 week 1 day 2 is calendar date
+/// 1816-12-31, TCK's Temporal1 [1]).
+pub fn epoch_day_from_week_fields(week_year: i32, week: u32, day_of_week: i64) -> Option<i32> {
+    let weekday = weekday_from_iso_number(day_of_week)?;
+    let d = NaiveDate::from_isoywd_opt(week_year, week, weekday)?;
+    Some(d.signed_duration_since(epoch()).num_days() as i32)
+}
+
+/// Constructs an epoch-day from a calendar year plus an ordinal day
+/// (`1..=365`/`366`) -- the inverse of `date_component`'s `"ordinalDay"`.
+pub fn epoch_day_from_ordinal_fields(year: i32, ordinal_day: u32) -> Option<i32> {
+    let d = NaiveDate::from_yo_opt(year, ordinal_day)?;
+    Some(d.signed_duration_since(epoch()).num_days() as i32)
+}
+
+/// Constructs an epoch-day from a calendar year, quarter (`1..=4`), and
+/// day-of-quarter (`1`-based) -- the inverse of `date_component`'s
+/// `"quarter"`/`"dayOfQuarter"`.
+pub fn epoch_day_from_quarter_fields(year: i32, quarter: u32, day_of_quarter: i64) -> Option<i32> {
+    if !(1..=4).contains(&quarter) {
+        return None;
+    }
+    let quarter_start_month = (quarter - 1) * 3 + 1;
+    let quarter_start = NaiveDate::from_ymd_opt(year, quarter_start_month, 1)?;
+    let d = quarter_start.checked_add_signed(chrono::Duration::days(day_of_quarter - 1))?;
+    Some(d.signed_duration_since(epoch()).num_days() as i32)
 }
 
 /// Adds a `Duration` to a `Date` via real calendar month arithmetic
@@ -698,11 +792,15 @@ pub fn parse_time(s: &str) -> Option<(i64, i32)> {
         return None;
     }
     let (time_part, offset_part) = split_time_offset(s);
-    let offset_part = offset_part?;
-    Some((
-        parse_time_of_day(time_part)?,
-        parse_offset_seconds(offset_part)?,
-    ))
+    // A missing offset defaults to UTC (`+00:00`) -- real Cypher's
+    // `time()` falls back to the statement's default time zone rather
+    // than rejecting the string outright (TCK's Temporal10: `time('14:30')`
+    // is a valid, offset-less argument).
+    let offset_seconds = match offset_part {
+        Some(part) => parse_offset_seconds(part)?,
+        None => 0,
+    };
+    Some((parse_time_of_day(time_part)?, offset_seconds))
 }
 
 /// `d.<prop>` component access shared by `LocalTime` and (for its own
@@ -1277,10 +1375,9 @@ pub fn truncate_date_unit(epoch_day: i32, unit: &str) -> Option<i32> {
 /// *within its own ISO week* -- the `dayOfWeek` override key on a
 /// `.truncate('week', ...)` result (`date.truncate('week', d,
 /// {dayOfWeek: 2})` is "the Tuesday of `d`'s week"), not general
-/// week-date construction (which needs a `{year, week, dayOfWeek}`
-/// triple with no existing anchor date at all -- still unsupported,
-/// see this module's top-of-file docs). `None` for an out-of-range
-/// `day_of_week`.
+/// week-date construction from a `{year, week, dayOfWeek}` triple with
+/// no existing anchor date (that's `epoch_day_from_week_fields`).
+/// `None` for an out-of-range `day_of_week`.
 pub fn set_iso_weekday(epoch_day: i32, day_of_week: i64) -> Option<i32> {
     if !(1..=7).contains(&day_of_week) {
         return None;
