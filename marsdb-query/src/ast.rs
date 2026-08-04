@@ -111,6 +111,26 @@ pub enum ReturnExpr {
         where_clause: Option<Box<WithExpr>>,
         project: Option<Box<ReturnExpr>>,
     },
+    /// `ALL(x IN list WHERE cond)` / `ANY(...)` / `NONE(...)` / `SINGLE(...)`
+    /// — shares `ListComp`'s "one bound variable over a list, optionally
+    /// filtered" shape (no `project` half; a quantifier always yields a
+    /// `Bool`, never a projected list). `where_clause` absent means "every
+    /// element's own truthiness", same convention `CASE`'s subject-less
+    /// `WHEN` branch already uses (`matches!(v, Literal(Bool(true)))`).
+    Quantifier {
+        kind: QuantifierKind,
+        var: String,
+        source: Box<ReturnExpr>,
+        where_clause: Option<Box<WithExpr>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

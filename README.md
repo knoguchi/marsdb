@@ -206,7 +206,15 @@ bounds clamp to `[0, len]` instead of producing `null`) in `RETURN`/`WITH`.
 List comprehensions (`[x IN list WHERE cond | expr]`, both `WHERE` and
 `| expr` independently optional — `[x IN list]` is a legal no-op filter),
 whose `WHERE` reuses the same expression shape as `WITH ... WHERE`
-(comparisons + `AND`/`OR`/`NOT`, not yet arbitrary boolean expressions).
+(comparisons + `AND`/`OR`/`NOT`, not yet arbitrary boolean expressions —
+a bare `WHERE x`/`WHERE true` isn't parseable yet, only `WHERE x > 2`
+shapes). Quantifiers `ALL(x IN list WHERE cond)`/`ANY(...)`/`NONE(...)`/
+`SINGLE(...)` (same `WHERE` shape as list comprehensions, no `WHERE` means
+"every element's own truthiness"), with real three-valued NULL logic — a
+definite `true`/`false` among the elements decides the answer even with
+other `null` elements present; only "no definite answer, but at least one
+`null`" actually yields `null` (e.g. `all(x IN [0, null] WHERE x = 2)` is
+`false`, not `null`, since `0 = 2` is a definite `false`).
 A leading `WITH` with no preceding `MATCH` (`WITH [1,2,3] AS list RETURN
 list[1]`) is also valid on its own.
 Two independent `MATCH` parts

@@ -5,8 +5,8 @@ use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValu
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir, Statement, Tail,
-    UnwindClause, UnwindSource, WithClause, WithExpr,
+    QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir,
+    Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -1589,6 +1589,34 @@ impl<'a> Executor<'a> {
                 }
                 Ok(Value::List(result))
             }
+            ReturnExpr::Quantifier {
+                kind,
+                var,
+                source,
+                where_clause,
+            } => {
+                let source_v = self.eval_return_expr(txn, source, row)?;
+                let items = match source_v {
+                    Value::List(items) => items,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}")))
+                    }
+                };
+                let mut preds = Vec::with_capacity(items.len());
+                for item in &items {
+                    let mut scoped_row = row.clone();
+                    scoped_row.insert(var.clone(), value_to_binding_restore(item));
+                    preds.push(match where_clause {
+                        Some(w) => self.eval_with_expr(txn, w, &scoped_row)?,
+                        None => item_truthy(item),
+                    });
+                }
+                Ok(match eval_quantifier(*kind, &preds) {
+                    Some(b) => Value::Literal(Literal::Bool(b)),
+                    None => Value::Null,
+                })
+            }
         }
     }
 
@@ -1786,9 +1814,11 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
         ReturnExpr::Arith(..) => format!("col{idx}"),
-        ReturnExpr::ListLit(..) | ReturnExpr::Index(..) | ReturnExpr::Slice(..) | ReturnExpr::ListComp { .. } => {
-            format!("col{idx}")
-        }
+        ReturnExpr::ListLit(..)
+        | ReturnExpr::Index(..)
+        | ReturnExpr::Slice(..)
+        | ReturnExpr::ListComp { .. }
+        | ReturnExpr::Quantifier { .. } => format!("col{idx}"),
     }
 }
 
@@ -1838,6 +1868,7 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::ListComp { source, project, .. } => {
             contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate)
         }
+        ReturnExpr::Quantifier { source, .. } => contains_aggregate(source),
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -2449,6 +2480,73 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
     }
 }
 
+/// A quantifier's own per-element truthiness check when it has no `WHERE`
+/// at all (`ANY(x IN list)`, not `ANY(x IN list WHERE ...)`) -- three-
+/// valued, same as a real `WHERE` predicate: `null` propagates as
+/// "unknown" (`None`), a literal bool passes through, anything else
+/// (non-bool, non-null) is definitely-false, same convention `CASE`'s
+/// subject-less `WHEN` branch already uses for a non-bool test value.
+fn item_truthy(v: &Value) -> Option<bool> {
+    match v {
+        Value::Null => None,
+        Value::Literal(Literal::Bool(b)) | Value::Property(PropertyValue::Bool(b)) => Some(*b),
+        _ => Some(false),
+    }
+}
+
+/// Real Cypher quantifiers use three-valued logic, not a simple count --
+/// a single definite `true`/`false` among the elements can already decide
+/// the answer even in the presence of other `null` elements, and only
+/// "no definite answer, but at least one unknown" actually yields `null`.
+/// Confirmed against the real TCK scenarios (Quantifier1-4, scenario 10,
+/// "... on lists containing nulls") rather than assumed -- a first version
+/// of this collapsed `null` predicates to `false`, which silently passed
+/// every non-null-list scenario but produced 19 real wrong answers on
+/// exactly these null-list cases.
+fn eval_quantifier(kind: QuantifierKind, preds: &[Option<bool>]) -> Option<bool> {
+    let true_count = preds.iter().filter(|p| **p == Some(true)).count();
+    let any_false = preds.iter().any(|p| *p == Some(false));
+    let any_null = preds.iter().any(|p| p.is_none());
+    match kind {
+        QuantifierKind::Any => {
+            if true_count > 0 {
+                Some(true)
+            } else if any_null {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        QuantifierKind::None => {
+            if true_count > 0 {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        QuantifierKind::All => {
+            if any_false {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        QuantifierKind::Single => {
+            if true_count >= 2 {
+                Some(false)
+            } else if any_null {
+                None
+            } else {
+                Some(true_count == 1)
+            }
+        }
+    }
+}
+
 fn to_integer(v: &Value) -> Result<Value, QueryError> {
     // A float-formatted string ('1.7', '2.9') isn't an i64, but real
     // Cypher's toInteger() still accepts it -- parse as a float and
@@ -2642,6 +2740,32 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
                 });
             }
             Ok(Value::List(result))
+        }
+        ReturnExpr::Quantifier {
+            kind,
+            var,
+            source,
+            where_clause,
+        } => {
+            let source_v = eval_projected_expr(source, row)?;
+            let items = match source_v {
+                Value::List(items) => items,
+                Value::Null => return Ok(Value::Null),
+                other => return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}"))),
+            };
+            let mut preds = Vec::with_capacity(items.len());
+            for item in &items {
+                let mut scoped_row = row.clone();
+                scoped_row.insert(var.clone(), item.clone());
+                preds.push(match where_clause {
+                    Some(w) => eval_with_expr_projected(w, &scoped_row)?,
+                    None => item_truthy(item),
+                });
+            }
+            Ok(match eval_quantifier(*kind, &preds) {
+                Some(b) => Value::Literal(Literal::Bool(b)),
+                None => Value::Null,
+            })
         }
     }
 }
