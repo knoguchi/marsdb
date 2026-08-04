@@ -247,9 +247,12 @@ detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)
 delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
 // Order matters: `prop_access` (`n.prop`) is tried first -- both start with
 // an `identifier`, and only backtrack to `set_label_item` (`n:Label`) if
-// the "." doesn't match.
+// the "." doesn't match. RHS is a full `return_expr` (not `literal`) --
+// real Cypher's SET value can be any expression (`SET n.name = n.name +
+// ' was here'`), same as `CREATE`'s own inline `{...}` prop values
+// already are (`map_expr`/`Executor::eval_props_to_values`).
 set_clause     = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
-set_item       = { (prop_access ~ "=" ~ literal) | set_label_item }
+set_item       = { (prop_access ~ "=" ~ return_expr) | set_label_item }
 set_label_item = { identifier ~ (":" ~ identifier)+ }
 
 remove_clause   = { ^"REMOVE" ~ remove_item ~ ("," ~ remove_item)* }

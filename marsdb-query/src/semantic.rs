@@ -252,7 +252,11 @@ fn project_return(items: &[ReturnItem], scope: &Scope) -> Result<Scope, QueryErr
 
 fn validate_set_item(item: &SetItem, scope: &Scope) -> Result<(), QueryError> {
     match item {
-        SetItem::Prop(access, _) => require_graph(scope, &access.var, "SET property target"),
+        SetItem::Prop(access, value) => {
+            require_graph(scope, &access.var, "SET property target")?;
+            infer_expr(value, scope)?;
+            Ok(())
+        }
         SetItem::Labels(var, _) => require_kind(scope, var, &Kind::Node, "SET label target"),
     }
 }

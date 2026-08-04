@@ -812,7 +812,7 @@ impl<'a> Executor<'a> {
                 &clause.on_match
             };
             for item in items {
-                apply_set_item(write_txn, row, item)?;
+                self.apply_set_item(Txn::Write(write_txn), write_txn, row, item)?;
             }
         }
         Ok(())
@@ -2603,7 +2603,7 @@ impl<'a> Executor<'a> {
         let write_txn = require_write_txn(txn);
         for row in rows {
             for item in items {
-                apply_set_item(write_txn, row, item)?;
+                self.apply_set_item(txn, write_txn, row, item)?;
             }
         }
         match ret {
@@ -2636,92 +2636,104 @@ impl<'a> Executor<'a> {
             }),
         }
     }
-}
 
-fn apply_set_item(
-    write_txn: &WriteTransaction,
-    row: &BindingRow,
-    item: &SetItem,
-) -> Result<(), QueryError> {
-    match item {
-        // `SET n.prop = null` *removes* the property in real Cypher (found
-        // via TCK's Set2 "Set a Property to Null" scenarios, which this
-        // codebase previously couldn't parse at all -- `SET` had no
-        // trailing RETURN to observe the result with, so this bug was
-        // never exercised until that gap closed). Storing a literal
-        // `PropertyValue::Null` instead is observably different: `n.prop`
-        // still shows up as a (nulled-out) key when a caller enumerates a
-        // node's own props (e.g. this RETURN's own node-to-string
-        // rendering), where a real missing property wouldn't.
-        SetItem::Prop(pa, Literal::Null) => {
-            let binding = row
-                .get(&pa.var)
-                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
-            match binding {
-                Binding::Node(id) => {
-                    GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
-                }
-                Binding::Edge(id) => {
-                    GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
-                }
+    fn apply_set_item(
+        &self,
+        txn: Txn,
+        write_txn: &WriteTransaction,
+        row: &BindingRow,
+        item: &SetItem,
+    ) -> Result<(), QueryError> {
+        match item {
+            SetItem::Prop(pa, expr) => {
+                let binding = row
+                    .get(&pa.var)
+                    .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
                 // `SET` on a null binding is a documented no-op, same as
-                // `DELETE`/`REMOVE` on one -- an `OPTIONAL MATCH` that
-                // found nothing pads its variables with null (found via
-                // TCK's Set1/Set3 "Ignore null when setting
-                // property/label" scenarios; same "previously unparseable
-                // without a trailing RETURN to observe it" story as the
-                // null-removes-property bug just above).
-                Binding::Value(PropertyValue::Null) => {}
-                Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
+                // `DELETE`/`REMOVE` on one -- an `OPTIONAL MATCH` that found
+                // nothing pads its variables with null (found via TCK's
+                // Set1/Set3 "Ignore null when setting property/label"
+                // scenarios).
+                if matches!(binding, Binding::Value(PropertyValue::Null)) {
+                    return Ok(());
+                }
+                let node_id = if let Binding::Node(id) = binding {
+                    Some(*id)
+                } else {
+                    None
+                };
+                let edge_id = if let Binding::Edge(id) = binding {
+                    Some(*id)
+                } else {
+                    None
+                };
+                if node_id.is_none() && edge_id.is_none() {
                     return Err(QueryError::UnboundVariable(format!(
-                        "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
-                        pa.var
-                    )))
+                    "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
+                    pa.var
+                )));
                 }
-            }
-        }
-        SetItem::Prop(pa, lit) => {
-            let binding = row
-                .get(&pa.var)
-                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
-            let value = literal_to_value(lit);
-            match binding {
-                Binding::Node(id) => {
-                    GraphStore::set_node_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                }
-                Binding::Edge(id) => {
-                    GraphStore::set_edge_prop_in_txn(write_txn, *id, &pa.prop, value)?;
-                }
-                Binding::Value(PropertyValue::Null) => {}
-                Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
-                    return Err(QueryError::UnboundVariable(format!(
-                        "'{}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding",
-                        pa.var
-                    )))
-                }
-            }
-        }
-        SetItem::Labels(var, labels) => {
-            let binding = row
-                .get(var)
-                .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-            match binding {
-                Binding::Node(id) => {
-                    for label in labels {
-                        GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+                let value = self.eval_return_expr(txn, expr, row)?;
+                // `SET n.prop = null` *removes* the property in real Cypher
+                // (found via TCK's Set2 "Set a Property to Null" scenarios,
+                // which this codebase previously couldn't parse at all --
+                // `SET` had no trailing RETURN to observe the result with, so
+                // this bug was never exercised until that gap closed).
+                // Storing a literal `PropertyValue::Null` instead is
+                // observably different: `n.prop` still shows up as a
+                // (nulled-out) key when a caller enumerates a node's own
+                // props (e.g. this RETURN's own node-to-string rendering),
+                // where a real missing property wouldn't. The RHS being
+                // `null` is now a *runtime* fact (it's any `ReturnExpr`, not
+                // just the `Literal::Null` token), not something checkable
+                // from the AST alone -- `SET n.prop = coalesce(x, null)`
+                // must remove the property too if `x` turns out null.
+                if matches!(value, Value::Null) {
+                    if let Some(id) = node_id {
+                        GraphStore::remove_node_prop_in_txn(write_txn, id, &pa.prop)?;
+                    }
+                    if let Some(id) = edge_id {
+                        GraphStore::remove_edge_prop_in_txn(write_txn, id, &pa.prop)?;
+                    }
+                } else {
+                    let pv = value_to_storable_property(&value).ok_or_else(|| {
+                    QueryError::Type(format!(
+                        "property '{}' can't be stored -- MarsDB's node/edge properties are limited \
+                         to null/bool/int/float/string/date/duration; a list/map/node/edge/path value \
+                         (got {value:?}) isn't storable",
+                        pa.prop
+                    ))
+                })?;
+                    if let Some(id) = node_id {
+                        GraphStore::set_node_prop_in_txn(write_txn, id, &pa.prop, pv.clone())?;
+                    }
+                    if let Some(id) = edge_id {
+                        GraphStore::set_edge_prop_in_txn(write_txn, id, &pa.prop, pv)?;
                     }
                 }
-                // Same null-is-a-no-op rule as the property arm above.
-                Binding::Value(PropertyValue::Null) => {}
-                _ => {
-                    return Err(QueryError::UnboundVariable(format!(
-                        "'{var}' isn't a node — SET can only add labels to a node"
-                    )))
+            }
+            SetItem::Labels(var, labels) => {
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                match binding {
+                    Binding::Node(id) => {
+                        for label in labels {
+                            GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+                        }
+                    }
+                    // Same null-is-a-no-op rule as the property arm above.
+                    Binding::Value(PropertyValue::Null) => {}
+                    _ => {
+                        return Err(QueryError::UnboundVariable(format!(
+                            "'{var}' isn't a node — SET can only add labels to a node"
+                        )))
+                    }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn apply_remove_item(

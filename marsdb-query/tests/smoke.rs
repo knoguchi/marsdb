@@ -3792,3 +3792,59 @@ fn with_where_variable_against_literal_still_works() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(int_value(&result.rows[0][0]), 1);
 }
+
+#[test]
+fn set_property_to_a_computed_expression() {
+    // SetItem::Prop's RHS used to be Literal-only -- `SET n.prop =
+    // <arithmetic/property-read/function-call>` couldn't parse at all.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {name: 'Andres'})");
+    let result = run(
+        &store,
+        "MATCH (n:A) SET n.name = n.name + ' was here' RETURN n.name",
+    );
+    assert_eq!(str_value(&result.rows[0][0]), "Andres was here");
+
+    run(&store, "CREATE (:B {x: 10})");
+    let result2 = run(&store, "MATCH (n:B) SET n.y = n.x * 2 RETURN n.y");
+    assert_eq!(int_value(&result2.rows[0][0]), 20);
+}
+
+#[test]
+fn set_property_to_a_computed_null_removes_it() {
+    // The null-removes-property rule is a *runtime* fact about the
+    // evaluated value now, not a check against the `Literal::Null` AST
+    // token -- `SET n.prop = coalesce(null, null)` must remove the
+    // property too, the same as `SET n.prop = null` already did.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:C {keep: 1, drop: 5})");
+    let result = run(
+        &store,
+        "MATCH (n:C) SET n.drop = coalesce(null, null) RETURN n",
+    );
+    let Value::Node(node) = &result.rows[0][0] else {
+        panic!("expected a node");
+    };
+    assert!(!node.props.contains_key("drop"));
+    assert_eq!(
+        node.props.get("keep"),
+        Some(&marsdb_graph::PropertyValue::Int(1))
+    );
+}
+
+#[test]
+fn set_property_to_a_param_still_works() {
+    // Regression guard: widening SetItem::Prop's RHS to a general
+    // ReturnExpr must not break $param substitution, the far more common
+    // real-world SET shape.
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:D {n: 1})");
+    let stmt = parse("MATCH (n:D) SET n.n = $v RETURN n.n").unwrap();
+    let mut stmt = stmt;
+    let mut params = HashMap::new();
+    params.insert("v".to_string(), marsdb_graph::PropertyValue::Int(99));
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int_value(&result.rows[0][0]), 99);
+}

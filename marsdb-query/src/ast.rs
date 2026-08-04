@@ -304,7 +304,12 @@ pub struct ReturnTail {
 
 #[derive(Debug, Clone)]
 pub enum SetItem {
-    Prop(PropAccess, Literal),
+    /// `SET n.prop = <expr>` — the value is any `ReturnExpr` (arithmetic,
+    /// a property read, a function call, ...), not just a literal, same
+    /// as `CREATE`'s inline `{...}` prop values already are. Evaluating
+    /// to `Value::Null` removes the property (matches real Cypher; see
+    /// `executor::apply_set_item`'s docs), not storing a literal null.
+    Prop(PropAccess, ReturnExpr),
     /// `SET n:A:B` — adds each label to the node's label set (idempotent,
     /// not an error if already present).
     Labels(String, Vec<String>),

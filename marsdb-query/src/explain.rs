@@ -189,8 +189,13 @@ fn explain_tail(tail: &Tail) -> String {
             items
                 .iter()
                 .map(|item| match item {
-                    SetItem::Prop(pa, lit) =>
-                        format!("{}.{} = {}", pa.var, pa.prop, format_literal(lit)),
+                    // `value` is a general `ReturnExpr` now (SET's RHS can
+                    // be any expression, not just a literal) -- no
+                    // dedicated formatter for the full expression grammar
+                    // exists here, so this falls back to `Debug` rather
+                    // than under-representing it as if it were always a
+                    // literal.
+                    SetItem::Prop(pa, value) => format!("{}.{} = {value:?}", pa.var, pa.prop),
                     SetItem::Labels(var, labels) => format!("{var}:{}", labels.join(":")),
                 })
                 .collect::<Vec<_>>()
