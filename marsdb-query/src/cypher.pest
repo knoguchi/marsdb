@@ -345,9 +345,27 @@ and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
 // `is_null_expr` tried before `comparison` -- both start with
 // `prop_access`, but `comparison` requires a `compare_op` to follow,
 // which `kw_is` never is, so ordered choice backtracks cleanly.
-unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | ("(" ~ expr ~ ")") }
-comparison    = { prop_access ~ compare_op ~ literal }
+// `label_predicate`/`var_compare` both start with a bare `identifier`
+// (no dot) -- tried after `comparison`/`is_null_expr` (which require a
+// dot) so ordered choice backtracks cleanly off the missing dot, then
+// distinguishes on `:` (label_predicate) vs a `compare_op` (var_compare).
+unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | ("(" ~ expr ~ ")") }
+// RHS is `prop_access` too, not just `literal` -- real Cypher's WHERE
+// routinely compares two properties (`a.id = b.id`), not just a property
+// against a constant. Only the `literal` shape is eligible for the
+// planner's index-seek fusion (see planner.rs); a `prop_access` RHS
+// always falls back to `Expr::PropCompare`, a generic post-scan filter.
+comparison    = { prop_access ~ compare_op ~ (prop_access | literal) }
 is_null_expr  = { prop_access ~ is_null_suffix }
+// `a:A`, `a:A:B` -- a bare variable followed by one or more labels,
+// same shape as `set_label_item`. Desugars in parser.rs to a chain of
+// `Expr::HasLabel`, `And`-ed together for the multi-label case.
+label_predicate = { identifier ~ (":" ~ identifier)+ }
+// `a = b` / `a <> b` -- node/relationship identity comparison (real
+// Cypher's `Expr::VarEq`/`Not(VarEq)`); only `=`/`<>` are meaningful for
+// identity (no ordering exists between two nodes), enforced in
+// parser.rs, not the grammar.
+var_compare = { identifier ~ compare_op ~ identifier }
 compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" | (^"STARTS" ~ ^"WITH") | (^"ENDS" ~ ^"WITH") | ^"CONTAINS" }
 
 prop_access = { identifier ~ "." ~ identifier }

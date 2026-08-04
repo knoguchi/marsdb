@@ -181,6 +181,7 @@ fn substitute_expr(
         }
         Expr::Not(e) => substitute_expr(e, params)?,
         Expr::Compare(_, _, lit) => substitute_literal(lit, params)?,
+        Expr::PropCompare(_, _, _) => {}
         Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
         Expr::VarEq(_, _) => {}

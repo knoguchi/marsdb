@@ -354,6 +354,10 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
         Expr::Compare(access, _, _) | Expr::IsNull(access) => {
             require_property_owner(scope, &access.var)
         }
+        Expr::PropCompare(left, _, right) => {
+            require_property_owner(scope, &left.var)?;
+            require_property_owner(scope, &right.var)
+        }
         Expr::HasLabel(var, _) => require_kind(scope, var, &Kind::Node, "label predicate"),
         Expr::VarEq(left, right) => {
             require_graph(scope, left, "identity predicate")?;

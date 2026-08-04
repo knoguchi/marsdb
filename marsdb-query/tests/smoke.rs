@@ -104,6 +104,79 @@ fn limit_clause_pushed_into_scan_edge_cases() {
     assert_eq!(run(&store, "MATCH (n) RETURN n LIMIT 2").rows.len(), 2);
 }
 
+/// `WHERE a:A` -- a user-typed label predicate directly in pattern-level
+/// `WHERE`, not just the planner-synthesized form multi-label node
+/// patterns already used internally.
+#[test]
+fn where_label_predicate_filters_by_label() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A:B {id: 1})");
+    run(&store, "CREATE (:A {id: 2})");
+    run(&store, "CREATE (:B {id: 3})");
+
+    let result = run(&store, "MATCH (n) WHERE n:A RETURN n.id");
+    assert_eq!(result.rows.len(), 2);
+
+    let result = run(&store, "MATCH (n) WHERE n:A:B RETURN n.id");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => assert_eq!(*i, 1),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `WHERE a.prop op b.prop` -- a property compared against another
+/// property, not a constant (`Expr::PropCompare`, never eligible for
+/// the planner's index-seek fusion).
+#[test]
+fn where_prop_compare_filters_by_another_variables_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X {val: 5})-[:E]->(:Y {val: 10})");
+    run(&store, "CREATE (:X {val: 20})-[:E]->(:Y {val: 1})");
+
+    let result = run(
+        &store,
+        "MATCH (x:X)-[:E]->(y:Y) WHERE x.val < y.val RETURN x.val, y.val",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (
+            Value::Property(marsdb_graph::PropertyValue::Int(x)),
+            Value::Property(marsdb_graph::PropertyValue::Int(y)),
+        ) => {
+            assert_eq!(*x, 5);
+            assert_eq!(*y, 10);
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `WHERE a = b` / `WHERE a <> b` -- node/relationship identity
+/// comparison (`Expr::VarEq`/`Not(VarEq)`), distinct from comparing two
+/// of their properties.
+#[test]
+fn where_var_compare_checks_node_identity() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {id: 1})-[:E]->(:N {id: 2})");
+
+    let result = run(&store, "MATCH (a)-[:E]->(b) WHERE a = a RETURN a.id");
+    assert_eq!(result.rows.len(), 1);
+
+    let result = run(&store, "MATCH (a)-[:E]->(b) WHERE a <> b RETURN a.id, b.id");
+    assert_eq!(result.rows.len(), 1);
+}
+
+/// Only `=`/`<>` are meaningful for node/relationship identity -- `<`
+/// etc. have no defined ordering between two nodes, must be a real
+/// error, not a silent `false`/panic.
+#[test]
+fn where_var_compare_with_ordering_operator_is_a_syntax_error() {
+    let err = marsdb_query::parse("MATCH (a)-[:E]->(b) WHERE a < b RETURN a")
+        .expect_err("ordering a node identity comparison must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("only = and <>"), "unexpected error: {msg}");
+}
+
 #[test]
 fn skip_alone_drops_the_first_n_rows_after_order_by() {
     let store = GraphStore::open_memory().unwrap();

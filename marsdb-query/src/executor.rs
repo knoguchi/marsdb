@@ -2212,6 +2212,11 @@ impl<'a> Executor<'a> {
                 let prop_value = self.lookup_prop(txn, pa, row)?;
                 compare(&prop_value, *op, lit)
             }
+            Expr::PropCompare(left, op, right) => {
+                let a = self.lookup_prop(txn, left, row)?;
+                let b = self.lookup_prop(txn, right, row)?;
+                compare_property_pair_opt(&a, *op, &b)
+            }
             // Always definite -- that's the whole point of IS NULL, so
             // this is the one `Expr` leaf that's always `Some`, same as
             // `HasLabel`/`VarEq` below.
@@ -3587,6 +3592,23 @@ fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> Option
         return None;
     }
     compare_property_pair(prop, op, &literal_to_value(lit))
+}
+
+/// Same null-handling as `compare()`, but both sides are a looked-up
+/// property (`Expr::PropCompare` -- `a.id = b.id`) instead of one side
+/// being a fixed `Literal`.
+fn compare_property_pair_opt(
+    a: &Option<PropertyValue>,
+    op: CompareOp,
+    b: &Option<PropertyValue>,
+) -> Option<bool> {
+    let (Some(a), Some(b)) = (a, b) else {
+        return None;
+    };
+    if matches!(a, PropertyValue::Null) || matches!(b, PropertyValue::Null) {
+        return None;
+    }
+    compare_property_pair(a, op, b)
 }
 
 /// The actual per-type comparison rules, shared by `compare()`

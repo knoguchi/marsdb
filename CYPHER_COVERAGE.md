@@ -92,7 +92,12 @@ requires an explicit relationship type on every hop (`-[:KNOWS]->`,
 where an untyped hop legitimately means "any relationship," a brand new
 edge with no type is meaningless, matching real Cypher's own rule.
 `WHERE` (including the
-string predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`), one `WITH`
+string predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`, a user-typed label
+predicate `WHERE n:Label`/`n:Label1:Label2`, a property compared against
+*another* property rather than a constant `WHERE a.id = b.id`, and
+node/relationship identity comparison `WHERE a = b`/`WHERE a <> b` — only
+`=`/`<>` are meaningful for identity, no ordering exists between two
+nodes/relationships, so `WHERE a < b` is a real error), one `WITH`
 boundary per statement (projection/rename, its own `WHERE`/
 `WITH...WHERE`/`ORDER BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/
 `SET`/`REMOVE`/`MATCH ... CREATE` (adds an edge between two
