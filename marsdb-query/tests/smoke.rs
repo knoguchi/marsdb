@@ -1638,3 +1638,95 @@ fn shortest_path_requires_a_variable_length_hop() {
     let err = parse("MATCH p = shortestPath((a)-[:KNOWS]->(b)) RETURN p").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("variable-length"));
 }
+
+fn int(v: &Value) -> i64 {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+        Value::Literal(marsdb_query::Literal::Int(i)) => *i,
+        other => panic!("expected Int, got {other:?}"),
+    }
+}
+
+fn list_ints(v: &Value) -> Vec<i64> {
+    match v {
+        Value::List(items) => items.iter().map(int).collect(),
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+#[test]
+fn standalone_with_no_preceding_match() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN list");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
+}
+
+#[test]
+fn with_list_binds_as_a_real_list_not_null() {
+    // Regression: `item_binding` used to route any non-Var WITH item
+    // through `value_to_property_value`, which silently collapsed
+    // Value::List/Node/Edge to PropertyValue::Null.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 1 + 1, 2 * 2] AS list RETURN list");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 4]);
+}
+
+#[test]
+fn with_binds_a_node_as_a_real_node_not_null() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:X {n: 1})-[:R]->(b:Y {n: 2})");
+    let result = run(
+        &store,
+        "MATCH (a:X)-[:R]->(b:Y) WITH CASE a.n WHEN 1 THEN a ELSE b END AS chosen RETURN chosen",
+    );
+    match &result.rows[0][0] {
+        Value::Node(_) => {}
+        other => panic!("expected a Node, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_index_by_position() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN list[0], list[2]");
+    assert_eq!(int(&result.rows[0][0]), 1);
+    assert_eq!(int(&result.rows[0][1]), 3);
+}
+
+#[test]
+fn list_index_negative_counts_from_end() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN list[-1]");
+    assert_eq!(int(&result.rows[0][0]), 5);
+}
+
+#[test]
+fn list_index_out_of_bounds_is_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN list[10], list[-10]");
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+}
+
+#[test]
+fn list_slice_basic_and_open_ended() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN list[1..3], list[..2], list[2..]",
+    );
+    assert_eq!(list_ints(&result.rows[0][0]), vec![2, 3]);
+    assert_eq!(list_ints(&result.rows[0][1]), vec![1, 2]);
+    assert_eq!(list_ints(&result.rows[0][2]), vec![3, 4, 5]);
+}
+
+#[test]
+fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
+    // Regression guard: unlike single-element indexing, out-of-range slice
+    // bounds clamp to [0, len] rather than producing null.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH [1, 2, 3] AS list RETURN list[-100..100], list[5..10]");
+    assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
+    assert_eq!(list_ints(&result.rows[0][1]), Vec::<i64>::new());
+}

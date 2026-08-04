@@ -473,6 +473,16 @@ impl<'a> Executor<'a> {
                         &mut carried_vars,
                     )?;
                 }
+                // A statement-leading WITH -- no pattern was matched, so
+                // there's nothing to seed `new_vars` with beyond what the
+                // WITH clause itself projects (`apply_with_or_carry`
+                // always takes the `Some(with)` branch here, never the
+                // "no WITH, just extend carried_vars" one, since `with` is
+                // always present on this variant by construction).
+                QueryClause::With(with) => {
+                    current_rows =
+                        self.apply_with_or_carry(txn, &Some(with.clone()), current_rows, HashSet::new(), &mut carried_vars)?;
+                }
             }
         }
         }
@@ -824,7 +834,23 @@ impl<'a> Executor<'a> {
             ReturnExpr::Var(v) => row.get(v).cloned().ok_or_else(|| QueryError::UnboundVariable(v.clone())),
             other => {
                 let value = self.eval_return_expr(txn, other, row)?;
-                Ok(Binding::Value(value_to_property_value(&value)))
+                // `value_to_property_value` collapses Node/Edge/List/Path
+                // to Null -- fine for a bare Var (handled above, never
+                // reaches here) but wrong for any *wrapped* non-Var
+                // expression that still evaluates to one of those (a list
+                // literal/index/slice, or a CASE branch returning a bound
+                // node/edge): those need the matching real Binding kind,
+                // not a silently-nulled scalar. `Path` still falls back to
+                // Null here -- a real, separate gap (needs a `Value::Path`
+                // -> `Binding::Path` conversion this doesn't have yet),
+                // not something any currently-reachable expression form
+                // produces though.
+                Ok(match value {
+                    Value::Node(n) => Binding::Node(n.id),
+                    Value::Edge(e) => Binding::Edge(e.id),
+                    Value::List(items) => Binding::List(items),
+                    other => Binding::Value(value_to_property_value(&other)),
+                })
             }
         }
     }
@@ -1512,6 +1538,20 @@ impl<'a> Executor<'a> {
                 let rv = self.eval_return_expr(txn, r, row)?;
                 apply_arith(*op, &lv, &rv)
             }
+            ReturnExpr::ListLit(items) => Ok(Value::List(
+                items.iter().map(|item| self.eval_return_expr(txn, item, row)).collect::<Result<Vec<_>, _>>()?,
+            )),
+            ReturnExpr::Index(base, index) => {
+                let base_v = self.eval_return_expr(txn, base, row)?;
+                let index_v = self.eval_return_expr(txn, index, row)?;
+                apply_index(&base_v, &index_v)
+            }
+            ReturnExpr::Slice(base, start, end) => {
+                let base_v = self.eval_return_expr(txn, base, row)?;
+                let start_v = start.as_deref().map(|s| self.eval_return_expr(txn, s, row)).transpose()?;
+                let end_v = end.as_deref().map(|e| self.eval_return_expr(txn, e, row)).transpose()?;
+                apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
+            }
         }
     }
 
@@ -1709,6 +1749,7 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
         ReturnExpr::Arith(..) => format!("col{idx}"),
+        ReturnExpr::ListLit(..) | ReturnExpr::Index(..) | ReturnExpr::Slice(..) => format!("col{idx}"),
     }
 }
 
@@ -1744,6 +1785,13 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
                 || else_.as_deref().is_some_and(contains_aggregate)
         }
         ReturnExpr::Arith(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
+        ReturnExpr::ListLit(items) => items.iter().any(contains_aggregate),
+        ReturnExpr::Index(base, index) => contains_aggregate(base) || contains_aggregate(index),
+        ReturnExpr::Slice(base, start, end) => {
+            contains_aggregate(base)
+                || start.as_deref().is_some_and(contains_aggregate)
+                || end.as_deref().is_some_and(contains_aggregate)
+        }
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -2266,6 +2314,69 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
     })
 }
 
+/// `list[index]` -- a negative index counts from the end (`-1` is the
+/// last element). Out of bounds either way is `Null`, not an error --
+/// matches real Cypher (`[1,2,3][10]` is `null`, not a failure), and is
+/// the only sane behavior for an index that's itself a runtime expression
+/// rather than a literal a human could sanity-check up front.
+fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
+    if matches!(list, Value::Null) || matches!(index, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::List(items) = list else {
+        return Err(QueryError::Parse(format!("[] indexing needs a list, got {list:?}")));
+    };
+    let Some(ArithNum::Int(i)) = as_arith_num(index) else {
+        return Err(QueryError::Parse(format!("a list index must be an integer, got {index:?}")));
+    };
+    let len = items.len() as i64;
+    let i = if i < 0 { i + len } else { i };
+    if i < 0 || i >= len {
+        return Ok(Value::Null);
+    }
+    Ok(items[i as usize].clone())
+}
+
+/// `list[start..end]` -- same negative-counts-from-end rule as
+/// `apply_index`, but bounds clamp to `[0, len]` instead of nulling out
+/// (`[1,2,3][-5..5]` is the whole list, not `null`), and a start at or
+/// past the (clamped) end yields `[]` rather than erroring
+/// (`[1,2,3][3..1]` is `[]`) -- both match real Cypher, and both were
+/// real TCK scenarios, not guessed behavior.
+fn apply_slice(list: &Value, start: Option<&Value>, end: Option<&Value>) -> Result<Value, QueryError> {
+    if matches!(list, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::List(items) = list else {
+        return Err(QueryError::Parse(format!("[..] slicing needs a list, got {list:?}")));
+    };
+    let len = items.len() as i64;
+    let clamp = |i: i64| -> i64 {
+        let i = if i < 0 { i + len } else { i };
+        i.clamp(0, len)
+    };
+    let bound_index = |v: Option<&Value>, default: i64| -> Result<Option<i64>, QueryError> {
+        match v {
+            None => Ok(Some(default)),
+            Some(Value::Null) => Ok(None),
+            Some(other) => match as_arith_num(other) {
+                Some(ArithNum::Int(i)) => Ok(Some(clamp(i))),
+                _ => Err(QueryError::Parse(format!("a slice bound must be an integer, got {other:?}"))),
+            },
+        }
+    };
+    // A null bound (as opposed to an *omitted* one, already handled by
+    // `start`/`end` being `None` at the AST level) propagates -- same
+    // null-handling convention as every other operator here.
+    let (Some(start_idx), Some(end_idx)) = (bound_index(start, 0)?, bound_index(end, len)?) else {
+        return Ok(Value::Null);
+    };
+    if start_idx >= end_idx {
+        return Ok(Value::List(Vec::new()));
+    }
+    Ok(Value::List(items[start_idx as usize..end_idx as usize].to_vec()))
+}
+
 fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
     match name.to_ascii_lowercase().as_str() {
         "coalesce" => Ok(args
@@ -2415,6 +2526,20 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let lv = eval_projected_expr(l, row)?;
             let rv = eval_projected_expr(r, row)?;
             apply_arith(*op, &lv, &rv)
+        }
+        ReturnExpr::ListLit(items) => {
+            Ok(Value::List(items.iter().map(|item| eval_projected_expr(item, row)).collect::<Result<Vec<_>, _>>()?))
+        }
+        ReturnExpr::Index(base, index) => {
+            let base_v = eval_projected_expr(base, row)?;
+            let index_v = eval_projected_expr(index, row)?;
+            apply_index(&base_v, &index_v)
+        }
+        ReturnExpr::Slice(base, start, end) => {
+            let base_v = eval_projected_expr(base, row)?;
+            let start_v = start.as_deref().map(|s| eval_projected_expr(s, row)).transpose()?;
+            let end_v = end.as_deref().map(|e| eval_projected_expr(e, row)).transpose()?;
+            apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
         }
     }
 }
