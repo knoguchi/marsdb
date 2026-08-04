@@ -39,6 +39,11 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Compare(PropAccess, CompareOp, Literal),
+    /// `n.prop IS NULL` — unlike `Compare`, this is always a definite
+    /// `true`/`false`, never "unknown" (that's the whole point of the
+    /// check). `IS NOT NULL` parses to `Not(IsNull(..))`, reusing the
+    /// existing `Not` variant rather than a fourth boolean-op variant.
+    IsNull(PropAccess),
     /// Does the node bound to `var` have label `label` among its (possibly
     /// multiple) labels? Synthesized by the planner for the 2nd+ label in a
     /// multi-label pattern like `(n:Post:Message)` — never user-typed.
@@ -148,9 +153,14 @@ pub enum ReturnExpr {
     /// `lhs op rhs` — a single comparison between two arbitrary
     /// expressions (unlike `WithExpr::Compare`'s `ReturnExpr`-vs-`Literal`
     /// shape, `rhs` here can itself be a variable/property/arithmetic
-    /// expression). Chained comparisons (`1 < x < 10`) aren't supported
-    /// yet — see the README's Cypher coverage section.
+    /// expression). A chain (`1 < x < 10`) parses into nested `And`s of
+    /// each adjacent pair (`(1 < x) AND (x < 10)`), same as real Cypher's
+    /// own chained-comparison semantics — not a separate AST shape.
     Compare(Box<ReturnExpr>, CompareOp, Box<ReturnExpr>),
+    /// `x IS NULL` — always a definite `true`/`false`, never "unknown"
+    /// (that's the whole point of the check). `IS NOT NULL` parses to
+    /// `Not(IsNull(..))`, reusing the existing `Not` variant.
+    IsNull(Box<ReturnExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -236,8 +236,10 @@ decides the answer), list/map equality is real structural comparison
 (`[1,0] >= [1]` is `true`). A type-mismatched comparison's result depends
 on the operator: `=`/`<>` are always definite (`1 = 'a'` is `false`,
 `1 <> 'a'` is `true`), while ordering and the string predicates are `null`
-(no defined answer), not `false`. Chained comparisons (`1 < x < 10`) and
-`IS NULL`/`IS NOT NULL` aren't supported yet.
+(no defined answer), not `false`. Chained comparisons (`1 < x < 10`, in
+`RETURN`/`WITH` — folds into `(1 < x) AND (x < 10)`, real Cypher's own
+semantics) and `IS NULL`/`IS NOT NULL` (`x IS NULL`, both in `RETURN`/
+`WITH` and in a pattern's own `WHERE`, e.g. `WHERE n.prop IS NOT NULL`).
 Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`
