@@ -174,6 +174,13 @@ pub enum ReturnExpr {
     /// (that's the whole point of the check). `IS NOT NULL` parses to
     /// `Not(IsNull(..))`, reusing the existing `Not` variant.
     IsNull(Box<ReturnExpr>),
+    /// `(n:Foo)`/`(n:Foo:Bar)` used as a boolean expression — `true` iff
+    /// the bound node has every listed label, `false` otherwise (a
+    /// definite bool, not three-valued — same as `Expr::HasLabel`, the
+    /// pattern-position sibling this mirrors, but reachable directly from
+    /// `RETURN`/`WITH`/`WHERE` instead of only ever being synthesized by
+    /// the planner for a multi-label pattern token).
+    HasLabel(String, Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

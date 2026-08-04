@@ -490,6 +490,10 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             infer_expr(inner, scope)?;
             Kind::Scalar
         }
+        ReturnExpr::HasLabel(var, _) => {
+            require_graph(scope, var, "(n:Label) target")?;
+            Kind::Scalar
+        }
     })
 }
 

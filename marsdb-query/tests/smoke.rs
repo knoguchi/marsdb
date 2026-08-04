@@ -4088,3 +4088,38 @@ fn unknown_function_name_is_a_semantic_error_not_a_panic() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().starts_with("semantic error:"));
 }
+
+#[test]
+fn label_check_expression_true_and_false() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+    run(&store, "CREATE (:Foo)");
+    let result = run(&store, "MATCH (n) RETURN (n:Foo)");
+    assert_eq!(result.rows.len(), 2);
+    assert!(!bool_value(&result.rows[0][0]));
+    assert!(bool_value(&result.rows[1][0]));
+}
+
+#[test]
+fn label_check_expression_requires_every_listed_label() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A:B)");
+    let result = run(&store, "MATCH (n:A:B) RETURN (n:A:B), (n:A:C)");
+    assert!(bool_value(&result.rows[0][0]));
+    assert!(!bool_value(&result.rows[0][1]));
+}
+
+#[test]
+fn label_check_expression_on_a_null_binding_is_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "OPTIONAL MATCH (n:DoesNotExist) RETURN (n:Foo)");
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn label_check_expression_on_a_non_node_is_a_semantic_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("WITH 5 AS x RETURN (x:Foo)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
+}
