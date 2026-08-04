@@ -265,11 +265,24 @@ node_label   = { ":" ~ identifier }
 
 // Order matters: rel_right's trailing "->" must be tried before rel_either's
 // bare "-", or "-[:KNOWS]->" would parse as rel_either and leave a dangling
-// ">" that fails the rest of the pattern instead of matching rel_right.
-rel_pattern = { rel_right | rel_left | rel_either }
-rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]->" }
-rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
-rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
+// ">" that fails the rest of the pattern instead of matching rel_right. Same
+// reasoning for the bracketless forms below: rel_right_bare's "-->" must be
+// tried before rel_either_bare's bare "--", or "-->(b)" would match "--" and
+// leave a dangling ">". The bracketed and bracketless alternatives don't
+// conflict with each other (second character is always "[" vs "-"/">"), so
+// their relative order doesn't matter.
+rel_pattern     = { rel_right | rel_left | rel_either | rel_right_bare | rel_left_bare | rel_either_bare }
+rel_right       = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]->" }
+rel_left        = { "<-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
+rel_either      = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
+// `-->`/`<--`/`--` -- the bracketless shorthand for an anonymous,
+// untyped, propertyless relationship (real Cypher: brackets are only
+// needed at all to carry a var/type/range/props). No inner pairs, so
+// `parse_rel_pattern`'s child loop below runs zero times for these,
+// producing a `RelPattern` identical to `-[]->`/`<-[]-`/`-[]-`.
+rel_right_bare  = { "-->" }
+rel_left_bare   = { "<--" }
+rel_either_bare = { "--" }
 rel_var     = { identifier }
 rel_type    = { ":" ~ identifier }
 // Variable-length hop count: `*`, `*N`, `*N..`, `*N..M`, `*..M`. Captured
