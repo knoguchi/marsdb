@@ -260,7 +260,15 @@ with_where_clause = { ^"WHERE" ~ with_expr }
 with_expr         = { with_or_expr }
 with_or_expr      = { with_and_expr ~ (^"OR" ~ with_and_expr)* }
 with_and_expr     = { with_unary_expr ~ (^"AND" ~ with_unary_expr)* }
-with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_comparison | ("(" ~ with_expr ~ ")") }
+// `with_is_null_expr` tried before `with_comparison` -- both start with
+// `add_expr`, but `with_comparison` requires a `compare_op` to follow,
+// which `kw_is` never is, so ordered choice backtracks cleanly.
+with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_is_null_expr | with_comparison | ("(" ~ with_expr ~ ")") }
+// `x IS NULL` / `x IS NOT NULL` where `x` is any `add_expr`, not just a
+// property access -- real Cypher's WITH...WHERE needs this for a whole
+// bound var (`WHERE r IS NULL`, checking an OPTIONAL MATCH miss), not
+// just `n.prop IS NULL`.
+with_is_null_expr = { add_expr ~ is_null_suffix }
 // `add_expr` on both sides, not `return_expr` -- `return_expr` now
 // includes its own optional trailing comparison (`compare_expr`), so
 // using it here would let either side greedily consume the whole

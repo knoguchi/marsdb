@@ -215,7 +215,18 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         }
     }
     if let Some(expr) = &with.where_clause {
-        validate_with_expr(expr, &projected)?;
+        // Real Cypher lets `WITH x AS y WHERE ...` see both the pre-WITH
+        // binding (`x`) and the new alias (`y`) -- matches the merged-row
+        // evaluation `executor::materialize_with` does at runtime for the
+        // same reason (see its docs). Aggregation collapses rows, so
+        // there's no single pre-WITH scope to fall back to there.
+        if crate::executor::has_aggregate(&with.items) {
+            validate_with_expr(expr, &projected)?;
+        } else {
+            let mut merged = input.clone();
+            merged.extend(projected.iter().map(|(k, v)| (k.clone(), v.clone())));
+            validate_with_expr(expr, &merged)?;
+        }
     }
     if let Some(order_by) = &with.order_by {
         for (expr, _) in order_by {
@@ -376,6 +387,10 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
         WithExpr::Compare(left, _, right) => {
             infer_expr(left, scope)?;
             infer_expr(right, scope)?;
+            Ok(())
+        }
+        WithExpr::IsNull(e) => {
+            infer_expr(e, scope)?;
             Ok(())
         }
     }

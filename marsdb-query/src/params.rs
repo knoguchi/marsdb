@@ -142,6 +142,7 @@ fn substitute_with_expr(
             substitute_return_expr(lhs, params)?;
             substitute_return_expr(rhs, params)?;
         }
+        WithExpr::IsNull(e) => substitute_return_expr(e, params)?,
     }
     Ok(())
 }
