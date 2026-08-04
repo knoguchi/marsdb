@@ -4291,3 +4291,86 @@ fn order_by_desc_sorts_lists_correctly() {
         ]
     );
 }
+
+#[test]
+fn delete_target_can_be_a_map_value_access() {
+    // Delete targets used to be bare identifiers only -- `DELETE
+    // nodes.key`/`friends[$i]` (any expression that evaluates to a node/
+    // relationship/path) couldn't parse at all.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:User)");
+    run(&store, "CREATE (:User)");
+    run(
+        &store,
+        "MATCH (u:User) WITH {key: u} AS nodes DELETE nodes.key",
+    );
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int_value(&count.rows[0][0]), 0);
+}
+
+#[test]
+fn delete_target_can_be_a_list_index() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:User)-[:FRIEND]->(:A)");
+    run(&store, "CREATE (:User)-[:FRIEND]->(:B)");
+    run(
+        &store,
+        "MATCH (:User)-[:FRIEND]->(n) WITH collect(n) AS friends DETACH DELETE friends[0]",
+    );
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int_value(&count.rows[0][0]), 3);
+}
+
+#[test]
+fn detach_delete_whole_named_path() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X)-[:R]->()-[:R]->()-[:R]->()");
+    run(&store, "MATCH p = (:X)-->()-->()-->() DETACH DELETE p");
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int_value(&count.rows[0][0]), 0);
+}
+
+#[test]
+fn delete_arithmetic_expression_is_a_semantic_error() {
+    // Structurally can never be a node/relationship/path (unlike
+    // `map.key`, below) -- rejected at semantic-validation time,
+    // independent of whether MATCH finds any rows to actually reach
+    // materialize_delete with (TCK's Delete5 [9]).
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+    let stmt = parse("MATCH (n) DELETE 1 + 1").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
+}
+
+#[test]
+fn delete_a_non_graph_map_value_is_a_runtime_type_error() {
+    // A map/property access types as Kind::Scalar structurally (it might
+    // legitimately hold a node at runtime, e.g. `nodes.key` elsewhere in
+    // this file) so it passes semantic validation -- only once the actual
+    // value (a plain Int here, not a node/edge/path) is in hand does
+    // delete_value catch it.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+    let stmt = parse("MATCH (n) WITH {key: 5} AS m DELETE m.key").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("type error:"));
+}
+
+#[test]
+fn delete_multiple_bare_variables_across_two_rows_of_the_same_edge() {
+    // Regression guard: a bare-variable DELETE target must keep using the
+    // raw row Binding (no existence check), not full expression
+    // evaluation -- otherwise the second of two rows referencing the same
+    // already-deleted-by-the-first-row entities would error instead of
+    // silently deduping. Exact shape from TCK's Delete4 [1].
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()-[:R]->()");
+    let result = run(
+        &store,
+        "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c",
+    );
+    assert_eq!(int_value(&result.rows[0][0]), 2);
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int_value(&count.rows[0][0]), 0);
+}

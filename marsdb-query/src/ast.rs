@@ -278,8 +278,14 @@ pub enum Tail {
     /// pre-existing terminal-mutation shape) vs `Some` (this statement's
     /// final clause is actually this RETURN, projected off whatever the
     /// mutation left in scope).
-    Delete(Vec<String>, Option<ReturnTail>),
-    DetachDelete(Vec<String>, Option<ReturnTail>),
+    /// Each target is any expression, not just a bare variable — real
+    /// Cypher allows `DELETE list[0]`/`DELETE map.key`/`DELETE aPath`
+    /// (deletes every node/edge in the path). Evaluated per row
+    /// (`executor::materialize_delete`); `Value::Null` is a documented
+    /// no-op, anything that isn't a node/relationship/path is a real
+    /// `QueryError::Type`.
+    Delete(Vec<ReturnExpr>, Option<ReturnTail>),
+    DetachDelete(Vec<ReturnExpr>, Option<ReturnTail>),
     Set(Vec<SetItem>, Option<ReturnTail>),
     Remove(Vec<RemoveItem>, Option<ReturnTail>),
     /// `MATCH ... CREATE ...` — same pattern syntax as `Statement::Create`,

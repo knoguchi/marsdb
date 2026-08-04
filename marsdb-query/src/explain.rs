@@ -192,8 +192,26 @@ fn explain_tail(tail: &Tail) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Tail::Delete(vars, _) => format!("DELETE {}", vars.join(", ")),
-        Tail::DetachDelete(vars, _) => format!("DETACH DELETE {}", vars.join(", ")),
+        // Targets are a general `ReturnExpr` now (DELETE's target can be
+        // any expression, not just a bare variable) -- same `Debug`
+        // fallback SET's RHS formatting already uses, for the same reason
+        // (no dedicated formatter for the full expression grammar here).
+        Tail::Delete(targets, _) => format!(
+            "DELETE {}",
+            targets
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Tail::DetachDelete(targets, _) => format!(
+            "DETACH DELETE {}",
+            targets
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Tail::Set(items, _) => format!(
             "SET {}",
             items

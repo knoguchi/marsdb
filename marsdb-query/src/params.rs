@@ -197,7 +197,13 @@ fn substitute_tail(
                 substitute_return_expr(&mut item.expr, params)?;
             }
         }
-        Tail::Delete(_, ret) | Tail::DetachDelete(_, ret) | Tail::Remove(_, ret) => {
+        Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
+            for expr in exprs {
+                substitute_return_expr(expr, params)?;
+            }
+            substitute_return_tail(ret, params)?;
+        }
+        Tail::Remove(_, ret) => {
             substitute_return_tail(ret, params)?;
         }
         Tail::Set(items, ret) => {

@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    is_aggregate_name, Expr, MergeClause, Pattern, QueryClause, RemoveItem, ReturnExpr, ReturnItem,
-    ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
+    is_aggregate_name, Expr, Literal, MergeClause, Pattern, QueryClause, RemoveItem, ReturnExpr,
+    ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::QueryError;
 
@@ -231,9 +231,58 @@ fn validate_tail(tail: &Option<Tail>, scope: &mut Scope) -> Result<Scope, QueryE
     };
     match tail {
         Tail::Return(items, _) => project_return(items, scope),
-        Tail::Delete(vars, ret) | Tail::DetachDelete(vars, ret) => {
-            for var in vars {
-                require_graph(scope, var, "DELETE target")?;
+        Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
+            for expr in exprs {
+                // Some shapes can *never* evaluate to a node/relationship/
+                // path, by construction, regardless of what any variable
+                // inside them turns out to hold at runtime -- rejected
+                // immediately here rather than only once a row actually
+                // reaches `delete_value` (which a `MATCH` matching zero
+                // rows would skip entirely, real Cypher's own
+                // `InvalidArgumentType` is independent of whether any data
+                // exists -- TCK's Delete5 `[9]`, `DELETE 1 + 1`). `null` is
+                // the one literal exempt, since deleting it is a
+                // documented no-op, not a type error.
+                if !matches!(expr, ReturnExpr::Lit(Literal::Null))
+                    && matches!(
+                        expr,
+                        ReturnExpr::Lit(_)
+                            | ReturnExpr::CountStar
+                            | ReturnExpr::Arith(..)
+                            | ReturnExpr::And(..)
+                            | ReturnExpr::Or(..)
+                            | ReturnExpr::Xor(..)
+                            | ReturnExpr::Not(..)
+                            | ReturnExpr::Compare(..)
+                            | ReturnExpr::IsNull(..)
+                            | ReturnExpr::MapLit(..)
+                            | ReturnExpr::ListLit(..)
+                    )
+                {
+                    return Err(semantic(
+                        "DELETE target must evaluate to a node, relationship, or path -- a \
+                         literal/arithmetic/boolean/map/list expression never can",
+                    ));
+                }
+                let kind = infer_expr(expr, scope)?;
+                // `Scalar` is deliberately not rejected here, same
+                // reasoning as `bind_unwind`'s: a map/list access
+                // (`nodes.key`, `friends[0]`) types as `Scalar` in this
+                // codebase's `Kind` system even when it legitimately holds
+                // a `Node`/`Edge`/`Path` at runtime (TCK's Delete5 `[3]`/
+                // `[5]` scenarios are exactly this shape) -- only a
+                // confidently-wrong kind (a real number/string/bool/map)
+                // is rejected here, everything else defers to the runtime
+                // `QueryError::Type` in `delete_value`.
+                if !matches!(
+                    kind,
+                    Kind::Node | Kind::Edge | Kind::Path | Kind::Unknown | Kind::Scalar
+                ) {
+                    return Err(semantic(format!(
+                        "DELETE target is {}, not a node, relationship, or path",
+                        kind_name(&kind)
+                    )));
+                }
             }
             validate_return_tail(ret, scope)
         }

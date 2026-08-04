@@ -2556,7 +2556,7 @@ impl<'a> Executor<'a> {
     fn materialize_delete(
         &self,
         txn: Txn,
-        vars: &[String],
+        targets: &[ReturnExpr],
         rows: &[BindingRow],
         detach: bool,
         ret: &Option<ReturnTail>,
@@ -2565,32 +2565,41 @@ impl<'a> Executor<'a> {
         let mut deleted_nodes = HashSet::new();
         let mut deleted_edges = HashSet::new();
         for row in rows {
-            for var in vars {
-                let binding = row
-                    .get(var)
-                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
-                match binding {
-                    Binding::Node(id) => {
-                        if deleted_nodes.insert(*id) {
-                            GraphStore::delete_node_in_txn(write_txn, *id, detach)?;
-                        }
-                    }
-                    Binding::Edge(id) => {
-                        if deleted_edges.insert(*id) {
-                            GraphStore::delete_edge_in_txn(write_txn, *id)?;
-                        }
-                    }
-                    // A null binding is a real, legal DELETE target -- an
-                    // `OPTIONAL MATCH` that didn't match pads its variables
-                    // with null, and deleting that null is specified as a
-                    // silent no-op, not an error (real Cypher: "deleting
-                    // null does nothing").
-                    Binding::Value(PropertyValue::Null) => {}
-                    Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
-                        return Err(QueryError::UnboundVariable(format!(
-                            "'{var}' is a WITH-projected scalar, not a node/edge — DELETE needs a graph binding"
-                        )))
-                    }
+            for target in targets {
+                // A bare variable (`DELETE r, a, b`, by far the common
+                // case) deletes by the raw id already sitting in the row's
+                // `Binding` -- no existence check, no property fetch.
+                // That's what lets `DELETE r, a, b` work when two rows of
+                // the same undirected match both reference the same `a`/
+                // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
+                // row's own dedup lookup must succeed even though the
+                // first row already deleted them. Anything else (`list[0]`,
+                // `map.key`, a whole path variable's *elements* accessed
+                // computedly, ...) has no such raw shortcut and goes
+                // through real evaluation instead -- which correctly does
+                // still error via `deleted_entity_access` if it tries to
+                // read a property off something already gone, since that's
+                // a genuine access, not just a re-statement of identity.
+                if let ReturnExpr::Var(name) = target {
+                    let binding = row
+                        .get(name)
+                        .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                    delete_binding(
+                        write_txn,
+                        binding,
+                        detach,
+                        &mut deleted_nodes,
+                        &mut deleted_edges,
+                    )?;
+                } else {
+                    let value = self.eval_return_expr(txn, target, row)?;
+                    delete_value(
+                        write_txn,
+                        &value,
+                        detach,
+                        &mut deleted_nodes,
+                        &mut deleted_edges,
+                    )?;
                 }
             }
         }
@@ -2801,6 +2810,115 @@ impl<'a> Executor<'a> {
         }
         Ok(())
     }
+}
+
+/// `materialize_delete`'s bare-variable fast path -- deletes straight off
+/// the row's raw `Binding` (just an id), no existence check and no
+/// property fetch, so re-referencing an already-deleted-this-statement
+/// entity by identity (a later row of the same multi-row `DELETE`) is a
+/// silent dedup no-op, not an error. Mirrors `delete_value`'s shape
+/// (including the path/null/type-error handling) but over `Binding`/
+/// `PathBinding` (raw ids) instead of `Value`/`PathElem` (fully
+/// materialized records).
+fn delete_binding(
+    write_txn: &WriteTransaction,
+    binding: &Binding,
+    detach: bool,
+    deleted_nodes: &mut HashSet<NodeId>,
+    deleted_edges: &mut HashSet<EdgeId>,
+) -> Result<(), QueryError> {
+    match binding {
+        Binding::Node(id) => {
+            if deleted_nodes.insert(*id) {
+                GraphStore::delete_node_in_txn(write_txn, *id, detach)?;
+            }
+        }
+        Binding::Edge(id) => {
+            if deleted_edges.insert(*id) {
+                GraphStore::delete_edge_in_txn(write_txn, *id)?;
+            }
+        }
+        Binding::Path(elems) => {
+            for elem in elems {
+                if let PathBinding::Edge(id) = elem {
+                    if deleted_edges.insert(*id) {
+                        GraphStore::delete_edge_in_txn(write_txn, *id)?;
+                    }
+                }
+            }
+            for elem in elems {
+                if let PathBinding::Node(id) = elem {
+                    if deleted_nodes.insert(*id) {
+                        GraphStore::delete_node_in_txn(write_txn, *id, detach)?;
+                    }
+                }
+            }
+        }
+        // A null binding is a real, legal DELETE target -- an `OPTIONAL
+        // MATCH` that didn't match pads its variables with null, and
+        // deleting that is a documented no-op, not an error.
+        Binding::Value(PropertyValue::Null) => {}
+        Binding::Value(_) | Binding::List(_) | Binding::Map(_) => {
+            return Err(QueryError::Type(
+                "DELETE needs a node, relationship, or path, not a scalar/list/map".into(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Deletes whatever `value` evaluated to -- a node, a relationship, every
+/// node/edge in a path (edges first, then nodes, so a plain non-`detach`
+/// `DELETE` of a path succeeds as long as the path's *own* edges are all
+/// part of the same delete — an edge outside the path still correctly
+/// blocks it, matching real Cypher), or nothing at all for `null` (a
+/// documented no-op: an `OPTIONAL MATCH` that didn't match pads its
+/// variables with null, and deleting that is specified as silent, not an
+/// error). Anything else (a list, a map, a bare scalar, ...) is a real
+/// `QueryError::Type` -- `DELETE`'s target must resolve to a graph
+/// element, unlike `SET`'s RHS.
+fn delete_value(
+    write_txn: &WriteTransaction,
+    value: &Value,
+    detach: bool,
+    deleted_nodes: &mut HashSet<NodeId>,
+    deleted_edges: &mut HashSet<EdgeId>,
+) -> Result<(), QueryError> {
+    match value {
+        Value::Node(n) => {
+            if deleted_nodes.insert(n.id) {
+                GraphStore::delete_node_in_txn(write_txn, n.id, detach)?;
+            }
+        }
+        Value::Edge(e) => {
+            if deleted_edges.insert(e.id) {
+                GraphStore::delete_edge_in_txn(write_txn, e.id)?;
+            }
+        }
+        Value::Path(elems) => {
+            for elem in elems {
+                if let PathElem::Edge(e) = elem {
+                    if deleted_edges.insert(e.id) {
+                        GraphStore::delete_edge_in_txn(write_txn, e.id)?;
+                    }
+                }
+            }
+            for elem in elems {
+                if let PathElem::Node(n) = elem {
+                    if deleted_nodes.insert(n.id) {
+                        GraphStore::delete_node_in_txn(write_txn, n.id, detach)?;
+                    }
+                }
+            }
+        }
+        Value::Null => {}
+        other => {
+            return Err(QueryError::Type(format!(
+                "DELETE needs a node, relationship, or path, got {other:?}"
+            )))
+        }
+    }
+    Ok(())
 }
 
 fn apply_remove_item(

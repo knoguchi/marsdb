@@ -602,20 +602,20 @@ fn parse_mutating_tail(pair: Pair<Rule>) -> Result<Tail, QueryError> {
         .transpose()?;
     match clause.as_rule() {
         Rule::detach_delete_clause => {
-            let vars = clause
+            let targets = clause
                 .into_inner()
-                .filter(|p| p.as_rule() == Rule::identifier)
-                .map(|p| p.as_str().to_string())
-                .collect();
-            Ok(Tail::DetachDelete(vars, ret))
+                .filter(|p| p.as_rule() == Rule::return_expr)
+                .map(parse_return_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Tail::DetachDelete(targets, ret))
         }
         Rule::delete_clause => {
-            let vars = clause
+            let targets = clause
                 .into_inner()
-                .filter(|p| p.as_rule() == Rule::identifier)
-                .map(|p| p.as_str().to_string())
-                .collect();
-            Ok(Tail::Delete(vars, ret))
+                .filter(|p| p.as_rule() == Rule::return_expr)
+                .map(parse_return_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Tail::Delete(targets, ret))
         }
         Rule::set_clause => {
             let items = clause
