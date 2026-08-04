@@ -1363,17 +1363,72 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
         Rule::unary_expr => Ok(Expr::Not(Box::new(parse_unary_expr(inner)?))),
         Rule::is_null_expr => Ok(parse_is_null_expr(inner)),
         Rule::comparison => parse_comparison(inner),
+        Rule::label_predicate => Ok(parse_label_predicate(inner)),
+        Rule::var_compare => parse_var_compare(inner),
         Rule::expr => parse_expr(inner),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
     }
 }
 
+/// `comparison = { prop_access ~ compare_op ~ (prop_access | literal) }` --
+/// RHS shape picks the variant: a `literal` keeps the old `Expr::Compare`
+/// (the only shape the planner's index-seek fusion recognizes), a second
+/// `prop_access` becomes `Expr::PropCompare` (never fused, always a
+/// generic post-scan filter).
 fn parse_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
     let mut inner = pair.into_inner();
     let prop_access = parse_prop_access(inner.next().expect("comparison has a prop_access"));
     let op = parse_compare_op(inner.next().expect("comparison has a compare_op"));
-    let literal = parse_literal(inner.next().expect("comparison has a literal"))?;
-    Ok(Expr::Compare(prop_access, op, literal))
+    let rhs = inner.next().expect("comparison has an rhs");
+    Ok(match rhs.as_rule() {
+        Rule::prop_access => Expr::PropCompare(prop_access, op, parse_prop_access(rhs)),
+        Rule::literal => Expr::Compare(prop_access, op, parse_literal(rhs)?),
+        r => unreachable!("unexpected comparison rhs rule {r:?}"),
+    })
+}
+
+/// `label_predicate = { identifier ~ (":" ~ identifier)+ }` -- `a:A:B`
+/// desugars to `HasLabel(a, A) AND HasLabel(a, B)`, same multi-label
+/// shape `set_label_item` already uses for `SET`/`REMOVE`.
+fn parse_label_predicate(pair: Pair<Rule>) -> Expr {
+    let mut inner = pair.into_inner();
+    let var = inner
+        .next()
+        .expect("label_predicate has a var identifier")
+        .as_str()
+        .to_string();
+    let mut labels = inner.map(|p| p.as_str().to_string());
+    let first = labels.next().expect("label_predicate has >= 1 label");
+    labels.fold(Expr::HasLabel(var.clone(), first), |acc, label| {
+        Expr::And(Box::new(acc), Box::new(Expr::HasLabel(var.clone(), label)))
+    })
+}
+
+/// `var_compare = { identifier ~ compare_op ~ identifier }` -- node/
+/// relationship identity comparison. Only `=`/`<>` are meaningful (no
+/// ordering exists between two nodes/relationships); anything else is a
+/// real error, not a silent `false`.
+fn parse_var_compare(pair: Pair<Rule>) -> Result<Expr, QueryError> {
+    let mut inner = pair.into_inner();
+    let a = inner
+        .next()
+        .expect("var_compare has a lhs identifier")
+        .as_str()
+        .to_string();
+    let op = parse_compare_op(inner.next().expect("var_compare has a compare_op"));
+    let b = inner
+        .next()
+        .expect("var_compare has a rhs identifier")
+        .as_str()
+        .to_string();
+    match op {
+        CompareOp::Eq => Ok(Expr::VarEq(a, b)),
+        CompareOp::Ne => Ok(Expr::Not(Box::new(Expr::VarEq(a, b)))),
+        _ => Err(QueryError::Syntax(format!(
+            "{a} {op:?} {b}: only = and <> are meaningful for comparing two nodes/relationships \
+             by identity (no ordering exists between them)"
+        ))),
+    }
 }
 
 /// `is_null_expr = { prop_access ~ is_null_suffix }` -- `is_null_suffix`'s

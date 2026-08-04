@@ -367,6 +367,14 @@ fn format_expr(expr: &Expr) -> String {
             format_compare_op(*op),
             format_literal(lit)
         ),
+        Expr::PropCompare(l, op, r) => format!(
+            "{}.{} {} {}.{}",
+            l.var,
+            l.prop,
+            format_compare_op(*op),
+            r.var,
+            r.prop
+        ),
         Expr::IsNull(pa) => format!("{}.{} IS NULL", pa.var, pa.prop),
         Expr::HasLabel(var, label) => format!("{var}:{label}"),
         Expr::VarEq(a, b) => format!("{a} = {b}"),

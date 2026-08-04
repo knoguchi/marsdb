@@ -39,6 +39,11 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Compare(PropAccess, CompareOp, Literal),
+    /// `a.id = b.id` / `x.val < y.val` — a property compared against
+    /// *another* property, not a constant. Never eligible for the
+    /// planner's index-seek fusion (that only matches `Compare`'s
+    /// literal-RHS shape), always evaluated as a generic post-scan filter.
+    PropCompare(PropAccess, CompareOp, PropAccess),
     /// `n.prop IS NULL` — unlike `Compare`, this is always a definite
     /// `true`/`false`, never "unknown" (that's the whole point of the
     /// check). `IS NOT NULL` parses to `Not(IsNull(..))`, reusing the
@@ -46,14 +51,21 @@ pub enum Expr {
     IsNull(PropAccess),
     /// Does the node bound to `var` have label `label` among its (possibly
     /// multiple) labels? Synthesized by the planner for the 2nd+ label in a
-    /// multi-label pattern like `(n:Post:Message)` — never user-typed.
+    /// multi-label pattern like `(n:Post:Message)`, *and* user-typed
+    /// directly in a `WHERE` (`WHERE a:A`, `WHERE a:A:B` desugars to an
+    /// `And` chain of one `HasLabel` per label).
     HasLabel(String, String),
     /// Do these two row bindings refer to the same node/edge? Synthesized
     /// by the planner when a pattern's hop variable is a "bound-node
     /// repetition" — the same variable already bound earlier reappearing
     /// mid-pattern (e.g. IS7's `p`, bound by an earlier MATCH, reappearing
     /// as the endpoint of an OPTIONAL MATCH pattern: `(a)-[r:KNOWS]-(p)`
-    /// must mean "KNOWS *this* `p`", not "KNOWS anyone"). Never user-typed.
+    /// must mean "KNOWS *this* `p`", not "KNOWS anyone"). Also user-typed
+    /// directly in a `WHERE` (`WHERE a = b`; `WHERE a <> b` desugars to
+    /// `Not(VarEq(a, b))`) — real Cypher's node/relationship identity
+    /// comparison, distinct from comparing two of their *properties*
+    /// (`PropCompare`) or two arbitrary values (`WithExpr::Compare`,
+    /// post-projection only).
     VarEq(String, String),
 }
 
