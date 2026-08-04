@@ -569,7 +569,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &clause.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_with_expr(txn, where_clause, &row)? {
+                if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
                     filtered.push(row);
                 }
             }
@@ -654,7 +654,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &part.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_expr(txn, where_clause, &row)? {
+                if self.eval_expr(txn, where_clause, &row)? == Some(true) {
                     filtered.push(row);
                 }
             }
@@ -752,7 +752,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &with.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_with_expr(txn, where_clause, &row)? {
+                if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
                     filtered.push(row);
                 }
             }
@@ -1043,11 +1043,18 @@ impl<'a> Executor<'a> {
     /// WITH's HAVING-equivalent — evaluated against the already-projected/
     /// grouped row, same as ORDER BY. Never pushed into the planner (see
     /// `WithExpr`'s docs).
-    fn eval_with_expr(&self, txn: Txn, expr: &WithExpr, row: &BindingRow) -> Result<bool, QueryError> {
+    /// `Option<bool>` — `None` is Cypher's "unknown" (see `compare()`'s
+    /// docs), propagated through `AND`/`OR`/`NOT` via `and3`/`or3`/`map`
+    /// instead of collapsing to `false` partway through. Every call site
+    /// filters a row by checking `== Some(true)` — unknown behaves like
+    /// `false` for filtering purposes, but *only* at that final step, not
+    /// internally, since `AND`/`OR`'s truth tables need to tell "false"
+    /// and "unknown" apart to combine correctly.
+    fn eval_with_expr(&self, txn: Txn, expr: &WithExpr, row: &BindingRow) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
-            WithExpr::And(l, r) => self.eval_with_expr(txn, l, row)? && self.eval_with_expr(txn, r, row)?,
-            WithExpr::Or(l, r) => self.eval_with_expr(txn, l, row)? || self.eval_with_expr(txn, r, row)?,
-            WithExpr::Not(e) => !self.eval_with_expr(txn, e, row)?,
+            WithExpr::And(l, r) => and3(self.eval_with_expr(txn, l, row)?, self.eval_with_expr(txn, r, row)?),
+            WithExpr::Or(l, r) => or3(self.eval_with_expr(txn, l, row)?, self.eval_with_expr(txn, r, row)?),
+            WithExpr::Not(e) => self.eval_with_expr(txn, e, row)?.map(|b| !b),
             WithExpr::Compare(lhs, op, lit) => {
                 let value = self.eval_return_expr(txn, lhs, row)?;
                 compare_value(&value, *op, lit)
@@ -1229,7 +1236,7 @@ impl<'a> Executor<'a> {
                 let rows = self.eval_plan(txn, input, seed)?;
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    if self.eval_expr(txn, predicate, &row)? {
+                    if self.eval_expr(txn, predicate, &row)? == Some(true) {
                         out.push(row);
                     }
                 }
@@ -1263,11 +1270,15 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
-    fn eval_expr(&self, txn: Txn, expr: &Expr, row: &BindingRow) -> Result<bool, QueryError> {
+    /// `Option<bool>` — see `eval_with_expr`'s docs, same reasoning.
+    /// `HasLabel`/`VarEq` never produce "unknown" (they operate on real
+    /// bound node/edge identity, not a possibly-null property), so they
+    /// always return `Some`.
+    fn eval_expr(&self, txn: Txn, expr: &Expr, row: &BindingRow) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
-            Expr::And(l, r) => self.eval_expr(txn, l, row)? && self.eval_expr(txn, r, row)?,
-            Expr::Or(l, r) => self.eval_expr(txn, l, row)? || self.eval_expr(txn, r, row)?,
-            Expr::Not(e) => !self.eval_expr(txn, e, row)?,
+            Expr::And(l, r) => and3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
+            Expr::Or(l, r) => or3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
+            Expr::Not(e) => self.eval_expr(txn, e, row)?.map(|b| !b),
             Expr::Compare(pa, op, lit) => {
                 let prop_value = self.lookup_prop(txn, pa, row)?;
                 compare(&prop_value, *op, lit)
@@ -1278,12 +1289,12 @@ impl<'a> Executor<'a> {
                     return Err(QueryError::UnboundVariable(var.clone()));
                 };
                 let node = GraphStore::get_node_in_txn(txn, *id)?;
-                node.is_some_and(|n| n.labels.iter().any(|l| l == label))
+                Some(node.is_some_and(|n| n.labels.iter().any(|l| l == label)))
             }
             Expr::VarEq(a, b) => {
                 let ba = row.get(a).ok_or_else(|| QueryError::UnboundVariable(a.clone()))?;
                 let bb = row.get(b).ok_or_else(|| QueryError::UnboundVariable(b.clone()))?;
-                match (ba, bb) {
+                Some(match (ba, bb) {
                     (Binding::Node(x), Binding::Node(y)) => x == y,
                     (Binding::Edge(x), Binding::Edge(y)) => x == y,
                     // A null-padded `Binding::Value` (from an earlier
@@ -1294,7 +1305,7 @@ impl<'a> Executor<'a> {
                     // occurrences of the same pattern variable, which are
                     // always the same kind when both are real.
                     _ => false,
-                }
+                })
             }
         })
     }
@@ -1903,7 +1914,7 @@ fn reconstruct_path(parent: &HashMap<NodeId, (NodeId, EdgeId)>, start: NodeId, e
 /// (below) by reducing a `Value` down to the `Option<PropertyValue>` shape
 /// it expects; `Node`/`Edge`/`List` have no meaningful comparison against
 /// a `Literal` and fall back to "absent", same as a missing property does.
-fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> bool {
+fn compare_value(value: &Value, op: CompareOp, lit: &Literal) -> Option<bool> {
     let prop = match value {
         Value::Null => None,
         Value::Property(pv) => Some(pv.clone()),
@@ -1995,9 +2006,20 @@ fn neighbors_for_direction(
     })
 }
 
-fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {
-    let Some(prop) = prop else { return false };
-    match (prop, lit) {
+/// Three-valued: `None` is Cypher's "unknown", not `false` -- any
+/// comparison touching a null (a missing property, or a literal `null` on
+/// either side) is unknown, always, regardless of operator -- including
+/// `Eq` (`x = null` is unknown, never true, same as real Cypher; it is
+/// *not* how `x`'s own missing-ness is tested -- there's no `IS NULL`
+/// operator yet). Callers combine this with `and3`/`or3`/`Option::map`
+/// (for `NOT`) rather than unwrapping early, so unknown propagates
+/// correctly through `AND`/`OR`/`NOT` instead of collapsing to `false`.
+fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> Option<bool> {
+    let Some(prop) = prop else { return None };
+    if matches!(prop, PropertyValue::Null) || matches!(lit, Literal::Null) {
+        return None;
+    }
+    Some(match (prop, lit) {
         (PropertyValue::Int(a), Literal::Int(b)) => cmp_ord(op, *a, *b),
         (PropertyValue::Int(a), Literal::Float(b)) => cmp_f64(op, *a as f64, *b),
         (PropertyValue::Float(a), Literal::Float(b)) => cmp_f64(op, *a, *b),
@@ -2013,8 +2035,27 @@ fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> bool {
             CompareOp::Ne => a != b,
             _ => false,
         },
-        (PropertyValue::Null, Literal::Null) => matches!(op, CompareOp::Eq),
         _ => false,
+    })
+}
+
+/// `None`/`None` (both unknown) combines to unknown, matching Cypher's
+/// `AND` truth table -- `false` wins over `unknown` (`false AND unknown =
+/// false`), but `true AND unknown = unknown`, not `true`.
+fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Mirrors `and3` for `OR` -- `true` wins over `unknown`.
+fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
     }
 }
 
@@ -2047,11 +2088,14 @@ fn cmp_ord<T: PartialOrd>(op: CompareOp, a: T, b: T) -> bool {
 
 /// Value equality for CASE's WHEN-comparison (and, elsewhere, DISTINCT
 /// dedup within an aggregate). Null == Null -> true here deliberately,
-/// matching `compare()`'s convention above, not standard three-valued NULL
-/// logic. `Node`/`Edge` compare by id (graph identity), not full-struct
-/// contents — cheaper, and the correct semantics regardless (two bindings
-/// are "the same node" iff the same node, not iff their label/prop
-/// snapshots happen to match).
+/// unlike `compare()`'s three-valued `WHERE`-filter semantics -- CASE and
+/// DISTINCT need a definite yes/no ("is this the same value as a value
+/// already collected", "does this WHEN branch match") rather than
+/// "unknown", so plain equality is the correct, separate choice here, not
+/// an oversight. `Node`/`Edge` compare by id (graph identity), not
+/// full-struct contents — cheaper, and the correct semantics regardless
+/// (two bindings are "the same node" iff the same node, not iff their
+/// label/prop snapshots happen to match).
 pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
