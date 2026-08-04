@@ -209,7 +209,9 @@ impl AggAcc {
         match self {
             AggAcc::Count { distinct, n } => {
                 if dedup_seen(distinct, v)? {
-                    *n += 1;
+                    *n = n
+                        .checked_add(1)
+                        .ok_or_else(|| QueryError::Parse("count() overflow".into()))?;
                 }
             }
             AggAcc::Sum {
@@ -222,7 +224,11 @@ impl AggAcc {
                     return Ok(());
                 }
                 match numeric_value(v) {
-                    Some(Numeric::Int(i)) => *total_int += i,
+                    Some(Numeric::Int(i)) => {
+                        *total_int = total_int
+                            .checked_add(i)
+                            .ok_or_else(|| QueryError::Parse("sum() integer overflow".into()))?;
+                    }
                     Some(Numeric::Float(f)) => {
                         *saw_float = true;
                         *total_float += f;
@@ -250,7 +256,9 @@ impl AggAcc {
                     }
                 };
                 *total += f;
-                *n += 1;
+                *n = n
+                    .checked_add(1)
+                    .ok_or_else(|| QueryError::Parse("avg() count overflow".into()))?;
             }
             AggAcc::Min { distinct, best } => {
                 if !dedup_seen(distinct, v)? {
@@ -364,6 +372,14 @@ mod tests {
             acc.finish(),
             Value::Property(PropertyValue::Int(3))
         ));
+    }
+
+    #[test]
+    fn integer_sum_overflow_is_an_error() {
+        let mut acc = AggAcc::identity("sum", false);
+        acc.fold(&int(i64::MAX)).unwrap();
+        let err = acc.fold(&int(1)).unwrap_err();
+        assert!(err.to_string().contains("sum() integer overflow"));
     }
 
     #[test]

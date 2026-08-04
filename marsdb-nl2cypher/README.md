@@ -61,7 +61,10 @@ anything else that turns a prompt into text.
    readable, which this leans on directly) — not an open-ended retry loop.
    Fails with both attempts included if the repair also doesn't parse.
 4. **`translate_and_run(&db, &client, question)`** — the common case in one
-   call: introspect, translate, execute.
+   call: introspect, translate, execute. This helper is read-only by default:
+   generated CREATE/MERGE/SET/REMOVE/DELETE statements are rejected before
+   execution. Writes require the explicit `translate_and_run_with_policy`
+   API with `ExecutionPolicy::AllowWrites`.
 
 ## Example
 

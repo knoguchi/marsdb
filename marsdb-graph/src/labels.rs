@@ -31,9 +31,9 @@ pub(crate) fn intern_label(write_txn: &WriteTransaction, label: &str) -> Result<
 /// redb's single-writer lock — see `GraphStore::begin_read`).
 pub(crate) fn resolve_label(txn: Txn, label_id: u32) -> Result<String, GraphError> {
     let i2l = txn.open_table(marsdb_storage::tables::ID_TO_LABEL)?;
-    let value = i2l
-        .get(label_id)?
-        .expect("label id present in nodes/edges table must be interned");
+    let value = i2l.get(label_id)?.ok_or_else(|| {
+        GraphError::CorruptData(format!("label id {label_id} has no interned string"))
+    })?;
     Ok(value.value().to_string())
 }
 

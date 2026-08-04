@@ -11,3 +11,6 @@ description = "Thin embedded-KV storage trait boundary used internally by MarsDB
 [dependencies]
 redb.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

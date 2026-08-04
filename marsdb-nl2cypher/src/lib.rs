@@ -61,6 +61,7 @@ pub enum Nl2CypherError {
     InvalidCypher {
         attempts: Vec<(String, String)>,
     },
+    WriteNotAllowed(String),
 }
 
 impl fmt::Display for Nl2CypherError {
@@ -79,8 +80,21 @@ impl fmt::Display for Nl2CypherError {
                 }
                 Ok(())
             }
+            Nl2CypherError::WriteNotAllowed(cypher) => write!(
+                f,
+                "generated Cypher is not read-only and was not executed: {cypher}"
+            ),
         }
     }
+}
+
+/// Authorization policy for generated Cypher. Read-only is the secure
+/// default used by [`translate_and_run`]; callers must explicitly opt in to
+/// letting model output mutate the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    ReadOnly,
+    AllowWrites,
 }
 
 impl std::error::Error for Nl2CypherError {}
@@ -281,8 +295,28 @@ pub fn translate_and_run(
     client: &dyn LlmClient,
     question: &str,
 ) -> Result<(String, QueryResult), Nl2CypherError> {
+    translate_and_run_with_policy(db, client, question, ExecutionPolicy::ReadOnly)
+}
+
+/// Translate and execute with an explicit authorization policy. Use
+/// [`ExecutionPolicy::AllowWrites`] only when the caller has independently
+/// authenticated and authorized the natural-language request.
+pub fn translate_and_run_with_policy(
+    db: &Database,
+    client: &dyn LlmClient,
+    question: &str,
+    policy: ExecutionPolicy,
+) -> Result<(String, QueryResult), Nl2CypherError> {
     let schema = introspect_schema(db)?;
     let cypher = translate(client, &schema, question)?;
+    if policy == ExecutionPolicy::ReadOnly {
+        let stmt = marsdb_query::parse(&cypher).map_err(|err| Nl2CypherError::InvalidCypher {
+            attempts: vec![(cypher.clone(), err.to_string())],
+        })?;
+        if !marsdb_query::is_read_only(&stmt) {
+            return Err(Nl2CypherError::WriteNotAllowed(cypher));
+        }
+    }
     let result = db.execute(&cypher).map_err(Nl2CypherError::Execute)?;
     Ok((cypher, result))
 }

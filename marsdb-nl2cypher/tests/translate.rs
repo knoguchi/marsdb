@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 
 use marsdb::Database;
-use marsdb_nl2cypher::{introspect_schema, translate, LlmClient, Nl2CypherError, SchemaSummary};
+use marsdb_nl2cypher::{
+    introspect_schema, translate, translate_and_run, translate_and_run_with_policy,
+    ExecutionPolicy, LlmClient, Nl2CypherError, SchemaSummary,
+};
 
 /// Returns each entry in `responses` in order, one per `complete()` call —
 /// lets a test script exactly what the "LLM" says on the first call vs. a
@@ -125,4 +128,28 @@ fn introspect_schema_on_empty_database() {
     let schema = introspect_schema(&db).unwrap();
     assert!(schema.node_labels.is_empty());
     assert!(schema.rel_types.is_empty());
+}
+
+#[test]
+fn translate_and_run_rejects_generated_writes_by_default() {
+    let db = Database::in_memory().unwrap();
+    let client = FakeLlmClient::new(vec!["CREATE (:Person {name: 'Mallory'})"]);
+
+    let err = translate_and_run(&db, &client, "add Mallory").unwrap_err();
+    assert!(matches!(err, Nl2CypherError::WriteNotAllowed(_)));
+    let rows = db.execute("MATCH (n) RETURN n").unwrap();
+    assert!(
+        rows.rows.is_empty(),
+        "rejected model output must not mutate data"
+    );
+}
+
+#[test]
+fn generated_writes_require_explicit_opt_in() {
+    let db = Database::in_memory().unwrap();
+    let client = FakeLlmClient::new(vec!["CREATE (:Person {name: 'Ada'})"]);
+
+    translate_and_run_with_policy(&db, &client, "add Ada", ExecutionPolicy::AllowWrites).unwrap();
+    let rows = db.execute("MATCH (n:Person) RETURN n.name").unwrap();
+    assert_eq!(rows.rows.len(), 1);
 }

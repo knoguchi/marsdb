@@ -495,6 +495,88 @@ fn integer_arithmetic_overflow_returns_errors_instead_of_panicking() {
     }
 }
 
+#[test]
+fn integer_sum_overflow_returns_error_instead_of_panicking() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("UNWIND [9223372036854775807, 1] AS x RETURN sum(x)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("sum() integer overflow"));
+}
+
+#[test]
+fn execution_options_enforce_rows_expansions_cancellation_and_timeout() {
+    use std::time::Duration;
+
+    use marsdb_query::{CancellationToken, ExecutionOptions, QueryError};
+
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Item {id: 1})-[:NEXT]->(:Item {id: 2})-[:NEXT]->(:Item {id: 3})",
+    );
+    let executor = Executor::new(&store);
+
+    let scan = parse("MATCH (n:Item) RETURN n").unwrap();
+    let err = executor
+        .execute_with_options(
+            &scan,
+            &ExecutionOptions {
+                max_intermediate_rows: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, QueryError::ResourceLimit(_)));
+
+    let err = executor
+        .execute_with_options(
+            &scan,
+            &ExecutionOptions {
+                max_intermediate_rows: Some(10),
+                max_result_rows: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, QueryError::ResourceLimit(_)));
+
+    let expand = parse("MATCH (n:Item)-[:NEXT]->(m:Item) RETURN m").unwrap();
+    let err = executor
+        .execute_with_options(
+            &expand,
+            &ExecutionOptions {
+                max_relationship_expansions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, QueryError::ResourceLimit(_)));
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let err = executor
+        .execute_with_options(
+            &scan,
+            &ExecutionOptions {
+                cancellation_token: Some(token),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, QueryError::Cancelled));
+
+    let err = executor
+        .execute_with_options(
+            &scan,
+            &ExecutionOptions {
+                timeout: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, QueryError::Timeout));
+}
+
 /// A nested aggregate inside an arithmetic expression (`1 + count(x)`) is
 /// a real, deliberate rejection, not a silent wrong answer -- `Arith`
 /// existing at all made this reachable for the first time (previously
@@ -690,6 +772,50 @@ fn variable_length_bounded_range_respects_max_hops() {
         .collect();
     reached.sort();
     assert_eq!(reached, vec![1, 2]);
+}
+
+#[test]
+fn variable_length_preserves_distinct_paths_to_same_node() {
+    use std::collections::BTreeMap;
+
+    // Diamond: a -> b -> d and a -> c -> d are distinct paths and must
+    // therefore produce two rows even though they share the same endpoint.
+    let store = GraphStore::open_memory().unwrap();
+    let mut nodes = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "name".to_string(),
+            marsdb_graph::PropertyValue::String(name.to_string()),
+        );
+        nodes.push(store.create_node(&["Item"], props).unwrap());
+    }
+    for (src, dst) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        store
+            .create_edge("NEXT", nodes[src], nodes[dst], BTreeMap::new())
+            .unwrap();
+    }
+
+    let result = run(
+        &store,
+        "MATCH (a:Item {name: 'a'})-[:NEXT*2]->(d:Item {name: 'd'}) RETURN d.name",
+    );
+    assert_eq!(result.rows.len(), 2, "both distinct paths must survive");
+}
+
+#[test]
+fn variable_length_does_not_reuse_relationship_in_same_path() {
+    use std::collections::BTreeMap;
+
+    // An undirected traversal may cross the same edge in either direction,
+    // but relationship uniqueness forbids using it to walk a -> b -> a.
+    let store = GraphStore::open_memory().unwrap();
+    let a = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+    let b = store.create_node(&["Item"], BTreeMap::new()).unwrap();
+    store.create_edge("LINK", a, b, BTreeMap::new()).unwrap();
+
+    let result = run(&store, "MATCH (a:Item)-[:LINK*2]-(b:Item) RETURN b");
+    assert!(result.rows.is_empty());
 }
 
 #[test]
