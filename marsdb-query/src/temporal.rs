@@ -797,6 +797,16 @@ fn combine_epoch_day_and_nanos_of_day(epoch_day: i32, nanos_of_day: i64) -> i64 
     epoch_day as i64 * SECONDS_PER_DAY + nanos_of_day / 1_000_000_000
 }
 
+/// Combines an `(epoch_day, nanos_of_day)` pair into `LocalDateTime`'s
+/// own `(epoch_seconds, nanos)` storage shape -- shared by `<type>.
+/// truncate()`'s date+time recombination step.
+pub fn combine_date_and_time(epoch_day: i32, nanos_of_day: i64) -> (i64, i32) {
+    (
+        combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day),
+        (nanos_of_day % 1_000_000_000) as i32,
+    )
+}
+
 /// Calendar + time-of-day fields for `localdatetime({...})`/
 /// `datetime({...})`'s map constructors -- bundled into one struct (not
 /// 7 positional args) purely to stay under clippy's argument-count cap,
@@ -1222,6 +1232,80 @@ pub fn duration_in_seconds(
         raw / NANOS_PER_SEC as i64,
         (raw % NANOS_PER_SEC as i64) as i32,
     )
+}
+
+// ---------------------------------------------------------------------
+// <type>.truncate(unit, value, map)
+// ---------------------------------------------------------------------
+
+/// Truncates a calendar date down to the start of `unit` -- `None` for
+/// any unit that isn't a calendar-scale one (`hour`/`minute`/... apply
+/// to the *time* half, see `truncate_time_unit`). `millennium`/
+/// `century`/`decade` floor the year to the nearest boundary below it
+/// (`2017 -> 2000`, `1984 -> 1900`/`1980`) -- plain `year -
+/// year.rem_euclid(N)`, correct for negative years too since
+/// `rem_euclid` is always non-negative. `week`/`weekYear` use the same
+/// ISO week-date `chrono` already computes for `.week`/`.weekYear`
+/// component access (`date_component`) -- the Monday of that ISO week/
+/// week-year.
+pub fn truncate_date_unit(epoch_day: i32, unit: &str) -> Option<i32> {
+    let d = date_from_epoch_day(epoch_day);
+    let y = d.year();
+    let to_epoch_day = |d: NaiveDate| d.signed_duration_since(epoch()).num_days() as i32;
+    match unit {
+        "millennium" => epoch_day_from_ymd(y - y.rem_euclid(1000), 1, 1),
+        "century" => epoch_day_from_ymd(y - y.rem_euclid(100), 1, 1),
+        "decade" => epoch_day_from_ymd(y - y.rem_euclid(10), 1, 1),
+        "year" => epoch_day_from_ymd(y, 1, 1),
+        "quarter" => epoch_day_from_ymd(y, (d.month() - 1) / 3 * 3 + 1, 1),
+        "month" => epoch_day_from_ymd(y, d.month(), 1),
+        "week" => {
+            let iso = d.iso_week();
+            NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)
+                .map(to_epoch_day)
+        }
+        "weekYear" => {
+            let iso = d.iso_week();
+            NaiveDate::from_isoywd_opt(iso.year(), 1, chrono::Weekday::Mon).map(to_epoch_day)
+        }
+        "day" => Some(epoch_day),
+        _ => None,
+    }
+}
+
+/// Moves `epoch_day` to the given ISO weekday (`1`=Monday..`7`=Sunday)
+/// *within its own ISO week* -- the `dayOfWeek` override key on a
+/// `.truncate('week', ...)` result (`date.truncate('week', d,
+/// {dayOfWeek: 2})` is "the Tuesday of `d`'s week"), not general
+/// week-date construction (which needs a `{year, week, dayOfWeek}`
+/// triple with no existing anchor date at all -- still unsupported,
+/// see this module's top-of-file docs). `None` for an out-of-range
+/// `day_of_week`.
+pub fn set_iso_weekday(epoch_day: i32, day_of_week: i64) -> Option<i32> {
+    if !(1..=7).contains(&day_of_week) {
+        return None;
+    }
+    let d = date_from_epoch_day(epoch_day);
+    let iso = d.iso_week();
+    let monday = NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)?;
+    let result = monday + chrono::Duration::days(day_of_week - 1);
+    Some(result.signed_duration_since(epoch()).num_days() as i32)
+}
+
+/// Truncates a time-of-day down to the start of `unit` -- `None` for
+/// any unit that isn't a clock-scale one. `day` truncates to midnight
+/// (`0`), the shared boundary between the date and time halves.
+pub fn truncate_time_unit(nanos_of_day: i64, unit: &str) -> Option<i64> {
+    let floor = |n: i64| (nanos_of_day / n) * n;
+    match unit {
+        "hour" => Some(floor(3_600_000_000_000)),
+        "minute" => Some(floor(60_000_000_000)),
+        "second" => Some(floor(1_000_000_000)),
+        "millisecond" => Some(floor(1_000_000)),
+        "microsecond" => Some(floor(1_000)),
+        "day" => Some(0),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

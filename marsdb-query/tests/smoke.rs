@@ -3953,6 +3953,133 @@ fn repeated_now_calls_within_one_query_return_the_same_instant() {
     }
 }
 
+/// `date.truncate(unit, value, map)` -- calendar-unit truncation
+/// (`millennium`/`century`/`decade`/`year`/`quarter`/`month`/`week`/
+/// `weekYear`/`day`), plus optional field overrides applied after
+/// truncation. Temporal9 [1].
+#[test]
+fn date_truncate_calendar_units() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(date.truncate('millennium', date({year: 2017, month: 10, day: 11}), {day: 2})), \
+                toString(date.truncate('century', date({year: 1984, month: 10, day: 11}), {})), \
+                toString(date.truncate('decade', date({year: 1984, month: 10, day: 11}), {})), \
+                toString(date.truncate('quarter', date({year: 1984, month: 11, day: 11}), {})), \
+                toString(date.truncate('week', date({year: 1984, month: 10, day: 11}), {}))",
+    );
+    let strs: Vec<String> = (0..5).map(|i| temporal_str(&result.rows[0][i])).collect();
+    assert_eq!(
+        strs,
+        vec![
+            "2000-01-02",
+            "1900-01-01",
+            "1980-01-01",
+            "1984-10-01",
+            "1984-10-08"
+        ]
+    );
+}
+
+/// `weekYear` truncation crosses a real ISO week-year boundary (Jan 1
+/// 1984 belongs to ISO week-year 1983) -- Temporal9 [1].
+#[test]
+fn date_truncate_week_year_crosses_iso_boundary() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(date.truncate('weekYear', datetime({year: 1984, month: 1, day: 1, hour: 12, timezone: '+01:00'}), {})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1983-01-03");
+}
+
+/// `datetime.truncate`/`localdatetime.truncate` -- a calendar-scale
+/// unit truncates the date *and* resets the time to midnight; a
+/// clock-scale unit leaves the date untouched. Temporal9 [2]/[3].
+#[test]
+fn date_time_truncate_calendar_vs_clock_units() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(datetime.truncate('millennium', datetime({year: 2017, month: 10, day: 11, hour: 12, minute: 31, second: 14, timezone: '+01:00'}), {day: 2})), \
+                toString(localdatetime.truncate('hour', datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'}), {nanosecond: 2}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "2000-01-02T00:00+01:00");
+    assert_eq!(
+        temporal_str(&result.rows[0][1]),
+        "1984-10-11T12:00:00.000000002"
+    );
+}
+
+/// `localtime.truncate`/`time.truncate` -- clock-only truncation, `time.
+/// truncate` inherits the source's offset unless overridden. Temporal9
+/// [4]/[5].
+#[test]
+fn local_time_and_time_truncate() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(localtime.truncate('day', datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'}), {nanosecond: 2})), \
+                toString(time.truncate('hour', time({hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'}), {}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "00:00:00.000000002");
+    assert_eq!(temporal_str(&result.rows[0][1]), "12:00+01:00");
+}
+
+/// `date.truncate('week', d, {dayOfWeek: N})` -- the `dayOfWeek`
+/// override moves within the truncated result's own ISO week (found
+/// as a real bug: `apply_date_overrides` didn't recognize `dayOfWeek`
+/// at all and silently ignored it instead of applying it or erroring).
+/// Temporal9 [1].
+#[test]
+fn date_truncate_day_of_week_override() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(date.truncate('week', date({year: 1984, month: 10, day: 11}), {dayOfWeek: 2})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-09");
+}
+
+/// A `.truncate()` map with a field the target type has no slot for
+/// (`hour` on a `date.truncate` result, which is a bare `Date`) is a
+/// real error, not silently ignored.
+#[test]
+fn date_truncate_rejects_a_time_only_override_field() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt =
+        parse("RETURN date.truncate('year', date({year: 1984, month: 10, day: 11}), {hour: 5})")
+            .unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("unrecognized field"),
+        "expected an unrecognized-field error, got: {err}"
+    );
+}
+
+/// A `.truncate()` map overriding *only* `nanosecond` must keep the
+/// truncated base's own millisecond/microsecond digits, not silently
+/// reset them to zero -- found as a real bug (`{nanosecond: 2}` alone
+/// was dropping the base's `.645` millisecond value entirely instead
+/// of producing `.645000002`). Temporal9 [2]-[5].
+#[test]
+fn truncate_sub_second_override_keeps_the_bases_other_digits() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(localdatetime.truncate('millisecond', datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'}), {nanosecond: 2})), \
+                toString(localdatetime.truncate('microsecond', datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'}), {nanosecond: 2}))",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-10-11T12:31:14.645000002"
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][1]),
+        "1984-10-11T12:31:14.645876002"
+    );
+}
+
 #[test]
 fn stored_time_and_date_time_survive_the_storage_round_trip() {
     let store = GraphStore::open_memory().unwrap();

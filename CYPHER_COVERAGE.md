@@ -49,11 +49,11 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 344 | 1 | 311 | 348 | 0 | 34.3% |
+| expressions/temporal | 1004 | 635 | 1 | 342 | 26 | 0 | 63.2% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2272** | **1** | **342** | **1196** | **69** | **58.6%** |
+| **TOTAL** | **3880** | **2563** | **1** | **373** | **874** | **69** | **66.1%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -322,17 +322,31 @@ call within one query shares a single captured instant (real Cypher's
 guarantee — `duration.between(date(), date())` is always exactly
 `PT0S`).
 
+`<type>.truncate(unit, value, map?)` — rounds `value` down to the start
+of `unit` (`millennium`/`century`/`decade`/`year`/`quarter`/`month`/
+`week`/`weekYear`/`day` for the calendar half, `hour`/`minute`/`second`/
+`millisecond`/`microsecond` for the clock half — `day` resets the whole
+time-of-day to midnight), then applies an optional trailing map's field
+overrides on top (same override semantics as temporal projection —
+`dayOfWeek` moves within the truncated result's own ISO week, and a
+sub-second override touching only `nanosecond` keeps the truncated
+base's own millisecond/microsecond digits rather than resetting them).
+`datetime.truncate`/`localdatetime.truncate` truncate *both* halves at
+once for a calendar-scale unit (resetting time to midnight) or just the
+clock half for a clock-scale one.
+
 **Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
 `DateTime` — needs a real IANA timezone database (DST transition rules,
 zone-name lookup), deliberately out of scope, no dependency pulled in
 for it; week-date/ordinal-date/quarter construction (`date({year: 2015,
 week: 1})`, `date('2015-W30-2')`, `date('2015-202')` — only the calendar
 year/month/day forms, for the date half of every type, including as a
-projection override key, e.g. `date({date: d, week: 1})` still isn't
-supported even though `date({date: d, day: 5})` is); `<temporal>.
-truncate(...)`, and the alternate ISO-8601 combined date-time duration
-syntax (`duration('P2012-02-02T14:37:21.545')`). See `marsdb-query/src/
-temporal.rs`'s module doc comment for the same list in code.
+projection/truncate override key, e.g. `date({date: d, week: 1})` still
+isn't supported even though `date({date: d, day: 5})`/`date.truncate(
+'week', d, {dayOfWeek: 2})` are); the alternate ISO-8601 combined
+date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`). See
+`marsdb-query/src/temporal.rs`'s module doc comment for the same list
+in code.
 
 ## Indexes & EXPLAIN
 
