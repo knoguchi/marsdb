@@ -428,11 +428,18 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             };
             let base = apply_index_seeks(base, txn)?;
             if let LogicalPlan::NodeByLabelScan { var, label } = &base {
-                // First candidate that's a real `var.prop = literal`
-                // equality *and* has a declared index -- not just the
-                // first syntactically, since an earlier conjunct might
-                // name an unindexed property while a later one does.
-                let mut chosen = None;
+                // Among every `var.prop = literal` equality conjunct that
+                // *has* a declared index, pick the one with the smallest
+                // cheap cardinality estimate (`index_match_count_in_txn`,
+                // O(1) via redb's per-key entry count) -- not just the
+                // first syntactically. Two candidate indexes rarely narrow
+                // equally well (e.g. `WHERE country = 'US' AND email =
+                // 'x@y.com'` -- `email` is far more selective), and an
+                // `IndexSeek` reading fewer entries is strictly cheaper, so
+                // this is a real cost comparison, not a guess. Ties (equal
+                // counts, including the common "both empty/unbacked" case)
+                // keep the first-encountered candidate for determinism.
+                let mut chosen: Option<(usize, u64)> = None;
                 for (i, c) in candidates.iter().enumerate() {
                     let Expr::Compare(pa, CompareOp::Eq, lit) = c else {
                         continue;
@@ -441,11 +448,15 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                         continue;
                     }
                     if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_some() {
-                        chosen = Some(i);
-                        break;
+                        let value = literal_to_value(lit);
+                        let count =
+                            GraphStore::index_match_count_in_txn(txn, label, &pa.prop, &value)?;
+                        if chosen.is_none_or(|(_, best)| count < best) {
+                            chosen = Some((i, count));
+                        }
                     }
                 }
-                if let Some(i) = chosen {
+                if let Some((i, _)) = chosen {
                     let Expr::Compare(pa, _, lit) = candidates.remove(i) else {
                         unreachable!("chosen index always points at a Compare, checked above")
                     };
@@ -513,6 +524,8 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use marsdb_graph::{GraphStore, PropertyValue, Txn};
 
     use super::*;
@@ -631,6 +644,57 @@ mod tests {
                         assert_eq!(pa.prop, "age")
                     }
                     other => panic!("expected the residual age > 35 predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picks_the_more_selective_index_when_multiple_equality_candidates_are_indexed() {
+        // `country = 'US'` matches most of the graph, `email = '...'`
+        // matches exactly one node -- both have declared indexes, so the
+        // cardinality-based choice must seek on `email`, not just take
+        // whichever conjunct appears first in the WHERE clause.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Person", "country", false).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        for i in 0..20 {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "country".to_string(),
+                PropertyValue::String("US".to_string()),
+            );
+            props.insert(
+                "email".to_string(),
+                PropertyValue::String(format!("user{i}@x.com")),
+            );
+            store.create_node(&["Person"], props).unwrap();
+        }
+        let part = part_from(
+            "MATCH (n:Person) WHERE n.country = 'US' AND n.email = 'user7@x.com' RETURN n",
+        );
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                match *input {
+                    LogicalPlan::IndexSeek { prop, value, .. } => {
+                        assert_eq!(prop, "email");
+                        assert_eq!(value, PropertyValue::String("user7@x.com".to_string()));
+                    }
+                    other => panic!("expected the seek underneath, got {other:?}"),
+                }
+                match predicate {
+                    Expr::Compare(pa, CompareOp::Eq, Literal::String(s)) => {
+                        assert_eq!(pa.prop, "country");
+                        assert_eq!(s, "US");
+                    }
+                    other => panic!("expected the residual country predicate, got {other:?}"),
                 }
             }
             other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),

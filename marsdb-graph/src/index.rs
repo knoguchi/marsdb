@@ -242,6 +242,32 @@ pub fn lookup_exact(
     Ok(ids)
 }
 
+/// Cheap, exact cardinality of `(label, prop) = value` under a declared
+/// index — the stat the query planner uses to pick the most selective
+/// candidate when several indexed equality conjuncts are available for the
+/// same scan (see `marsdb_query::planner::apply_index_seeks`). O(1): redb's
+/// `MultimapValue::len()` reports a count it already tracks per key, so
+/// this never walks the matching entries themselves, unlike `lookup_exact`.
+/// Returns 0 if no such index/value exists (same "caller already checked
+/// `lookup_index_def`" contract as `lookup_exact`).
+pub fn match_count(
+    txn: Txn,
+    label: &str,
+    prop: &str,
+    value: &PropertyValue,
+) -> Result<u64, GraphError> {
+    let Some(label_id) = lookup_label_id(txn, label)? else {
+        return Ok(0);
+    };
+    let Some(prop_id) = lookup_prop_id(txn, prop)? else {
+        return Ok(0);
+    };
+    let key = index_key(label_id, prop_id, value);
+    let index = txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
+    let count = index.get(key.as_slice())?.len();
+    Ok(count)
+}
+
 /// Every declared index whose label is in `label_ids`, as `(label_id,
 /// prop_id, prop_name, IndexDef)`. `INDEX_DEFS` is scanned in full (not a
 /// prefix-range query — `TableHandle` only exposes `get`/`iter`, and the
