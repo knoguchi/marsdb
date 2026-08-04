@@ -145,6 +145,7 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, PropertyValue>) -> 
         }
         Expr::Not(e) => substitute_expr(e, params)?,
         Expr::Compare(_, _, lit) => substitute_literal(lit, params)?,
+        Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
         Expr::VarEq(_, _) => {}
     }
@@ -271,6 +272,7 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
             substitute_return_expr(l, params)?;
             substitute_return_expr(r, params)?;
         }
+        ReturnExpr::IsNull(e) => substitute_return_expr(e, params)?,
     }
     Ok(())
 }

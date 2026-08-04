@@ -623,17 +623,53 @@ fn parse_bool_not_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     }
 }
 
+/// `compare_expr = { add_expr ~ ((compare_op ~ add_expr)+ | is_null_suffix)? }`
+/// -- either a chain of 1+ `compare_op ~ add_expr` pairs, a single
+/// `is_null_suffix`, or neither. A chain folds into nested `And`s of
+/// each *adjacent* pair (`a op0 b op1 c` -> `(a op0 b) AND (b op1 c)`,
+/// real Cypher's own chained-comparison semantics) -- note this means a
+/// middle operand like `b` is evaluated twice, harmless since no
+/// `ReturnExpr` form has side effects.
 fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let lhs = parse_add_expr(inner.next().expect("compare_expr has at least one add_expr"))?;
-    match (inner.next(), inner.next()) {
-        (Some(op_pair), Some(rhs_pair)) => {
-            let op = parse_compare_op(op_pair);
-            let rhs = parse_add_expr(rhs_pair)?;
-            Ok(ReturnExpr::Compare(Box::new(lhs), op, Box::new(rhs)))
+    let first = parse_add_expr(inner.next().expect("compare_expr has at least one add_expr"))?;
+    let Some(next) = inner.next() else {
+        return Ok(first);
+    };
+    if next.as_rule() == Rule::is_null_suffix {
+        return Ok(parse_is_null_suffix(next, first));
+    }
+    // A chain: `next` is the first compare_op, and the remaining pairs
+    // alternate compare_op, add_expr, compare_op, add_expr, ...
+    let mut operands = vec![first];
+    let mut ops = vec![parse_compare_op(next)];
+    loop {
+        operands.push(parse_add_expr(inner.next().expect("compare_op has a following add_expr"))?);
+        match inner.next() {
+            Some(op_pair) => ops.push(parse_compare_op(op_pair)),
+            None => break,
         }
-        (None, None) => Ok(lhs),
-        _ => unreachable!("compare_expr's compare_op/add_expr pair must appear together"),
+    }
+    let mut pairs = operands.windows(2).zip(&ops).map(|(pair, op)| {
+        ReturnExpr::Compare(Box::new(pair[0].clone()), *op, Box::new(pair[1].clone()))
+    });
+    let mut acc = pairs.next().expect("a comparison chain has at least one pair");
+    for next in pairs {
+        acc = ReturnExpr::And(Box::new(acc), Box::new(next));
+    }
+    Ok(acc)
+}
+
+/// `is_null_suffix = { kw_is ~ kw_not? ~ kw_null }` -- `kw_not`'s
+/// presence (as its own `Pair`, since it's atomic) distinguishes `IS
+/// NULL` from `IS NOT NULL`.
+fn parse_is_null_suffix(pair: Pair<Rule>, operand: ReturnExpr) -> ReturnExpr {
+    let is_not = pair.into_inner().any(|p| p.as_rule() == Rule::kw_not);
+    let is_null = ReturnExpr::IsNull(Box::new(operand));
+    if is_not {
+        ReturnExpr::Not(Box::new(is_null))
+    } else {
+        is_null
     }
 }
 
@@ -1062,6 +1098,7 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
     let inner = pair.into_inner().next().expect("unary_expr has one child");
     match inner.as_rule() {
         Rule::unary_expr => Ok(Expr::Not(Box::new(parse_unary_expr(inner)?))),
+        Rule::is_null_expr => Ok(parse_is_null_expr(inner)),
         Rule::comparison => parse_comparison(inner),
         Rule::expr => parse_expr(inner),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
@@ -1074,6 +1111,22 @@ fn parse_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
     let op = parse_compare_op(inner.next().expect("comparison has a compare_op"));
     let literal = parse_literal(inner.next().expect("comparison has a literal"))?;
     Ok(Expr::Compare(prop_access, op, literal))
+}
+
+/// `is_null_expr = { prop_access ~ is_null_suffix }` -- `is_null_suffix`'s
+/// `kw_not` presence (as its own `Pair`, since it's atomic) distinguishes
+/// `IS NULL` from `IS NOT NULL`, same as the `ReturnExpr` counterpart.
+fn parse_is_null_expr(pair: Pair<Rule>) -> Expr {
+    let mut inner = pair.into_inner();
+    let prop_access = parse_prop_access(inner.next().expect("is_null_expr has a prop_access"));
+    let suffix = inner.next().expect("is_null_expr has an is_null_suffix");
+    let is_not = suffix.into_inner().any(|p| p.as_rule() == Rule::kw_not);
+    let is_null = Expr::IsNull(prop_access);
+    if is_not {
+        Expr::Not(Box::new(is_null))
+    } else {
+        is_null
+    }
 }
 
 fn parse_compare_op(pair: Pair<Rule>) -> CompareOp {

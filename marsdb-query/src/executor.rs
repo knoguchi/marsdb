@@ -1371,6 +1371,10 @@ impl<'a> Executor<'a> {
                 let prop_value = self.lookup_prop(txn, pa, row)?;
                 compare(&prop_value, *op, lit)
             }
+            // Always definite -- that's the whole point of IS NULL, so
+            // this is the one `Expr` leaf that's always `Some`, same as
+            // `HasLabel`/`VarEq` below.
+            Expr::IsNull(pa) => Some(matches!(self.lookup_prop(txn, pa, row)?, None | Some(PropertyValue::Null))),
             Expr::HasLabel(var, label) => {
                 let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 let Binding::Node(id) = binding else {
@@ -1667,6 +1671,10 @@ impl<'a> Executor<'a> {
                 let lv = self.eval_return_expr(txn, l, row)?;
                 let rv = self.eval_return_expr(txn, r, row)?;
                 Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
+            }
+            ReturnExpr::IsNull(e) => {
+                let v = self.eval_return_expr(txn, e, row)?;
+                Ok(Value::Literal(Literal::Bool(matches!(v, Value::Null))))
             }
         }
     }
@@ -1988,7 +1996,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Or(..)
         | ReturnExpr::Xor(..)
         | ReturnExpr::Not(..)
-        | ReturnExpr::Compare(..) => format!("col{idx}"),
+        | ReturnExpr::Compare(..)
+        | ReturnExpr::IsNull(..) => format!("col{idx}"),
     }
 }
 
@@ -2045,6 +2054,7 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
         }
         ReturnExpr::Not(e) => contains_aggregate(e),
         ReturnExpr::Compare(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
+        ReturnExpr::IsNull(e) => contains_aggregate(e),
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::Lit(_) => false,
     }
 }
@@ -3220,6 +3230,7 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let rv = eval_projected_expr(r, row)?;
             Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
         }
+        ReturnExpr::IsNull(e) => Ok(Value::Literal(Literal::Bool(matches!(eval_projected_expr(e, row)?, Value::Null)))),
     }
 }
 

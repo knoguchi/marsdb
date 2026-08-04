@@ -112,10 +112,18 @@ kw_or  = @{ ^"OR" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_xor = @{ ^"XOR" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_and = @{ ^"AND" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
-// A single, optional comparison -- chained comparisons (`1 < x < 10`)
-// and `IS NULL`/`IS NOT NULL` are a deliberately separate, later change
-// (see README's Cypher coverage section).
-compare_expr  = { add_expr ~ (compare_op ~ add_expr)? }
+// Same word-boundary reasoning as `kw_or`/etc above -- `IS`/`NULL` are
+// short enough to realistically prefix a real identifier/property name
+// (`island`, `nullable`, ...).
+kw_is   = @{ ^"IS" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_null = @{ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_") }
+// A chain of 1+ comparisons (`1 < x < 10`), or a single `IS [NOT] NULL`
+// check -- never both on the same operand (real Cypher doesn't chain
+// IS NULL with a comparison operator either). The chain-vs-single-op
+// distinction is resolved in `parser.rs` (fold adjacent pairs with AND),
+// not here.
+compare_expr    = { add_expr ~ ((compare_op ~ add_expr)+ | is_null_suffix)? }
+is_null_suffix  = { kw_is ~ kw_not? ~ kw_null }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
 mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }
@@ -250,8 +258,12 @@ prop_kv  = { identifier ~ ":" ~ literal }
 expr       = { or_expr }
 or_expr    = { and_expr ~ (^"OR" ~ and_expr)* }
 and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
-unary_expr = { (^"NOT" ~ unary_expr) | comparison | ("(" ~ expr ~ ")") }
-comparison = { prop_access ~ compare_op ~ literal }
+// `is_null_expr` tried before `comparison` -- both start with
+// `prop_access`, but `comparison` requires a `compare_op` to follow,
+// which `kw_is` never is, so ordered choice backtracks cleanly.
+unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | ("(" ~ expr ~ ")") }
+comparison    = { prop_access ~ compare_op ~ literal }
+is_null_expr  = { prop_access ~ is_null_suffix }
 compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" | (^"STARTS" ~ ^"WITH") | (^"ENDS" ~ ^"WITH") | ^"CONTAINS" }
 
 prop_access = { identifier ~ "." ~ identifier }

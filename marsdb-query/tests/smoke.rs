@@ -2076,6 +2076,42 @@ fn type_mismatch_comparison_semantics_differ_by_operator() {
 }
 
 #[test]
+fn is_null_pattern_where_finds_missing_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person)");
+    let result = run(&store, "MATCH (n:Person) WHERE n.name IS NULL RETURN n");
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn is_not_null_pattern_where_excludes_missing_property() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {name: 'Alice'})");
+    run(&store, "CREATE (:Person)");
+    let result = run(&store, "MATCH (n:Person) WHERE n.name IS NOT NULL RETURN n.name");
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn is_null_return_expr() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN null IS NULL AS a, 1 IS NULL AS b, 1 IS NOT NULL AS c");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+    assert!(bool_val(&result.rows[0][2]));
+}
+
+#[test]
+fn chained_comparisons_fold_into_and() {
+    // `1 < x < 10` means `(1 < x) AND (x < 10)`, not `(1 < x) < 10`.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH 5 AS x RETURN 1 < x < 10 AS a, 1 < x < 3 AS b");
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
+#[test]
 fn list_comprehension_bare_where_now_parses() {
     // Regression: previously `filter_expr`'s WHERE reused WithExpr, which
     // only ever wrapped a single Compare -- a bare boolean value (`WHERE
