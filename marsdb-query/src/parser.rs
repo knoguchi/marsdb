@@ -450,12 +450,14 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
     let inner = pair.into_inner().next().expect("tail_clause has one child");
     match inner.as_rule() {
         Rule::return_clause => {
-            let items = inner
-                .into_inner()
+            let children: Vec<_> = inner.into_inner().collect();
+            let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
+            let items = children
+                .into_iter()
                 .filter(|p| p.as_rule() == Rule::return_item)
                 .map(parse_return_item)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Tail::Return(items))
+            Ok(Tail::Return(items, distinct))
         }
         Rule::detach_delete_clause => {
             let vars = inner

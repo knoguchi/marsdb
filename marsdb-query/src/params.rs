@@ -152,7 +152,7 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, PropertyValue>) -> 
 
 fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
     match tail {
-        Tail::Return(items) => {
+        Tail::Return(items, _) => {
             for item in items {
                 substitute_return_expr(&mut item.expr, params)?;
             }

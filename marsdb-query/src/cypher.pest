@@ -61,7 +61,7 @@ on_match_clause   = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 // new one — see `Tail::Create`'s docs).
 tail_clause = { return_clause | detach_delete_clause | delete_clause | remove_clause | set_clause | create_stmt }
 
-return_clause = { ^"RETURN" ~ return_item ~ ("," ~ return_item)* }
+return_clause = { ^"RETURN" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* }
 return_item   = { return_expr ~ (^"AS" ~ identifier)? }
 // Order matters: case_expr/function_call/prop_access need their extra
 // syntax tried before the bare `identifier` fallback, and `literal` must

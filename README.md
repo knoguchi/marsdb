@@ -113,8 +113,8 @@ cargo run -p marsdb-nl2cypher --example ollama_demo
 MarsDB's narrower Cypher subset (vs. full Neo4j Cypher) is a deliberate fit
 for this — a smaller grammar means fewer ways an LLM can generate something
 unparseable. The prompt tells the model what's supported *and* what to
-avoid (no bare `-->` shorthand, no `RETURN DISTINCT`, `MERGE` capped at one
-hop, etc.) — see `marsdb-nl2cypher/src/lib.rs`'s `CAPABILITIES` constant.
+avoid (no bare `-->` shorthand, `MERGE` capped at one hop, etc.) — see
+`marsdb-nl2cypher/src/lib.rs`'s `CAPABILITIES` constant.
 
 ## Architecture
 
@@ -174,8 +174,11 @@ in one query yet — each is a terminal tail, not a chainable clause).
 Multi-key `ORDER BY`, `LIMIT`, `CASE`, the built-in functions
 `coalesce()`/`toInteger()`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
-`DISTINCT` — inside an aggregate call only; a standalone `RETURN DISTINCT`
-result-set modifier doesn't exist yet). Two independent `MATCH` parts
+`DISTINCT` inside an aggregate call). `RETURN DISTINCT` (result-set-level
+dedup of the whole projected row, applied after grouping for an
+aggregating `RETURN` — a separate mechanism from `DISTINCT` inside one
+aggregate call, which only affects that aggregate's own accumulation).
+Two independent `MATCH` parts
 across one `WITH` boundary (`MATCH (a) WITH a MATCH (b) ...`, where `b`'s
 pattern doesn't chain from `a`) correctly cross-join, carrying `a`
 alongside every row `b` produces. `UNWIND <list> AS x` (fans a list out
@@ -221,8 +224,6 @@ need a definite yes/no, not "unknown".
 
 ## Roadmap
 
-- `RETURN DISTINCT` (result-set-level dedup; `DISTINCT` inside an
-  aggregate call already works)
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb

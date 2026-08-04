@@ -137,7 +137,12 @@ pub struct Pattern {
 
 #[derive(Debug, Clone)]
 pub enum Tail {
-    Return(Vec<ReturnItem>),
+    /// `distinct`: `RETURN DISTINCT ...` -- a result-set-level dedup of the
+    /// whole projected row, applied after projection (and after grouping,
+    /// for an aggregating RETURN) -- not the same knob as `DISTINCT` inside
+    /// an aggregate call (`count(DISTINCT x)`), which only affects that one
+    /// aggregate's own accumulation.
+    Return(Vec<ReturnItem>, bool),
     Delete(Vec<String>),
     DetachDelete(Vec<String>),
     Set(Vec<SetItem>),
