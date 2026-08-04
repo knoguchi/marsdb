@@ -39,6 +39,18 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
         // plain identifiers.
         Statement::CreateIndex { .. } => Ok(()),
         Statement::Explain(inner) => validate_statement(inner),
+        // Each part is independently scoped (no bindings shared across a
+        // UNION boundary), so each just gets its own ordinary validation
+        // pass -- the one UNION-specific check (every part's columns must
+        // match) needs each part's real, evaluated `QueryResult.columns`,
+        // which doesn't exist yet at this pre-execution stage, so it lives
+        // in `executor::materialize_union` instead.
+        Statement::Union { parts, .. } => {
+            for part in parts {
+                validate_statement(part)?;
+            }
+            Ok(())
+        }
         Statement::Match {
             clauses,
             tail,

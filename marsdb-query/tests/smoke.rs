@@ -4133,3 +4133,58 @@ fn label_check_expression_on_a_non_node_is_a_semantic_error() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().starts_with("semantic error:"));
 }
+
+#[test]
+fn union_dedups_by_default() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN 2 AS x UNION RETURN 1 AS x UNION RETURN 2 AS x",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn union_all_keeps_every_row() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN 2 AS x UNION ALL RETURN 1 AS x UNION ALL RETURN 2 AS x",
+    );
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn union_combines_two_match_clauses() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)");
+    run(&store, "CREATE (:B)");
+    let result = run(
+        &store,
+        "MATCH (a:A) RETURN a AS a UNION MATCH (b:B) RETURN b AS a",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn union_with_different_columns_is_a_semantic_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 AS a UNION RETURN 2 AS b").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().starts_with("semantic error:"));
+}
+
+#[test]
+fn mixing_union_and_union_all_is_a_syntax_error() {
+    let err = parse("RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a").unwrap_err();
+    assert!(err.to_string().starts_with("syntax error:"));
+}
+
+#[test]
+fn explain_over_a_union_shows_each_part_and_the_union_keyword() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "EXPLAIN RETURN 1 AS x UNION RETURN 2 AS x");
+    let lines = plan_lines(&result);
+    assert!(lines.iter().any(|l| l == "UNION"));
+    assert_eq!(lines.iter().filter(|l| l.contains("RETURN x")).count(), 2);
+}

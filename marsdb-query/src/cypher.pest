@@ -13,13 +13,33 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
 // `^"CREATE"`, but `pattern` always starts with `(`, never `INDEX`, so
 // ordered choice backtracks cleanly on a plain `CREATE (...)`. `explain_stmt`
 // tried first of all -- it's the only rule starting with `EXPLAIN`, so there's
-// no backtracking concern, just an ordinary prefix check.
-statement = { explain_stmt | create_index_stmt | create_stmt | match_stmt }
+// no backtracking concern, just an ordinary prefix check. `union_stmt` tried
+// before plain `match_stmt` -- both start by parsing one `match_stmt`, but
+// `union_stmt` additionally requires at least one trailing `UNION [ALL]
+// match_stmt`; if that's absent, pest backtracks cleanly onto plain
+// `match_stmt` (same ordered-choice-with-backtracking reasoning as
+// `create_index_stmt`/`create_stmt` above), at the cost of reparsing the
+// first part once on a non-UNION statement -- a normal, cheap PEG tradeoff.
+statement = { explain_stmt | create_index_stmt | create_stmt | union_stmt | match_stmt }
 
 // `EXPLAIN <statement>` -- never wraps another `explain_stmt` (real Cypher's
 // own `EXPLAIN EXPLAIN ...` isn't valid either), so the inner alternative
 // list deliberately excludes it rather than reusing `statement` itself.
-explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt | match_stmt) }
+// `union_stmt` before `match_stmt` here for the same backtracking reason
+// `statement`'s own alternation needs it.
+explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt | union_stmt | match_stmt) }
+
+// `RETURN 1 AS x UNION RETURN 2 AS x` / `... UNION ALL ...` -- each part is
+// an independent `match_stmt` (own scope, no bindings shared across parts,
+// matching real Cypher), concatenated. Whether every part actually used
+// `ALL` consistently (real Cypher rejects mixing `UNION` and `UNION ALL` in
+// one statement) and whether every part's column list actually matches are
+// both semantic checks (`parser.rs::parse_union_stmt`/`executor::
+// materialize_union`), not grammar-level restrictions -- both are only
+// checkable after parsing, once real column names/`all`-flags are in hand.
+union_stmt = { match_stmt ~ (union_op ~ match_stmt)+ }
+union_op   = { ^"UNION" ~ all_kw? }
+all_kw     = { ^"ALL" }
 
 create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
 

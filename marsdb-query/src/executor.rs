@@ -354,25 +354,22 @@ impl<'a> Executor<'a> {
         }
         if is_read_only(stmt) {
             let read_txn = self.store.begin_read()?;
-            let Statement::Match {
-                clauses,
-                tail,
-                order_by,
-                limit,
-            } = stmt
-            else {
-                unreachable!("is_read_only only returns true for Statement::Match")
-            };
             // No explicit commit/abort — a ReadTransaction is a pure
             // snapshot view with nothing to roll back; it releases on drop.
-            return self.execute_match(
-                Txn::Read(&read_txn),
-                clauses,
-                tail,
-                order_by,
-                *limit,
-                guard,
-            );
+            return match stmt {
+                Statement::Union { parts, all } => {
+                    self.materialize_union(Txn::Read(&read_txn), parts, *all, guard)
+                }
+                Statement::Match {
+                    clauses,
+                    tail,
+                    order_by,
+                    limit,
+                } => {
+                    self.execute_match(Txn::Read(&read_txn), clauses, tail, order_by, *limit, guard)
+                }
+                _ => unreachable!("is_read_only only returns true for Statement::Match/Union"),
+            };
         }
         let write_txn = self.store.begin_write()?;
         let outcome = self.execute_in_write_transaction_validated(stmt, &write_txn, guard);
@@ -519,6 +516,9 @@ impl<'a> Executor<'a> {
                 // caller set ever changes, rather than becoming a latent
                 // panic.
                 self.execute_explain(inner)
+            }
+            Statement::Union { parts, all } => {
+                self.materialize_union(Txn::Write(write_txn), parts, *all, guard)
             }
         }
     }
@@ -2654,6 +2654,62 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// `<match_stmt> UNION [ALL] <match_stmt> ...` — every part shares the
+    /// same `txn` (one snapshot for a read-only union, one write
+    /// transaction otherwise — see `is_read_only`'s own `Union` handling)
+    /// but no bindings: each part is `execute_match`'d completely
+    /// independently, matching real Cypher's own scoping. Column names
+    /// must match exactly across every part (real Cypher's
+    /// `DifferentColumnsInUnion` — checked here, once each part's real
+    /// `QueryResult.columns` is in hand, rather than statically, since
+    /// nothing else in this codebase infers a `RETURN` list's column
+    /// names without evaluating it). `all: false` (plain `UNION`) dedups
+    /// the combined rows via the same `dedup_rows` `RETURN DISTINCT`
+    /// already uses; `all: true` keeps every row.
+    fn materialize_union(
+        &self,
+        txn: Txn,
+        parts: &[Statement],
+        all: bool,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        let mut combined: Option<QueryResult> = None;
+        for part in parts {
+            let Statement::Match {
+                clauses,
+                tail,
+                order_by,
+                limit,
+            } = part
+            else {
+                unreachable!(
+                    "union_stmt parts are always Statement::Match -- see parser::parse_union_stmt"
+                )
+            };
+            let result = self.execute_match(txn, clauses, tail, order_by, *limit, guard)?;
+            combined = Some(match combined {
+                None => result,
+                Some(mut acc) => {
+                    if acc.columns != result.columns {
+                        return Err(QueryError::Semantic(format!(
+                            "UNION requires every part to return the same columns -- got {:?} \
+                             and {:?}",
+                            acc.columns, result.columns
+                        )));
+                    }
+                    acc.rows.extend(result.rows);
+                    acc
+                }
+            });
+            guard.check_intermediate_rows(combined.as_ref().map(|r| r.rows.len()).unwrap_or(0))?;
+        }
+        let mut result = combined.expect("union_stmt grammar guarantees at least 2 parts");
+        if !all {
+            result.rows = dedup_rows(result.rows)?;
+        }
+        Ok(result)
+    }
+
     fn apply_set_item(
         &self,
         txn: Txn,
@@ -2844,6 +2900,9 @@ fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
 /// which execute generated or otherwise untrusted Cypher can enforce a
 /// read-only policy using the same classification as the executor.
 pub fn is_read_only(stmt: &Statement) -> bool {
+    if let Statement::Union { parts, .. } = stmt {
+        return parts.iter().all(is_read_only);
+    }
     let Statement::Match {
         tail: Some(Tail::Return(_, _)),
         clauses,

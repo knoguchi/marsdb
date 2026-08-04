@@ -497,4 +497,18 @@ pub enum Statement {
         order_by: Option<Vec<(ReturnExpr, SortDir)>>,
         limit: Option<i64>,
     },
+    /// `<match_stmt> UNION [ALL] <match_stmt> (UNION [ALL] <match_stmt>)*`
+    /// — each `parts` entry is itself a `Statement::Match`, own scope, no
+    /// bindings shared across parts (real Cypher: a UNION member can't see
+    /// a preceding member's variables). `all` applies uniformly to the
+    /// whole statement — real Cypher rejects mixing bare `UNION` and
+    /// `UNION ALL` in one statement (a semantic check, `parser::
+    /// parse_union_stmt`, since it's only checkable once every part's own
+    /// `UNION`/`UNION ALL` keyword is in hand). `false` = dedup the
+    /// combined rows (`UNION`'s default); `true` = keep every row
+    /// (`UNION ALL`).
+    Union {
+        parts: Vec<Statement>,
+        all: bool,
+    },
 }

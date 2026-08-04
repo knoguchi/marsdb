@@ -40,16 +40,49 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         Rule::explain_stmt => parse_explain_stmt(inner),
         Rule::create_index_stmt => parse_create_index_stmt(inner),
         Rule::create_stmt => parse_create_stmt(inner),
+        Rule::union_stmt => parse_union_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected statement child rule {r:?}"),
     }
 }
 
+/// `union_stmt = { match_stmt ~ (union_op ~ match_stmt)+ }` -- real
+/// Cypher rejects mixing bare `UNION` and `UNION ALL` within one
+/// statement, checked here (not grammar-level, since `union_op`'s
+/// `ALL`-or-not is only knowable per-occurrence once parsed) by
+/// requiring every `union_op` between parts to agree.
+fn parse_union_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
+    let mut inner = pair.into_inner();
+    let first = parse_match_stmt(inner.next().expect("union_stmt has a first match_stmt"))?;
+    let mut parts = vec![first];
+    let mut all: Option<bool> = None;
+    while let Some(op_pair) = inner.next() {
+        let this_all = op_pair.into_inner().next().is_some();
+        match all {
+            None => all = Some(this_all),
+            Some(prev) if prev != this_all => {
+                return Err(QueryError::Syntax(
+                    "can't mix UNION and UNION ALL in the same statement".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        let part_pair = inner
+            .next()
+            .expect("union_op is always followed by a match_stmt");
+        parts.push(parse_match_stmt(part_pair)?);
+    }
+    Ok(Statement::Union {
+        parts,
+        all: all.unwrap_or(false),
+    })
+}
+
 /// `explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt |
-/// match_stmt) }` -- one child, the wrapped statement, dispatched through
-/// the same per-rule parsers `parse_statement` itself uses (not a second
-/// copy of `parse_statement`, since `explain_stmt` can't recurse into
-/// another `explain_stmt`).
+/// union_stmt | match_stmt) }` -- one child, the wrapped statement,
+/// dispatched through the same per-rule parsers `parse_statement` itself
+/// uses (not a second copy of `parse_statement`, since `explain_stmt`
+/// can't recurse into another `explain_stmt`).
 fn parse_explain_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let inner = pair
         .into_inner()
@@ -58,6 +91,7 @@ fn parse_explain_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let wrapped = match inner.as_rule() {
         Rule::create_index_stmt => parse_create_index_stmt(inner),
         Rule::create_stmt => parse_create_stmt(inner),
+        Rule::union_stmt => parse_union_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected explain_stmt child rule {r:?}"),
     }?;
