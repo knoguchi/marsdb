@@ -130,6 +130,30 @@ fn property_to_py<'py>(
         } => ::marsdb::temporal::format_duration(*months, *days, *seconds, *nanos)
             .into_pyobject(py)?
             .into_any(),
+        marsdb_graph::PropertyValue::LocalTime(nanos_of_day) => {
+            ::marsdb::temporal::format_local_time(*nanos_of_day)
+                .into_pyobject(py)?
+                .into_any()
+        }
+        marsdb_graph::PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => ::marsdb::temporal::format_time(*nanos_of_day, *offset_seconds)
+            .into_pyobject(py)?
+            .into_any(),
+        marsdb_graph::PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => ::marsdb::temporal::format_local_date_time(*epoch_seconds, *nanos)
+            .into_pyobject(py)?
+            .into_any(),
+        marsdb_graph::PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        } => ::marsdb::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds)
+            .into_pyobject(py)?
+            .into_any(),
     })
 }
 

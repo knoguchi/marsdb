@@ -21,10 +21,12 @@ pub struct EdgeId(pub u64);
 /// still print/compare/access-components as a date" scenarios need that
 /// distinction to survive the storage boundary, not just live in the
 /// query layer's own `Value` the way `Value::List` does -- see that
-/// type's own doc comment for the contrasting case). MarsDB does *not*
-/// yet have `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` variants (no
-/// time-of-day, no timezone) -- see the README's "Cypher coverage"
-/// section for exactly what that leaves unsupported.
+/// type's own doc comment for the contrasting case). `LocalTime`/`Time`/
+/// `LocalDateTime`/`DateTime` (Cypher's other four temporal types) follow
+/// the same reasoning below. Only *fixed* UTC offsets are supported for
+/// `Time`/`DateTime` -- named timezones (`Europe/Stockholm`) aren't; see
+/// the README's "Cypher coverage" section for exactly what that leaves
+/// unsupported.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     Null,
@@ -61,6 +63,44 @@ pub enum PropertyValue {
         days: i64,
         seconds: i64,
         nanos: i32,
+    },
+    /// A time-of-day with no date or timezone, stored as nanoseconds since
+    /// midnight (`0..86_400_000_000_000`, always non-negative -- there's no
+    /// sign to carry the way `Date`'s epoch-day has). Cypher's `LOCAL TIME`.
+    LocalTime(i64),
+    /// A time-of-day with a *fixed* UTC offset (Cypher's `TIME`) -- named
+    /// timezones (`Europe/Stockholm`) aren't supported, only literal
+    /// `+HH:MM`-style offsets (see `marsdb-query::temporal`'s module docs
+    /// for the exact scope). `nanos_of_day` is the wall-clock reading (same
+    /// representation as `LocalTime`); `offset_seconds` is seconds *east*
+    /// of UTC. Comparison/equality use the UTC-equivalent instant-of-day
+    /// (`nanos_of_day - offset_seconds`), not the raw wall-clock reading --
+    /// two `Time`s at different offsets can represent the same instant.
+    Time {
+        nanos_of_day: i64,
+        offset_seconds: i32,
+    },
+    /// A calendar date + time-of-day with no timezone (Cypher's `LOCAL
+    /// DATETIME`), stored as a naive (zone-less) instant: whole seconds
+    /// since the Unix epoch (`epoch_seconds`, signed -- a pre-1970 value is
+    /// negative) plus a `0..999_999_999` nanosecond remainder that always
+    /// stays non-negative (the sign lives entirely in `epoch_seconds`,
+    /// mirroring `Duration`'s "no separately-signed remainder" invariant).
+    LocalDateTime {
+        epoch_seconds: i64,
+        nanos: i32,
+    },
+    /// A calendar date + time-of-day with a *fixed* UTC offset (Cypher's
+    /// `DATETIME`). `epoch_seconds`/`nanos` are the *UTC instant* (same
+    /// convention as `LocalDateTime`); `offset_seconds` is kept only for
+    /// display/round-tripping the original wall-clock reading --
+    /// comparison/equality use the instant alone, matching real Cypher
+    /// (two `DateTime`s at the same instant but different offsets are
+    /// equal, even though they print differently).
+    DateTime {
+        epoch_seconds: i64,
+        nanos: i32,
+        offset_seconds: i32,
     },
 }
 

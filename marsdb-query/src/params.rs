@@ -362,9 +362,14 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
         // substitute to. Erroring here (not silently dropping to Null) is
         // the same "a real gap should say so, not produce a plausible-
         // looking wrong answer" stance `apply_arith` already documents.
-        PropertyValue::Date(_) | PropertyValue::Duration { .. } => {
+        PropertyValue::Date(_)
+        | PropertyValue::Duration { .. }
+        | PropertyValue::LocalTime(_)
+        | PropertyValue::Time { .. }
+        | PropertyValue::LocalDateTime { .. }
+        | PropertyValue::DateTime { .. } => {
             return Err(QueryError::Type(format!(
-                "${name}: passing a Date/Duration value as a query parameter isn't supported yet"
+                "${name}: passing a temporal value as a query parameter isn't supported yet"
             )))
         }
     })

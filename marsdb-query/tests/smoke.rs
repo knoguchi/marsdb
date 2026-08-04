@@ -3168,7 +3168,23 @@ fn temporal_str(v: &Value) -> String {
             seconds,
             nanos,
         }) => marsdb_query::temporal::format_duration(*months, *days, *seconds, *nanos),
-        other => panic!("expected String/Date/Duration, got {other:?}"),
+        Value::Property(marsdb_graph::PropertyValue::LocalTime(n)) => {
+            marsdb_query::temporal::format_local_time(*n)
+        }
+        Value::Property(marsdb_graph::PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        }) => marsdb_query::temporal::format_time(*nanos_of_day, *offset_seconds),
+        Value::Property(marsdb_graph::PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }) => marsdb_query::temporal::format_local_date_time(*epoch_seconds, *nanos),
+        Value::Property(marsdb_graph::PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            offset_seconds,
+        }) => marsdb_query::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
+        other => panic!("expected a temporal/String value, got {other:?}"),
     }
 }
 
@@ -3519,6 +3535,211 @@ fn stored_date_survives_the_storage_round_trip() {
     );
     let result = run(&store, "MATCH (n) RETURN n.created");
     assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11");
+}
+
+// -- Temporal: LocalTime/Time/LocalDateTime/DateTime -------------------
+//
+// Real shapes pulled directly from the TCK's Temporal1/2/5/7/8 feature
+// files. Scope: fixed UTC offsets only (`'+01:00'`) -- named timezones
+// (`'Europe/Stockholm'`) are a documented gap, covered by
+// `datetime_named_timezone_is_rejected_not_silently_wrong` below.
+
+#[test]
+fn local_time_construct_from_map_and_string() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:31:14.645876123");
+
+    let result = run(&store, "RETURN toString(localtime('21:40:32.142')) AS r");
+    assert_eq!(temporal_str(&result.rows[0][0]), "21:40:32.142");
+
+    // No seconds/fraction given -> none printed (real Cypher's rule).
+    let result = run(&store, "RETURN toString(localtime('21:40')) AS r");
+    assert_eq!(temporal_str(&result.rows[0][0]), "21:40");
+}
+
+#[test]
+fn time_construct_from_map_and_string() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(time({hour: 12, minute: 31, second: 14, nanosecond: 645876123, timezone: '+01:00'})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:31:14.645876123+01:00");
+
+    let result = run(&store, "RETURN toString(time('21:40:32.142+0100')) AS r");
+    assert_eq!(temporal_str(&result.rows[0][0]), "21:40:32.142+01:00");
+
+    // Zero offset prints as `Z`, not `+00:00` -- Temporal2 [3].
+    let result = run(&store, "RETURN toString(time('2140-00:00')) AS r");
+    assert_eq!(temporal_str(&result.rows[0][0]), "21:40Z");
+}
+
+#[test]
+fn time_requires_a_timezone_bare_localtime_shape_is_rejected() {
+    let err = marsdb_query::parse("RETURN time('21:40:32')")
+        .and_then(|stmt| {
+            let store = GraphStore::open_memory().unwrap();
+            Executor::new(&store).execute(&stmt)
+        })
+        .expect_err("time() with no offset must be rejected");
+    assert!(format!("{err}").to_lowercase().contains("time"));
+}
+
+#[test]
+fn local_date_time_construct_from_map_and_string() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11T12:31:14");
+
+    let result = run(
+        &store,
+        "RETURN toString(localdatetime('2015-07-21T21:40:32.142')) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "2015-07-21T21:40:32.142");
+}
+
+#[test]
+fn date_time_construct_from_map_and_string() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, timezone: '+01:00'})) AS r",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-10-11T12:31:14+01:00"
+    );
+
+    let result = run(
+        &store,
+        "RETURN toString(datetime('2015-07-21T21:40:32.142+0100')) AS r",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "2015-07-21T21:40:32.142+01:00"
+    );
+}
+
+#[test]
+fn datetime_named_timezone_is_rejected_not_silently_wrong() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN datetime('2015-07-21T21:40:32.142[Europe/Stockholm]')").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("named timezone"),
+        "expected a named-timezone error, got: {err}"
+    );
+
+    let stmt2 =
+        parse("RETURN datetime({year: 2020, month: 1, day: 1, timezone: 'Europe/Stockholm'})")
+            .unwrap();
+    let err2 = Executor::new(&store).execute(&stmt2).unwrap_err();
+    assert!(
+        err2.to_string().contains("named timezone"),
+        "expected a named-timezone error, got: {err2}"
+    );
+}
+
+/// `Time`'s comparison is by the UTC-equivalent instant-of-day, not the
+/// raw wall-clock reading -- Temporal7 [3].
+#[test]
+fn time_comparison_is_instant_based_not_wall_clock() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH time({hour: 10, minute: 0, timezone: '+01:00'}) AS x, \
+              time({hour: 9, minute: 35, second: 14, nanosecond: 645876123, timezone: '+00:00'}) AS d \
+         RETURN x > d, x < d, x >= d, x <= d, x = d",
+    );
+    let bools: Vec<bool> = result.rows[0].iter().map(boolean).collect();
+    assert_eq!(bools, vec![false, true, false, true, false]);
+}
+
+/// Two `DateTime`s at the same instant but different offsets are equal
+/// -- real Cypher's rule (see `PropertyValue::DateTime`'s doc comment),
+/// not the derived structural equality every other `PropertyValue`
+/// variant gets.
+#[test]
+fn date_time_equality_is_instant_based_not_structural() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH datetime({year: 2020, month: 1, day: 1, hour: 1, minute: 0, second: 0, timezone: '+01:00'}) AS x, \
+              datetime({year: 2020, month: 1, day: 1, hour: 0, minute: 0, second: 0, timezone: '+00:00'}) AS d \
+         RETURN x = d",
+    );
+    assert!(boolean(&result.rows[0][0]));
+}
+
+/// `DateTime`'s calendar/clock component access (`.hour`, `.day`, ...)
+/// reflects the *local* (offset-adjusted) wall-clock reading that was
+/// written, not the underlying UTC instant -- `epochSeconds`/
+/// `epochMillis` are the one exception, always UTC. Temporal5 [4].
+#[test]
+fn date_time_component_access_uses_local_reading_except_epoch_fields() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, timezone: '+01:00'}) AS d \
+         RETURN d.year, d.month, d.day, d.hour, d.minute, d.second, d.timezone, d.offset, d.offsetSeconds, d.offsetMinutes",
+    );
+    let ints: Vec<i64> = [0usize, 1, 2, 3, 4, 5]
+        .iter()
+        .map(|&i| match &result.rows[0][i] {
+            Value::Property(marsdb_graph::PropertyValue::Int(n)) => *n,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(ints, vec![1984, 10, 11, 12, 31, 14]);
+    assert_eq!(temporal_str(&result.rows[0][6]), "+01:00");
+    assert_eq!(temporal_str(&result.rows[0][7]), "+01:00");
+}
+
+/// `datetime(...) + duration(...)` -- real calendar month arithmetic on
+/// the *local* reading, seconds/nanos carrying across day boundaries
+/// (unlike `Date`, which has no time-of-day to carry into). Temporal8.
+#[test]
+fn date_time_plus_duration() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, second: 14, timezone: '+01:00'}) \
+                          + duration({months: 1, days: 5, hours: 2})) AS r",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-11-16T14:31:14+01:00"
+    );
+}
+
+/// `Time`/`LocalTime` + `Duration` wraps at the 24h boundary -- there's
+/// no calendar to carry an extra day into.
+#[test]
+fn time_plus_duration_wraps_at_midnight() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(time({hour: 23, minute: 0, timezone: 'Z'}) + duration({hours: 2})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "01:00Z");
+}
+
+#[test]
+fn stored_time_and_date_time_survive_the_storage_round_trip() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE ({t: time({hour: 9, minute: 0, timezone: '+02:00'})})",
+    );
+    let result = run(&store, "MATCH (n) RETURN n.t");
+    assert_eq!(temporal_str(&result.rows[0][0]), "09:00+02:00");
 }
 
 #[test]

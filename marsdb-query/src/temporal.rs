@@ -6,14 +6,19 @@
 //! itself, matching the split `apply_arith`/`compare` already have from
 //! e.g. the planner).
 //!
-//! Scope, honestly: only `DATE` (calendar year/month/day, no week-date/
-//! ordinal-date/quarter construction forms) and `DURATION` are supported.
-//! `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` (anything with a
-//! time-of-day or timezone) don't exist at all -- see the README's
-//! "Cypher coverage" section for the exact list of what that leaves out
-//! of TCK's `expressions/temporal` suite.
+//! Scope, honestly: `DATE` (calendar year/month/day, no week-date/
+//! ordinal-date/quarter construction forms), `DURATION`, `LOCAL TIME`,
+//! `TIME`, `LOCAL DATETIME`, and `DATETIME` are all supported -- but
+//! `TIME`/`DATETIME` only accept a *fixed* UTC offset (`'+01:00'`,
+//! `{timezone: '+01:00'}`), never a named timezone (`'Europe/Stockholm'`)
+//! -- that needs a real IANA timezone database, deliberately out of
+//! scope (no DST/zone-rule awareness anywhere in this module). See the
+//! README's "Cypher coverage" section for the exact list of what that
+//! leaves out of TCK's `expressions/temporal` suite.
 
 use chrono::{Datelike, NaiveDate};
+
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Average Gregorian month length in days (365.2425 / 12) -- Neo4j's own
 /// documented conversion factor for folding a fractional month (e.g. the
@@ -53,6 +58,23 @@ pub fn today_epoch_day() -> i32 {
     let today = chrono::Utc::now().date_naive();
     epoch_day_from_ymd(today.year(), today.month(), today.day())
         .expect("today is always a valid date")
+}
+
+/// `localtime()`/`time()` with no arguments -- the current UTC time-of-
+/// day, same zero-configuration "no timezone support, so 'now' can only
+/// mean one fixed instant" stance as `today_epoch_day`.
+pub fn now_utc_nanos_of_day() -> i64 {
+    use chrono::Timelike;
+    let now = chrono::Utc::now();
+    now.num_seconds_from_midnight() as i64 * 1_000_000_000 + now.nanosecond() as i64
+}
+
+/// `localdatetime()`/`datetime()` with no arguments -- the current UTC
+/// instant, as `(epoch_seconds, nanos)`.
+pub fn now_utc_epoch_seconds_and_nanos() -> (i64, i32) {
+    use chrono::Timelike;
+    let now = chrono::Utc::now();
+    (now.timestamp(), now.nanosecond() as i32)
 }
 
 pub fn format_date(epoch_day: i32) -> String {
@@ -500,6 +522,479 @@ fn scan_number_unit_pairs(s: &str) -> Option<Vec<(f64, char)>> {
         i += 1;
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------
+// LocalTime / Time
+// ---------------------------------------------------------------------
+
+/// Builds a `LocalTime`'s nanos-of-day from calendar-style fields
+/// (`localtime({hour, minute, second, nanosecond})`'s already-summed
+/// sub-second `nanos`) -- range-checked the same way `date_from_map`
+/// checks year/month/day, `None` for anything out of range.
+pub fn local_time_nanos_from_fields(
+    hour: i64,
+    minute: i64,
+    second: i64,
+    nanos: i64,
+) -> Option<i64> {
+    if !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+        || !(0..1_000_000_000).contains(&nanos)
+    {
+        return None;
+    }
+    Some(hour * 3_600_000_000_000 + minute * 60_000_000_000 + second * 1_000_000_000 + nanos)
+}
+
+/// Parses `HH[:MM[:SS[.fraction]]]` or the compact `HHMM[SS[.fraction]]`/
+/// `HH` forms into nanoseconds since midnight -- the same colon-vs-
+/// compact dispatch `parse_date` uses for the calendar forms.
+fn parse_time_of_day(s: &str) -> Option<i64> {
+    if !s.is_ascii() || s.is_empty() {
+        return None;
+    }
+    let (hour, minute, second, nanos) = if s.contains(':') {
+        let mut parts = s.splitn(3, ':');
+        let h: u32 = parts.next()?.parse().ok()?;
+        let m: u32 = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        let (sec, nanos) = match parts.next() {
+            Some(p) => parse_seconds_fraction(p)?,
+            None => (0, 0),
+        };
+        (h, m, sec, nanos)
+    } else {
+        match s.len() {
+            2 => (s.parse().ok()?, 0, 0, 0),
+            4 => (s[0..2].parse().ok()?, s[2..4].parse().ok()?, 0, 0),
+            n if n > 4 => {
+                let (sec, nanos) = parse_seconds_fraction(&s[4..])?;
+                (s[0..2].parse().ok()?, s[2..4].parse().ok()?, sec, nanos)
+            }
+            _ => return None,
+        }
+    };
+    local_time_nanos_from_fields(hour as i64, minute as i64, second as i64, nanos as i64)
+}
+
+/// `"32.142"` / `"32"` -> `(seconds, nanos)`. The whole-number part must
+/// be exactly 2 digits when called from the compact (no-`:`) form's
+/// tail, but this function itself doesn't enforce that -- `parse_time_of_day`
+/// slices the fixed-width prefix before calling it.
+fn parse_seconds_fraction(s: &str) -> Option<(u32, u32)> {
+    let (sec_str, frac_str) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let sec: u32 = sec_str.parse().ok()?;
+    if sec >= 60 {
+        return None;
+    }
+    let nanos = match frac_str {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut digits = f.to_string();
+            digits.truncate(9);
+            while digits.len() < 9 {
+                digits.push('0');
+            }
+            digits.parse().ok()?
+        }
+    };
+    Some((sec, nanos))
+}
+
+/// Splits a time-of-day-with-offset string into `(time_part,
+/// offset_part)` -- the offset marker is a trailing `Z` or the first
+/// `+`/`-` at index >= 1 (a bare time-of-day's own components are
+/// digits/`:`/`.` only, so that's always the offset sign, never
+/// something inside the time itself). Only ever called on the *time*
+/// half of a combined date+time string (after splitting on `T`), never
+/// the date half, which legitimately contains `-`.
+fn split_time_offset(s: &str) -> (&str, Option<&str>) {
+    if let Some(stripped) = s.strip_suffix('Z') {
+        return (stripped, Some("Z"));
+    }
+    let bytes = s.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            return (&s[..i], Some(&s[i..]));
+        }
+    }
+    (s, None)
+}
+
+/// `Z` or `[+-]HH[:MM[:SS]]` / compact `[+-]HHMM[SS]` -> whole seconds
+/// east of UTC.
+pub fn parse_offset_seconds(s: &str) -> Option<i32> {
+    if s == "Z" {
+        return Some(0);
+    }
+    let bytes = s.as_bytes();
+    let sign: i32 = match bytes.first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let (h, m, sec): (i32, i32, i32) = if rest.contains(':') {
+        let mut parts = rest.splitn(3, ':');
+        let h = parts.next()?.parse().ok()?;
+        let m = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        let sec = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        (h, m, sec)
+    } else {
+        match rest.len() {
+            2 => (rest.parse().ok()?, 0, 0),
+            4 => (rest[0..2].parse().ok()?, rest[2..4].parse().ok()?, 0),
+            6 => (
+                rest[0..2].parse().ok()?,
+                rest[2..4].parse().ok()?,
+                rest[4..6].parse().ok()?,
+            ),
+            _ => return None,
+        }
+    };
+    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+        return None;
+    }
+    Some(sign * (h * 3600 + m * 60 + sec))
+}
+
+/// `localtime('21:40:32.142')` -- a bare time-of-day, no offset allowed
+/// (a trailing `Z`/`+HH:MM` makes the whole string fail the strict
+/// digit/`:`/`.`-only parse above and correctly return `None`, the same
+/// "reject, don't guess" stance as every other malformed-input case in
+/// this module).
+pub fn parse_local_time(s: &str) -> Option<i64> {
+    parse_time_of_day(s.trim())
+}
+
+/// `time('21:40:32.142+01:00')` -- a time-of-day *with* a required
+/// offset. Returns `None` if the string has no offset at all, or if it
+/// carries a bracketed named-zone suffix (`[Europe/Stockholm]`) -- the
+/// caller (`Executor::call_builtin`'s `"time"` arm) checks for `[`
+/// itself first and raises a specific "named zones aren't supported"
+/// error rather than this generic parse failure, but this function
+/// still refuses to silently ignore/misparse the bracket if called
+/// directly.
+pub fn parse_time(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    if s.contains('[') {
+        return None;
+    }
+    let (time_part, offset_part) = split_time_offset(s);
+    let offset_part = offset_part?;
+    Some((
+        parse_time_of_day(time_part)?,
+        parse_offset_seconds(offset_part)?,
+    ))
+}
+
+/// `d.<prop>` component access shared by `LocalTime` and (for its own
+/// wall-clock time-of-day fields) `Time`/`LocalDateTime`/`DateTime`.
+pub fn local_time_component(nanos_of_day: i64, prop: &str) -> Option<i64> {
+    Some(match prop {
+        "hour" => nanos_of_day / 3_600_000_000_000,
+        "minute" => (nanos_of_day / 60_000_000_000) % 60,
+        "second" => (nanos_of_day / 1_000_000_000) % 60,
+        "millisecond" => (nanos_of_day / 1_000_000) % 1000,
+        "microsecond" => (nanos_of_day / 1_000) % 1_000_000,
+        "nanosecond" => nanos_of_day % 1_000_000_000,
+        _ => return None,
+    })
+}
+
+/// Formats an offset as Cypher's canonical text: `Z` for UTC, else
+/// `[+-]HH:MM` (extended with `:SS` only when the offset has a non-zero
+/// seconds component -- real offsets are almost always whole minutes,
+/// but the TCK's timezone grep found at least one `-02:05:07` example).
+pub fn format_offset(offset_seconds: i32) -> String {
+    if offset_seconds == 0 {
+        return "Z".to_string();
+    }
+    let sign = if offset_seconds < 0 { "-" } else { "+" };
+    let abs = offset_seconds.unsigned_abs();
+    let h = abs / 3600;
+    let m = (abs / 60) % 60;
+    let sec = abs % 60;
+    if sec != 0 {
+        format!("{sign}{h:02}:{m:02}:{sec:02}")
+    } else {
+        format!("{sign}{h:02}:{m:02}")
+    }
+}
+
+/// `HH:MM` always; `:SS` only if seconds/nanos are non-zero; `.fraction`
+/// only if nanos is non-zero (trailing zeros trimmed) -- matches every
+/// `toString(localtime(...))`/`toString(time(...))` example in the TCK,
+/// where `'21:40'` (no seconds given) prints without `:00`, but
+/// `'21:40:32'` (seconds given, even if it were `:00`... though no TCK
+/// example actually exercises that edge) prints with it.
+fn format_time_of_day(nanos_of_day: i64) -> String {
+    let hour = nanos_of_day / 3_600_000_000_000;
+    let minute = (nanos_of_day / 60_000_000_000) % 60;
+    let second = (nanos_of_day / 1_000_000_000) % 60;
+    let nanos = (nanos_of_day % 1_000_000_000) as u32;
+    let mut out = format!("{hour:02}:{minute:02}");
+    if second != 0 || nanos != 0 {
+        out.push_str(&format!(":{second:02}"));
+        if nanos != 0 {
+            let mut frac = format!("{nanos:09}");
+            while frac.ends_with('0') {
+                frac.pop();
+            }
+            out.push('.');
+            out.push_str(&frac);
+        }
+    }
+    out
+}
+
+pub fn format_local_time(nanos_of_day: i64) -> String {
+    format_time_of_day(nanos_of_day)
+}
+
+pub fn format_time(nanos_of_day: i64, offset_seconds: i32) -> String {
+    format!(
+        "{}{}",
+        format_time_of_day(nanos_of_day),
+        format_offset(offset_seconds)
+    )
+}
+
+// ---------------------------------------------------------------------
+// LocalDateTime / DateTime
+// ---------------------------------------------------------------------
+
+/// Decomposes total (possibly negative) `epoch_seconds` into an
+/// `(epoch_day, nanos_of_day)` pair -- `div_euclid`/`rem_euclid`, not
+/// plain `/`/`%`, so a pre-1970 instant (negative `epoch_seconds`)
+/// still gets a `nanos_of_day` in `0..NANOS_PER_DAY` (Rust's `%` on a
+/// negative dividend returns a negative remainder, which would put the
+/// "same calendar day" one day off).
+fn split_epoch_seconds(epoch_seconds: i64) -> (i32, i64) {
+    let epoch_day = epoch_seconds.div_euclid(SECONDS_PER_DAY) as i32;
+    let secs_of_day = epoch_seconds.rem_euclid(SECONDS_PER_DAY);
+    (epoch_day, secs_of_day * 1_000_000_000)
+}
+
+fn combine_epoch_day_and_nanos_of_day(epoch_day: i32, nanos_of_day: i64) -> i64 {
+    epoch_day as i64 * SECONDS_PER_DAY + nanos_of_day / 1_000_000_000
+}
+
+/// Calendar + time-of-day fields for `localdatetime({...})`/
+/// `datetime({...})`'s map constructors -- bundled into one struct (not
+/// 7 positional args) purely to stay under clippy's argument-count cap,
+/// matching this codebase's established convention for that lint (see
+/// e.g. `executor.rs`'s `VarExpandSpec`/`IndexSeekSpec`).
+pub struct CalendarDateTime {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
+    pub nanos: i64,
+}
+
+/// Builds a naive (zone-less) `(epoch_seconds, nanos)` instant from
+/// calendar + time-of-day fields -- shared by `localdatetime({...})`'s
+/// map form and (before the UTC offset adjustment) `datetime({...})`'s.
+pub fn local_date_time_from_fields(f: CalendarDateTime) -> Option<(i64, i32)> {
+    let epoch_day = epoch_day_from_ymd(f.year, f.month, f.day)?;
+    let nanos_of_day = local_time_nanos_from_fields(f.hour, f.minute, f.second, f.nanos)?;
+    Some((
+        combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day),
+        (nanos_of_day % 1_000_000_000) as i32,
+    ))
+}
+
+/// Same as `local_date_time_from_fields`, but the wall-clock reading is
+/// in `offset_seconds` east of UTC -- subtracts the offset to get the
+/// UTC instant `DateTime` actually stores (see its doc comment).
+pub fn date_time_from_fields(f: CalendarDateTime, offset_seconds: i32) -> Option<(i64, i32)> {
+    let (local_epoch_seconds, nanos) = local_date_time_from_fields(f)?;
+    Some((local_epoch_seconds - offset_seconds as i64, nanos))
+}
+
+/// Parses `YYYY-MM-DDTHH:MM:SS.fff` (and the compact/date-only-precision
+/// variants `parse_date` already supports for the date half) into a
+/// naive `(epoch_seconds, nanos)` instant.
+pub fn parse_local_date_time(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    let (date_part, time_part) = s.split_once('T')?;
+    let epoch_day = parse_date(date_part)?;
+    let nanos_of_day = parse_time_of_day(time_part)?;
+    Some((
+        combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day),
+        (nanos_of_day % 1_000_000_000) as i32,
+    ))
+}
+
+/// Same date+time parse as `parse_local_date_time`, plus a required
+/// offset on the time half -- `None` for a bracketed named-zone suffix,
+/// same "caller gives the specific error" split as `parse_time`.
+pub fn parse_date_time(s: &str) -> Option<(i64, i32, i32)> {
+    let s = s.trim();
+    if s.contains('[') {
+        return None;
+    }
+    let (date_part, time_part) = s.split_once('T')?;
+    let epoch_day = parse_date(date_part)?;
+    let (time_only, offset_part) = split_time_offset(time_part);
+    let offset_seconds = parse_offset_seconds(offset_part?)?;
+    let nanos_of_day = parse_time_of_day(time_only)?;
+    let local_epoch_seconds = combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day);
+    Some((
+        local_epoch_seconds - offset_seconds as i64,
+        (nanos_of_day % 1_000_000_000) as i32,
+        offset_seconds,
+    ))
+}
+
+/// `d.<prop>` component access for `LocalDateTime`/`DateTime`'s
+/// *calendar* fields (`year`, `month`, ..., `dayOfQuarter`) -- delegates
+/// straight to `date_component` on the instant's calendar day, since
+/// the calendar math is identical to `Date`'s.
+pub fn date_time_calendar_component(epoch_seconds: i64, prop: &str) -> Option<i64> {
+    let (epoch_day, _) = split_epoch_seconds(epoch_seconds);
+    date_component(epoch_day, prop)
+}
+
+/// `d.<prop>` component access for `LocalDateTime`/`DateTime`'s
+/// *time-of-day* fields (`hour`, ..., `nanosecond`) -- delegates to
+/// `local_time_component` on the instant's nanos-of-day, folding in the
+/// caller-supplied sub-second `nanos` remainder (`epoch_seconds` alone
+/// only has whole-second precision).
+pub fn date_time_clock_component(epoch_seconds: i64, nanos: i32, prop: &str) -> Option<i64> {
+    let (_, nanos_of_day) = split_epoch_seconds(epoch_seconds);
+    local_time_component(nanos_of_day + nanos as i64, prop)
+}
+
+pub fn epoch_seconds_and_millis(epoch_seconds: i64, nanos: i32) -> (i64, i64) {
+    (
+        epoch_seconds,
+        epoch_seconds * 1000 + (nanos as i64) / 1_000_000,
+    )
+}
+
+/// `YYYY-MM-DDTHH:MM[:SS[.fraction]]` -- date half via `format_date`,
+/// time half via the same `format_time_of_day` rule `LocalTime`/`Time`
+/// use (seconds/fraction only shown when non-zero).
+pub fn format_local_date_time(epoch_seconds: i64, nanos: i32) -> String {
+    let (epoch_day, nanos_of_day) = split_epoch_seconds(epoch_seconds);
+    format!(
+        "{}T{}",
+        format_date(epoch_day),
+        format_time_of_day(nanos_of_day + nanos as i64)
+    )
+}
+
+/// `Time`/`LocalTime` + `Duration` -- wraps at the 24h boundary (`Time`/
+/// `LocalTime` have no calendar, so there's no "next day" to carry
+/// into). Real Cypher truncates a Duration's calendar components
+/// (`months`/`days`) when adding it to a time-only value -- only
+/// `seconds`/`nanos` apply -- rather than erroring, so this never fails
+/// (`Option` elsewhere in this module means "can overflow"; wrapping
+/// never can).
+pub fn add_duration_to_time(nanos_of_day: i64, seconds: i64, nanos: i32, negate: bool) -> i64 {
+    let (seconds, nanos) = if negate {
+        (-seconds, -nanos)
+    } else {
+        (seconds, nanos)
+    };
+    let total: i128 = nanos_of_day as i128 + seconds as i128 * NANOS_PER_SEC + nanos as i128;
+    total.rem_euclid(NANOS_PER_DAY as i128) as i64
+}
+
+const NANOS_PER_DAY: i64 = SECONDS_PER_DAY * 1_000_000_000;
+
+/// `LocalDateTime`/`DateTime` + `Duration` -- real calendar month
+/// arithmetic on the date part (same `checked_add_months`/
+/// `checked_sub_months` clamping as `add_duration_to_date`), then
+/// `days`/`seconds`/`nanos` added as one exact nanosecond count that
+/// carries across day boundaries (unlike `Date`, which has no time-of-
+/// day to carry *into* -- a `LocalDateTime`/`DateTime` does, so nothing
+/// here gets truncated the way `add_duration_to_date`'s `seconds`/
+/// `nanos` do). Operates on the *local* wall-clock reading -- `DateTime`
+/// callers pass `epoch_seconds + offset_seconds` in and subtract
+/// `offset_seconds` back out of the result, so month/day arithmetic
+/// happens against the calendar the user actually wrote, not the UTC
+/// instant (matches real Cypher: `datetime({..., timezone: '+05:00'})
+/// + duration({months: 1})` advances the *local* month).
+pub fn add_duration_to_local_date_time(
+    epoch_seconds: i64,
+    existing_nanos: i32,
+    months: i64,
+    days: i64,
+    seconds: i64,
+    nanos: i32,
+    negate: bool,
+) -> Option<(i64, i32)> {
+    let (months, days, seconds, nanos) = if negate {
+        (
+            months.checked_neg()?,
+            days.checked_neg()?,
+            seconds.checked_neg()?,
+            nanos.checked_neg()?,
+        )
+    } else {
+        (months, days, seconds, nanos)
+    };
+    let (epoch_day, nanos_of_day) = split_epoch_seconds(epoch_seconds);
+    let d = date_from_epoch_day(epoch_day);
+    let with_months = if months >= 0 {
+        d.checked_add_months(chrono::Months::new(months.try_into().ok()?))?
+    } else {
+        d.checked_sub_months(chrono::Months::new(months.checked_neg()?.try_into().ok()?))?
+    };
+    let new_epoch_day = with_months.signed_duration_since(epoch()).num_days();
+
+    let total_ns: i128 = nanos_of_day as i128
+        + existing_nanos as i128
+        + days as i128 * NANOS_PER_DAY as i128
+        + seconds as i128 * NANOS_PER_SEC
+        + nanos as i128;
+    let day_ns = NANOS_PER_DAY as i128;
+    let extra_days = total_ns.div_euclid(day_ns) as i64;
+    let final_nanos_of_day = total_ns.rem_euclid(day_ns) as i64;
+
+    let final_epoch_day = new_epoch_day.checked_add(extra_days)?;
+    let final_epoch_seconds = final_epoch_day
+        .checked_mul(SECONDS_PER_DAY)?
+        .checked_add(final_nanos_of_day / 1_000_000_000)?;
+    Some((
+        final_epoch_seconds,
+        (final_nanos_of_day % 1_000_000_000) as i32,
+    ))
+}
+
+pub fn format_date_time(epoch_seconds: i64, nanos: i32, offset_seconds: i32) -> String {
+    // The *displayed* wall-clock reading is the local (offset-adjusted)
+    // one, not the stored UTC instant -- `DateTime` round-trips through
+    // `toString`/reparse showing the original offset's time-of-day, per
+    // the TCK's own examples (e.g. `datetime({..., timezone: '+01:00'})`
+    // prints that same `+01:00` wall-clock hour back, not the UTC one).
+    let local_epoch_seconds = epoch_seconds + offset_seconds as i64;
+    format!(
+        "{}{}",
+        format_local_date_time(local_epoch_seconds, nanos),
+        format_offset(offset_seconds)
+    )
 }
 
 #[cfg(test)]

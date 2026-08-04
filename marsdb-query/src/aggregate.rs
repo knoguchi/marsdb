@@ -38,6 +38,16 @@ pub(crate) enum HashKey {
     List(Vec<HashKey>),
     Date(i32),
     Duration(i64, i64, i64, i32),
+    LocalTime(i64),
+    // Keyed by the UTC-equivalent instant-of-day, not the raw wall-clock
+    // fields -- matches `Time`'s equality rule (see its doc comment), so
+    // two structurally-different `Time`s at the same instant hash equal.
+    TimeInstant(i64),
+    LocalDateTime(i64, i32),
+    // `offset_seconds` deliberately excluded -- see `DateTime`'s doc
+    // comment (equality/ordering is instant-only), same reasoning as
+    // `TimeInstant` above.
+    DateTimeInstant(i64, i32),
 }
 
 pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
@@ -82,6 +92,20 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
             seconds,
             nanos,
         } => HashKey::Duration(*months, *days, *seconds, *nanos),
+        PropertyValue::LocalTime(nanos_of_day) => HashKey::LocalTime(*nanos_of_day),
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => HashKey::TimeInstant(nanos_of_day - *offset_seconds as i64 * 1_000_000_000),
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => HashKey::LocalDateTime(*epoch_seconds, *nanos),
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            ..
+        } => HashKey::DateTimeInstant(*epoch_seconds, *nanos),
     }
 }
 

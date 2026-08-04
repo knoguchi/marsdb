@@ -420,9 +420,8 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             } else {
                 match name.to_ascii_lowercase().as_str() {
                     "coalesce" => unify_many(&arg_kinds),
-                    "tointeger" | "tostring" | "tofloat" | "toboolean" | "date" | "duration" => {
-                        Kind::Scalar
-                    }
+                    "tointeger" | "tostring" | "tofloat" | "toboolean" | "date" | "duration"
+                    | "localtime" | "time" | "localdatetime" | "datetime" => Kind::Scalar,
                     "length" => {
                         if let Some(kind) = arg_kinds.first() {
                             require_compatible_kind(kind, &Kind::Path, "length() argument")?;
