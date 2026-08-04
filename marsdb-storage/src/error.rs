@@ -2,8 +2,9 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum StorageError {
+    Io(std::io::Error),
     Database(redb::DatabaseError),
-    Transaction(redb::TransactionError),
+    Transaction(Box<redb::TransactionError>),
     Table(redb::TableError),
     Storage(redb::StorageError),
     Commit(redb::CommitError),
@@ -17,6 +18,7 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StorageError::Io(e) => write!(f, "I/O error: {e}"),
             StorageError::Database(e) => write!(f, "database error: {e}"),
             StorageError::Transaction(e) => write!(f, "transaction error: {e}"),
             StorageError::Table(e) => write!(f, "table error: {e}"),
@@ -34,6 +36,12 @@ impl fmt::Display for StorageError {
     }
 }
 
+impl From<std::io::Error> for StorageError {
+    fn from(e: std::io::Error) -> Self {
+        StorageError::Io(e)
+    }
+}
+
 impl std::error::Error for StorageError {}
 
 impl From<redb::DatabaseError> for StorageError {
@@ -44,7 +52,7 @@ impl From<redb::DatabaseError> for StorageError {
 
 impl From<redb::TransactionError> for StorageError {
     fn from(e: redb::TransactionError) -> Self {
-        StorageError::Transaction(e)
+        StorageError::Transaction(Box::new(e))
     }
 }
 

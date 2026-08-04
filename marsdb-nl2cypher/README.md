@@ -55,8 +55,8 @@ anything else that turns a prompt into text.
    a hand-written, deliberately short capability/gap list + the question.
    `prior_attempt` turns this into a repair prompt instead of a fresh one.
 3. **`translate(&client, &schema, question)`** — calls the LLM, strips a
-   markdown code fence if present, tries `marsdb_query::parse`. If that
-   fails, feeds the *exact* parse error back to the LLM for one repair
+   markdown code fence if present, then parses and semantically binds the
+   statement. If that fails, feeds the *exact* validation error back for one repair
    attempt (this codebase's parse errors are written to be genuinely
    readable, which this leans on directly) — not an open-ended retry loop.
    Fails with both attempts included if the repair also doesn't parse.

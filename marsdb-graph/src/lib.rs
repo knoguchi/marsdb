@@ -8,4 +8,4 @@ mod store;
 pub use error::GraphError;
 pub use marsdb_storage::{ReadTransaction, Txn, WriteTransaction};
 pub use model::{AdjEntry, Direction, Edge, EdgeId, Node, NodeId, PropertyValue};
-pub use store::GraphStore;
+pub use store::{GraphStore, IntegrityReport};

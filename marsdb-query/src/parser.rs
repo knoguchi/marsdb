@@ -818,9 +818,10 @@ fn parse_postfix_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// half of `start..`/`..end`. The pair's own source text (captured before
 /// `.into_inner()` consumes it) does: split on the first `..`, and
 /// whichever side is non-blank is present.
-fn parse_slice_bounds(
-    slice_range_pair: Pair<Rule>,
-) -> Result<(Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>), QueryError> {
+type OptionalReturnExpr = Option<Box<ReturnExpr>>;
+type SliceBounds = (OptionalReturnExpr, OptionalReturnExpr);
+
+fn parse_slice_bounds(slice_range_pair: Pair<Rule>) -> Result<SliceBounds, QueryError> {
     let raw = slice_range_pair.as_str().to_string();
     let dotdot_at = raw.find("..").expect("slice_range always contains ..");
     let has_start = !raw[..dotdot_at].trim().is_empty();
@@ -885,9 +886,9 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// with_expr)? }` -- shared by `list_comprehension` and `quantifier_expr`,
 /// so this returns the three parsed pieces rather than an `Expr` directly;
 /// each caller wraps them into its own `ReturnExpr` variant.
-fn parse_filter_expr(
-    pair: Pair<Rule>,
-) -> Result<(String, Box<ReturnExpr>, Option<Box<ReturnExpr>>), QueryError> {
+type ParsedFilterExpr = (String, Box<ReturnExpr>, OptionalReturnExpr);
+
+fn parse_filter_expr(pair: Pair<Rule>) -> Result<ParsedFilterExpr, QueryError> {
     let mut inner = pair.into_inner();
     let var = inner
         .next()
@@ -1026,8 +1027,7 @@ fn parse_pattern(pair: Pair<Rule>) -> Result<Pattern, QueryError> {
     let mut inner = pair.into_inner();
     let start = parse_node_pattern(inner.next().expect("pattern has a start node"))?;
     let mut hops = Vec::new();
-    loop {
-        let Some(rel_pair) = inner.next() else { break };
+    while let Some(rel_pair) = inner.next() {
         let node_pair = inner
             .next()
             .ok_or_else(|| QueryError::Parse("dangling relationship in pattern".into()))?;

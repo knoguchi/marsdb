@@ -16,7 +16,7 @@ const BINARY_TREE_2: &str = include_str!("../graphs/binary-tree-2.cypher");
 enum Outcome {
     Pass,
     WrongResult,
-    UnexpectedOutcome,
+    UnexpectedBehavior,
     ParseRejected,
     RunnerUnsupported,
 }
@@ -128,7 +128,7 @@ fn run_scenario(scenario: &Scenario) -> (Outcome, Option<String>) {
     match &scenario.expected {
         Expected::AnyError => match result {
             Ok(_) => (
-                Outcome::UnexpectedOutcome,
+                Outcome::UnexpectedBehavior,
                 Some("expected an error, query succeeded".to_string()),
             ),
             Err(_) => (Outcome::Pass, None),
@@ -175,7 +175,7 @@ fn unsupported(reason: String) -> marsdb::Error {
 fn classify_query_error(e: marsdb::Error) -> (Outcome, Option<String>) {
     match &e {
         marsdb::Error::Query(QueryError::Parse(_)) => (Outcome::ParseRejected, Some(e.to_string())),
-        _ => (Outcome::UnexpectedOutcome, Some(e.to_string())),
+        _ => (Outcome::UnexpectedBehavior, Some(e.to_string())),
     }
 }
 
@@ -315,7 +315,7 @@ fn report(reports: &[ScenarioReport]) {
             total,
             counts.get(&Outcome::Pass).unwrap_or(&0),
             counts.get(&Outcome::WrongResult).unwrap_or(&0),
-            counts.get(&Outcome::UnexpectedOutcome).unwrap_or(&0),
+            counts.get(&Outcome::UnexpectedBehavior).unwrap_or(&0),
             counts.get(&Outcome::ParseRejected).unwrap_or(&0),
             counts.get(&Outcome::RunnerUnsupported).unwrap_or(&0),
         );
@@ -327,7 +327,7 @@ fn report(reports: &[ScenarioReport]) {
         grand_total,
         totals.get(&Outcome::Pass).unwrap_or(&0),
         totals.get(&Outcome::WrongResult).unwrap_or(&0),
-        totals.get(&Outcome::UnexpectedOutcome).unwrap_or(&0),
+        totals.get(&Outcome::UnexpectedBehavior).unwrap_or(&0),
         totals.get(&Outcome::ParseRejected).unwrap_or(&0),
         totals.get(&Outcome::RunnerUnsupported).unwrap_or(&0),
     );
@@ -348,7 +348,7 @@ fn report(reports: &[ScenarioReport]) {
 
     let unexpected: Vec<&ScenarioReport> = reports
         .iter()
-        .filter(|r| r.outcome == Outcome::UnexpectedOutcome)
+        .filter(|r| r.outcome == Outcome::UnexpectedBehavior)
         .collect();
     if !unexpected.is_empty() {
         println!("\n--- UnexpectedOutcome scenarios (errored/succeeded when the opposite was expected) ---");

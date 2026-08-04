@@ -577,6 +577,49 @@ fn execution_options_enforce_rows_expansions_cancellation_and_timeout() {
     assert!(matches!(err, QueryError::Timeout));
 }
 
+#[test]
+fn semantic_validation_rejects_invalid_names_and_structural_types() {
+    let store = GraphStore::open_memory().unwrap();
+    for (cypher, expected) in [
+        ("RETURN missing", "undefined variable 'missing'"),
+        (
+            "WITH 1 AS x MATCH (x)-[:R]->(n) RETURN n",
+            "node pattern requires a node",
+        ),
+        (
+            "MATCH ()-[r:R]->() SET r:Label",
+            "SET label target requires a node",
+        ),
+        (
+            "MATCH (n) WITH n AS kept RETURN n",
+            "undefined variable 'n'",
+        ),
+        (
+            "MATCH (n) WITH n AS x, n AS x RETURN x",
+            "duplicate variable 'x'",
+        ),
+    ] {
+        let stmt = parse(cypher).unwrap();
+        let err = Executor::new(&store).execute(&stmt).unwrap_err();
+        assert!(
+            err.to_string().contains("semantic error") && err.to_string().contains(expected),
+            "{cypher}: expected {expected:?}, got {err}"
+        );
+    }
+}
+
+#[test]
+fn match_create_binds_created_relationship_for_return() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Root {id: 1})");
+    let result = run(
+        &store,
+        "MATCH (a:Root {id: 1}) CREATE (a)-[r:LINK]->(b:Leaf) RETURN r",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(&result.rows[0][0], Value::Edge(edge) if edge.label == "LINK"));
+}
+
 /// A nested aggregate inside an arithmetic expression (`1 + count(x)`) is
 /// a real, deliberate rejection, not a silent wrong answer -- `Arith`
 /// existing at all made this reachable for the first time (previously

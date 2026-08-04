@@ -17,6 +17,7 @@ pub use redb::{
     TableDefinition, WriteTransaction,
 };
 
+use std::fs::OpenOptions;
 use std::path::Path;
 
 /// Version of the MarsDB-owned tables and record encodings. This is separate
@@ -94,6 +95,74 @@ impl StorageEngine {
     pub fn begin_read(&self) -> Result<ReadTransaction, StorageError> {
         Ok(self.db.begin_read()?)
     }
+
+    /// Run redb's physical checksum/allocation integrity check. A `false`
+    /// result means damage was found and repaired; an unrecoverable database
+    /// is returned as an error.
+    pub fn check_integrity(&mut self) -> Result<bool, StorageError> {
+        Ok(self.db.check_integrity()?)
+    }
+
+    /// Write a transactionally consistent copy of every MarsDB table to a
+    /// new database file. The destination is created exclusively so an
+    /// existing file is never silently overwritten.
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let path = path.as_ref();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+
+        let result = (|| {
+            let source = self.db.begin_read()?;
+            let destination = redb::Database::builder().create_file(file)?;
+            let write = destination.begin_write()?;
+
+            macro_rules! copy_table {
+                ($definition:expr) => {{
+                    let source_table = source.open_table($definition)?;
+                    let mut destination_table = write.open_table($definition)?;
+                    for entry in source_table.iter()? {
+                        let (key, value) = entry?;
+                        destination_table.insert(key.value(), value.value())?;
+                    }
+                }};
+            }
+
+            macro_rules! copy_multimap {
+                ($definition:expr) => {{
+                    let source_table = source.open_multimap_table($definition)?;
+                    let mut destination_table = write.open_multimap_table($definition)?;
+                    for entry in source_table.iter()? {
+                        let (key, values) = entry?;
+                        for value in values {
+                            destination_table.insert(key.value(), value?.value())?;
+                        }
+                    }
+                }};
+            }
+
+            copy_table!(tables::META);
+            copy_table!(tables::LABEL_TO_ID);
+            copy_table!(tables::ID_TO_LABEL);
+            copy_table!(tables::NODES);
+            copy_table!(tables::EDGES);
+            copy_multimap!(tables::ADJ_OUT);
+            copy_multimap!(tables::ADJ_IN);
+            copy_multimap!(tables::NODE_LABEL_INDEX);
+
+            write.commit()?;
+            Ok::<(), StorageError>(())
+        })();
+
+        if result.is_err() {
+            // This file was created exclusively above, so removing an
+            // incomplete backup cannot affect pre-existing user data.
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +207,77 @@ mod tests {
                 ..
             } if found == CURRENT_FORMAT_VERSION + 1
         ));
+    }
+
+    #[test]
+    fn backup_copies_all_tables_and_refuses_to_overwrite() {
+        let source = StorageEngine::open_memory().unwrap();
+        let write = source.begin_write().unwrap();
+        {
+            write
+                .open_table(tables::META)
+                .unwrap()
+                .insert("next_node_id", 7)
+                .unwrap();
+            write
+                .open_table(tables::LABEL_TO_ID)
+                .unwrap()
+                .insert("Person", 3)
+                .unwrap();
+            write
+                .open_table(tables::ID_TO_LABEL)
+                .unwrap()
+                .insert(3, "Person")
+                .unwrap();
+            write
+                .open_table(tables::NODES)
+                .unwrap()
+                .insert(6, &[1, 2, 3][..])
+                .unwrap();
+            write
+                .open_multimap_table(tables::NODE_LABEL_INDEX)
+                .unwrap()
+                .insert(3, 6)
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.redb");
+        source.backup_to(&path).unwrap();
+
+        let backup = StorageEngine::open_file(&path).unwrap();
+        let read = backup.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(tables::META)
+                .unwrap()
+                .get("next_node_id")
+                .unwrap()
+                .unwrap()
+                .value(),
+            7
+        );
+        assert_eq!(
+            read.open_table(tables::NODES)
+                .unwrap()
+                .get(6)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            read.open_multimap_table(tables::NODE_LABEL_INDEX)
+                .unwrap()
+                .get(3)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .value(),
+            6
+        );
+
+        assert!(matches!(source.backup_to(&path), Err(StorageError::Io(_))));
     }
 }
