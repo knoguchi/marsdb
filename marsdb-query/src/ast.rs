@@ -123,6 +123,11 @@ pub enum ReturnExpr {
         source: Box<ReturnExpr>,
         where_clause: Option<Box<WithExpr>>,
     },
+    /// `{a: 1, b: 2 + 1}` — a general expression map, the `RETURN`-level
+    /// counterpart to `prop_map`'s literal-only property-map syntax used
+    /// by `CREATE`/`MERGE`/`prop_kv` (which stays scoped to a
+    /// `Literal` value, since a stored property is always a scalar).
+    MapLit(Vec<(String, ReturnExpr)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

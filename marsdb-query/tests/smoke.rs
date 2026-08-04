@@ -1903,6 +1903,38 @@ fn quantifier_does_not_break_ordinary_function_calls() {
 }
 
 #[test]
+fn map_literal_property_access() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH {existing: 42, notMissing: null} AS m RETURN m.missing, m.notMissing, m.existing",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert_eq!(int(&result.rows[0][2]), 42);
+}
+
+#[test]
+fn map_literal_with_expression_values() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN {a: 1, b: 1 + 1} AS m");
+    match &result.rows[0][0] {
+        Value::Map(m) => {
+            assert_eq!(int(m.get("a").unwrap()), 1);
+            assert_eq!(int(m.get("b").unwrap()), 2);
+        }
+        other => panic!("expected a Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn map_literal_property_access_on_null_is_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH null AS m RETURN m.missing");
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
 fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     // Regression guard: unlike single-element indexing, out-of-range slice
     // bounds clamp to [0, len] rather than producing null.

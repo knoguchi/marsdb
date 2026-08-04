@@ -634,6 +634,17 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
                 _ => Ok(ReturnExpr::ListLit(items.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?)),
             }
         }
+        Rule::map_expr => Ok(ReturnExpr::MapLit(
+            inner
+                .into_inner()
+                .map(|kv| {
+                    let mut kv = kv.into_inner();
+                    let key = kv.next().expect("map_kv has a key identifier").as_str().to_string();
+                    let value = parse_return_expr(kv.next().expect("map_kv has a value return_expr"))?;
+                    Ok::<_, QueryError>((key, value))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
