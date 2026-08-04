@@ -5223,11 +5223,22 @@ fn date_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
     if let Value::Property(PropertyValue::Date(d)) = arg {
         return Ok(Value::Property(PropertyValue::Date(*d)));
     }
+    // `date(otherTemporal)` -- a bare `LocalDateTime`/`DateTime` argument
+    // projects its own date part, same as `date({date: otherTemporal})`
+    // (TCK's Temporal3 [1]).
+    if matches!(
+        arg,
+        Value::Property(PropertyValue::LocalDateTime { .. } | PropertyValue::DateTime { .. })
+    ) {
+        let epoch_day = extract_date_base_epoch_day("date() argument", arg)?;
+        return Ok(Value::Property(PropertyValue::Date(epoch_day)));
+    }
     if let Some(s) = as_arith_str(arg) {
         let d = temporal::parse_date(s).ok_or_else(|| {
             QueryError::Type(format!(
                 "'{s}' isn't a date string MarsDB can parse -- only the calendar forms YYYY-MM-DD/YYYYMMDD/\
-                 YYYY-MM/YYYYMM/YYYY are supported, not week-date or ordinal-date forms"
+                 YYYY-MM/YYYYMM/YYYY, week-date forms YYYY-Www[-D]/YYYYWww[D], and ordinal-date forms \
+                 YYYY-DDD/YYYYDDD are supported"
             ))
         })?;
         return Ok(Value::Property(PropertyValue::Date(d)));
@@ -5240,42 +5251,27 @@ fn date_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
     )))
 }
 
-/// `date({year, month, day})` — the calendar construction form only (see
-/// `date_builtin`'s docs for what's deliberately missing).
-/// Pulls `(year, month, day)` out of a `Date`/`LocalDateTime`/`DateTime`
-/// value -- the "base" a `date`/`datetime`/`localdatetime` map key
-/// projects its calendar fields from (`date({date: other, day: 5})`,
-/// `localdatetime({date: other, hour: 10, ...})`, ...). `DateTime` uses
-/// its *local* (offset-adjusted) reading, matching every other
-/// `DateTime` calendar-component access (see `date_time_component`'s
-/// docs).
-fn extract_date_base(key: &str, v: &Value) -> Result<(i32, u32, u32), QueryError> {
-    let ymd = |epoch_day: i32| {
-        (
-            temporal::date_component(epoch_day, "year").unwrap() as i32,
-            temporal::date_component(epoch_day, "month").unwrap() as u32,
-            temporal::date_component(epoch_day, "day").unwrap() as u32,
-        )
-    };
+/// Pulls the local (offset-adjusted for `DateTime`) epoch-day out of a
+/// `Date`/`LocalDateTime`/`DateTime` value -- the "base" a `date`/
+/// `datetime` map key projects its calendar fields from
+/// (`date({date: other, day: 5})`, `localdatetime({date: other, hour:
+/// 10, ...})`, ...). Returns the raw epoch-day (not a pre-split
+/// `(year, month, day)`) so a caller can read *any* calendar component
+/// off it (`weekYear`/`week`/`dayOfWeek`/`quarter`/`dayOfQuarter`/
+/// `ordinalDay` via `date_component`), for defaulting the alternate
+/// week/ordinal/quarter-date map-construction forms (see
+/// `calendar_fields_from_map`).
+fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i32, QueryError> {
     match v {
-        Value::Property(PropertyValue::Date(d)) => Ok(ymd(*d)),
-        Value::Property(PropertyValue::LocalDateTime { epoch_seconds, .. }) => Ok((
-            temporal::date_time_calendar_component(*epoch_seconds, "year").unwrap() as i32,
-            temporal::date_time_calendar_component(*epoch_seconds, "month").unwrap() as u32,
-            temporal::date_time_calendar_component(*epoch_seconds, "day").unwrap() as u32,
-        )),
+        Value::Property(PropertyValue::Date(d)) => Ok(*d),
+        Value::Property(PropertyValue::LocalDateTime { epoch_seconds, .. }) => {
+            Ok(temporal::split_epoch_seconds(*epoch_seconds).0)
+        }
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             offset_seconds,
             ..
-        }) => {
-            let local = epoch_seconds + *offset_seconds as i64;
-            Ok((
-                temporal::date_time_calendar_component(local, "year").unwrap() as i32,
-                temporal::date_time_calendar_component(local, "month").unwrap() as u32,
-                temporal::date_time_calendar_component(local, "day").unwrap() as u32,
-            ))
-        }
+        }) => Ok(temporal::split_epoch_seconds(epoch_seconds + *offset_seconds as i64).0),
         other => Err(QueryError::Type(format!(
             "'{key}' must be a Date, LocalDateTime, or DateTime, got {other:?}"
         ))),
@@ -5338,56 +5334,192 @@ fn extract_time_base(
     }
 }
 
+const DATE_ALLOWED_KEYS: &[&str] = &[
+    "year",
+    "month",
+    "day",
+    "week",
+    "dayOfWeek",
+    "ordinalDay",
+    "quarter",
+    "dayOfQuarter",
+    "date",
+];
+
 fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
-    const ALLOWED: &[&str] = &["year", "month", "day", "date"];
-    if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
-        return Err(QueryError::Type(format!(
-            "date({{...}}) key '{bad}' isn't supported -- MarsDB only builds a Date from a calendar {{year, month, \
-             day}} map (optionally projected from another temporal value via a 'date' key), not week-date/\
-             quarter/ordinal-day construction"
-        )));
-    }
-    let base = m
-        .get("date")
-        .map(|v| extract_date_base("date", v))
-        .transpose()?;
-    let integer_field = |key: &str, value: &Value| {
-        value_as_i64(value)
-            .ok_or_else(|| QueryError::Type(format!("date({{...}})'s '{key}' must be an integer")))
-    };
-    let year_raw = match m.get("year") {
-        Some(v) => integer_field("year", v)?,
-        None => match base {
-            Some((y, _, _)) => y as i64,
-            None => return Err(QueryError::Type("date({...}) requires a 'year' key".into())),
-        },
-    };
-    let year = i32::try_from(year_raw).map_err(|_| {
-        QueryError::Type(format!(
-            "date({{...}})'s 'year' is out of range: {year_raw}"
-        ))
-    })?;
-    let month_raw = match m.get("month") {
-        Some(v) => integer_field("month", v)?,
-        None => base.map_or(1, |(_, m, _)| m as i64),
-    };
-    let month = u32::try_from(month_raw).map_err(|_| {
-        QueryError::Type(format!(
-            "date({{...}})'s 'month' is out of range: {month_raw}"
-        ))
-    })?;
-    let day_raw = match m.get("day") {
-        Some(v) => integer_field("day", v)?,
-        None => base.map_or(1, |(_, _, d)| d as i64),
-    };
-    let day = u32::try_from(day_raw).map_err(|_| {
-        QueryError::Type(format!("date({{...}})'s 'day' is out of range: {day_raw}"))
-    })?;
+    let (year, month, day) = calendar_fields_from_map("date", m, DATE_ALLOWED_KEYS)?;
     temporal::epoch_day_from_ymd(year, month, day).ok_or_else(|| {
         QueryError::Type(format!(
             "{year:04}-{month:02}-{day:02} isn't a valid calendar date"
         ))
     })
+}
+
+/// Computes `(year, month, day)` from a map that specifies one of four
+/// mutually exclusive ways to pin a calendar day -- the plain calendar
+/// form (`year`/`month`/`day`, each optionally defaulted from a `date`/
+/// `datetime` base's own value), ISO week-date (`week`/`dayOfWeek`,
+/// defaulted from the base's `weekYear`/`week`/`dayOfWeek`), ordinal-date
+/// (`ordinalDay`, year defaulted from the base's `year`), or quarter-date
+/// (`quarter`/`dayOfQuarter`, defaulted from the base's `quarter`/
+/// `dayOfQuarter`) -- real Cypher's four alternate ways to construct a
+/// date, all reducible to the same `(year, month, day)` triple
+/// `epoch_day_from_ymd` needs. Shared by `date()`'s own map form and
+/// `localdatetime()`/`datetime()`'s map forms (`allowed` differs only in
+/// whether clock/timezone keys are also permitted in the same map -- this
+/// function only ever looks at the date-shaped keys).
+fn calendar_fields_from_map(
+    caller: &str,
+    m: &BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<(i32, u32, u32), QueryError> {
+    if let Some(bad) = m.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(QueryError::Type(format!(
+            "{caller}({{...}}) key '{bad}' isn't a recognized field"
+        )));
+    }
+    let int_field = |key: &str, value: &Value| {
+        value_as_i64(value).ok_or_else(|| {
+            QueryError::Type(format!("{caller}({{...}})'s '{key}' must be an integer"))
+        })
+    };
+    let base_epoch_day = m
+        .get("date")
+        .map(|v| ("date", v))
+        .or_else(|| m.get("datetime").map(|v| ("datetime", v)))
+        .map(|(k, v)| extract_date_base_epoch_day(k, v))
+        .transpose()?;
+    let epoch_day_from_component =
+        |prop: &str| base_epoch_day.map(|ed| temporal::date_component(ed, prop).unwrap());
+
+    if m.contains_key("week") || m.contains_key("dayOfWeek") {
+        let week_year = match m.get("year") {
+            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
+                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
+            })?,
+            None => i32::try_from(epoch_day_from_component("weekYear").ok_or_else(|| {
+                QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
+            })?)
+            .unwrap(),
+        };
+        let week = match m.get("week") {
+            Some(v) => u32::try_from(int_field("week", v)?).map_err(|_| {
+                QueryError::Type(format!("{caller}({{...}})'s 'week' is out of range"))
+            })?,
+            None => u32::try_from(epoch_day_from_component("week").ok_or_else(|| {
+                QueryError::Type(format!("{caller}({{...}}) requires a 'week' key"))
+            })?)
+            .unwrap(),
+        };
+        let day_of_week = match m.get("dayOfWeek") {
+            Some(v) => int_field("dayOfWeek", v)?,
+            None => epoch_day_from_component("dayOfWeek").unwrap_or(1),
+        };
+        let epoch_day = temporal::epoch_day_from_week_fields(week_year, week, day_of_week)
+            .ok_or_else(|| {
+                QueryError::Type(format!(
+                    "{caller}({{...}}) has an out-of-range week-date field"
+                ))
+            })?;
+        return Ok((
+            temporal::date_component(epoch_day, "year").unwrap() as i32,
+            temporal::date_component(epoch_day, "month").unwrap() as u32,
+            temporal::date_component(epoch_day, "day").unwrap() as u32,
+        ));
+    }
+
+    if m.contains_key("ordinalDay") {
+        let year = match m.get("year") {
+            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
+                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
+            })?,
+            None => i32::try_from(epoch_day_from_component("year").ok_or_else(|| {
+                QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
+            })?)
+            .unwrap(),
+        };
+        let ordinal_raw = int_field("ordinalDay", m.get("ordinalDay").unwrap())?;
+        let ordinal_day = u32::try_from(ordinal_raw).map_err(|_| {
+            QueryError::Type(format!("{caller}({{...}})'s 'ordinalDay' is out of range"))
+        })?;
+        let epoch_day =
+            temporal::epoch_day_from_ordinal_fields(year, ordinal_day).ok_or_else(|| {
+                QueryError::Type(format!(
+                    "{caller}({{...}}) has an out-of-range ordinalDay field"
+                ))
+            })?;
+        return Ok((
+            year,
+            temporal::date_component(epoch_day, "month").unwrap() as u32,
+            temporal::date_component(epoch_day, "day").unwrap() as u32,
+        ));
+    }
+
+    if m.contains_key("quarter") || m.contains_key("dayOfQuarter") {
+        let year = match m.get("year") {
+            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
+                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
+            })?,
+            None => i32::try_from(epoch_day_from_component("year").ok_or_else(|| {
+                QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
+            })?)
+            .unwrap(),
+        };
+        let quarter = match m.get("quarter") {
+            Some(v) => u32::try_from(int_field("quarter", v)?).map_err(|_| {
+                QueryError::Type(format!("{caller}({{...}})'s 'quarter' is out of range"))
+            })?,
+            None => u32::try_from(epoch_day_from_component("quarter").ok_or_else(|| {
+                QueryError::Type(format!("{caller}({{...}}) requires a 'quarter' key"))
+            })?)
+            .unwrap(),
+        };
+        let day_of_quarter = match m.get("dayOfQuarter") {
+            Some(v) => int_field("dayOfQuarter", v)?,
+            None => epoch_day_from_component("dayOfQuarter").unwrap_or(1),
+        };
+        let epoch_day = temporal::epoch_day_from_quarter_fields(year, quarter, day_of_quarter)
+            .ok_or_else(|| {
+                QueryError::Type(format!(
+                    "{caller}({{...}}) has an out-of-range quarter-date field"
+                ))
+            })?;
+        return Ok((
+            year,
+            temporal::date_component(epoch_day, "month").unwrap() as u32,
+            temporal::date_component(epoch_day, "day").unwrap() as u32,
+        ));
+    }
+
+    let year_raw = match m.get("year") {
+        Some(v) => int_field("year", v)?,
+        None => epoch_day_from_component("year")
+            .ok_or_else(|| QueryError::Type(format!("{caller}({{...}}) requires a 'year' key")))?,
+    };
+    let year = i32::try_from(year_raw).map_err(|_| {
+        QueryError::Type(format!(
+            "{caller}({{...}})'s 'year' is out of range: {year_raw}"
+        ))
+    })?;
+    let month_raw = match m.get("month") {
+        Some(v) => int_field("month", v)?,
+        None => epoch_day_from_component("month").unwrap_or(1),
+    };
+    let month = u32::try_from(month_raw).map_err(|_| {
+        QueryError::Type(format!(
+            "{caller}({{...}})'s 'month' is out of range: {month_raw}"
+        ))
+    })?;
+    let day_raw = match m.get("day") {
+        Some(v) => int_field("day", v)?,
+        None => epoch_day_from_component("day").unwrap_or(1),
+    };
+    let day = u32::try_from(day_raw).map_err(|_| {
+        QueryError::Type(format!(
+            "{caller}({{...}})'s 'day' is out of range: {day_raw}"
+        ))
+    })?;
+    Ok((year, month, day))
 }
 
 /// `duration(...)` — a string (ISO-8601 `'P...'` text, `temporal::
@@ -5587,6 +5719,23 @@ fn local_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Valu
     if let Value::Property(PropertyValue::LocalTime(t)) = arg {
         return Ok(Value::Property(PropertyValue::LocalTime(*t)));
     }
+    // `localtime(otherTemporal)` -- a bare `Time`/`LocalDateTime`/
+    // `DateTime` argument projects its own time-of-day part (offset
+    // dropped, same as `{time: otherTemporal}`), TCK's Temporal3 [2].
+    if matches!(
+        arg,
+        Value::Property(
+            PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::DateTime { .. }
+        )
+    ) {
+        let (hour, minute, second, nanos, _) = extract_time_base("localtime() argument", arg)?;
+        let t = temporal::local_time_nanos_from_fields(hour, minute, second, nanos).ok_or_else(
+            || QueryError::Type("localtime() argument has an out-of-range field".into()),
+        )?;
+        return Ok(Value::Property(PropertyValue::LocalTime(t)));
+    }
     if let Some(s) = as_arith_str(arg) {
         let t = temporal::parse_local_time(s).ok_or_else(|| {
             QueryError::Type(format!("'{s}' isn't a local time string MarsDB can parse"))
@@ -5648,6 +5797,28 @@ fn time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
         return Ok(Value::Property(PropertyValue::Time {
             nanos_of_day: *nanos_of_day,
             offset_seconds: *offset_seconds,
+        }));
+    }
+    // `time(otherTemporal)` -- a bare `LocalTime`/`LocalDateTime`/
+    // `DateTime` argument projects its own time part, defaulting the
+    // offset to UTC when the source has none (`LocalTime`/
+    // `LocalDateTime`), same as `{time: otherTemporal}` (TCK's
+    // Temporal3 [3]).
+    if matches!(
+        arg,
+        Value::Property(
+            PropertyValue::LocalTime(_)
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::DateTime { .. }
+        )
+    ) {
+        let (hour, minute, second, nanos, offset_seconds) =
+            extract_time_base("time() argument", arg)?;
+        let nanos_of_day = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
+            .ok_or_else(|| QueryError::Type("time() argument has an out-of-range field".into()))?;
+        return Ok(Value::Property(PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds: offset_seconds.unwrap_or(0),
         }));
     }
     if let Some(s) = as_arith_str(arg) {
@@ -5744,6 +5915,33 @@ fn local_date_time_builtin(
             nanos: *nanos,
         }));
     }
+    // `localdatetime(otherTemporal)` -- a bare `DateTime` argument drops
+    // its offset and keeps its local date+time, same as
+    // `{datetime: otherTemporal}` (TCK's Temporal3 [7]).
+    if matches!(arg, Value::Property(PropertyValue::DateTime { .. })) {
+        let epoch_day = extract_date_base_epoch_day("localdatetime() argument", arg)?;
+        let year = temporal::date_component(epoch_day, "year").unwrap() as i32;
+        let month = temporal::date_component(epoch_day, "month").unwrap() as u32;
+        let day = temporal::date_component(epoch_day, "day").unwrap() as u32;
+        let (hour, minute, second, nanos, _) = extract_time_base("localdatetime() argument", arg)?;
+        let (epoch_seconds, nanos) =
+            temporal::local_date_time_from_fields(temporal::CalendarDateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                nanos,
+            })
+            .ok_or_else(|| {
+                QueryError::Type("localdatetime() argument has an out-of-range field".into())
+            })?;
+        return Ok(Value::Property(PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        }));
+    }
     if let Some(s) = as_arith_str(arg) {
         let (epoch_seconds, nanos) = temporal::parse_local_date_time(s).ok_or_else(|| {
             QueryError::Type(format!(
@@ -5756,7 +5954,8 @@ fn local_date_time_builtin(
         }));
     }
     if let Value::Map(m) = arg {
-        let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
+        let (year, month, day) =
+            calendar_fields_from_map("localdatetime", m, DATE_TIME_ALLOWED_KEYS)?;
         let (hour, minute, second, nanos, _) = clock_fields_from_map(m)?;
         let (epoch_seconds, nanos) =
             temporal::local_date_time_from_fields(temporal::CalendarDateTime {
@@ -5785,6 +5984,11 @@ const DATE_TIME_ALLOWED_KEYS: &[&str] = &[
     "year",
     "month",
     "day",
+    "week",
+    "dayOfWeek",
+    "ordinalDay",
+    "quarter",
+    "dayOfQuarter",
     "hour",
     "minute",
     "second",
@@ -5796,56 +6000,6 @@ const DATE_TIME_ALLOWED_KEYS: &[&str] = &[
     "time",
     "datetime",
 ];
-
-/// A `date`/`datetime` map key's projected `(year, month, day)`
-/// default -- `date` takes priority if both are somehow present, else
-/// `datetime` (which carries both date and time fields at once, see
-/// `extract_date_base`/`extract_time_base`'s shared acceptance of
-/// `LocalDateTime`/`DateTime`).
-fn date_base_from_map(m: &BTreeMap<String, Value>) -> Result<Option<(i32, u32, u32)>, QueryError> {
-    if let Some(v) = m.get("date") {
-        return Ok(Some(extract_date_base("date", v)?));
-    }
-    if let Some(v) = m.get("datetime") {
-        return Ok(Some(extract_date_base("datetime", v)?));
-    }
-    Ok(None)
-}
-
-/// `year`/`month`/`day` extraction shared by `localdatetime`/`datetime`'s
-/// map form -- same defaulting rule `date_from_map` uses (month/day
-/// default to `1`, or to a `date`/`datetime` base's own value when one
-/// was projected), factored out since both callers need it alongside
-/// their own extra fields.
-fn date_ymd_from_map(
-    m: &BTreeMap<String, Value>,
-    allowed: &[&str],
-) -> Result<(i32, u32, u32), QueryError> {
-    if let Some(bad) = m.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return Err(QueryError::Type(format!(
-            "'{bad}' isn't a recognized field"
-        )));
-    }
-    let base = date_base_from_map(m)?;
-    let year_raw = match m.get("year") {
-        Some(v) => {
-            value_as_i64(v).ok_or_else(|| QueryError::Type("'year' must be an integer".into()))?
-        }
-        None => match base {
-            Some((y, _, _)) => y as i64,
-            None => return Err(QueryError::Type("requires a 'year' key".into())),
-        },
-    };
-    let year = i32::try_from(year_raw)
-        .map_err(|_| QueryError::Type(format!("'year' is out of range: {year_raw}")))?;
-    let month_raw = int_field(m, "month", base.map_or(1, |(_, mo, _)| mo as i64))?;
-    let month = u32::try_from(month_raw)
-        .map_err(|_| QueryError::Type(format!("'month' is out of range: {month_raw}")))?;
-    let day_raw = int_field(m, "day", base.map_or(1, |(_, _, d)| d as i64))?;
-    let day = u32::try_from(day_raw)
-        .map_err(|_| QueryError::Type(format!("'day' is out of range: {day_raw}")))?;
-    Ok((year, month, day))
-}
 
 /// `datetime(...)` -- zero args (now, UTC), a string, a map
 /// (`datetime({year, ..., timezone: '+01:00'})`), or another `DateTime`
@@ -5900,7 +6054,7 @@ fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value
         }));
     }
     if let Value::Map(m) = arg {
-        let (year, month, day) = date_ymd_from_map(m, DATE_TIME_ALLOWED_KEYS)?;
+        let (year, month, day) = calendar_fields_from_map("datetime", m, DATE_TIME_ALLOWED_KEYS)?;
         let (hour, minute, second, nanos, offset_seconds) = clock_fields_from_map(m)?;
         let offset_seconds = offset_seconds.unwrap_or(0);
         let (epoch_seconds, nanos) = temporal::date_time_from_fields(

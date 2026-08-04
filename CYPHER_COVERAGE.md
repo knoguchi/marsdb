@@ -21,19 +21,19 @@ scope.
 | clauses/delete | 41 | 20 | 0 | 0 | 21 | 0 | 48.8% |
 | clauses/match | 381 | 273 | 0 | 0 | 73 | 35 | 71.7% |
 | clauses/match-where | 34 | 15 | 0 | 0 | 19 | 0 | 44.1% |
-| clauses/merge | 75 | 25 | 0 | 3 | 47 | 0 | 33.3% |
+| clauses/merge | 75 | 26 | 0 | 2 | 47 | 0 | 34.7% |
 | clauses/remove | 33 | 18 | 0 | 0 | 15 | 0 | 54.5% |
-| clauses/return | 63 | 31 | 0 | 2 | 30 | 0 | 49.2% |
-| clauses/return-orderby | 35 | 25 | 0 | 2 | 6 | 2 | 71.4% |
+| clauses/return | 63 | 32 | 0 | 1 | 30 | 0 | 50.8% |
+| clauses/return-orderby | 35 | 25 | 0 | 0 | 8 | 2 | 71.4% |
 | clauses/return-skip-limit | 31 | 25 | 0 | 0 | 6 | 0 | 80.6% |
 | clauses/set | 53 | 23 | 0 | 0 | 30 | 0 | 43.4% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/unwind | 14 | 9 | 0 | 0 | 3 | 2 | 64.3% |
-| clauses/with | 29 | 10 | 0 | 1 | 17 | 1 | 34.5% |
-| clauses/with-orderBy | 292 | 163 | 0 | 1 | 126 | 2 | 55.8% |
+| clauses/with | 29 | 11 | 0 | 0 | 17 | 1 | 37.9% |
+| clauses/with-orderBy | 292 | 166 | 0 | 0 | 124 | 2 | 56.8% |
 | clauses/with-skip-limit | 9 | 4 | 0 | 0 | 5 | 0 | 44.4% |
 | clauses/with-where | 19 | 2 | 0 | 0 | 17 | 0 | 10.5% |
-| expressions/aggregation | 35 | 21 | 0 | 4 | 10 | 0 | 60.0% |
+| expressions/aggregation | 35 | 25 | 0 | 0 | 10 | 0 | 71.4% |
 | expressions/boolean | 150 | 140 | 0 | 0 | 10 | 0 | 93.3% |
 | expressions/comparison | 72 | 54 | 0 | 0 | 18 | 0 | 75.0% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
@@ -49,11 +49,11 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 635 | 1 | 342 | 26 | 0 | 63.2% |
+| expressions/temporal | 1004 | 845 | 1 | 132 | 26 | 0 | 84.2% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2563** | **1** | **373** | **874** | **69** | **66.1%** |
+| **TOTAL** | **3880** | **2783** | **1** | **153** | **874** | **69** | **71.7%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -83,16 +83,19 @@ Column meanings:
   shape the TCK runner doesn't parse at all (a named graph beyond the two
   vendored, or an untested step form).
 
-`expressions/temporal` is 1004 of the 3880 total scenarios (26%) and pulls
-the aggregate average down — `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/
-`DATETIME` are supported, but only with a *fixed* UTC offset (`'+01:00'`);
-a named timezone (`'Europe/Stockholm'`) needs a real IANA timezone
-database, deliberately out of scope (no DST/zone-rule awareness anywhere
-in `marsdb-query::temporal`), so the scenarios exercising those still
-fail at the `reject` stage. See [Temporal types](#temporal-types) below
-for exactly what *is* supported (construction, arithmetic, component
-access, comparison, string round-tripping — for all six temporal types,
-not just `Date`/`Duration`).
+`expressions/temporal` is 1004 of the 3880 total scenarios (26%). Calendar
+construction/parsing (`year`/`month`/`day`, ISO week-date, ordinal-date,
+and quarter-date forms, both as map keys and as strings), component
+access, arithmetic, comparison, and cross-type conversion (`date(anExisting
+DateTime)`, etc.) are all supported for every one of the six temporal
+types, not just `Date`/`Duration` — see [Temporal types](#temporal-types)
+below. The remaining `unexp` scenarios are almost entirely one deliberate
+scope cut: `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` only support a
+*fixed* UTC offset (`'+01:00'`), not a named timezone (`'Europe/
+Stockholm'`), which would need a real IANA timezone database (no DST/
+zone-rule awareness anywhere in `marsdb-query::temporal`) — those
+scenarios fail at runtime with a clear "named timezone" error, not
+silently.
 
 ## Clauses
 
@@ -250,13 +253,23 @@ timezone (`'Europe/Stockholm'`) is rejected with a clear error, not
 misparsed; see the gap list below.
 
 Construction: `date()`/`localtime()`/`time()`/`localdatetime()`/
-`datetime()` with no arguments (the current UTC value); from a string
-(`date('2015-07-21')`, `time('21:40:32.142+01:00')`, ... — calendar-only
-date forms, `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY`, no
-week-date/ordinal-date forms); from a map (`date({year, month, day})`,
-`time({hour, minute, second, millisecond, microsecond, nanosecond,
-timezone})`, ...); or from another value of the same type (identity,
-e.g. round-tripping through `toString`). `duration({years, months,
+`datetime()` with no arguments (the current UTC value); from a string,
+either a plain calendar date (`date('2015-07-21')`,
+`time('21:40:32.142+01:00')`, `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/
+`YYYY`), an ISO week-date (`date('2015-W30-2')`/`date('2015W302')`, day
+defaults to `1` when omitted), or an ordinal-date (`date('2015-202')`/
+`date('2015202')`); from a map, either the plain calendar form
+(`date({year, month, day})`) or the week-date (`date({year, week,
+dayOfWeek})`) / ordinal-date (`date({year, ordinalDay})`) / quarter-date
+(`date({year, quarter, dayOfQuarter})`) alternates — `time({hour, minute,
+second, millisecond, microsecond, nanosecond, timezone})`, ...; from
+another value of the *same* type (identity, e.g. round-tripping through
+`toString`); or from a value of a *different* temporal type
+(`date(existingDateTime)`, `localtime(existingTime)`, ...), which
+projects just the relevant part, same as the equivalent `{date: ...}`/
+`{time: ...}` map form. `time()`/`datetime()` from a string with no
+offset default to UTC rather than erroring (matches real Cypher's
+"statement default time zone" fallback). `duration({years, months,
 weeks, days, hours, minutes, seconds, milliseconds, microseconds,
 nanoseconds})`/`duration('P1Y2M3DT4H5M6S')` (real ISO-8601 duration
 normalization, verified line-by-line against the TCK's examples,
@@ -338,13 +351,8 @@ clock half for a clock-scale one.
 **Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
 `DateTime` — needs a real IANA timezone database (DST transition rules,
 zone-name lookup), deliberately out of scope, no dependency pulled in
-for it; week-date/ordinal-date/quarter construction (`date({year: 2015,
-week: 1})`, `date('2015-W30-2')`, `date('2015-202')` — only the calendar
-year/month/day forms, for the date half of every type, including as a
-projection/truncate override key, e.g. `date({date: d, week: 1})` still
-isn't supported even though `date({date: d, day: 5})`/`date.truncate(
-'week', d, {dayOfWeek: 2})` are); the alternate ISO-8601 combined
-date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`). See
+for it; the alternate ISO-8601 combined date-time duration syntax
+(`duration('P2012-02-02T14:37:21.545')`). See
 `marsdb-query/src/temporal.rs`'s module doc comment for the same list
 in code.
 
