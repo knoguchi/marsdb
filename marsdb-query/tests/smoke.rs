@@ -3558,3 +3558,53 @@ fn match_without_declared_index_still_works() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "alice@x.com");
 }
+
+#[test]
+fn where_clause_equality_fuses_into_index_seek() {
+    // Unlike an inline pattern property (already covered by
+    // create_index_then_lookup_via_index_seek), a WHERE-clause equality
+    // compiles to a separate outer Filter -- apply_index_seeks' newer
+    // predicate-extraction pass is what finds it.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com', age: 30})");
+    run(&store, "CREATE (:Person {email: 'bob@x.com', age: 25})");
+    run(&store, "CREATE INDEX ON :Person(email)");
+
+    let result = run(
+        &store,
+        "MATCH (n:Person) WHERE n.email = 'alice@x.com' RETURN n.age",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 30);
+}
+
+#[test]
+fn index_seek_combined_with_a_non_indexed_conjunct_keeps_the_residual_filter() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {email: 'alice@x.com', age: 30})");
+    run(&store, "CREATE (:Person {email: 'alice@x.com', age: 40})");
+    run(&store, "CREATE INDEX ON :Person(email)");
+
+    let result = run(
+        &store,
+        "MATCH (n:Person) WHERE n.email = 'alice@x.com' AND n.age > 35 RETURN n.age",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 40);
+}
+
+#[test]
+fn limit_on_a_non_unique_index_seek_stops_at_the_right_count() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person {city: 'Tokyo', name: 'a'})");
+    run(&store, "CREATE (:Person {city: 'Tokyo', name: 'b'})");
+    run(&store, "CREATE (:Person {city: 'Tokyo', name: 'c'})");
+    run(&store, "CREATE (:Person {city: 'Osaka', name: 'd'})");
+    run(&store, "CREATE INDEX ON :Person(city)");
+
+    let result = run(
+        &store,
+        "MATCH (n:Person {city: 'Tokyo'}) RETURN n.name LIMIT 2",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
