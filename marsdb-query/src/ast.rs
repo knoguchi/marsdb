@@ -364,6 +364,11 @@ pub enum WithExpr {
     Or(Box<WithExpr>, Box<WithExpr>),
     Not(Box<WithExpr>),
     Compare(ReturnExpr, CompareOp, ReturnExpr),
+    /// `x IS NULL` -- `x` is any `add_expr`, not just a property access
+    /// (`WHERE r IS NULL`, checking an OPTIONAL MATCH miss on a whole
+    /// bound var). `IS NOT NULL` parses to `Not(IsNull(..))`, same
+    /// convention as pattern-level `Expr::IsNull`.
+    IsNull(ReturnExpr),
 }
 
 /// A `WITH` clause: projects/renames the current bindings, optionally

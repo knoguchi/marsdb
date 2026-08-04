@@ -479,10 +479,29 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
         .expect("with_unary_expr has one child");
     match inner.as_rule() {
         Rule::with_unary_expr => Ok(WithExpr::Not(Box::new(parse_with_unary_expr(inner)?))),
+        Rule::with_is_null_expr => Ok(parse_with_is_null_expr(inner)?),
         Rule::with_comparison => parse_with_comparison(inner),
         Rule::with_expr => parse_with_expr(inner),
         r => unreachable!("unexpected with_unary_expr child rule {r:?}"),
     }
+}
+
+/// `with_is_null_expr = { add_expr ~ is_null_suffix }` -- mirrors
+/// `parse_is_null_expr`, but the operand is a general `ReturnExpr`
+/// (`add_expr`), not just `prop_access`.
+fn parse_with_is_null_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let operand = parse_add_expr(inner.next().expect("with_is_null_expr has an add_expr"))?;
+    let suffix = inner
+        .next()
+        .expect("with_is_null_expr has an is_null_suffix");
+    let is_not = suffix.into_inner().any(|p| p.as_rule() == Rule::kw_not);
+    let is_null = WithExpr::IsNull(operand);
+    Ok(if is_not {
+        WithExpr::Not(Box::new(is_null))
+    } else {
+        is_null
+    })
 }
 
 fn parse_with_comparison(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {

@@ -107,6 +107,84 @@ fn limit_clause_pushed_into_scan_edge_cases() {
 /// `WHERE a:A` -- a user-typed label predicate directly in pattern-level
 /// `WHERE`, not just the planner-synthesized form multi-label node
 /// patterns already used internally.
+/// Real Cypher's `WITH x AS y WHERE ...` sees *both* the pre-WITH
+/// binding (`x`) and the new alias (`y`) -- the WHERE isn't scoped to
+/// only the projected/aliased row the way a later clause is.
+#[test]
+fn with_where_sees_both_pre_and_post_with_bindings() {
+    let store = GraphStore::open_memory().unwrap();
+    for name in ["A", "B", "C"] {
+        run(&store, &format!("CREATE (:N {{name2: '{name}'}})"));
+    }
+
+    let result = run(
+        &store,
+        "MATCH (a) WITH a.name2 AS name WHERE a.name2 = 'B' RETURN name",
+    );
+    assert_eq!(result.rows.len(), 1);
+
+    let result = run(
+        &store,
+        "MATCH (a) WITH a.name2 AS name WHERE name = 'B' RETURN name",
+    );
+    assert_eq!(result.rows.len(), 1);
+
+    let result = run(
+        &store,
+        "MATCH (a) WITH a.name2 AS name WHERE name = 'B' OR a.name2 = 'C' RETURN name",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
+
+/// An aggregating `WITH ... WHERE` must still only see the grouped/
+/// aggregated names -- no pre-WITH fallback, since aggregation collapses
+/// many rows into one and there's no single "the" pre-WITH row left.
+#[test]
+fn aggregating_with_where_does_not_fall_back_to_pre_with_scope() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:P {name: 'A'})-[:REL]->(), (a)-[:REL]->(), (b:P {name: 'B'})-[:REL]->()",
+    );
+    let result = run(
+        &store,
+        "MATCH (a)-->() WITH a, count(*) AS relCount WHERE relCount > 1 RETURN a.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "A"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `WITH ... WHERE x IS NULL` on a whole bound var (not just a
+/// property), the common "OPTIONAL MATCH missed" check.
+#[test]
+fn with_where_is_null_checks_a_whole_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {name: 'x'})");
+    let result = run(
+        &store,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[r:REL]->(x) WITH r WHERE r IS NULL RETURN count(*) AS c",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(i)) => assert_eq!(*i, 1),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `WITH ... WHERE x IS NOT NULL` -- the `Not(IsNull(..))` desugaring.
+#[test]
+fn with_where_is_not_null() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {name: 'x'})");
+    let result = run(
+        &store,
+        "MATCH (a:A) WITH a WHERE a IS NOT NULL RETURN a.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+}
+
 #[test]
 fn where_label_predicate_filters_by_label() {
     let store = GraphStore::open_memory().unwrap();

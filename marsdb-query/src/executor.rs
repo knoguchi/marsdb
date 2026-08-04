@@ -1327,7 +1327,8 @@ impl<'a> Executor<'a> {
         with: &WithClause,
         rows: &[BindingRow],
     ) -> Result<Vec<BindingRow>, QueryError> {
-        let mut out = if !has_aggregate(&with.items) {
+        let is_aggregating = has_aggregate(&with.items);
+        let mut out = if !is_aggregating {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut new_row = BindingRow::new();
@@ -1356,9 +1357,28 @@ impl<'a> Executor<'a> {
         };
         if let Some(where_clause) = &with.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
-            for row in out {
-                if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
-                    filtered.push(row);
+            if is_aggregating {
+                // Aggregation collapses many input rows into one group --
+                // there's no single pre-WITH row left to fall back to, so
+                // (matching real Cypher) WHERE only sees the grouped/
+                // aggregated names, same as `RETURN`'s own aggregate WHERE.
+                for row in out {
+                    if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
+                        filtered.push(row);
+                    }
+                }
+            } else {
+                // Real Cypher lets a `WITH x AS y WHERE ...` immediately
+                // following see *both* the pre-WITH binding (`x`) and the
+                // new alias (`y`) -- confirmed via the TCK's own
+                // `WithWhere7` scenarios. New aliases shadow same-named
+                // old bindings on conflict.
+                for (row, new_row) in rows.iter().zip(out) {
+                    let mut merged = row.clone();
+                    merged.extend(new_row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    if self.eval_with_expr(txn, where_clause, &merged)? == Some(true) {
+                        filtered.push(new_row);
+                    }
                 }
             }
             out = filtered;
@@ -1699,6 +1719,8 @@ impl<'a> Executor<'a> {
                 let rv = self.eval_return_expr(txn, rhs, row)?;
                 compare_values(&lv, *op, &rv)
             }
+            // Always definite -- same reasoning as `Expr::IsNull`.
+            WithExpr::IsNull(e) => Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null)),
         })
     }
 
@@ -3213,7 +3235,7 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
 /// iff this is true, otherwise the existing row-at-a-time path runs
 /// completely unchanged (zero perf/behavior impact on non-aggregating
 /// queries).
-fn has_aggregate(items: &[ReturnItem]) -> bool {
+pub(crate) fn has_aggregate(items: &[ReturnItem]) -> bool {
     // `contains_aggregate`, not `is_top_level_aggregate` -- an aggregate
     // nested inside a wrapping expression (`1 + count(x)`, now parseable
     // since ReturnExpr::Arith exists) still needs to route to the
