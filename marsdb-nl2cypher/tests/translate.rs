@@ -54,10 +54,10 @@ fn translate_strips_a_markdown_code_fence() {
 
 #[test]
 fn translate_repairs_after_one_bad_attempt() {
-    // The first response uses the bare `-->` shorthand, which doesn't
-    // parse -- the repair round should get a real chance to fix it.
+    // The first response has an unclosed relationship bracket, which
+    // doesn't parse -- the repair round should get a real chance to fix it.
     let client = FakeLlmClient::new(vec![
-        "MATCH (a:Person)-->(b:Person) RETURN a.name, b.name",
+        "MATCH (a:Person)-[:KNOWS->(b:Person) RETURN a.name, b.name",
         "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name",
     ]);
     let schema = SchemaSummary::default();
@@ -82,8 +82,8 @@ fn translate_repairs_semantically_invalid_cypher() {
 #[test]
 fn translate_gives_up_after_the_repair_attempt_also_fails() {
     let client = FakeLlmClient::new(vec![
-        "MATCH (a)-->(b) RETURN a",
-        "MATCH (a)-->(b) RETURN a", // still broken -- no repair actually happened
+        "MATCH (a)-[:X->(b) RETURN a",
+        "MATCH (a)-[:X->(b) RETURN a", // still broken -- no repair actually happened
     ]);
     let schema = SchemaSummary::default();
     let err = translate(&client, &schema, "anything").unwrap_err();

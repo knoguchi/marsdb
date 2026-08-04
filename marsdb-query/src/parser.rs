@@ -1105,9 +1105,9 @@ fn parse_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, QueryError> {
 fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
     let inner = pair.into_inner().next().expect("rel_pattern has one child");
     let direction = match inner.as_rule() {
-        Rule::rel_right => RelDirection::Right,
-        Rule::rel_left => RelDirection::Left,
-        Rule::rel_either => RelDirection::Either,
+        Rule::rel_right | Rule::rel_right_bare => RelDirection::Right,
+        Rule::rel_left | Rule::rel_left_bare => RelDirection::Left,
+        Rule::rel_either | Rule::rel_either_bare => RelDirection::Either,
         r => unreachable!("unexpected rel_pattern child rule {r:?}"),
     };
     let mut var = None;

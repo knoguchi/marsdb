@@ -3713,3 +3713,38 @@ fn type_error_for_a_runtime_value_shape_mismatch() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().starts_with("type error:"));
 }
+
+#[test]
+fn bracketless_relationship_arrows_match_the_bracketed_forms() {
+    // `-->`/`<--`/`--` are real Cypher's shorthand for an anonymous,
+    // untyped, propertyless relationship -- brackets are only needed at
+    // all to carry a var/type/range/props. Must behave identically to
+    // `-[]->`/`<-[]-`/`-[]-`, not just parse.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {n: 'a'})-[:X]->(:B {n: 'b'})");
+
+    let out = run(&store, "MATCH (a)-->(b) RETURN a.n, b.n");
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(str_value(&out.rows[0][0]), "a");
+    assert_eq!(str_value(&out.rows[0][1]), "b");
+
+    let in_ = run(&store, "MATCH (b)<--(a) RETURN a.n, b.n");
+    assert_eq!(in_.rows.len(), 1);
+    assert_eq!(str_value(&in_.rows[0][0]), "a");
+    assert_eq!(str_value(&in_.rows[0][1]), "b");
+
+    let either = run(&store, "MATCH (x)--(y) RETURN x.n, y.n");
+    assert_eq!(either.rows.len(), 2, "undirected must match both endpoints");
+}
+
+#[test]
+fn create_with_bracketless_arrow_makes_an_anonymous_untyped_relationship() {
+    // `resolve_or_create_node`/`materialize_create` default an unnamed
+    // relationship type to "REL" -- confirms `CREATE (:A)-->(:B)` reaches
+    // that same path, not some special-cased no-op.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-->(:B)");
+    let out = run(&store, "MATCH ()-[:REL]->() RETURN count(*)");
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(int_value(&out.rows[0][0]), 1);
+}
