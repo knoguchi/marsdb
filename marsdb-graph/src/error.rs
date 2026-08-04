@@ -18,4 +18,8 @@ pub enum GraphError {
     NodeNotFound(NodeId),
     #[error("corrupt database: {0}")]
     CorruptData(String),
+    #[error("unique constraint violation: label {label:?} property {property:?} already has a node with this value")]
+    UniqueConstraintViolation { label: String, property: String },
+    #[error("no index on label {label:?} property {property:?}")]
+    IndexNotFound { label: String, property: String },
 }

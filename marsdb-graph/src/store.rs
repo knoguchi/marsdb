@@ -319,9 +319,11 @@ impl GraphStore {
         drop(nodes);
         let mut label_index =
             write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
-        for label_id in label_ids {
+        for &label_id in &label_ids {
             label_index.insert(label_id, id)?;
         }
+        drop(label_index);
+        crate::index::on_node_created(write_txn, id, &label_ids, &record.props)?;
         Ok(NodeId(id))
     }
 
@@ -566,10 +568,45 @@ impl GraphStore {
         let record: NodeRecord = decode(&removed_bytes)?;
         let mut label_index =
             write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
-        for label_id in record.label_ids {
+        for &label_id in &record.label_ids {
             label_index.remove(label_id, id.0)?;
         }
+        drop(label_index);
+        crate::index::on_node_deleted(write_txn, id.0, &record.label_ids, &record.props)?;
         Ok(true)
+    }
+
+    /// Declares an index on `(label, prop)`, backfilling it from every
+    /// existing node with `label` — see `index::create_index`'s own docs
+    /// for the exact semantics (idempotency, unique-violation behavior).
+    pub fn create_index(&self, label: &str, prop: &str, unique: bool) -> Result<(), GraphError> {
+        let write_txn = self.begin_write()?;
+        crate::index::create_index(&write_txn, label, prop, unique)?;
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// `None` means no index is declared on `(label, prop)`.
+    pub fn index_def(
+        &self,
+        label: &str,
+        prop: &str,
+    ) -> Result<Option<crate::IndexDef>, GraphError> {
+        let read_txn = self.begin_read()?;
+        crate::index::lookup_index_def(Txn::Read(&read_txn), label, prop)
+    }
+
+    /// Every node currently indexed under `(label, prop) = value`. Empty
+    /// (not an error) if no such index exists — check `index_def` first if
+    /// the caller needs to distinguish "no index" from "index, no match".
+    pub fn lookup_by_index(
+        &self,
+        label: &str,
+        prop: &str,
+        value: &PropertyValue,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        let read_txn = self.begin_read()?;
+        crate::index::lookup_exact(Txn::Read(&read_txn), label, prop, value)
     }
 
     pub fn set_node_prop(
@@ -603,10 +640,19 @@ impl GraphStore {
             return Ok(false);
         };
         let mut record: NodeRecord = decode(&bytes)?;
-        record.props.insert(key.to_string(), value);
+        let old_value = record.props.insert(key.to_string(), value.clone());
         let new_bytes = encode(&record)?;
         let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
         nodes.insert(id.0, new_bytes.as_slice())?;
+        drop(nodes);
+        crate::index::on_node_prop_changed(
+            write_txn,
+            id.0,
+            &record.label_ids,
+            key,
+            old_value.as_ref(),
+            Some(&value),
+        )?;
         Ok(true)
     }
 
@@ -662,10 +708,19 @@ impl GraphStore {
             return Ok(false);
         };
         let mut record: NodeRecord = decode(&bytes)?;
-        record.props.remove(key);
+        let old_value = record.props.remove(key);
         let new_bytes = encode(&record)?;
         let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
         nodes.insert(id.0, new_bytes.as_slice())?;
+        drop(nodes);
+        crate::index::on_node_prop_changed(
+            write_txn,
+            id.0,
+            &record.label_ids,
+            key,
+            old_value.as_ref(),
+            None,
+        )?;
         Ok(true)
     }
 
@@ -716,6 +771,8 @@ impl GraphStore {
             let mut label_index =
                 write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             label_index.insert(label_id, id.0)?;
+            drop(label_index);
+            crate::index::on_node_created(write_txn, id.0, &[label_id], &record.props)?;
         }
         Ok(true)
     }
@@ -748,6 +805,8 @@ impl GraphStore {
             let mut label_index =
                 write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             label_index.remove(label_id, id.0)?;
+            drop(label_index);
+            crate::index::on_node_deleted(write_txn, id.0, &[label_id], &record.props)?;
         }
         Ok(true)
     }
@@ -937,5 +996,304 @@ mod tests {
         assert!(
             matches!(error, GraphError::CorruptData(message) if message.contains("missing edge 999"))
         );
+    }
+
+    #[test]
+    fn create_index_backfills_existing_nodes() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut alice_props = BTreeMap::new();
+        alice_props.insert(
+            "email".to_string(),
+            PropertyValue::String("alice@x.com".to_string()),
+        );
+        let alice = store.create_node(&["Person"], alice_props).unwrap();
+        let mut bob_props = BTreeMap::new();
+        bob_props.insert(
+            "email".to_string(),
+            PropertyValue::String("bob@x.com".to_string()),
+        );
+        store.create_node(&["Person"], bob_props).unwrap();
+        // A Person with no email at all -- must not show up under any lookup.
+        store.create_node(&["Person"], BTreeMap::new()).unwrap();
+
+        store.create_index("Person", "email", false).unwrap();
+
+        let found = store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("alice@x.com".to_string()),
+            )
+            .unwrap();
+        assert_eq!(found, vec![alice]);
+    }
+
+    #[test]
+    fn create_index_rejects_duplicate_unique_value() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props1 = BTreeMap::new();
+        props1.insert(
+            "email".to_string(),
+            PropertyValue::String("same@x.com".to_string()),
+        );
+        store.create_node(&["Person"], props1).unwrap();
+        let mut props2 = BTreeMap::new();
+        props2.insert(
+            "email".to_string(),
+            PropertyValue::String("same@x.com".to_string()),
+        );
+        store.create_node(&["Person"], props2).unwrap();
+
+        let error = store.create_index("Person", "email", true).unwrap_err();
+        assert!(matches!(
+            error,
+            GraphError::UniqueConstraintViolation { .. }
+        ));
+
+        // A rejected unique index must not partially exist.
+        assert!(store.index_def("Person", "email").unwrap().is_none());
+    }
+
+    #[test]
+    fn lookup_by_index_on_undeclared_index_is_empty_not_an_error() {
+        let store = GraphStore::open_memory().unwrap();
+        store.create_node(&["Person"], BTreeMap::new()).unwrap();
+        let found = store
+            .lookup_by_index("Person", "email", &PropertyValue::String("x".to_string()))
+            .unwrap();
+        assert_eq!(found, Vec::new());
+        assert!(store.index_def("Person", "email").unwrap().is_none());
+    }
+
+    #[test]
+    fn index_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let store = GraphStore::open_file(&path).unwrap();
+            let mut props = BTreeMap::new();
+            props.insert(
+                "email".to_string(),
+                PropertyValue::String("x@x.com".to_string()),
+            );
+            store.create_node(&["Person"], props).unwrap();
+            store.create_index("Person", "email", false).unwrap();
+        }
+        let store = GraphStore::open_file(&path).unwrap();
+        assert!(store.index_def("Person", "email").unwrap().is_some());
+        let found = store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("x@x.com".to_string()),
+            )
+            .unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn create_node_after_index_declared_is_indexed_immediately() {
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("new@x.com".to_string()),
+        );
+        let node = store.create_node(&["Person"], props).unwrap();
+
+        let found = store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("new@x.com".to_string()),
+            )
+            .unwrap();
+        assert_eq!(found, vec![node]);
+    }
+
+    #[test]
+    fn set_node_prop_moves_the_index_entry() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("old@x.com".to_string()),
+        );
+        let node = store.create_node(&["Person"], props).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+
+        store
+            .set_node_prop(
+                node,
+                "email",
+                PropertyValue::String("new@x.com".to_string()),
+            )
+            .unwrap();
+
+        assert!(store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("old@x.com".to_string())
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .lookup_by_index(
+                    "Person",
+                    "email",
+                    &PropertyValue::String("new@x.com".to_string())
+                )
+                .unwrap(),
+            vec![node]
+        );
+    }
+
+    #[test]
+    fn set_node_prop_enforces_unique_index() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props1 = BTreeMap::new();
+        props1.insert(
+            "email".to_string(),
+            PropertyValue::String("a@x.com".to_string()),
+        );
+        store.create_node(&["Person"], props1).unwrap();
+        let mut props2 = BTreeMap::new();
+        props2.insert(
+            "email".to_string(),
+            PropertyValue::String("b@x.com".to_string()),
+        );
+        let node2 = store.create_node(&["Person"], props2).unwrap();
+        store.create_index("Person", "email", true).unwrap();
+
+        let error = store
+            .set_node_prop(node2, "email", PropertyValue::String("a@x.com".to_string()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GraphError::UniqueConstraintViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn remove_node_prop_removes_the_index_entry() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("gone@x.com".to_string()),
+        );
+        let node = store.create_node(&["Person"], props).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+
+        let write = store.begin_write().unwrap();
+        GraphStore::remove_node_prop_in_txn(&write, node, "email").unwrap();
+        write.commit().unwrap();
+
+        assert!(store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("gone@x.com".to_string())
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn delete_node_removes_its_index_entries() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("deleted@x.com".to_string()),
+        );
+        let node = store.create_node(&["Person"], props).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+
+        store.delete_node(node, false).unwrap();
+
+        assert!(store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("deleted@x.com".to_string())
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn add_node_label_indexes_existing_props_under_the_new_label() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("multi@x.com".to_string()),
+        );
+        let node = store.create_node(&["Contact"], props).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+
+        // Not indexed yet -- the node isn't a Person.
+        assert!(store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("multi@x.com".to_string())
+            )
+            .unwrap()
+            .is_empty());
+
+        let write = store.begin_write().unwrap();
+        GraphStore::add_node_label_in_txn(&write, node, "Person").unwrap();
+        write.commit().unwrap();
+
+        assert_eq!(
+            store
+                .lookup_by_index(
+                    "Person",
+                    "email",
+                    &PropertyValue::String("multi@x.com".to_string())
+                )
+                .unwrap(),
+            vec![node]
+        );
+    }
+
+    #[test]
+    fn remove_node_label_removes_index_entries_under_that_label() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut props = BTreeMap::new();
+        props.insert(
+            "email".to_string(),
+            PropertyValue::String("dual@x.com".to_string()),
+        );
+        let node = store.create_node(&["Person", "Contact"], props).unwrap();
+        store.create_index("Person", "email", false).unwrap();
+        assert_eq!(
+            store
+                .lookup_by_index(
+                    "Person",
+                    "email",
+                    &PropertyValue::String("dual@x.com".to_string())
+                )
+                .unwrap(),
+            vec![node]
+        );
+
+        let write = store.begin_write().unwrap();
+        GraphStore::remove_node_label_in_txn(&write, node, "Person").unwrap();
+        write.commit().unwrap();
+
+        assert!(store
+            .lookup_by_index(
+                "Person",
+                "email",
+                &PropertyValue::String("dual@x.com".to_string())
+            )
+            .unwrap()
+            .is_empty());
     }
 }
