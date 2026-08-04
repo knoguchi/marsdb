@@ -12,6 +12,7 @@ use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
 use crate::planner::{build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::result::QueryResult;
+use crate::temporal;
 use crate::value::{PathElem, Value};
 
 /// Hidden key used to correlate `OPTIONAL MATCH` results back to the outer
@@ -197,7 +198,7 @@ impl<'a> Executor<'a> {
                     }
 
                     let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
-                    let rel_props = literal_props_to_values(&rel.props);
+                    let rel_props = self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row)?;
                     let (src, dst) = match rel.direction {
                         RelDirection::Right => (prev_id, node_id),
                         RelDirection::Left => (node_id, prev_id),
@@ -246,8 +247,39 @@ impl<'a> Executor<'a> {
             }
         }
         let labels: Vec<&str> = node.labels.iter().map(String::as_str).collect();
-        let props = literal_props_to_values(&node.props);
+        let props = self.eval_props_to_values(Txn::Write(write_txn), &node.props, row)?;
         Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
+    }
+
+    /// Evaluates a CREATE pattern's `{...}` prop map -- each value is any
+    /// `ReturnExpr` (`self.eval_return_expr`), not just a literal, which
+    /// is what lets `CREATE (:Val {d: date({year: 1984, ...})})` work
+    /// (see `cypher.pest`'s `map_expr` docs). `row` is whatever's already
+    /// bound so far in this same CREATE (earlier hops, earlier
+    /// comma-separated patterns) -- a prop expression referencing one of
+    /// those (unusual, but not disallowed) resolves the same as anywhere
+    /// else `eval_return_expr` runs.
+    fn eval_props_to_values(
+        &self,
+        txn: Txn,
+        props: &[(String, ReturnExpr)],
+        row: &BindingRow,
+    ) -> Result<BTreeMap<String, PropertyValue>, QueryError> {
+        props
+            .iter()
+            .map(|(k, expr)| {
+                let value = self.eval_return_expr(txn, expr, row)?;
+                let pv = value_to_storable_property(&value).ok_or_else(|| {
+                    QueryError::Parse(format!(
+                        "property '{k}' can't be stored -- MarsDB's node/edge properties are limited to null/\
+                         bool/int/float/string/date/duration; a list/map/node/edge/path value (got {value:?}) \
+                         isn't storable, matching PropertyValue's real, deliberately fixed set of variants (see \
+                         its doc comment)"
+                    ))
+                })?;
+                Ok((k.clone(), pv))
+            })
+            .collect()
     }
 
     /// Runs `MERGE` once per row in `rows` (`clause.pattern.hops.len() <=
@@ -324,7 +356,7 @@ impl<'a> Executor<'a> {
                 new_row.insert(var.clone(), Binding::Node(node_id));
             }
             let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
-            let rel_props = literal_props_to_values(&rel.props);
+            let rel_props = self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row)?;
             let (src, dst) = match rel.direction {
                 RelDirection::Right => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
@@ -1435,6 +1467,11 @@ impl<'a> Executor<'a> {
             // have real `.prop` access, just not through this method (its
             // values aren't always a scalar `PropertyValue`) — see
             // `lookup_prop_value`, which `ReturnExpr::Prop` actually calls.
+            // A `Binding::Value` holding a `Date`/`Duration` also has real
+            // `.prop` access (`d.year`, etc) — also handled there, not
+            // here, for the same "not always a scalar `PropertyValue`"
+            // reason (well, it always *is* one here, but `lookup_prop_value`
+            // is where that access actually happens either way).
             Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => Ok(None),
         }
     }
@@ -1444,10 +1481,18 @@ impl<'a> Executor<'a> {
     /// property against a `Literal`), a map's value can be any `Value`
     /// shape (nested list/map/node), not just a scalar `PropertyValue`,
     /// so this returns the wider type and handles `Binding::Map` itself
-    /// rather than collapsing through `lookup_prop`.
+    /// rather than collapsing through `lookup_prop`. A `Binding::Value`
+    /// holding a `Date`/`Duration` is handled here too, for the same
+    /// reason -- `d.year`/`d.months`/etc are real component accessors
+    /// (Temporal5's whole scenario shape, `WITH v.date AS d ... RETURN
+    /// d.year`), not a stored property `lookup_prop` could ever find.
     fn lookup_prop_value(&self, txn: Txn, pa: &PropAccess, row: &BindingRow) -> Result<Value, QueryError> {
         match row.get(&pa.var) {
             Some(Binding::Map(m)) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
+            Some(Binding::Value(pv)) => Ok(match temporal_component(pv, &pa.prop) {
+                Some(component) => Value::Property(component),
+                None => Value::Null,
+            }),
             Some(_) => Ok(match self.lookup_prop(txn, pa, row)? {
                 Some(PropertyValue::Null) | None => Value::Null,
                 Some(pv) => Value::Property(pv),
@@ -2337,6 +2382,25 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
     }
 }
 
+/// `eval_props_to_values`'s stricter cousin of `value_to_property_value`
+/// above -- a CREATE prop value that evaluates to a list/map/node/edge/
+/// path is a real, reportable error (`None` here), not a silent `Null`.
+/// `value_to_property_value`'s silent-`Null` fallback is correct at *its*
+/// call sites (a WITH-projected scalar, where a `Value::List`/`Map` genuinely
+/// can't occur — see its own doc comment) but was never meant for CREATE's
+/// prop map, where a list/map literal is a real, everyday thing to write
+/// (`CREATE (n {tags: [1, 2, 3]})`) that MarsDB's storage layer just
+/// doesn't support persisting yet -- silently storing `null` instead
+/// would be a wrong answer, not a graceful degradation.
+fn value_to_storable_property(v: &Value) -> Option<PropertyValue> {
+    match v {
+        Value::Null => Some(PropertyValue::Null),
+        Value::Property(pv) => Some(pv.clone()),
+        Value::Literal(lit) => Some(literal_to_value(lit)),
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => None,
+    }
+}
+
 /// A bound `NodeId`/`EdgeId` whose record is no longer in the store means
 /// exactly one thing within a single statement's transaction: it was
 /// deleted earlier in this same statement (e.g. `MATCH (n) DELETE n RETURN
@@ -2366,10 +2430,6 @@ fn literal_to_value(lit: &Literal) -> PropertyValue {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
     }
-}
-
-fn literal_props_to_values(props: &[(String, Literal)]) -> BTreeMap<String, PropertyValue> {
-    props.iter().map(|(k, v)| (k.clone(), literal_to_value(v))).collect()
 }
 
 fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
@@ -2483,165 +2543,6 @@ fn compare_property_pair(a: &PropertyValue, op: CompareOp, b: &PropertyValue) ->
             | CompareOp::Gt
             | CompareOp::Ge => None,
         },
-    }
-}
-
-/// `ReturnExpr::Compare`'s general value-vs-value comparison -- unlike
-/// `compare_value` (`WithExpr::Compare`'s `Value`-vs-`Literal` shape),
-/// both sides here can be any expression, including two lists/maps.
-/// Lists/maps get real structural three-valued equality (`value_eq3`),
-/// not `value_to_property_value`'s lossy Null-collapse -- an earlier
-/// version routed everything through that collapse, which made every
-/// list/map `=`/`<>` comparison silently `null` regardless of content
-/// (a real bug, caught via real TCK scenarios: `[1,2] = [1,2]` must be
-/// `true`, not `null`). Ordering ops on a list/map are still null (no
-/// defined ordering), same as any other type-mismatched ordering.
-fn compare_values(l: &Value, op: CompareOp, r: &Value) -> Option<bool> {
-    if matches!(l, Value::List(_) | Value::Map(_)) || matches!(r, Value::List(_) | Value::Map(_)) {
-        return match op {
-            CompareOp::Eq => value_eq3(l, r),
-            CompareOp::Ne => value_eq3(l, r).map(|b| !b),
-            // Real Cypher orders lists lexicographically (confirmed via a
-            // real TCK scenario: `[1, 0] >= [1]` is `true` -- `[1]` is a
-            // prefix of `[1, 0]`, so the longer list is greater once
-            // every shared prefix position compares equal).
-            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
-                value_ord3(l, r).map(|ord| match op {
-                    CompareOp::Lt => ord.is_lt(),
-                    CompareOp::Le => ord.is_le(),
-                    CompareOp::Gt => ord.is_gt(),
-                    CompareOp::Ge => ord.is_ge(),
-                    _ => unreachable!(),
-                })
-            }
-            CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => None,
-        };
-    }
-    let lp = value_to_property_value(l);
-    let rp = value_to_property_value(r);
-    if matches!(lp, PropertyValue::Null) || matches!(rp, PropertyValue::Null) {
-        return None;
-    }
-    compare_property_pair(&lp, op, &rp)
-}
-
-/// `compare_values`'s ordering counterpart to `value_eq3` -- a list
-/// compares lexicographically: the first position where the two lists
-/// definitely differ decides the order; a `null` at the first
-/// undecided position makes the whole comparison `None` (matches real
-/// Cypher and a real TCK scenario: `[1, 2] >= [1, null]` is `null`, not
-/// decided by list length the way `[1, null] >= [1]` is, since that
-/// pair never even reaches the differing/null position -- `[1]` runs
-/// out first). If every shared-prefix position compares equal, the
-/// shorter list sorts first (same convention as string/tuple ordering).
-fn value_ord3(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return None;
-    }
-    if let (Value::List(xs), Value::List(ys)) = (a, b) {
-        for (x, y) in xs.iter().zip(ys) {
-            match value_ord3(x, y) {
-                None => return None,
-                Some(Ordering::Equal) => continue,
-                decided => return decided,
-            }
-        }
-        return Some(xs.len().cmp(&ys.len()));
-    }
-    if matches!(a, Value::List(_) | Value::Map(_)) || matches!(b, Value::List(_) | Value::Map(_)) {
-        return None;
-    }
-    let pa = value_to_property_value(a);
-    let pb = value_to_property_value(b);
-    if matches!(pa, PropertyValue::Null) || matches!(pb, PropertyValue::Null) {
-        return None;
-    }
-    property_ord3(&pa, &pb)
-}
-
-/// Per-type ordering, mirroring `compare_property_pair`'s per-type
-/// dispatch but returning a real `Ordering` (needed by `value_ord3`'s
-/// recursive list-element comparison, which must distinguish "equal, keep
-/// comparing the rest of the list" from "decided, stop here"). NaN
-/// correctly yields `None` via `f64::partial_cmp` -- IEEE NaN has no
-/// order relative to anything, including itself.
-fn property_ord3(a: &PropertyValue, b: &PropertyValue) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (PropertyValue::Int(x), PropertyValue::Int(y)) => x.partial_cmp(y),
-        (PropertyValue::Int(x), PropertyValue::Float(y)) => (*x as f64).partial_cmp(y),
-        (PropertyValue::Float(x), PropertyValue::Float(y)) => x.partial_cmp(y),
-        (PropertyValue::Float(x), PropertyValue::Int(y)) => x.partial_cmp(&(*y as f64)),
-        (PropertyValue::String(x), PropertyValue::String(y)) => Some(x.cmp(y)),
-        (PropertyValue::Bool(x), PropertyValue::Bool(y)) => Some(x.cmp(y)),
-        _ => None,
-    }
-}
-
-/// Three-valued structural equality for `compare_values`'s list/map
-/// operands -- a definite length/key mismatch is `false` regardless of
-/// any `null` elsewhere (confirmed via real TCK scenarios: `{} = {k:
-/// null}` is `false`, and `[1,2] = [1]` is `false` despite no nulls
-/// needing to be considered at all); otherwise every element must
-/// compare `Some(true)` for an overall `true`, any element comparing
-/// `Some(false)` makes the whole thing `false` immediately, and
-/// anything else (some elements `None`, none definitely mismatched)
-/// is `None`. Scalars fall through to the ordinary `Eq` case of
-/// `compare_property_pair`.
-fn value_eq3(a: &Value, b: &Value) -> Option<bool> {
-    if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return None;
-    }
-    match (a, b) {
-        (Value::List(xs), Value::List(ys)) => {
-            if xs.len() != ys.len() {
-                return Some(false);
-            }
-            let mut any_null = false;
-            for (x, y) in xs.iter().zip(ys) {
-                match value_eq3(x, y) {
-                    Some(false) => return Some(false),
-                    None => any_null = true,
-                    Some(true) => {}
-                }
-            }
-            if any_null {
-                None
-            } else {
-                Some(true)
-            }
-        }
-        (Value::Map(ma), Value::Map(mb)) => {
-            if ma.len() != mb.len() {
-                return Some(false);
-            }
-            let mut any_null = false;
-            for (k, v) in ma {
-                match mb.get(k) {
-                    None => return Some(false),
-                    Some(v2) => match value_eq3(v, v2) {
-                        Some(false) => return Some(false),
-                        None => any_null = true,
-                        Some(true) => {}
-                    },
-                }
-            }
-            if any_null {
-                None
-            } else {
-                Some(true)
-            }
-        }
-        (Value::List(_) | Value::Map(_), _) | (_, Value::List(_) | Value::Map(_)) => Some(false),
-        _ => {
-            let pa = value_to_property_value(a);
-            let pb = value_to_property_value(b);
-            if matches!(pa, PropertyValue::Null) || matches!(pb, PropertyValue::Null) {
-                None
-            } else {
-                compare_property_pair(&pa, CompareOp::Eq, &pb)
-            }
-        }
     }
 }
 
@@ -2784,6 +2685,9 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
             return Ok(Value::Property(PropertyValue::String(format!("{sa}{sb}"))));
         }
     }
+    if let Some(result) = apply_temporal_arith(op, a, b)? {
+        return Ok(result);
+    }
     let (Some(na), Some(nb)) = (as_arith_num(a), as_arith_num(b)) else {
         return Err(QueryError::Parse(format!(
             "arithmetic needs two numbers (or, for +, two strings) -- got {a:?} and {b:?}"
@@ -2825,6 +2729,90 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
     })
 }
 
+fn as_date(v: &Value) -> Option<i32> {
+    match v {
+        Value::Property(PropertyValue::Date(d)) => Some(*d),
+        _ => None,
+    }
+}
+
+fn as_duration(v: &Value) -> Option<temporal::DurationParts> {
+    match v {
+        Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => Some((*months, *days, *seconds, *nanos)),
+        _ => None,
+    }
+}
+
+fn duration_value((months, days, seconds, nanos): temporal::DurationParts) -> Value {
+    Value::Property(PropertyValue::Duration { months, days, seconds, nanos })
+}
+
+/// The `Date`/`Duration` cases of `+`/`-`/`*`/`/` -- tried before
+/// `apply_arith`'s generic numeric path, since a `Date`/`Duration`
+/// operand is never an `ArithNum`. Returns `Ok(None)` (not an error) for
+/// any operand-type combination it doesn't recognize, so `apply_arith`
+/// falls through to its own "not two numbers" error with the *original*
+/// operands in the message, rather than this function needing to
+/// duplicate that error text.
+///
+/// Only `Date`/`Duration` arithmetic is implemented here -- there's no
+/// `Time`/`DateTime`/`LocalDateTime` to add a `Duration` to (see this
+/// module's temporal-support docs), and `Date - Date` (which real Cypher
+/// doesn't define as a direct operator either -- `duration.between(...)`
+/// is the real spelling, itself out of scope, see the README) is
+/// deliberately *not* handled, falling through to the same "not two
+/// numbers" error a truly nonsensical subtraction would already get.
+fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Value>, QueryError> {
+    let date_plus_duration = |d: i32, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
+        let (months, days, seconds, nanos) = dur;
+        temporal::add_duration_to_date(d, months, days, seconds, nanos, negate)
+            .map(|d| Value::Property(PropertyValue::Date(d)))
+            .ok_or_else(|| QueryError::Parse("date +/- duration produced an out-of-range date".into()))
+    };
+    Ok(match op {
+        ArithOp::Add => {
+            if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
+                Some(date_plus_duration(d, dur, false)?)
+            } else if let (Some(dur), Some(d)) = (as_duration(a), as_date(b)) {
+                Some(date_plus_duration(d, dur, false)?)
+            } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
+                Some(duration_value(temporal::add_duration(x, y)))
+            } else {
+                None
+            }
+        }
+        ArithOp::Sub => {
+            if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
+                Some(date_plus_duration(d, dur, true)?)
+            } else if let (Some(x), Some(y)) = (as_duration(a), as_duration(b)) {
+                Some(duration_value(temporal::sub_duration(x, y)))
+            } else {
+                None
+            }
+        }
+        ArithOp::Mul => {
+            if let (Some(dur), Some(f)) = (as_duration(a), value_as_f64(b)) {
+                Some(duration_value(temporal::scale_duration(dur, f)))
+            } else if let (Some(f), Some(dur)) = (value_as_f64(a), as_duration(b)) {
+                Some(duration_value(temporal::scale_duration(dur, f)))
+            } else {
+                None
+            }
+        }
+        ArithOp::Div => {
+            if let (Some(dur), Some(f)) = (as_duration(a), value_as_f64(b)) {
+                if f == 0.0 {
+                    return Err(QueryError::Parse("division by zero".into()));
+                }
+                Some(duration_value(temporal::scale_duration(dur, 1.0 / f)))
+            } else {
+                None
+            }
+        }
+        ArithOp::Mod => None,
+    })
+}
+
 /// `list[index]` -- a negative index counts from the end (`-1` is the
 /// last element). Out of bounds either way is `Null`, not an error --
 /// matches real Cypher (`[1,2,3][10]` is `null`, not a failure), and is
@@ -2834,8 +2822,20 @@ fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
     if matches!(list, Value::Null) || matches!(index, Value::Null) {
         return Ok(Value::Null);
     }
+    // `map[key]` -- real Cypher's dynamic map-field access (`map['name']`,
+    // as opposed to `map.name`'s static form -- `lookup_prop`/`ReturnExpr
+    // ::Prop` above). Unlike `.prop`, this can return a full nested
+    // `Value` (a list/map field value), not just a scalar `PropertyValue`
+    // -- `apply_index`'s return type already allows that, no narrowing
+    // needed the way `map_value_as_property` has to for `.prop`.
+    if let Value::Map(entries) = list {
+        let Some(key) = as_arith_str(index) else {
+            return Err(QueryError::Parse(format!("a map index must be a string, got {index:?}")));
+        };
+        return Ok(entries.get(key).cloned().unwrap_or(Value::Null));
+    }
     let Value::List(items) = list else {
-        return Err(QueryError::Parse(format!("[] indexing needs a list, got {list:?}")));
+        return Err(QueryError::Parse(format!("[] indexing needs a list or map, got {list:?}")));
     };
     let Some(ArithNum::Int(i)) = as_arith_num(index) else {
         return Err(QueryError::Parse(format!("a list index must be an integer, got {index:?}")));
@@ -2899,6 +2899,12 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
             Some(v) => to_integer(v),
             None => Ok(Value::Null),
         },
+        "tostring" => match args.first() {
+            Some(v) => to_string_value(v),
+            None => Ok(Value::Null),
+        },
+        "date" => date_builtin(args),
+        "duration" => duration_builtin(args),
         // The dominant real-world use of shortestPath() is measuring it
         // (degrees-of-separation queries), not returning/rendering the
         // raw path object — path elements alternate node/edge/.../node,
@@ -3011,10 +3017,205 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
         // real error (found via a real TCK scenario expecting exactly
         // this), not a silent null the way an out-of-range/unparseable
         // scalar is.
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+        Value::Property(PropertyValue::Date(_) | PropertyValue::Duration { .. })
+        | Value::Node(_)
+        | Value::Edge(_)
+        | Value::List(_)
+        | Value::Map(_)
+        | Value::Path(_) => {
             return Err(QueryError::Parse(format!("toInteger() cannot convert {v:?} to an integer")))
         }
     })
+}
+
+/// `toString(...)` — Int/Float/Bool render the same as their `Display`
+/// impl already does elsewhere (`marsdb-cli`'s `format_property`/
+/// `format_literal`); `Date`/`Duration` go through `temporal::format_*`.
+/// Null propagates, while graph, collection, map, and path values are a
+/// runtime type error rather than silently becoming null (TypeConversion4
+/// scenario [10]).
+fn to_string_value(v: &Value) -> Result<Value, QueryError> {
+    let s = match v {
+        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => s.clone(),
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => i.to_string(),
+        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => f.to_string(),
+        Value::Property(PropertyValue::Bool(b)) | Value::Literal(Literal::Bool(b)) => b.to_string(),
+        Value::Property(PropertyValue::Date(d)) => temporal::format_date(*d),
+        Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => {
+            temporal::format_duration(*months, *days, *seconds, *nanos)
+        }
+        Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
+            return Ok(Value::Null);
+        }
+        Value::Literal(Literal::Param(name)) => {
+            unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
+        }
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+            return Err(QueryError::Parse(format!("toString() cannot convert {v:?} to a string")))
+        }
+    };
+    Ok(Value::Property(PropertyValue::String(s)))
+}
+
+/// `date()` — zero args (today, UTC — see `temporal::today_epoch_day`'s
+/// docs), a string (`date('2015-07-21')`, the calendar forms `temporal::
+/// parse_date` supports), a map (`date({year: 1984, month: 10, day:
+/// 11})`, calendar construction only), or another `Date` (identity —
+/// `date(d)` where `d` is already a `Date`, e.g. from `toString`
+/// round-tripping through `date(toString(d))`). Deliberately does *not*
+/// support the week-date/ordinal-date/quarter map or string construction
+/// forms real Cypher also has (`date({year: 2015, week: 1})`,
+/// `date('2015-W30-2')`, ...) — a real, documented gap (see the README),
+/// not a silent wrong answer: both `parse_date` and `date_from_map`
+/// return a clear error/`None` for those rather than guessing.
+fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() > 1 {
+        return Err(QueryError::Parse(format!("date() expects zero or one argument, got {}", args.len())));
+    }
+    let Some(arg) = args.first() else {
+        return Ok(Value::Property(PropertyValue::Date(temporal::today_epoch_day())));
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Property(PropertyValue::Date(d)) = arg {
+        return Ok(Value::Property(PropertyValue::Date(*d)));
+    }
+    if let Some(s) = as_arith_str(arg) {
+        let d = temporal::parse_date(s).ok_or_else(|| {
+            QueryError::Parse(format!(
+                "'{s}' isn't a date string MarsDB can parse -- only the calendar forms YYYY-MM-DD/YYYYMMDD/\
+                 YYYY-MM/YYYYMM/YYYY are supported, not week-date or ordinal-date forms"
+            ))
+        })?;
+        return Ok(Value::Property(PropertyValue::Date(d)));
+    }
+    if let Value::Map(m) = arg {
+        return Ok(Value::Property(PropertyValue::Date(date_from_map(m)?)));
+    }
+    Err(QueryError::Parse(format!("date() doesn't support this argument: {arg:?}")))
+}
+
+/// `date({year, month, day})` — the calendar construction form only (see
+/// `date_builtin`'s docs for what's deliberately missing).
+fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
+    const ALLOWED: &[&str] = &["year", "month", "day"];
+    if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+        return Err(QueryError::Parse(format!(
+            "date({{...}}) key '{bad}' isn't supported -- MarsDB only builds a Date from a calendar {{year, month, \
+             day}} map, not week-date/quarter/ordinal-day construction"
+        )));
+    }
+    let integer_field = |key: &str, value: &Value| {
+        value_as_i64(value).ok_or_else(|| QueryError::Parse(format!("date({{...}})'s '{key}' must be an integer")))
+    };
+    let year_raw = integer_field(
+        "year",
+        m.get("year").ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?,
+    )?;
+    let year = i32::try_from(year_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'year' is out of range: {year_raw}")))?;
+    let month_raw = match m.get("month") {
+        Some(v) => integer_field("month", v)?,
+        None => 1,
+    };
+    let month = u32::try_from(month_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'month' is out of range: {month_raw}")))?;
+    let day_raw = match m.get("day") {
+        Some(v) => integer_field("day", v)?,
+        None => 1,
+    };
+    let day = u32::try_from(day_raw)
+        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'day' is out of range: {day_raw}")))?;
+    temporal::epoch_day_from_ymd(year, month, day)
+        .ok_or_else(|| QueryError::Parse(format!("{year:04}-{month:02}-{day:02} isn't a valid calendar date")))
+}
+
+/// `duration(...)` — a string (ISO-8601 `'P...'` text, `temporal::
+/// parse_duration`) or a map (`duration({days: 14, hours: 16})`,
+/// `temporal::normalize_duration`). No zero-arg form (real Cypher has
+/// none either — a duration has no "current" value the way a date/time
+/// does).
+fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
+    if args.len() != 1 {
+        return Err(QueryError::Parse(format!("duration() expects exactly one argument, got {}", args.len())));
+    }
+    let arg = &args[0];
+    if matches!(arg, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (months, days, seconds, nanos) = if let Some(s) = as_arith_str(arg) {
+        temporal::parse_duration(s).ok_or_else(|| {
+            QueryError::Parse(format!(
+                "'{s}' isn't a duration string MarsDB can parse -- only ISO-8601 'PnYnMnWnDTnHnMnS' text is \
+                 supported, not the alternate combined date-time duration syntax"
+            ))
+        })?
+    } else if let Value::Map(m) = arg {
+        temporal::normalize_duration(duration_fields_from_map(m)?)
+    } else {
+        return Err(QueryError::Parse(format!("duration() doesn't support this argument: {arg:?}")));
+    };
+    Ok(Value::Property(PropertyValue::Duration { months, days, seconds, nanos }))
+}
+
+fn duration_fields_from_map(m: &BTreeMap<String, Value>) -> Result<temporal::DurationFields, QueryError> {
+    const ALLOWED: &[&str] = &[
+        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds",
+        "nanoseconds",
+    ];
+    if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+        return Err(QueryError::Parse(format!("duration({{...}}) key '{bad}' isn't a recognized duration unit")));
+    }
+    let field = |key: &str| -> Result<f64, QueryError> {
+        match m.get(key) {
+            None => Ok(0.0),
+            Some(v) => value_as_f64(v).ok_or_else(|| QueryError::Parse(format!("duration({{...}})'s '{key}' must be a number"))),
+        }
+    };
+    Ok(temporal::DurationFields {
+        years: field("years")?,
+        months: field("months")?,
+        weeks: field("weeks")?,
+        days: field("days")?,
+        hours: field("hours")?,
+        minutes: field("minutes")?,
+        seconds: field("seconds")?,
+        milliseconds: field("milliseconds")?,
+        microseconds: field("microseconds")?,
+        nanoseconds: field("nanoseconds")?,
+    })
+}
+
+fn value_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+fn value_as_f64(v: &Value) -> Option<f64> {
+    match as_arith_num(v)? {
+        ArithNum::Int(i) => Some(i as f64),
+        ArithNum::Float(f) => Some(f),
+    }
+}
+
+/// Shared `Date`/`Duration` component access for `d.<prop>` — used by
+/// both `lookup_prop` (a bound row variable, e.g. `WITH v.date AS d ...
+/// d.year`) and `eval_projected_expr`'s `Prop` arm (the post-projection/
+/// ORDER BY path). Returns `None` for any property name that isn't a
+/// recognized component (or a non-temporal `PropertyValue`), the same
+/// "treat as absent, not an error" convention every other `.prop` access
+/// already follows for an unknown property.
+fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
+    match pv {
+        PropertyValue::Date(d) => temporal::date_component(*d, prop).map(PropertyValue::Int),
+        PropertyValue::Duration { months, days, seconds, nanos } => {
+            temporal::duration_component(*months, *days, *seconds, *nanos, prop).map(PropertyValue::Int)
+        }
+        _ => None,
+    }
 }
 
 /// Sorts `rows` (already-projected `RETURN`/`WITH` output, `columns`
@@ -3077,6 +3278,14 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
                 Value::Edge(e) => Ok(match e.props.get(&pa.prop).cloned() {
                     Some(PropertyValue::Null) | None => Value::Null,
                     Some(v) => Value::Property(v),
+                }),
+                // `d.year`/`d.months`/etc component access on a `Date`/
+                // `Duration` in projected/ORDER BY position -- mirrors
+                // `lookup_prop_value`'s equivalent `Binding::Value(pv)`
+                // handling for the pre-projection path.
+                Value::Property(pv) => Ok(match temporal_component(pv, &pa.prop) {
+                    Some(component) => Value::Property(component),
+                    None => Value::Null,
                 }),
                 _ => Ok(Value::Null),
             }
@@ -3331,6 +3540,7 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Some(PropertyValue::Float(x)), Some(PropertyValue::Float(y))) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
         (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
         (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
+        (Some(PropertyValue::Date(x)), Some(PropertyValue::Date(y))) => x.cmp(&y),
         _ => Ordering::Equal,
     }
 }
@@ -3363,6 +3573,170 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
         (PropertyValue::Float(x), PropertyValue::Float(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
         (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(&y),
         (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(&y),
+        // `Duration` deliberately has no arm here (falls through to
+        // `None` below) -- no defined ordering, only equality (see
+        // `compare_values`'s docs on why months/days/seconds aren't
+        // fungible enough to order against each other).
+        (PropertyValue::Date(x), PropertyValue::Date(y)) => x.cmp(&y),
         _ => return None,
     })
+}
+
+/// General `lhs op rhs` for `ReturnExpr::Compare` -- unlike `compare()`
+/// (a `PropertyValue`-vs-`Literal` comparison for pattern-level `WHERE`,
+/// where the RHS is always a literal), both sides here are already-
+/// evaluated `Value`s, since either can be a *computed* result (e.g. two
+/// `date(...)` calls) with no `Literal` able to stand in for it.
+/// Three-valued like `compare()`: `None` (Cypher's "unknown") for a null
+/// operand, an operator with no meaning for the operands' types (e.g. `<`
+/// between two `Duration`s), or a type mismatch.
+fn compare_values(a: &Value, op: CompareOp, b: &Value) -> Option<bool> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    match op {
+        CompareOp::Eq => value_equal_ternary(a, b),
+        CompareOp::Ne => value_equal_ternary(a, b).map(|eq| !eq),
+        CompareOp::Lt => ordered_compare(a, b, |o| o == std::cmp::Ordering::Less),
+        CompareOp::Le => ordered_compare(a, b, |o| o != std::cmp::Ordering::Greater),
+        CompareOp::Gt => ordered_compare(a, b, |o| o == std::cmp::Ordering::Greater),
+        CompareOp::Ge => ordered_compare(a, b, |o| o != std::cmp::Ordering::Less),
+        CompareOp::StartsWith | CompareOp::EndsWith | CompareOp::Contains => {
+            let (Some(s), Some(p)) = (as_arith_str(a), as_arith_str(b)) else {
+                return None;
+            };
+            Some(match op {
+                CompareOp::StartsWith => s.starts_with(p),
+                CompareOp::EndsWith => s.ends_with(p),
+                CompareOp::Contains => s.contains(p),
+                _ => unreachable!("only StartsWith/EndsWith/Contains reach this arm"),
+            })
+        }
+    }
+}
+
+/// `<`/`<=`/`>`/`>=` -- numeric operands are special-cased (not folded
+/// into `value_partial_cmp` below) specifically so `NaN` compares as a
+/// definite `false` on every operator, matching real Cypher (`0.0/0.0 >
+/// 1` is `false`, not `null`) -- verified against Comparison2's
+/// "Comparing NaN" scenario, which is what exposed `comparable_ordering`'s
+/// `unwrap_or(Equal)` silently making `NaN >= x`/`NaN <= x` both `true`.
+/// Every other type (`List`, `Date`, `String`, `Bool`, ...) has no NaN-like
+/// "exists but is unorderable" value, so `None` there really does mean
+/// Cypher's ordinary "unknown" (a null operand, a null found while
+/// lexicographically comparing two lists, or a genuine type mismatch),
+/// not something to special-case to `false`.
+fn ordered_compare(a: &Value, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> Option<bool> {
+    if let (Some(x), Some(y)) = (value_as_f64(a), value_as_f64(b)) {
+        return Some(x.partial_cmp(&y).map(pred).unwrap_or(false));
+    }
+    value_partial_cmp(a, b).map(pred)
+}
+
+/// `<`/`<=`/`>`/`>=` between two `List`s -- real Cypher orders lists
+/// lexicographically: the first position where the two lists differ
+/// decides the result; if every position up to the shorter list's length
+/// is equal, the shorter list is "less". A `null` found at a
+/// not-yet-decided position makes the *whole* comparison unknown (`None`)
+/// -- lexicographic order can't skip past an undecided position to look
+/// for a later one that happens to differ, since whether that later
+/// position is even reached depends on what the undecided one turns out
+/// to be. Verified element-by-element against every row of Comparison2's
+/// "Comparing lists" scenario (`[1, 2] >= [1, null]` is `null`, not
+/// `false`, even though `2 >= null` alone would also be `null` -- the
+/// point is *why*: position 0 is equal, so position 1 is where the
+/// answer would come from, and it's undecided). Delegates to
+/// `comparable_ordering` for every non-list, non-numeric pair (`Date`,
+/// `String`, `Bool`, ...), which has no list case to get wrong.
+fn value_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    if let (Value::List(xs), Value::List(ys)) = (a, b) {
+        for (x, y) in xs.iter().zip(ys) {
+            match value_partial_cmp(x, y) {
+                Some(Ordering::Equal) => continue,
+                other => return other,
+            }
+        }
+        return Some(xs.len().cmp(&ys.len()));
+    }
+    comparable_ordering(a, b)
+}
+
+/// `=`/`<>`'s equality -- three-valued (`None` is Cypher's "unknown"),
+/// recursing into `List`/`Map` element-by-element so a `null` *inside* a
+/// list/map only makes the overall result unknown when it actually
+/// matters, not automatically `false`/`true`: a length/key-set mismatch
+/// is `false` outright (definite, regardless of any null present --
+/// `{k: null} = {}` is `false`, not `null`, since the key sets alone
+/// already prove inequality), a definite element mismatch anywhere makes
+/// the whole comparison `false` (short-circuits, `false` outranks
+/// `unknown` the same way `and3`/`or3` already rank them), and only once
+/// every element is confirmed equal or unknown (never definitely
+/// unequal) does an unknown element propagate to an unknown overall
+/// result. Verified against every row of List3's and Comparison1's
+/// list/map equality scenarios. Scalars fall back to numeric-cross-type-
+/// aware equality (`1 = 1.0` is `true`, unlike `value_eq`'s plain
+/// `PropertyValue` equality, which doesn't promote `Int`/`Float` against
+/// each other) or plain `value_eq` for everything else (`Date`,
+/// `Duration`'s component equality, `Node`/`Edge` identity, ...).
+fn value_equal_ternary(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::List(xs), Value::List(ys)) => {
+            if xs.len() != ys.len() {
+                return Some(false);
+            }
+            fold_ternary_eq(xs.iter().zip(ys).map(|(x, y)| value_equal_ternary(x, y)))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            if !x.keys().eq(y.keys()) {
+                return Some(false);
+            }
+            fold_ternary_eq(x.iter().map(|(k, xv)| value_equal_ternary(xv, &y[k])))
+        }
+        _ => Some(values_equal_numeric_aware(a, b)),
+    }
+}
+
+/// Combines a sequence of per-element three-valued equality results into
+/// one overall result: any definite `Some(false)` wins outright
+/// (short-circuits), otherwise `Some(true)` only if every element was a
+/// definite `Some(true)`, else `None` (at least one element's equality
+/// was itself unknown, and nothing else disproved the match).
+fn fold_ternary_eq(mut results: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut saw_unknown = false;
+    for r in results.by_ref() {
+        match r {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => saw_unknown = true,
+        }
+    }
+    if saw_unknown {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+/// `=`/`<>`'s scalar leaf case: numeric cross-type promotion (`1 = 1.0`
+/// is `true` in real Cypher, matching `compare()`'s existing `Int`-vs-
+/// `Float` handling) that `value_eq`'s plain `PropertyValue` equality
+/// doesn't give (`PropertyValue::Int(1) != PropertyValue::Float(1.0)`,
+/// different enum variants) -- falls back to `value_eq` for every non-
+/// numeric pair (`Date`, `Duration`'s component equality, `String`,
+/// `Bool`, `Node`/`Edge` identity, ...), which is already correct for
+/// those.
+fn values_equal_numeric_aware(a: &Value, b: &Value) -> bool {
+    match (as_arith_num(a), as_arith_num(b)) {
+        (Some(ArithNum::Int(x)), Some(ArithNum::Int(y))) => x == y,
+        (Some(ArithNum::Int(x)), Some(ArithNum::Float(y))) | (Some(ArithNum::Float(y)), Some(ArithNum::Int(x))) => {
+            x as f64 == y
+        }
+        (Some(ArithNum::Float(x)), Some(ArithNum::Float(y))) => x == y,
+        _ => value_eq(a, b),
+    }
 }

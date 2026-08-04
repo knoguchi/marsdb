@@ -110,6 +110,16 @@ fn property_to_scalar(p: &PropertyValue) -> TckScalar {
         PropertyValue::Int(i) => TckScalar::Int(*i),
         PropertyValue::Float(f) => TckScalar::Float(*f),
         PropertyValue::String(s) => TckScalar::Str(s.clone()),
+        // The TCK's expected-result cells write a date/duration as its
+        // ISO-8601 string (`'1984-10-11'`, `'P12Y5M...'`), never a
+        // distinct literal syntax -- comparing as `Str` (not adding a
+        // `TckScalar::Date`/`Duration` variant) is what makes that
+        // comparison line up, matching `format_property`'s equivalent
+        // choice in `marsdb-cli`.
+        PropertyValue::Date(d) => TckScalar::Str(marsdb::temporal::format_date(*d)),
+        PropertyValue::Duration { months, days, seconds, nanos } => {
+            TckScalar::Str(marsdb::temporal::format_duration(*months, *days, *seconds, *nanos))
+        }
     }
 }
 

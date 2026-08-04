@@ -157,6 +157,13 @@ slice_range     = { return_expr? ~ ".." ~ return_expr? }
 // `map_expr` (`{a: 1, b: 2+1}`) is unambiguous against everything else
 // here -- `{` starts nothing else `atom_expr` can produce.
 atom_expr   = { case_expr | quantifier_expr | function_call | list_expr | map_expr | prop_access | literal | identifier | ("(" ~ return_expr ~ ")") }
+// The *same* rule (not a near-duplicate) as a node/relationship's `{...}`
+// property map below -- `map_expr`/`map_kv` is reused there too (see
+// `node_pattern`), since a `CREATE`/`MERGE` prop value can be any
+// `return_expr` (e.g. `CREATE (:Val {date: date({year: 1984, ...})})`),
+// not just a bare `literal` -- `MATCH`/`MERGE`'s own inline pattern props
+// are further restricted back down to literals at plan-build time
+// instead (`planner::require_literal_pattern_prop`), not by the grammar.
 map_expr    = { "{" ~ (map_kv ~ ("," ~ map_kv)*)? ~ "}" }
 map_kv      = { identifier ~ ":" ~ return_expr }
 // `list_comprehension` (`[x IN list WHERE cond | expr]`) is tried before
@@ -233,7 +240,7 @@ sort_dir        = { ^"ASC" | ^"DESC" }
 
 pattern = { node_pattern ~ (rel_pattern ~ node_pattern)* }
 
-node_pattern = { "(" ~ node_var? ~ node_label* ~ prop_map? ~ ")" }
+node_pattern = { "(" ~ node_var? ~ node_label* ~ map_expr? ~ ")" }
 node_var     = { identifier }
 node_label   = { ":" ~ identifier }
 
@@ -241,9 +248,9 @@ node_label   = { ":" ~ identifier }
 // bare "-", or "-[:KNOWS]->" would parse as rel_either and leave a dangling
 // ">" that fails the rest of the pattern instead of matching rel_right.
 rel_pattern = { rel_right | rel_left | rel_either }
-rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]->" }
-rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]-" }
-rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ prop_map? ~ "]-" }
+rel_right   = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]->" }
+rel_left    = { "<-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
+rel_either  = { "-[" ~ rel_var? ~ rel_type? ~ rel_range? ~ map_expr? ~ "]-" }
 rel_var     = { identifier }
 rel_type    = { ":" ~ identifier }
 // Variable-length hop count: `*`, `*N`, `*N..`, `*N..M`, `*..M`. Captured
@@ -252,8 +259,10 @@ rel_type    = { ":" ~ identifier }
 // more) structurally, since the ".." literal itself produces no Pair.
 rel_range = @{ "*" ~ ASCII_DIGIT* ~ (".." ~ ASCII_DIGIT*)? }
 
-prop_map = { "{" ~ (prop_kv ~ ("," ~ prop_kv)*)? ~ "}" }
-prop_kv  = { identifier ~ ":" ~ literal }
+// A node/relationship's `{...}` property map is exactly `map_expr` (see
+// its docs above, next to `atom_expr`) -- evaluated per-row at CREATE
+// time (`Executor::eval_props_to_values`) the same way any other
+// `return_expr` is, not restricted to literal-only values.
 
 expr       = { or_expr }
 or_expr    = { and_expr ~ (^"OR" ~ and_expr)* }

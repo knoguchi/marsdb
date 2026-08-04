@@ -31,10 +31,15 @@ pub enum Value {
     /// A map literal (`{a: 1, b: 2}`) — like `List`, a query-layer-only
     /// concept, never persisted as a `PropertyValue` (nothing in the
     /// grammar can construct a map literal to store as a node/edge
-    /// property; node/edge props are still each individually a scalar
-    /// `PropertyValue`). `BTreeMap`, not `HashMap` — canonical key order
-    /// makes display/comparison deterministic without a separate sort
-    /// step.
+    /// property directly; a `CREATE {...}` prop map's *values* are each
+    /// evaluated and stored individually as their own scalar
+    /// `PropertyValue` — see `Executor::eval_props_to_values` — a `Value::
+    /// Map` reaching there is a real error, not silently dropped). Its
+    /// other main real use is as a `date(...)`/`duration(...)`
+    /// construction function's argument, e.g. `date({year: 1984, month:
+    /// 10, day: 11})` — see `Executor::call_builtin`. `BTreeMap`, not
+    /// `HashMap` — canonical key order makes display/comparison
+    /// deterministic without a separate sort step.
     Map(BTreeMap<String, Value>),
     Null,
 }

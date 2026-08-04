@@ -261,6 +261,63 @@ shortest-path search via BFS, not just the first path found — both
 endpoints must already be matched by a preceding clause), plus
 `length(p)` to measure one.
 
+`Date`/`Duration` temporal types (`PropertyValue::Date`/`Duration`,
+first-class storage variants, not `Int`/`String` reused — see
+`marsdb-graph/src/model.rs`'s doc comment): `date()` (today, UTC),
+`date('2015-07-21')` (calendar string forms only — `YYYY-MM-DD`/
+`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY`), `date({year, month, day})`
+(calendar map construction only), and `duration({years, months, weeks,
+days, hours, minutes, seconds, milliseconds, microseconds,
+nanoseconds})`/`duration('P1Y2M3DT4H5M6S')` (real ISO-8601 duration
+normalization, verified line-by-line against the TCK's examples,
+including fractional units — `duration({months: 0.75})` correctly
+becomes `P22DT19H51M49.5S`). Comparison (`<` `<=` `>` `>=` `=` `<>` on
+two `Date`s; `=`/`<>` only on two `Duration`s — component equality, no
+defined ordering), arithmetic (`date +/- duration`, `duration +/-
+duration`, `duration * number`, `duration / number` — `date` arithmetic
+uses real calendar month math, e.g. Jan 31 + 1 month clamps to Feb
+28/29), component access (`d.year`/`.month`/`.day`/`.quarter`/
+`.ordinalDay`/`.weekDay`/`.week`/`.weekYear`/`.dayOfQuarter` for a
+`Date`; `d.years`/`.quarters`/`.months`/`.weeks`/`.days`/`.hours`/
+`.minutes`/`.seconds`/`.milliseconds`/`.microseconds`/`.nanoseconds`
+(each the *whole* duration re-expressed in that one unit alone, not a
+calendar-style breakdown — `duration({years: 1, months: 4}).months` is
+`16`, not `4`) plus `.quartersOfYear`/`.monthsOfQuarter`/
+`.monthsOfYear`/`.daysOfWeek`/`.minutesOfHour`/`.secondsOfMinute`/
+`.millisecondsOfSecond`/`.microsecondsOfSecond`/`.nanosecondsOfSecond`
+(each unit's remainder within the next one up) for a `Duration`), and
+`toString()`
+(round-trips: `date(toString(d)) = d`). **Not** supported: `LOCAL TIME`/
+`TIME`/`LOCAL DATETIME`/`DATETIME` (no time-of-day or timezone type at
+all — no timezone database is linked in either), week-date/ordinal-date/
+quarter construction (`date({year: 2015, week: 1})`,
+`date('2015-W30-2')`, `date('2015-202')` — only the calendar
+year/month/day forms), projecting one temporal value from another
+(`date({date: d, day: 5})`), `duration.between(...)`/`.inDays(...)`/etc,
+`.truncate(...)`, and the alternate ISO-8601 combined date-time duration
+syntax (`duration('P2012-02-02T14:37:21.545')`). Together these cover
+the two largest, most foundational shapes of the TCK's
+`expressions/temporal` suite (construction + storage round-trip +
+comparison + component access + arithmetic for `Date`/`Duration`); the
+timezone-aware types and the truncate/between function families are
+real, substantial remaining gaps, not attempted — see `marsdb-query/src/
+temporal.rs`'s module doc comment for the same list in code.
+
+Two smaller, general (not temporal-specific) features landed alongside
+this: a general comparison operator (`x > d`, `1 + 1 = 2`) is now valid
+anywhere a `RETURN`/`WITH` expression is, not just `WHERE` (needed to
+express `date1 > date2`, since `WHERE`'s comparison RHS is
+literal-only) — including a correctly three-valued (`null`-propagating)
+`List`/`Map` equality and lexicographic `List` ordering, and a `NaN`-safe
+`<`/`<=`/`>`/`>=` that returns `false` (not `null`) the way real Cypher
+does. And `{key: <expr>, ...}` map literals are now a general expression
+(`RETURN {a: 1, b: 2}`, `WITH {x: 1} AS m RETURN m.x`, `map['key']`
+dynamic access) usable anywhere a `RETURN`/`WITH` expression is,
+including as a `CREATE`/`MERGE` pattern's inline property map value
+(`CREATE (n {tags: [1,2,3]})` now parses — though MarsDB's storage layer
+still can't persist a list/map-valued property, so that specific example
+fails at execution time with a clear error, not silently as `null`).
+
 Verified against all 7 of LDBC SNB Interactive's short-read reference
 queries (IS1-IS7) — see `marsdb-query/tests/ldbc_is_queries.rs`. Not
 verified: LDBC's complex queries (IC1-14: the full query set beyond one
@@ -287,6 +344,18 @@ need a definite yes/no, not "unknown".
 ## Roadmap
 
 - List-valued `$parameters`, to unblock `UNWIND $items AS x`
+- `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` temporal types (a
+  time-of-day, plus a timezone — offset and/or an IANA name — on top of
+  the `Date`/`Duration` support that already exists)
+- `duration.between(...)`/`.inDays(...)`/`.inSeconds(...)` and
+  `<temporal>.truncate(unit, ...)` — the TCK's two single largest
+  remaining `expressions/temporal` gaps by scenario count
+- Week-date/ordinal-date/quarter temporal construction
+  (`date({year: 2015, week: 1})`, `date('2015-W30-2')`) and projecting one
+  temporal value from another (`date({date: d, day: 5})`)
+- List/map-valued node/edge properties (`CREATE (n {tags: [1,2,3]})` now
+  parses but errors at execution — `PropertyValue` has no list/map
+  variant to store one in yet)
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
@@ -339,11 +408,13 @@ git submodule update --init marsdb-tck/openCypher
 cargo run --release -p marsdb-tck
 ```
 
-Attempts every scenario, including the ~75% that use Cypher features MarsDB
-doesn't implement at all (temporal/spatial types, list comprehensions,
-`CALL`, `ALL()`/`ANY()`/`NONE()` quantifiers, ...) — those report as a
-distinct "rejected at parse time" outcome, not lumped in with genuine
-wrong answers.
+Attempts every scenario, including the majority that use Cypher features
+MarsDB doesn't implement at all or only partially (spatial types; most of
+`expressions/temporal` — `Date`/`Duration` exist, `TIME`/`DATETIME` and
+`.truncate()`/`duration.between(...)` don't, see "Cypher coverage" above;
+list comprehensions; `CALL`; `ALL()`/`ANY()`/`NONE()` quantifiers, ...) —
+those report as a distinct "rejected at parse time" outcome, not lumped in
+with genuine wrong answers.
 Of the scenarios MarsDB's grammar accepts at all, it gets the *right*
 answer in the large majority — the real, checked-for-real signal this
 exists to produce, not the flat pass-rate over the whole suite. Side-effect

@@ -2146,6 +2146,342 @@ fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     assert_eq!(list_ints(&result.rows[0][1]), Vec::<i64>::new());
 }
 
+/// Renders a `Date`/`Duration`/`String` `Value` as text via the same
+/// `marsdb_query::temporal` formatting functions the CLI/TCK output paths
+/// use, so these tests check the exact ISO-8601 text a user would see,
+/// not just the internal `PropertyValue` representation.
+fn temporal_str(v: &Value) -> String {
+    match v {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+        Value::Property(marsdb_graph::PropertyValue::Date(d)) => marsdb_query::temporal::format_date(*d),
+        Value::Property(marsdb_graph::PropertyValue::Duration { months, days, seconds, nanos }) => {
+            marsdb_query::temporal::format_duration(*months, *days, *seconds, *nanos)
+        }
+        other => panic!("expected String/Date/Duration, got {other:?}"),
+    }
+}
+
+fn boolean(v: &Value) -> bool {
+    match v {
+        Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
+// -- Temporal (date/duration) -----------------------------------------
+//
+// Real shapes pulled directly from the TCK's expressions/temporal
+// feature files (Temporal1/2/4/5/6/7/8), not synthesized -- see the
+// README's "Cypher coverage" section for exactly what's covered and
+// what's deliberately out of scope (week-date/quarter/ordinal-day
+// construction, LOCAL TIME/TIME/LOCAL DATETIME/DATETIME, duration.
+// between(), truncate()).
+
+#[test]
+fn date_construct_from_calendar_map() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN date({year: 1984, month: 10, day: 11}) AS d");
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11");
+}
+
+#[test]
+fn date_construct_from_string_forms() {
+    let store = GraphStore::open_memory().unwrap();
+    // Temporal2 scenario [1] -- calendar forms only (no week-date/
+    // ordinal-date forms, see date_string_week_date_form_is_rejected).
+    let result = run(
+        &store,
+        "RETURN date('2015-07-21'), date('20150721'), date('2015-07'), date('201507'), date('2015')",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "2015-07-21");
+    assert_eq!(temporal_str(&row[1]), "2015-07-21");
+    assert_eq!(temporal_str(&row[2]), "2015-07-01");
+    assert_eq!(temporal_str(&row[3]), "2015-07-01");
+    assert_eq!(temporal_str(&row[4]), "2015-01-01");
+}
+
+#[test]
+fn date_string_week_date_form_is_rejected_not_misparsed() {
+    // Honest gap, not a silent wrong answer -- see temporal.rs's
+    // `parse_date` docs.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN date('2015-W30-2')").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("date"), "expected a clear date-parse error, got: {err}");
+}
+
+#[test]
+fn temporal_constructors_reject_malformed_inputs_and_wrong_arity() {
+    let store = GraphStore::open_memory().unwrap();
+    for query in [
+        "RETURN date('123é4')",
+        "RETURN duration('Pgarbage')",
+        "RETURN duration('P1Ygarbage')",
+        "RETURN date('2020', '2021')",
+        "RETURN duration('P1D', 'P2D')",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+}
+
+#[test]
+fn date_map_requires_in_range_integer_fields() {
+    let store = GraphStore::open_memory().unwrap();
+    for query in [
+        "RETURN date({year: 2020.9, month: 1, day: 2})",
+        "RETURN date({year: 4294969280, month: 1, day: 1})",
+        "RETURN date({year: 2020, month: 4294967297, day: 1})",
+        "RETURN date({year: 2020, month: 1, day: 4294967297})",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+}
+
+#[test]
+fn date_comparison() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH date({year: 1980, month: 12, day: 24}) AS x, date({year: 1984, month: 10, day: 11}) AS d \
+         RETURN x > d, x < d, x >= d, x <= d, x = d",
+    );
+    let row = &result.rows[0];
+    assert!(!boolean(&row[0]));
+    assert!(boolean(&row[1]));
+    assert!(!boolean(&row[2]));
+    assert!(boolean(&row[3]));
+    assert!(!boolean(&row[4]));
+}
+
+#[test]
+fn date_component_access_via_stored_property() {
+    // Temporal5 scenario [1]'s exact shape: construct via CREATE (so the
+    // Date round-trips through storage), then access components off a
+    // WITH-projected scalar.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Val {date: date({year: 1984, month: 10, day: 11})})");
+    let result = run(
+        &store,
+        "MATCH (v:Val) WITH v.date AS d \
+         RETURN d.year, d.quarter, d.month, d.week, d.weekYear, d.day, d.ordinalDay, d.weekDay, d.dayOfQuarter",
+    );
+    let row = &result.rows[0];
+    assert_eq!(int(&row[0]), 1984);
+    assert_eq!(int(&row[1]), 4);
+    assert_eq!(int(&row[2]), 10);
+    assert_eq!(int(&row[3]), 41);
+    assert_eq!(int(&row[4]), 1984);
+    assert_eq!(int(&row[5]), 11);
+    assert_eq!(int(&row[6]), 285);
+    assert_eq!(int(&row[7]), 4);
+    assert_eq!(int(&row[8]), 11);
+}
+
+#[test]
+fn duration_construct_from_map_normalizes_and_formats() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN duration({days: 14, hours: 16, minutes: 12}), \
+                duration({months: 5, days: 1.5}), \
+                duration({months: 0.75}), \
+                duration({weeks: 2.5}), \
+                duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70})",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "P14DT16H12M");
+    assert_eq!(temporal_str(&row[1]), "P5M1DT12H");
+    assert_eq!(temporal_str(&row[2]), "P22DT19H51M49.5S");
+    assert_eq!(temporal_str(&row[3]), "P17DT12H");
+    assert_eq!(temporal_str(&row[4]), "P12Y5M14DT16H13M10S");
+}
+
+#[test]
+fn duration_construct_from_string() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN duration('P14DT16H12M'), duration('P0.75M'), duration('P2.5W')");
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "P14DT16H12M");
+    assert_eq!(temporal_str(&row[1]), "P22DT19H51M49.5S");
+    assert_eq!(temporal_str(&row[2]), "P17DT12H");
+}
+
+#[test]
+fn duration_equality_is_component_wise_not_calendar_aware() {
+    // Temporal7 scenario [6] -- two durations with the same total months/
+    // days/seconds/nanos are equal even if their *inputs* differed
+    // (60s + 13m == 70s + 12m), but a different `days` component makes
+    // them unequal even when hours "look like" they'd make up the gap.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70}) AS x \
+         RETURN x = duration({years: 12, months: 5, days: 14, hours: 16, minutes: 13, seconds: 10}), \
+                x = duration({years: 12, months: 5, days: 13, hours: 40, minutes: 13, seconds: 10})",
+    );
+    let row = &result.rows[0];
+    assert!(boolean(&row[0]));
+    assert!(!boolean(&row[1]));
+}
+
+#[test]
+fn date_plus_and_minus_duration() {
+    // Temporal8 scenario [1] row 1.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Duration {dur: duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, \
+         seconds: 70, nanoseconds: 2})})",
+    );
+    let result = run(
+        &store,
+        "WITH date({year: 1984, month: 10, day: 11}) AS x \
+         MATCH (d:Duration) RETURN x + d.dur AS sum, x - d.dur AS diff",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1997-03-25");
+    assert_eq!(temporal_str(&row[1]), "1972-04-27");
+}
+
+#[test]
+fn date_plus_duration_with_fractional_components_carries_extra_day() {
+    // Regression guard for the bug an earlier version of
+    // `add_duration_to_date` had: dropping a duration's `seconds`/`nanos`
+    // remainder outright instead of folding any *whole* extra day out of
+    // it. Temporal8 scenario [1] row 3.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Duration {dur: duration({years: 12.5, months: 5.5, days: 14.5, hours: 16.5, \
+         minutes: 12.5, seconds: 70.5, nanoseconds: 3})})",
+    );
+    let result = run(
+        &store,
+        "WITH date({year: 1984, month: 10, day: 11}) AS x \
+         MATCH (d:Duration) RETURN x + d.dur AS sum, x - d.dur AS diff",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1997-10-11");
+    assert_eq!(temporal_str(&row[1]), "1971-10-12");
+}
+
+#[test]
+fn duration_plus_minus_scale() {
+    // Temporal8 scenarios [6]/[7].
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70, nanoseconds: 1}) AS x \
+         RETURN x + x, x - x, x * 2, x / 2",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "P24Y10M28DT32H26M20.000000002S");
+    assert_eq!(temporal_str(&row[1]), "PT0S");
+    assert_eq!(temporal_str(&row[2]), "P24Y10M28DT32H26M20.000000002S");
+    assert_eq!(temporal_str(&row[3]), "P6Y2M22DT13H21M8S");
+}
+
+#[test]
+fn duration_component_access() {
+    // Temporal5 scenario [7].
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:Val {date: duration({years: 1, months: 4, days: 10, hours: 1, minutes: 1, seconds: 1, \
+         nanoseconds: 111111111})})",
+    );
+    let result = run(
+        &store,
+        "MATCH (v:Val) WITH v.date AS d \
+         RETURN d.years, d.quarters, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, \
+                d.milliseconds, d.microseconds, d.nanoseconds",
+    );
+    let row = &result.rows[0];
+    assert_eq!(int(&row[0]), 1);
+    assert_eq!(int(&row[1]), 5);
+    assert_eq!(int(&row[2]), 16);
+    assert_eq!(int(&row[3]), 1);
+    assert_eq!(int(&row[4]), 10);
+    assert_eq!(int(&row[5]), 1);
+    assert_eq!(int(&row[6]), 61);
+    assert_eq!(int(&row[7]), 3661);
+    assert_eq!(int(&row[8]), 3_661_111);
+    assert_eq!(int(&row[9]), 3_661_111_111);
+    assert_eq!(int(&row[10]), 3_661_111_111_111);
+}
+
+#[test]
+fn to_string_and_round_trip() {
+    // Temporal6 scenarios [1]/[6].
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH date({year: 1984, month: 10, day: 11}) AS d \
+         RETURN toString(d), date(toString(d)) = d",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "1984-10-11");
+    assert!(boolean(&row[1]));
+
+    let result = run(
+        &store,
+        "WITH duration({years: 12, months: 5, days: -14, hours: 16}) AS d \
+         RETURN toString(d), duration(toString(d)) = d",
+    );
+    let row = &result.rows[0];
+    assert_eq!(temporal_str(&row[0]), "P12Y5M-14DT16H");
+    assert!(boolean(&row[1]));
+}
+
+#[test]
+fn to_string_rejects_invalid_types() {
+    // TypeConversion4 scenario [10]'s five examples: list, map, node,
+    // relationship, and path values are runtime type errors, not null.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n)-[:T]->(m)");
+    for query in [
+        "RETURN toString([])",
+        "RETURN toString({})",
+        "MATCH (n) RETURN toString(n)",
+        "MATCH ()-[r:T]->() RETURN toString(r)",
+        "MATCH p = ()-[:T]->() RETURN toString(p)",
+    ] {
+        let stmt = parse(query).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+    }
+
+    let result = run(&store, "RETURN toString(null)");
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+#[test]
+fn stored_date_survives_the_storage_round_trip() {
+    // Temporal4 scenario [1] -- a Date stored as a node property comes
+    // back as the same Date (not degraded to a plain Int/String), the
+    // real reason PropertyValue got a first-class Date variant instead of
+    // reusing Int/String -- see PropertyValue's own doc comment.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({created: date({year: 1984, month: 10, day: 11})})");
+    let result = run(&store, "MATCH (n) RETURN n.created");
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11");
+}
+
+#[test]
+fn create_with_unsupported_list_property_errors_clearly_not_silently_nulls() {
+    // Regression guard: adding general expression support to CREATE's
+    // `{...}` prop map (needed for `date(...)`/`duration(...)` values)
+    // must not let a list/map-valued property silently collapse to null
+    // -- PropertyValue has no list/map variant at all (see its doc
+    // comment), so this must be a clear error, not a wrong answer.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (n {tags: [1, 2, 3]})").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("property"), "expected a clear error, got: {err}");
+}
+
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
 // MATCH...CREATE followed directly by a RETURN in the same statement) ---
 

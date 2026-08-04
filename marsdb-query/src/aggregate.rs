@@ -36,6 +36,8 @@ pub(crate) enum HashKey {
     FloatBits(u64),
     Str(String),
     List(Vec<HashKey>),
+    Date(i32),
+    Duration(i64, i64, i64, i32),
 }
 
 pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
@@ -73,6 +75,8 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
         PropertyValue::Int(i) => HashKey::Int(*i),
         PropertyValue::Float(f) => HashKey::FloatBits(f.to_bits()),
         PropertyValue::String(s) => HashKey::Str(s.clone()),
+        PropertyValue::Date(d) => HashKey::Date(*d),
+        PropertyValue::Duration { months, days, seconds, nanos } => HashKey::Duration(*months, *days, *seconds, *nanos),
     }
 }
 

@@ -133,10 +133,17 @@ pub enum ReturnExpr {
         source: Box<ReturnExpr>,
         where_clause: Option<Box<ReturnExpr>>,
     },
-    /// `{a: 1, b: 2 + 1}` — a general expression map, the `RETURN`-level
-    /// counterpart to `prop_map`'s literal-only property-map syntax used
-    /// by `CREATE`/`MERGE`/`prop_kv` (which stays scoped to a
-    /// `Literal` value, since a stored property is always a scalar).
+    /// `{a: 1, b: 2 + 1}` — a general expression map. `NodePattern`/
+    /// `RelPattern`'s own `props` reuse this same `ReturnExpr` value type
+    /// (not a separate `Literal`-only map) for the identical `{...}`
+    /// pattern syntax — a `CREATE`/`MERGE` prop value can be any
+    /// expression too (`{date: date({year: 1984, ...})}`), evaluated
+    /// against the row already bound so far (`Executor::
+    /// eval_props_to_values`). `MATCH`/`MERGE`'s own inline pattern props
+    /// specifically are further restricted back down to plain literals at
+    /// plan-build time (`planner::require_literal_pattern_prop`) — a
+    /// computed value there doesn't make sense before any row exists to
+    /// evaluate it against, matching real Cypher's own restriction.
     MapLit(Vec<(String, ReturnExpr)>),
     /// `lhs AND/OR/XOR rhs`, `NOT rhs` — real three-valued logic (`Null`
     /// propagates per Cypher's truth tables, see `and3`/`or3`/`xor3` in
@@ -214,14 +221,19 @@ pub enum RelDirection {
 pub struct NodePattern {
     pub var: Option<String>,
     pub labels: Vec<String>,
-    pub props: Vec<(String, Literal)>,
+    /// `ReturnExpr`, not `Literal` — a CREATE prop value can be any
+    /// expression (`{date: date({year: 1984, ...})}`, `{x: 1 + 2}`), not
+    /// just a literal; see `cypher.pest`'s `map_expr` docs and
+    /// `Executor::eval_props_to_values`, which evaluates each one against
+    /// the row already bound so far in the same CREATE.
+    pub props: Vec<(String, ReturnExpr)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RelPattern {
     pub var: Option<String>,
     pub rel_type: Option<String>,
-    pub props: Vec<(String, Literal)>,
+    pub props: Vec<(String, ReturnExpr)>,
     pub direction: RelDirection,
     /// `[:TYPE*min..max]` — `None` means a fixed single hop (existing
     /// behavior). `max: None` means unbounded, capped at a safety depth by
