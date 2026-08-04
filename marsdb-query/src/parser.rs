@@ -10,8 +10,8 @@ use crate::error::QueryError;
 struct CypherParser;
 
 pub fn parse(input: &str) -> Result<Statement, QueryError> {
-    let mut pairs = CypherParser::parse(Rule::query, input)
-        .map_err(|e| QueryError::Parse(e.to_string()))?;
+    let mut pairs =
+        CypherParser::parse(Rule::query, input).map_err(|e| QueryError::Parse(e.to_string()))?;
     let query_pair = pairs.next().expect("query rule always produces one pair");
     let statement_pair = query_pair
         .into_inner()
@@ -24,8 +24,8 @@ pub fn parse(input: &str) -> Result<Statement, QueryError> {
 /// `"CREATE (a); CREATE (b); MATCH (n) RETURN n"`). A `;` inside a string
 /// literal doesn't split anything — see `queries`' grammar comment.
 pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
-    let mut pairs = CypherParser::parse(Rule::queries, input)
-        .map_err(|e| QueryError::Parse(e.to_string()))?;
+    let mut pairs =
+        CypherParser::parse(Rule::queries, input).map_err(|e| QueryError::Parse(e.to_string()))?;
     let queries_pair = pairs.next().expect("queries rule always produces one pair");
     queries_pair
         .into_inner()
@@ -90,7 +90,9 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         ));
     }
     for i in 0..clauses.len() {
-        let (QueryClause::Match(part), Some(QueryClause::Match(next))) = (&clauses[i], clauses.get(i + 1)) else {
+        let (QueryClause::Match(part), Some(QueryClause::Match(next))) =
+            (&clauses[i], clauses.get(i + 1))
+        else {
             continue;
         };
         if part.with.is_none() && !next.optional {
@@ -162,10 +164,18 @@ fn parse_merge_clause(pair: Pair<Rule>) -> Result<MergeClause, QueryError> {
     for p in inner {
         match p.as_rule() {
             Rule::on_create_clause => {
-                on_create = p.into_inner().filter(|p| p.as_rule() == Rule::set_item).map(parse_set_item).collect::<Result<_, _>>()?;
+                on_create = p
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::set_item)
+                    .map(parse_set_item)
+                    .collect::<Result<_, _>>()?;
             }
             Rule::on_match_clause => {
-                on_match = p.into_inner().filter(|p| p.as_rule() == Rule::set_item).map(parse_set_item).collect::<Result<_, _>>()?;
+                on_match = p
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::set_item)
+                    .map(parse_set_item)
+                    .collect::<Result<_, _>>()?;
             }
             Rule::with_clause => with = Some(parse_with_clause(p)?),
             r => unreachable!("unexpected merge_clause child rule {r:?}"),
@@ -182,7 +192,11 @@ fn parse_merge_clause(pair: Pair<Rule>) -> Result<MergeClause, QueryError> {
 fn parse_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause, QueryError> {
     let mut inner = pair.into_inner();
     let source = parse_unwind_source(inner.next().expect("unwind_clause has an unwind_source"))?;
-    let var = inner.next().expect("unwind_clause has an AS identifier").as_str().to_string();
+    let var = inner
+        .next()
+        .expect("unwind_clause has an AS identifier")
+        .as_str()
+        .to_string();
     let mut where_clause = None;
     let mut with = None;
     for p in inner {
@@ -204,7 +218,10 @@ fn parse_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause, QueryError> {
 }
 
 fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
-    let inner = pair.into_inner().next().expect("unwind_source has one child");
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("unwind_source has one child");
     match inner.as_rule() {
         Rule::list_literal => Ok(UnwindSource::List(
             inner
@@ -273,14 +290,21 @@ fn parse_path_pattern(pair: Pair<Rule>) -> Result<(Option<String>, bool, Pattern
             Rule::identifier => var = Some(p.as_str().to_string()),
             Rule::shortest_path_wrapper => {
                 shortest_path = true;
-                let inner_pattern = p.into_inner().next().expect("shortest_path_wrapper has a pattern");
+                let inner_pattern = p
+                    .into_inner()
+                    .next()
+                    .expect("shortest_path_wrapper has a pattern");
                 pattern = Some(parse_pattern(inner_pattern)?);
             }
             Rule::pattern => pattern = Some(parse_pattern(p)?),
             r => unreachable!("unexpected path_pattern child rule {r:?}"),
         }
     }
-    Ok((var, shortest_path, pattern.expect("path_pattern always has a pattern or shortest_path_wrapper")))
+    Ok((
+        var,
+        shortest_path,
+        pattern.expect("path_pattern always has a pattern or shortest_path_wrapper"),
+    ))
 }
 
 /// `shortestPath()`'s inner pattern must be exactly the shape it's built
@@ -339,12 +363,20 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
 
 fn parse_with_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     // with_expr = { with_or_expr }
-    parse_with_or_expr(pair.into_inner().next().expect("with_expr has a with_or_expr"))
+    parse_with_or_expr(
+        pair.into_inner()
+            .next()
+            .expect("with_expr has a with_or_expr"),
+    )
 }
 
 fn parse_with_or_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     let mut parts = pair.into_inner();
-    let mut acc = parse_with_and_expr(parts.next().expect("with_or_expr has at least one with_and_expr"))?;
+    let mut acc = parse_with_and_expr(
+        parts
+            .next()
+            .expect("with_or_expr has at least one with_and_expr"),
+    )?;
     for rest in parts {
         acc = WithExpr::Or(Box::new(acc), Box::new(parse_with_and_expr(rest)?));
     }
@@ -353,7 +385,11 @@ fn parse_with_or_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
 
 fn parse_with_and_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
     let mut parts = pair.into_inner();
-    let mut acc = parse_with_unary_expr(parts.next().expect("with_and_expr has at least one with_unary_expr"))?;
+    let mut acc = parse_with_unary_expr(
+        parts
+            .next()
+            .expect("with_and_expr has at least one with_unary_expr"),
+    )?;
     for rest in parts {
         acc = WithExpr::And(Box::new(acc), Box::new(parse_with_unary_expr(rest)?));
     }
@@ -361,7 +397,10 @@ fn parse_with_and_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
 }
 
 fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("with_unary_expr has one child");
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("with_unary_expr has one child");
     match inner.as_rule() {
         Rule::with_unary_expr => Ok(WithExpr::Not(Box::new(parse_with_unary_expr(inner)?))),
         Rule::with_comparison => parse_with_comparison(inner),
@@ -517,7 +556,11 @@ fn parse_mutating_tail(pair: Pair<Rule>) -> Result<Tail, QueryError> {
             Ok(Tail::Set(items, ret))
         }
         Rule::remove_clause => {
-            let items = clause.into_inner().filter(|p| p.as_rule() == Rule::remove_item).map(parse_remove_item).collect();
+            let items = clause
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::remove_item)
+                .map(parse_remove_item)
+                .collect();
             Ok(Tail::Remove(items, ret))
         }
         Rule::create_stmt => Ok(Tail::Create(parse_create_patterns(clause)?, ret)),
@@ -530,8 +573,13 @@ fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
     let first = inner.next().expect("set_item has at least one child");
     match first.as_rule() {
         Rule::prop_access => {
-            let literal_pair = inner.next().expect("set_item's prop_access form has a literal");
-            Ok(SetItem::Prop(parse_prop_access(first), parse_literal(literal_pair)?))
+            let literal_pair = inner
+                .next()
+                .expect("set_item's prop_access form has a literal");
+            Ok(SetItem::Prop(
+                parse_prop_access(first),
+                parse_literal(literal_pair)?,
+            ))
         }
         Rule::set_label_item => {
             let (var, labels) = parse_set_label_item(first);
@@ -543,7 +591,11 @@ fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
 
 fn parse_set_label_item(pair: Pair<Rule>) -> (String, Vec<String>) {
     let mut inner = pair.into_inner();
-    let var = inner.next().expect("set_label_item has a var identifier").as_str().to_string();
+    let var = inner
+        .next()
+        .expect("set_label_item has a var identifier")
+        .as_str()
+        .to_string();
     let labels = inner.map(|p| p.as_str().to_string()).collect();
     (var, labels)
 }
@@ -569,7 +621,10 @@ fn parse_return_item(pair: Pair<Rule>) -> Result<ReturnItem, QueryError> {
 }
 
 fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let inner = pair.into_inner().next().expect("return_expr has one child (bool_or_expr)");
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("return_expr has one child (bool_or_expr)");
     parse_bool_or_expr(inner)
 }
 
@@ -581,8 +636,14 @@ fn parse_return_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// structure -- only the operand rule (`bool_xor_expr`/etc) matters for
 /// building the left-fold.
 fn parse_bool_or_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_xor_expr);
-    let mut lhs = parse_bool_xor_expr(inner.next().expect("bool_or_expr has at least one bool_xor_expr"))?;
+    let mut inner = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::bool_xor_expr);
+    let mut lhs = parse_bool_xor_expr(
+        inner
+            .next()
+            .expect("bool_or_expr has at least one bool_xor_expr"),
+    )?;
     for rhs_pair in inner {
         lhs = ReturnExpr::Or(Box::new(lhs), Box::new(parse_bool_xor_expr(rhs_pair)?));
     }
@@ -590,8 +651,14 @@ fn parse_bool_or_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 }
 
 fn parse_bool_xor_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_and_expr);
-    let mut lhs = parse_bool_and_expr(inner.next().expect("bool_xor_expr has at least one bool_and_expr"))?;
+    let mut inner = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::bool_and_expr);
+    let mut lhs = parse_bool_and_expr(
+        inner
+            .next()
+            .expect("bool_xor_expr has at least one bool_and_expr"),
+    )?;
     for rhs_pair in inner {
         lhs = ReturnExpr::Xor(Box::new(lhs), Box::new(parse_bool_and_expr(rhs_pair)?));
     }
@@ -599,8 +666,14 @@ fn parse_bool_xor_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 }
 
 fn parse_bool_and_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let mut inner = pair.into_inner().filter(|p| p.as_rule() == Rule::bool_not_expr);
-    let mut lhs = parse_bool_not_expr(inner.next().expect("bool_and_expr has at least one bool_not_expr"))?;
+    let mut inner = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::bool_not_expr);
+    let mut lhs = parse_bool_not_expr(
+        inner
+            .next()
+            .expect("bool_and_expr has at least one bool_not_expr"),
+    )?;
     for rhs_pair in inner {
         lhs = ReturnExpr::And(Box::new(lhs), Box::new(parse_bool_not_expr(rhs_pair)?));
     }
@@ -632,7 +705,11 @@ fn parse_bool_not_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// `ReturnExpr` form has side effects.
 fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let first = parse_add_expr(inner.next().expect("compare_expr has at least one add_expr"))?;
+    let first = parse_add_expr(
+        inner
+            .next()
+            .expect("compare_expr has at least one add_expr"),
+    )?;
     let Some(next) = inner.next() else {
         return Ok(first);
     };
@@ -644,7 +721,9 @@ fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut operands = vec![first];
     let mut ops = vec![parse_compare_op(next)];
     loop {
-        operands.push(parse_add_expr(inner.next().expect("compare_op has a following add_expr"))?);
+        operands.push(parse_add_expr(
+            inner.next().expect("compare_op has a following add_expr"),
+        )?);
         match inner.next() {
             Some(op_pair) => ops.push(parse_compare_op(op_pair)),
             None => break,
@@ -653,7 +732,9 @@ fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut pairs = operands.windows(2).zip(&ops).map(|(pair, op)| {
         ReturnExpr::Compare(Box::new(pair[0].clone()), *op, Box::new(pair[1].clone()))
     });
-    let mut acc = pairs.next().expect("a comparison chain has at least one pair");
+    let mut acc = pairs
+        .next()
+        .expect("a comparison chain has at least one pair");
     for next in pairs {
         acc = ReturnExpr::And(Box::new(acc), Box::new(next));
     }
@@ -690,7 +771,11 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let mut lhs = parse_postfix_expr(inner.next().expect("mul_expr has at least one postfix_expr"))?;
+    let mut lhs = parse_postfix_expr(
+        inner
+            .next()
+            .expect("mul_expr has at least one postfix_expr"),
+    )?;
     while let Some(op_pair) = inner.next() {
         let op = match op_pair.as_str() {
             "*" => ArithOp::Mul,
@@ -709,13 +794,18 @@ fn parse_postfix_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut base = parse_atom_expr(inner.next().expect("postfix_expr has one atom_expr"))?;
     for postfix in inner {
         // index_or_slice = { "[" ~ (slice_range | return_expr) ~ "]" }
-        let child = postfix.into_inner().next().expect("index_or_slice has one child");
+        let child = postfix
+            .into_inner()
+            .next()
+            .expect("index_or_slice has one child");
         base = match child.as_rule() {
             Rule::slice_range => {
                 let (start, end) = parse_slice_bounds(child)?;
                 ReturnExpr::Slice(Box::new(base), start, end)
             }
-            Rule::return_expr => ReturnExpr::Index(Box::new(base), Box::new(parse_return_expr(child)?)),
+            Rule::return_expr => {
+                ReturnExpr::Index(Box::new(base), Box::new(parse_return_expr(child)?))
+            }
             r => unreachable!("unexpected index_or_slice child rule {r:?}"),
         };
     }
@@ -737,12 +827,16 @@ fn parse_slice_bounds(
     let has_end = !raw[dotdot_at + 2..].trim().is_empty();
     let mut bounds = slice_range_pair.into_inner();
     let start = if has_start {
-        Some(Box::new(parse_return_expr(bounds.next().expect("slice has a start return_expr"))?))
+        Some(Box::new(parse_return_expr(
+            bounds.next().expect("slice has a start return_expr"),
+        )?))
     } else {
         None
     };
     let end = if has_end {
-        Some(Box::new(parse_return_expr(bounds.next().expect("slice has an end return_expr"))?))
+        Some(Box::new(parse_return_expr(
+            bounds.next().expect("slice has an end return_expr"),
+        )?))
     } else {
         None
     };
@@ -759,7 +853,11 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
             let mut items = inner.into_inner().peekable();
             match items.peek().map(|p| p.as_rule()) {
                 Some(Rule::list_comprehension) => parse_list_comprehension(items.next().unwrap()),
-                _ => Ok(ReturnExpr::ListLit(items.map(parse_return_expr).collect::<Result<Vec<_>, _>>()?)),
+                _ => Ok(ReturnExpr::ListLit(
+                    items
+                        .map(parse_return_expr)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
             }
         }
         // `parse_map_expr` (below `parse_node_pattern`/`parse_rel_pattern`
@@ -787,11 +885,20 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// with_expr)? }` -- shared by `list_comprehension` and `quantifier_expr`,
 /// so this returns the three parsed pieces rather than an `Expr` directly;
 /// each caller wraps them into its own `ReturnExpr` variant.
-fn parse_filter_expr(pair: Pair<Rule>) -> Result<(String, Box<ReturnExpr>, Option<Box<ReturnExpr>>), QueryError> {
+fn parse_filter_expr(
+    pair: Pair<Rule>,
+) -> Result<(String, Box<ReturnExpr>, Option<Box<ReturnExpr>>), QueryError> {
     let mut inner = pair.into_inner();
-    let var = inner.next().expect("filter_expr has a bound variable").as_str().to_string();
+    let var = inner
+        .next()
+        .expect("filter_expr has a bound variable")
+        .as_str()
+        .to_string();
     let source = parse_return_expr(inner.next().expect("filter_expr has a source return_expr"))?;
-    let where_clause = inner.next().map(|w| parse_return_expr(w).map(Box::new)).transpose()?;
+    let where_clause = inner
+        .next()
+        .map(|w| parse_return_expr(w).map(Box::new))
+        .transpose()?;
     Ok((var, Box::new(source), where_clause))
 }
 
@@ -799,7 +906,11 @@ fn parse_list_comprehension(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> 
     let mut inner = pair.into_inner();
     let (var, source, where_clause) =
         parse_filter_expr(inner.next().expect("list_comprehension has a filter_expr"))?;
-    let project = inner.next().map(parse_return_expr).transpose()?.map(Box::new);
+    let project = inner
+        .next()
+        .map(parse_return_expr)
+        .transpose()?
+        .map(Box::new);
     Ok(ReturnExpr::ListComp {
         var,
         source,
@@ -810,7 +921,12 @@ fn parse_list_comprehension(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> 
 
 fn parse_quantifier_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let kind = match inner.next().expect("quantifier_expr has a quantifier_kw").as_str().to_ascii_uppercase().as_str()
+    let kind = match inner
+        .next()
+        .expect("quantifier_expr has a quantifier_kw")
+        .as_str()
+        .to_ascii_uppercase()
+        .as_str()
     {
         "ALL" => QuantifierKind::All,
         "ANY" => QuantifierKind::Any,
@@ -818,7 +934,8 @@ fn parse_quantifier_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         "SINGLE" => QuantifierKind::Single,
         other => unreachable!("unexpected quantifier_kw {other:?}"),
     };
-    let (var, source, where_clause) = parse_filter_expr(inner.next().expect("quantifier_expr has a filter_expr"))?;
+    let (var, source, where_clause) =
+        parse_filter_expr(inner.next().expect("quantifier_expr has a filter_expr"))?;
     Ok(ReturnExpr::Quantifier {
         kind,
         var,
@@ -836,8 +953,10 @@ fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         match p.as_rule() {
             Rule::case_when => {
                 let mut when_inner = p.into_inner();
-                let when = parse_return_expr(when_inner.next().expect("case_when has a WHEN expr"))?;
-                let then = parse_return_expr(when_inner.next().expect("case_when has a THEN expr"))?;
+                let when =
+                    parse_return_expr(when_inner.next().expect("case_when has a WHEN expr"))?;
+                let then =
+                    parse_return_expr(when_inner.next().expect("case_when has a THEN expr"))?;
                 whens.push((when, then));
             }
             // The only other possible child is the trailing ELSE return_expr.
@@ -853,7 +972,11 @@ fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 
 fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let name = inner.next().expect("function_call has a name").as_str().to_string();
+    let name = inner
+        .next()
+        .expect("function_call has a name")
+        .as_str()
+        .to_string();
     let call_args = inner.next().expect("function_call has call_args");
     let is_star = call_args.as_str().trim() == "*";
     if is_star {
@@ -877,13 +1000,25 @@ fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
             "'{name}(DISTINCT ...)' isn't valid — DISTINCT is only meaningful inside an aggregate function"
         )));
     }
-    Ok(ReturnExpr::Call { name, args, distinct })
+    Ok(ReturnExpr::Call {
+        name,
+        args,
+        distinct,
+    })
 }
 
 fn parse_prop_access(pair: Pair<Rule>) -> PropAccess {
     let mut inner = pair.into_inner();
-    let var = inner.next().expect("prop_access has a var").as_str().to_string();
-    let prop = inner.next().expect("prop_access has a prop").as_str().to_string();
+    let var = inner
+        .next()
+        .expect("prop_access has a var")
+        .as_str()
+        .to_string();
+    let prop = inner
+        .next()
+        .expect("prop_access has a prop")
+        .as_str()
+        .to_string();
     PropAccess { var, prop }
 }
 
@@ -908,9 +1043,13 @@ fn parse_node_pattern(pair: Pair<Rule>) -> Result<NodePattern, QueryError> {
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::node_var => var = Some(p.as_str().to_string()),
-            Rule::node_label => {
-                labels.push(p.into_inner().next().expect("node_label has an identifier").as_str().to_string())
-            }
+            Rule::node_label => labels.push(
+                p.into_inner()
+                    .next()
+                    .expect("node_label has an identifier")
+                    .as_str()
+                    .to_string(),
+            ),
             Rule::map_expr => props = parse_map_expr_as_props(p)?,
             r => unreachable!("unexpected node_pattern child rule {r:?}"),
         }
@@ -934,7 +1073,13 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
         match p.as_rule() {
             Rule::rel_var => var = Some(p.as_str().to_string()),
             Rule::rel_type => {
-                rel_type = Some(p.into_inner().next().expect("rel_type has an identifier").as_str().to_string())
+                rel_type = Some(
+                    p.into_inner()
+                        .next()
+                        .expect("rel_type has an identifier")
+                        .as_str()
+                        .to_string(),
+                )
             }
             Rule::rel_range => hop_range = Some(parse_rel_range(p.as_str())?),
             Rule::map_expr => props = parse_map_expr_as_props(p)?,
@@ -969,15 +1114,14 @@ fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
                 .parse()
                 .map_err(|_| QueryError::Parse("invalid variable-length min hop count".into()))?
         };
-        let max = if max_str.is_empty() {
-            None
-        } else {
-            Some(
-                max_str
-                    .parse()
-                    .map_err(|_| QueryError::Parse("invalid variable-length max hop count".into()))?,
-            )
-        };
+        let max =
+            if max_str.is_empty() {
+                None
+            } else {
+                Some(max_str.parse().map_err(|_| {
+                    QueryError::Parse("invalid variable-length max hop count".into())
+                })?)
+            };
         Ok((min, max))
     } else {
         let n: u32 = rest
@@ -1044,7 +1188,9 @@ fn unescape_string(s: &str) -> Result<String, QueryError> {
             Some('b') => out.push('\u{8}'),
             Some('f') => out.push('\u{c}'),
             Some(other) => {
-                return Err(QueryError::Parse(format!("unrecognized string escape '\\{other}'")))
+                return Err(QueryError::Parse(format!(
+                    "unrecognized string escape '\\{other}'"
+                )))
             }
             None => return Err(QueryError::Parse("string ends with a trailing '\\'".into())),
         }
@@ -1074,7 +1220,12 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
         Rule::bool_literal => Literal::Bool(inner.as_str().eq_ignore_ascii_case("true")),
         Rule::null_literal => Literal::Null,
         Rule::param => {
-            let name = inner.into_inner().next().expect("param has an identifier").as_str().to_string();
+            let name = inner
+                .into_inner()
+                .next()
+                .expect("param has an identifier")
+                .as_str()
+                .to_string();
             Literal::Param(name)
         }
         r => unreachable!("unexpected literal child rule {r:?}"),
@@ -1144,7 +1295,12 @@ fn parse_compare_op(pair: Pair<Rule>) -> CompareOp {
     // grammar (so any amount of whitespace between them matches, same as
     // `DETACH DELETE`) -- normalize before matching so the exact source
     // spacing/casing doesn't matter.
-    let normalized = pair.as_str().split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase();
+    let normalized = pair
+        .as_str()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
     match normalized.as_str() {
         "=" => CompareOp::Eq,
         "<>" => CompareOp::Ne,

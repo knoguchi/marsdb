@@ -53,7 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} -- ${}", show(&row[0]), show(&row[1]));
     }
 
-    let all = db.execute("MATCH (p:Product) RETURN p.name AS name, p.price AS price ORDER BY price")?;
+    let all =
+        db.execute("MATCH (p:Product) RETURN p.name AS name, p.price AS price ORDER BY price")?;
     let bars: Vec<(String, f64)> = all
         .rows
         .iter()
@@ -69,9 +70,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let below = plotters::style::RGBColor(180, 180, 180);
     let colored: Vec<(&str, f64, plotters::style::RGBColor)> = bars
         .iter()
-        .map(|(name, price)| (name.as_str(), *price, if *price >= min_price { above } else { below }))
+        .map(|(name, price)| {
+            (
+                name.as_str(),
+                *price,
+                if *price >= min_price { above } else { below },
+            )
+        })
         .collect();
-    viz::bar_chart("params_and_batch.svg", "Product prices (green >= $minPrice)", "price ($)", &colored)?;
+    viz::bar_chart(
+        "params_and_batch.svg",
+        "Product prices (green >= $minPrice)",
+        "price ($)",
+        &colored,
+    )?;
     println!("\nwrote params_and_batch.svg");
 
     Ok(())
@@ -83,7 +95,9 @@ fn show(v: &marsdb::Value) -> String {
         marsdb::Value::Property(marsdb::PropertyValue::Int(i)) => i.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Float(f)) => f.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Bool(b)) => b.to_string(),
-        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => "null".to_string(),
+        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => {
+            "null".to_string()
+        }
         other => format!("{other:?}"),
     }
 }

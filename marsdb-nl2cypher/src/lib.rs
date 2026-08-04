@@ -58,7 +58,9 @@ pub enum Nl2CypherError {
     /// parseable Cypher — both are included so the caller (or a human
     /// reading the error) can see exactly what the LLM tried and why it
     /// didn't work, not just "it failed."
-    InvalidCypher { attempts: Vec<(String, String)> },
+    InvalidCypher {
+        attempts: Vec<(String, String)>,
+    },
 }
 
 impl fmt::Display for Nl2CypherError {
@@ -67,7 +69,11 @@ impl fmt::Display for Nl2CypherError {
             Nl2CypherError::Llm(e) => write!(f, "LLM call failed: {e}"),
             Nl2CypherError::Execute(e) => write!(f, "query execution failed: {e}"),
             Nl2CypherError::InvalidCypher { attempts } => {
-                writeln!(f, "generated Cypher never parsed, after {} attempt(s):", attempts.len())?;
+                writeln!(
+                    f,
+                    "generated Cypher never parsed, after {} attempt(s):",
+                    attempts.len()
+                )?;
                 for (i, (cypher, err)) in attempts.iter().enumerate() {
                     writeln!(f, "  attempt {}: {cypher:?}\n    error: {err}", i + 1)?;
                 }
@@ -89,8 +95,11 @@ impl std::error::Error for Nl2CypherError {}
 /// anyway, so this stays entirely in terms of the existing public
 /// `Database::execute` API.
 pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError> {
-    let mut labels: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> = Default::default();
-    let nodes = db.execute("MATCH (n) RETURN n").map_err(Nl2CypherError::Execute)?;
+    let mut labels: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
+        Default::default();
+    let nodes = db
+        .execute("MATCH (n) RETURN n")
+        .map_err(Nl2CypherError::Execute)?;
     for row in &nodes.rows {
         if let Value::Node(n) = &row[0] {
             for label in &n.labels {
@@ -101,8 +110,11 @@ pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError>
         }
     }
 
-    let mut rel_types: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> = Default::default();
-    let edges = db.execute("MATCH ()-[r]->() RETURN r").map_err(Nl2CypherError::Execute)?;
+    let mut rel_types: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
+        Default::default();
+    let edges = db
+        .execute("MATCH ()-[r]->() RETURN r")
+        .map_err(Nl2CypherError::Execute)?;
     for row in &edges.rows {
         if let Value::Edge(e) = &row[0] {
             let entry = rel_types.entry(e.label.clone()).or_default();
@@ -114,7 +126,11 @@ pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError>
     Ok(SchemaSummary {
         node_labels: labels
             .into_iter()
-            .map(|(label, (count, properties))| LabelInfo { label, count, properties: properties.into_iter().collect() })
+            .map(|(label, (count, properties))| LabelInfo {
+                label,
+                count,
+                properties: properties.into_iter().collect(),
+            })
             .collect(),
         rel_types: rel_types
             .into_iter()
@@ -166,7 +182,11 @@ A query meant to produce output must end in a RETURN clause.
 /// Builds the prompt sent to the LLM. `prior_attempt`, when `Some((cypher,
 /// parse_error))`, turns this into a repair prompt instead of a fresh one
 /// — see [`translate`].
-pub fn build_prompt(schema: &SchemaSummary, question: &str, prior_attempt: Option<(&str, &str)>) -> String {
+pub fn build_prompt(
+    schema: &SchemaSummary,
+    question: &str,
+    prior_attempt: Option<(&str, &str)>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str("You translate natural-language questions into Cypher queries for MarsDB.\n\n");
     prompt.push_str(CAPABILITIES);
@@ -175,12 +195,26 @@ pub fn build_prompt(schema: &SchemaSummary, question: &str, prior_attempt: Optio
         prompt.push_str("  (empty database -- no nodes or relationships exist yet)\n");
     }
     for l in &schema.node_labels {
-        let props = if l.properties.is_empty() { "(none observed)".to_string() } else { l.properties.join(", ") };
-        prompt.push_str(&format!("  (:{}) -- {} node(s), properties seen: {props}\n", l.label, l.count));
+        let props = if l.properties.is_empty() {
+            "(none observed)".to_string()
+        } else {
+            l.properties.join(", ")
+        };
+        prompt.push_str(&format!(
+            "  (:{}) -- {} node(s), properties seen: {props}\n",
+            l.label, l.count
+        ));
     }
     for r in &schema.rel_types {
-        let props = if r.properties.is_empty() { "(none observed)".to_string() } else { r.properties.join(", ") };
-        prompt.push_str(&format!("  -[:{}]-> -- {} edge(s), properties seen: {props}\n", r.rel_type, r.count));
+        let props = if r.properties.is_empty() {
+            "(none observed)".to_string()
+        } else {
+            r.properties.join(", ")
+        };
+        prompt.push_str(&format!(
+            "  -[:{}]-> -- {} edge(s), properties seen: {props}\n",
+            r.rel_type, r.count
+        ));
     }
 
     if let Some((prev_cypher, err)) = prior_attempt {
@@ -215,7 +249,11 @@ fn extract_cypher(raw: &str) -> String {
 /// result by actually parsing it. One repair attempt on failure — not an
 /// open-ended retry loop, matching this codebase's stance throughout of
 /// erroring clearly over retrying indefinitely hoping it works.
-pub fn translate(client: &dyn LlmClient, schema: &SchemaSummary, question: &str) -> Result<String, Nl2CypherError> {
+pub fn translate(
+    client: &dyn LlmClient,
+    schema: &SchemaSummary,
+    question: &str,
+) -> Result<String, Nl2CypherError> {
     let prompt = build_prompt(schema, question, None);
     let raw = client.complete(&prompt).map_err(Nl2CypherError::Llm)?;
     let cypher = extract_cypher(&raw);
@@ -225,7 +263,9 @@ pub fn translate(client: &dyn LlmClient, schema: &SchemaSummary, question: &str)
     let first_err = marsdb_query::parse(&cypher).unwrap_err().to_string();
 
     let repair_prompt = build_prompt(schema, question, Some((&cypher, &first_err)));
-    let raw2 = client.complete(&repair_prompt).map_err(Nl2CypherError::Llm)?;
+    let raw2 = client
+        .complete(&repair_prompt)
+        .map_err(Nl2CypherError::Llm)?;
     let cypher2 = extract_cypher(&raw2);
     match marsdb_query::parse(&cypher2) {
         Ok(_) => Ok(cypher2),

@@ -15,8 +15,16 @@ pub fn print_table(result: &marsdb::QueryResult) {
 fn format_value(value: &Value) -> String {
     match value {
         Value::Node(n) => {
-            let props: Vec<String> = n.props.iter().map(|(k, v)| format!("{k}: {}", format_property(v))).collect();
-            let label_part = if n.labels.is_empty() { String::new() } else { format!(":{} ", n.labels.join(":")) };
+            let props: Vec<String> = n
+                .props
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", format_property(v)))
+                .collect();
+            let label_part = if n.labels.is_empty() {
+                String::new()
+            } else {
+                format!(":{} ", n.labels.join(":"))
+            };
             format!("({label_part}{{{}}})", props.join(", "))
         }
         Value::Edge(e) => format!("[:{}]", e.label),
@@ -27,7 +35,10 @@ fn format_value(value: &Value) -> String {
             format!("[{}]", cells.join(", "))
         }
         Value::Map(m) => {
-            let cells: Vec<String> = m.iter().map(|(k, v)| format!("{k}: {}", format_value(v))).collect();
+            let cells: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", format_value(v)))
+                .collect();
             format!("{{{}}}", cells.join(", "))
         }
         Value::Path(elems) => {
@@ -52,9 +63,12 @@ fn format_property(p: &PropertyValue) -> String {
         PropertyValue::Float(f) => f.to_string(),
         PropertyValue::String(s) => s.clone(),
         PropertyValue::Date(d) => marsdb::temporal::format_date(*d),
-        PropertyValue::Duration { months, days, seconds, nanos } => {
-            marsdb::temporal::format_duration(*months, *days, *seconds, *nanos)
-        }
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => marsdb::temporal::format_duration(*months, *days, *seconds, *nanos),
     }
 }
 

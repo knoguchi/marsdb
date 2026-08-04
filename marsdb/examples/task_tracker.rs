@@ -53,8 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Tasks by status",
         "count",
         &[
-            ("Open", count_for(false), plotters::style::RGBColor(221, 132, 82)),
-            ("Done", count_for(true), plotters::style::RGBColor(85, 168, 104)),
+            (
+                "Open",
+                count_for(false),
+                plotters::style::RGBColor(221, 132, 82),
+            ),
+            (
+                "Done",
+                count_for(true),
+                plotters::style::RGBColor(85, 168, 104),
+            ),
         ],
     )?;
     println!("\nwrote task_tracker.svg");
@@ -68,7 +76,9 @@ fn show(v: &marsdb::Value) -> String {
         marsdb::Value::Property(marsdb::PropertyValue::Int(i)) => i.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Float(f)) => f.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Bool(b)) => b.to_string(),
-        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => "null".to_string(),
+        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => {
+            "null".to_string()
+        }
         other => format!("{other:?}"),
     }
 }

@@ -12,7 +12,9 @@ use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 fn centered(size: u32, color: &'static RGBColor) -> TextStyle<'static> {
-    TextStyle::from(("sans-serif", size).into_font()).color(color).pos(Pos::new(HPos::Center, VPos::Center))
+    TextStyle::from(("sans-serif", size).into_font())
+        .color(color)
+        .pos(Pos::new(HPos::Center, VPos::Center))
 }
 
 /// A simple categorical bar chart: one bar per `(label, value, color)`.
@@ -26,7 +28,11 @@ pub fn bar_chart(
     let root = SVGBackend::new(path, (640, 480)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    let max = bars.iter().map(|(_, v, _)| *v).fold(0.0_f64, f64::max).max(1.0);
+    let max = bars
+        .iter()
+        .map(|(_, v, _)| *v)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let n = bars.len() as f64;
     let y_top = max * 1.15;
     let y_bottom = -(max * 0.08);
@@ -45,15 +51,26 @@ pub fn bar_chart(
         .draw()?;
 
     chart.draw_series(bars.iter().enumerate().map(|(i, (_, v, color))| {
-        Rectangle::new([(i as f64 + 0.12, 0.0), (i as f64 + 0.88, *v)], color.filled())
+        Rectangle::new(
+            [(i as f64 + 0.12, 0.0), (i as f64 + 0.88, *v)],
+            color.filled(),
+        )
     }))?;
 
     chart.draw_series(bars.iter().enumerate().map(|(i, (label, _, _))| {
-        Text::new(label.to_string(), (i as f64 + 0.5, y_bottom * 0.5), centered(16, &BLACK))
+        Text::new(
+            label.to_string(),
+            (i as f64 + 0.5, y_bottom * 0.5),
+            centered(16, &BLACK),
+        )
     }))?;
 
     chart.draw_series(bars.iter().enumerate().map(|(i, (_, v, _))| {
-        Text::new(format!("{v:.0}"), (i as f64 + 0.5, *v + max * 0.06), centered(14, &BLACK))
+        Text::new(
+            format!("{v:.0}"),
+            (i as f64 + 0.5, *v + max * 0.06),
+            centered(14, &BLACK),
+        )
     }))?;
 
     root.present()?;
@@ -80,7 +97,10 @@ pub fn graph_viz(
     let pos: Vec<(f64, f64)> = (0..nodes.len())
         .map(|i| {
             let angle = std::f64::consts::TAU * (i as f64) / n - std::f64::consts::FRAC_PI_2;
-            (center.0 + radius * angle.cos(), center.1 + radius * angle.sin())
+            (
+                center.0 + radius * angle.cos(),
+                center.1 + radius * angle.sin(),
+            )
         })
         .collect();
     let px = |p: (f64, f64)| -> (i32, i32) { (p.0.round() as i32, p.1.round() as i32) };
@@ -95,7 +115,10 @@ pub fn graph_viz(
         let (ux, uy) = (dx / len, dy / len);
         let node_r = 22.0;
         let tip = (x1 - ux * node_r, y1 - uy * node_r);
-        root.draw(&PathElement::new(vec![px((x0, y0)), px(tip)], BLACK.mix(0.6).stroke_width(2)))?;
+        root.draw(&PathElement::new(
+            vec![px((x0, y0)), px(tip)],
+            BLACK.mix(0.6).stroke_width(2),
+        ))?;
         let back = 10.0;
         let spread = 6.0;
         let base = (tip.0 - ux * back, tip.1 - uy * back);

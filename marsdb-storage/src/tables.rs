@@ -24,4 +24,5 @@ pub const ADJ_IN: MultimapTableDefinition<u64, &[u8]> = MultimapTableDefinition:
 /// label_id -> set of node_ids carrying that label. Secondary index so a
 /// label-filtered scan (`NodeByLabelScan`) can look up matching nodes
 /// directly instead of scanning every row in `NODES`.
-pub const NODE_LABEL_INDEX: MultimapTableDefinition<u32, u64> = MultimapTableDefinition::new("node_label_index");
+pub const NODE_LABEL_INDEX: MultimapTableDefinition<u32, u64> =
+    MultimapTableDefinition::new("node_label_index");

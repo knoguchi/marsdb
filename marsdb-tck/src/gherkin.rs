@@ -48,7 +48,10 @@ pub struct Scenario {
 
 pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
     let lines: Vec<&str> = content.lines().collect();
-    let mut cursor = Cursor { lines: &lines, pos: 0 };
+    let mut cursor = Cursor {
+        lines: &lines,
+        pos: 0,
+    };
     let mut feature_name = String::new();
     let mut out = Vec::new();
 
@@ -195,9 +198,18 @@ fn split_table_row(line: &str) -> Vec<String> {
 /// scenarios; see `expand_outline`, called by `parse_feature`.
 type Examples = (Vec<String>, Vec<Vec<String>>);
 
-fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, Option<Examples>), String> {
-    let header = cursor.peek_trimmed().expect("caller checked this is a Scenario: line");
-    let name = header.trim_start_matches("Scenario Outline:").trim_start_matches("Scenario:").trim().to_string();
+fn parse_scenario(
+    cursor: &mut Cursor,
+    feature_name: &str,
+) -> Result<(Scenario, Option<Examples>), String> {
+    let header = cursor
+        .peek_trimmed()
+        .expect("caller checked this is a Scenario: line");
+    let name = header
+        .trim_start_matches("Scenario Outline:")
+        .trim_start_matches("Scenario:")
+        .trim()
+        .to_string();
     cursor.pos += 1;
 
     let mut initial_graph = None;
@@ -219,7 +231,11 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, 
             // tolerated rather than assumed absent).
             if seen_first_then {
                 if let Some(next) = cursor.peek_trimmed() {
-                    if next.starts_with("Scenario:") || next.starts_with("Scenario Outline:") || next.starts_with('@') || next.starts_with("Feature:") {
+                    if next.starts_with("Scenario:")
+                        || next.starts_with("Scenario Outline:")
+                        || next.starts_with('@')
+                        || next.starts_with("Feature:")
+                    {
                         break;
                     }
                 } else {
@@ -228,17 +244,25 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, 
             }
             continue;
         }
-        if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") || line.starts_with('@') || line.starts_with("Feature:") {
+        if line.starts_with("Scenario:")
+            || line.starts_with("Scenario Outline:")
+            || line.starts_with('@')
+            || line.starts_with("Feature:")
+        {
             break;
         }
 
         if let Some(rest) = strip_given(line) {
             initial_graph = Some(parse_initial_graph(rest)?);
             cursor.pos += 1;
-        } else if line.starts_with("And having executed:") || line.starts_with("And after having executed:") {
+        } else if line.starts_with("And having executed:")
+            || line.starts_with("And after having executed:")
+        {
             cursor.pos += 1;
             setup_cypher.push(cursor.read_block()?);
-        } else if line.starts_with("And parameters are:") || line.starts_with("And parameter values are:") {
+        } else if line.starts_with("And parameters are:")
+            || line.starts_with("And parameter values are:")
+        {
             cursor.pos += 1;
             for row in cursor.read_table() {
                 if row.len() == 2 {
@@ -254,11 +278,17 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, 
             if cursor.peek_trimmed().is_some_and(|l| l.starts_with('|')) {
                 cursor.read_table();
             }
-        } else if line.starts_with("When executing query:") || line.starts_with("When executing control query:") {
+        } else if line.starts_with("When executing query:")
+            || line.starts_with("When executing control query:")
+        {
             let is_control = line.contains("control query");
             cursor.pos += 1;
             let block = if let Some(inline) = line.split_once("query:").map(|(_, r)| r.trim()) {
-                if inline.is_empty() { cursor.read_block()? } else { inline.to_string() }
+                if inline.is_empty() {
+                    cursor.read_block()?
+                } else {
+                    inline.to_string()
+                }
             } else {
                 cursor.read_block()?
             };
@@ -288,7 +318,9 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, 
                 expected = Some(Expected::AnyError);
             }
             seen_first_then = true;
-        } else if line.starts_with("And no side effects") || line.starts_with("And the side effects should be:") {
+        } else if line.starts_with("And no side effects")
+            || line.starts_with("And the side effects should be:")
+        {
             cursor.pos += 1;
             if cursor.peek_trimmed().is_some_and(|l| l.starts_with('|')) {
                 cursor.read_table();
@@ -309,7 +341,15 @@ fn parse_scenario(cursor: &mut Cursor, feature_name: &str) -> Result<(Scenario, 
     let initial_graph = initial_graph.ok_or("scenario has no Given ... graph step")?;
     let query = query.ok_or("scenario has no primary When executing query: step")?;
     let expected = expected.ok_or("scenario has no Then ... assertion")?;
-    let scenario = Scenario { feature_name: feature_name.to_string(), name, initial_graph, setup_cypher, params, query, expected };
+    let scenario = Scenario {
+        feature_name: feature_name.to_string(),
+        name,
+        initial_graph,
+        setup_cypher,
+        params,
+        query,
+        expected,
+    };
     Ok((scenario, examples))
 }
 
@@ -331,11 +371,19 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
                 out
             };
             let expected = match &template.expected {
-                Expected::Rows { row_order_matters, list_order_matters, header, rows } => Expected::Rows {
+                Expected::Rows {
+                    row_order_matters,
+                    list_order_matters,
+                    header,
+                    rows,
+                } => Expected::Rows {
                     row_order_matters: *row_order_matters,
                     list_order_matters: *list_order_matters,
                     header: header.iter().map(|s| subst(s)).collect(),
-                    rows: rows.iter().map(|r| r.iter().map(|c| subst(c)).collect()).collect(),
+                    rows: rows
+                        .iter()
+                        .map(|r| r.iter().map(|c| subst(c)).collect())
+                        .collect(),
                 },
                 other => other.clone(),
             };
@@ -344,7 +392,11 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
                 name: template.name.clone(),
                 initial_graph: template.initial_graph.clone(),
                 setup_cypher: template.setup_cypher.iter().map(|s| subst(s)).collect(),
-                params: template.params.iter().map(|(k, v)| (k.clone(), subst(v))).collect(),
+                params: template
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), subst(v)))
+                    .collect(),
                 query: subst(&template.query),
                 expected,
             })
@@ -364,7 +416,9 @@ fn parse_initial_graph(rest: &str) -> Result<InitialGraph, String> {
     } else if rest == "any graph" {
         Ok(InitialGraph::Any)
     } else if let Some(name) = rest.strip_suffix(" graph") {
-        Ok(InitialGraph::Named(name.trim_start_matches("the ").to_string()))
+        Ok(InitialGraph::Named(
+            name.trim_start_matches("the ").to_string(),
+        ))
     } else {
         Err(format!("unrecognized Given .. graph step: {rest:?}"))
     }
@@ -381,5 +435,10 @@ fn parse_result_expectation(rest: &str, cursor: &mut Cursor) -> Expected {
     let mut iter = table.into_iter();
     let header = iter.next().unwrap_or_default();
     let rows: Vec<Vec<String>> = iter.collect();
-    Expected::Rows { row_order_matters, list_order_matters, header, rows }
+    Expected::Rows {
+        row_order_matters,
+        list_order_matters,
+        header,
+        rows,
+    }
 }

@@ -27,7 +27,10 @@ use std::time::Duration;
 #[test]
 #[ignore]
 fn kill_mid_write_never_corrupts_or_loses_an_acknowledged_commit() {
-    let runs: u32 = std::env::var("CRASH_TEST_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let runs: u32 = std::env::var("CRASH_TEST_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
 
     for run in 0..runs {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -58,7 +61,9 @@ fn kill_mid_write_never_corrupts_or_loses_an_acknowledged_commit() {
         child.wait().ok();
 
         let db = marsdb::Database::open(&db_path).expect("reopen after kill must not error");
-        let result = db.execute("MATCH (c:Counter) RETURN c.n").expect("query after kill");
+        let result = db
+            .execute("MATCH (c:Counter) RETURN c.n")
+            .expect("query after kill");
         let mut values: Vec<i64> = result
             .rows
             .iter()

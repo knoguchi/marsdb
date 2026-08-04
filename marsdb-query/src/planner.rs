@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use crate::ast::{CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr};
+use crate::ast::{
+    CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr,
+};
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
 
@@ -39,7 +41,14 @@ pub fn build_match_plan(
         // Already bound by a prior QueryPart's WITH output — continue from
         // it instead of re-scanning, same Filter treatment as a hop node
         // (no preceding scan narrowed it, so check every listed label).
-        wrap_labels_and_props(LogicalPlan::Seed { var: start_var.clone() }, &start_var, &pattern.start, 0)?
+        wrap_labels_and_props(
+            LogicalPlan::Seed {
+                var: start_var.clone(),
+            },
+            &start_var,
+            &pattern.start,
+            0,
+        )?
     } else {
         scan_for(&start_var, &pattern.start)?
     };
@@ -79,8 +88,15 @@ pub fn build_match_plan(
         // for the Expand to bind — reusing the original name here would let
         // Expand's `new_row.insert` overwrite the existing binding before
         // it can be compared against, defeating the whole check.
-        let is_repeat = node.var.as_ref().is_some_and(|v| carried_vars.contains(v) || pattern_bound_vars.contains(v));
-        let to_var = if is_repeat { namer.name(&None) } else { namer.name(&node.var) };
+        let is_repeat = node
+            .var
+            .as_ref()
+            .is_some_and(|v| carried_vars.contains(v) || pattern_bound_vars.contains(v));
+        let to_var = if is_repeat {
+            namer.name(&None)
+        } else {
+            namer.name(&node.var)
+        };
         if !is_repeat {
             if let Some(v) = &node.var {
                 pattern_bound_vars.insert(v.clone());
@@ -118,7 +134,11 @@ pub fn build_match_plan(
         // reference a synthesized name, and downstream `RETURN`/`WHERE`
         // can't reference an identifier the user never wrote.
         let rel_filter_var = if rel.hop_range.is_none() {
-            Some(if rel_is_repeat { namer.name(&None) } else { namer.name(&rel.var) })
+            Some(if rel_is_repeat {
+                namer.name(&None)
+            } else {
+                namer.name(&rel.var)
+            })
         } else {
             rel.var.clone()
         };
@@ -176,7 +196,10 @@ pub fn build_match_plan(
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: Expr::Compare(
-                        PropAccess { var: rel_var.clone(), prop: key.clone() },
+                        PropAccess {
+                            var: rel_var.clone(),
+                            prop: key.clone(),
+                        },
                         CompareOp::Eq,
                         require_literal_pattern_prop(key, expr)?,
                     ),
@@ -189,7 +212,10 @@ pub fn build_match_plan(
                 };
             }
             if rel_is_repeat {
-                let original = rel.var.clone().expect("rel_is_repeat implies rel.var is Some");
+                let original = rel
+                    .var
+                    .clone()
+                    .expect("rel_is_repeat implies rel.var is Some");
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: Expr::VarEq(rel_var.clone(), original),
@@ -204,7 +230,10 @@ pub fn build_match_plan(
             }
         }
         if is_repeat {
-            let original = node.var.clone().expect("is_repeat implies node.var is Some");
+            let original = node
+                .var
+                .clone()
+                .expect("is_repeat implies node.var is Some");
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate: Expr::VarEq(to_var.clone(), original),
@@ -230,7 +259,9 @@ fn scan_for(var: &str, node: &NodePattern) -> Result<LogicalPlan, QueryError> {
             var: var.to_string(),
             label: label.clone(),
         },
-        None => LogicalPlan::AllNodesScan { var: var.to_string() },
+        None => LogicalPlan::AllNodesScan {
+            var: var.to_string(),
+        },
     };
     // Skip the first label — NodeByLabelScan above already selected for it.
     wrap_labels_and_props(base, var, node, 1)
@@ -245,7 +276,12 @@ fn scan_for(var: &str, node: &NodePattern) -> Result<LogicalPlan, QueryError> {
 /// a real expression against — `require_literal_pattern_prop` below
 /// rejects anything else with a clear error rather than this silently
 /// matching nothing.
-fn wrap_labels_and_props(plan: LogicalPlan, var: &str, node: &NodePattern, skip: usize) -> Result<LogicalPlan, QueryError> {
+fn wrap_labels_and_props(
+    plan: LogicalPlan,
+    var: &str,
+    node: &NodePattern,
+    skip: usize,
+) -> Result<LogicalPlan, QueryError> {
     let mut plan = plan;
     for label in node.labels.iter().skip(skip) {
         plan = LogicalPlan::Filter {

@@ -20,7 +20,8 @@ fn fixture(n: usize) -> Arc<Database> {
         patterns.push(format!("(n{i}:Item {{idx: {i}}})"));
     }
     let db = Database::in_memory().unwrap();
-    db.execute(&format!("CREATE {}", patterns.join(", "))).unwrap();
+    db.execute(&format!("CREATE {}", patterns.join(", ")))
+        .unwrap();
     Arc::new(db)
 }
 
@@ -41,17 +42,20 @@ fn bench_sequential_vs_concurrent_reads(c: &mut Criterion) {
     });
 
     for threads in [2usize, 4, 8] {
-        group.bench_function(BenchmarkId::from_parameter(format!("{threads}_threads")), |b| {
-            b.iter(|| {
-                let per_thread = TOTAL_READS / threads;
-                thread::scope(|s| {
-                    for _ in 0..threads {
-                        let db = Arc::clone(&db);
-                        s.spawn(move || run_reads(&db, per_thread));
-                    }
+        group.bench_function(
+            BenchmarkId::from_parameter(format!("{threads}_threads")),
+            |b| {
+                b.iter(|| {
+                    let per_thread = TOTAL_READS / threads;
+                    thread::scope(|s| {
+                        for _ in 0..threads {
+                            let db = Arc::clone(&db);
+                            s.spawn(move || run_reads(&db, per_thread));
+                        }
+                    });
                 });
-            });
-        });
+            },
+        );
     }
     group.finish();
 }

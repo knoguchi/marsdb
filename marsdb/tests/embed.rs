@@ -40,18 +40,25 @@ fn execute_with_params_substitutes_dollar_placeholders() {
     use std::collections::HashMap;
 
     let db = Database::in_memory().unwrap();
-    db.execute("CREATE (n:Person {personId: 42, name: 'Alice'})").unwrap();
+    db.execute("CREATE (n:Person {personId: 42, name: 'Alice'})")
+        .unwrap();
 
     let mut params = HashMap::new();
     params.insert("personId".to_string(), marsdb::PropertyValue::Int(42));
     let result = db
-        .execute_with_params("MATCH (n:Person {personId: $personId}) RETURN n.name", &params)
+        .execute_with_params(
+            "MATCH (n:Person {personId: $personId}) RETURN n.name",
+            &params,
+        )
         .unwrap();
     assert_eq!(result.rows.len(), 1);
 
     // Missing param -> clean error, not a panic.
     let err = db
-        .execute_with_params("MATCH (n:Person {personId: $missing}) RETURN n.name", &HashMap::new())
+        .execute_with_params(
+            "MATCH (n:Person {personId: $missing}) RETURN n.name",
+            &HashMap::new(),
+        )
         .unwrap_err();
     assert!(err.to_string().contains("missing"));
 }
@@ -69,13 +76,19 @@ fn execute_batch_runs_each_statement_and_returns_one_result_per_statement() {
     assert_eq!(results.len(), 3);
     assert!(results[0].columns.is_empty(), "CREATE returns no columns");
     assert!(results[1].columns.is_empty());
-    assert_eq!(results[2].rows.len(), 2, "both prior CREATEs must be visible to the final MATCH");
+    assert_eq!(
+        results[2].rows.len(),
+        2,
+        "both prior CREATEs must be visible to the final MATCH"
+    );
 }
 
 #[test]
 fn execute_batch_semicolon_inside_string_literal_does_not_split() {
     let db = Database::in_memory().unwrap();
-    let results = db.execute_batch("CREATE (n:Item {name: 'a;b'}); MATCH (n:Item) RETURN n.name").unwrap();
+    let results = db
+        .execute_batch("CREATE (n:Item {name: 'a;b'}); MATCH (n:Item) RETURN n.name")
+        .unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[1].rows.len(), 1);
 }
@@ -83,7 +96,9 @@ fn execute_batch_semicolon_inside_string_literal_does_not_split() {
 #[test]
 fn execute_batch_bad_syntax_anywhere_runs_nothing() {
     let db = Database::in_memory().unwrap();
-    let err = db.execute_batch("CREATE (a:Item); NOT VALID CYPHER").unwrap_err();
+    let err = db
+        .execute_batch("CREATE (a:Item); NOT VALID CYPHER")
+        .unwrap_err();
     assert!(matches!(err, marsdb::Error::Query(_)));
     // Nothing committed -- the parse error was caught before any statement ran.
     let result = db.execute("MATCH (n:Item) RETURN n").unwrap();
@@ -98,7 +113,11 @@ fn execute_batch_stops_at_first_runtime_failure_but_keeps_earlier_commits() {
         .unwrap_err();
     assert!(matches!(err, marsdb::Error::Query(_)));
     let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
-    assert_eq!(result.rows.len(), 1, "the first CREATE must stay committed even though a later statement failed");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "the first CREATE must stay committed even though a later statement failed"
+    );
 }
 
 /// `MATCH ... RETURN` opens a `ReadTransaction`, not a `WriteTransaction`
@@ -111,7 +130,8 @@ fn concurrent_reads_from_multiple_threads_all_see_correct_results() {
 
     let db = Arc::new(Database::in_memory().unwrap());
     for i in 0..200 {
-        db.execute(&format!("CREATE (n:Item {{idx: {i}}})")).unwrap();
+        db.execute(&format!("CREATE (n:Item {{idx: {i}}})"))
+            .unwrap();
     }
 
     let handles: Vec<_> = (0..8)
@@ -120,7 +140,11 @@ fn concurrent_reads_from_multiple_threads_all_see_correct_results() {
             thread::spawn(move || {
                 for _ in 0..50 {
                     let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
-                    assert_eq!(result.rows.len(), 200, "every concurrent reader must see all 200 rows");
+                    assert_eq!(
+                        result.rows.len(),
+                        200,
+                        "every concurrent reader must see all 200 rows"
+                    );
                 }
             })
         })
@@ -150,7 +174,8 @@ fn concurrent_write_and_reads_never_panic_or_see_torn_state() {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             for i in 0..300 {
-                db.execute(&format!("CREATE (n:Item {{idx: {i}}})")).unwrap();
+                db.execute(&format!("CREATE (n:Item {{idx: {i}}})"))
+                    .unwrap();
             }
             stop.store(true, Ordering::SeqCst);
         })

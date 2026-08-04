@@ -20,7 +20,11 @@ pub fn run(db: &Database) -> ExitCode {
 
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "marsdb> " } else { "   ...> " };
+        let prompt = if buffer.is_empty() {
+            "marsdb> "
+        } else {
+            "   ...> "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 buffer.push_str(&line);

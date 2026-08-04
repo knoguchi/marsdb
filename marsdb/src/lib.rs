@@ -72,6 +72,9 @@ impl Database {
     pub fn execute_batch(&self, cypher: &str) -> Result<Vec<QueryResult>, Error> {
         let stmts = marsdb_query::parse_many(cypher)?;
         let executor = marsdb_query::Executor::new(&self.store);
-        stmts.iter().map(|stmt| Ok(executor.execute(stmt)?)).collect()
+        stmts
+            .iter()
+            .map(|stmt| Ok(executor.execute(stmt)?))
+            .collect()
     }
 }

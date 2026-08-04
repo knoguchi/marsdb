@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use marsdb_graph::PropertyValue;
 
 use crate::ast::{
-    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr, ReturnTail, SetItem,
-    Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr,
+    ReturnTail, SetItem, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 
@@ -12,7 +12,10 @@ use crate::error::QueryError;
 /// using `params`, in place. Called before execution so the executor never
 /// sees `Literal::Param` — see the `unreachable!` in
 /// `executor::literal_to_value`.
-pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+pub fn substitute_params(
+    stmt: &mut Statement,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match stmt {
         Statement::Create(patterns) => {
             for pattern in patterns {
@@ -41,7 +44,10 @@ pub fn substitute_params(stmt: &mut Statement, params: &HashMap<String, Property
     Ok(())
 }
 
-fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_query_clause(
+    clause: &mut QueryClause,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match clause {
         QueryClause::Match(part) => substitute_query_part(part, params),
         QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
@@ -50,7 +56,10 @@ fn substitute_query_clause(clause: &mut QueryClause, params: &HashMap<String, Pr
     }
 }
 
-fn substitute_merge_clause(m: &mut MergeClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_merge_clause(
+    m: &mut MergeClause,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     substitute_pattern(&mut m.pattern, params)?;
     for item in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
         if let SetItem::Prop(_, lit) = item {
@@ -63,7 +72,10 @@ fn substitute_merge_clause(m: &mut MergeClause, params: &HashMap<String, Propert
     Ok(())
 }
 
-fn substitute_query_part(part: &mut QueryPart, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_query_part(
+    part: &mut QueryPart,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     substitute_pattern(&mut part.pattern, params)?;
     if let Some(expr) = &mut part.where_clause {
         substitute_expr(expr, params)?;
@@ -74,7 +86,10 @@ fn substitute_query_part(part: &mut QueryPart, params: &HashMap<String, Property
     Ok(())
 }
 
-fn substitute_unwind_clause(u: &mut UnwindClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_unwind_clause(
+    u: &mut UnwindClause,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     if let UnwindSource::List(literals) = &mut u.source {
         for lit in literals {
             substitute_literal(lit, params)?;
@@ -89,7 +104,10 @@ fn substitute_unwind_clause(u: &mut UnwindClause, params: &HashMap<String, Prope
     Ok(())
 }
 
-fn substitute_with_clause(with: &mut WithClause, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_with_clause(
+    with: &mut WithClause,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     for item in &mut with.items {
         substitute_return_expr(&mut item.expr, params)?;
     }
@@ -104,7 +122,10 @@ fn substitute_with_clause(with: &mut WithClause, params: &HashMap<String, Proper
     Ok(())
 }
 
-fn substitute_with_expr(expr: &mut WithExpr, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_with_expr(
+    expr: &mut WithExpr,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match expr {
         WithExpr::And(l, r) | WithExpr::Or(l, r) => {
             substitute_with_expr(l, params)?;
@@ -119,7 +140,10 @@ fn substitute_with_expr(expr: &mut WithExpr, params: &HashMap<String, PropertyVa
     Ok(())
 }
 
-fn substitute_pattern(pattern: &mut Pattern, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_pattern(
+    pattern: &mut Pattern,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     substitute_node(&mut pattern.start, params)?;
     for (rel, node) in &mut pattern.hops {
         for (_, expr) in &mut rel.props {
@@ -130,14 +154,20 @@ fn substitute_pattern(pattern: &mut Pattern, params: &HashMap<String, PropertyVa
     Ok(())
 }
 
-fn substitute_node(node: &mut NodePattern, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_node(
+    node: &mut NodePattern,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     for (_, expr) in &mut node.props {
         substitute_return_expr(expr, params)?;
     }
     Ok(())
 }
 
-fn substitute_expr(expr: &mut Expr, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_expr(
+    expr: &mut Expr,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match expr {
         Expr::And(l, r) | Expr::Or(l, r) => {
             substitute_expr(l, params)?;
@@ -152,7 +182,10 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, PropertyValue>) -> 
     Ok(())
 }
 
-fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_tail(
+    tail: &mut Tail,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match tail {
         Tail::Return(items, _) => {
             for item in items {
@@ -184,7 +217,10 @@ fn substitute_tail(tail: &mut Tail, params: &HashMap<String, PropertyValue>) -> 
 /// (`MATCH (n) SET n.x = $x RETURN n` needs both the `SET`'s own `$x` *and*
 /// nothing extra here since this RETURN has none — but `MATCH (n) DELETE n
 /// RETURN $y` does).
-fn substitute_return_tail(ret: &mut Option<ReturnTail>, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_return_tail(
+    ret: &mut Option<ReturnTail>,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     if let Some(rt) = ret {
         for item in &mut rt.items {
             substitute_return_expr(&mut item.expr, params)?;
@@ -193,7 +229,10 @@ fn substitute_return_tail(ret: &mut Option<ReturnTail>, params: &HashMap<String,
     Ok(())
 }
 
-fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_return_expr(
+    expr: &mut ReturnExpr,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
         ReturnExpr::Lit(lit) => substitute_literal(lit, params)?,
@@ -251,7 +290,9 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
             }
         }
         ReturnExpr::Quantifier {
-            source, where_clause, ..
+            source,
+            where_clause,
+            ..
         } => {
             substitute_return_expr(source, params)?;
             if let Some(w) = where_clause {
@@ -277,7 +318,10 @@ fn substitute_return_expr(expr: &mut ReturnExpr, params: &HashMap<String, Proper
     Ok(())
 }
 
-fn substitute_literal(lit: &mut Literal, params: &HashMap<String, PropertyValue>) -> Result<(), QueryError> {
+fn substitute_literal(
+    lit: &mut Literal,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
     if let Literal::Param(name) = lit {
         let value = params
             .get(name)

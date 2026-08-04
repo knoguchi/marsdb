@@ -24,5 +24,10 @@ fn many_inserts_then_explicit_abort_leaves_nothing() {
 
     let store = GraphStore::open_file(&path).unwrap();
     let nodes = store.all_nodes(Some("Item")).unwrap();
-    assert_eq!(nodes.len(), 0, "aborted transaction leaked {} nodes", nodes.len());
+    assert_eq!(
+        nodes.len(),
+        0,
+        "aborted transaction leaked {} nodes",
+        nodes.len()
+    );
 }

@@ -19,7 +19,13 @@ fn bench_create_edge(c: &mut Criterion) {
     let a = store.create_node(&["Item"], BTreeMap::new()).unwrap();
     let b_node = store.create_node(&["Item"], BTreeMap::new()).unwrap();
     c.bench_function("create_edge", |b| {
-        b.iter(|| black_box(store.create_edge("REL", a, b_node, BTreeMap::new()).unwrap()));
+        b.iter(|| {
+            black_box(
+                store
+                    .create_edge("REL", a, b_node, BTreeMap::new())
+                    .unwrap(),
+            )
+        });
     });
 }
 
@@ -38,7 +44,9 @@ fn bench_neighbors_1hop(c: &mut Criterion) {
         let center = store.create_node(&["Item"], BTreeMap::new()).unwrap();
         for _ in 0..fanout {
             let n = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-            store.create_edge("REL", center, n, BTreeMap::new()).unwrap();
+            store
+                .create_edge("REL", center, n, BTreeMap::new())
+                .unwrap();
         }
         group.bench_with_input(BenchmarkId::from_parameter(fanout), &fanout, |b, _| {
             b.iter(|| black_box(store.neighbors(center, Direction::Out, None).unwrap()));

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use marsdb_storage::{ReadTransaction, ReadableMultimapTable, ReadableTable, StorageEngine, Txn, WriteTransaction};
+use marsdb_storage::{
+    ReadTransaction, ReadableMultimapTable, ReadableTable, StorageEngine, Txn, WriteTransaction,
+};
 
 use crate::encode::{decode, encode, EdgeRecord, NodeRecord};
 use crate::error::GraphError;
@@ -97,7 +99,8 @@ impl GraphStore {
         let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
         nodes.insert(id, bytes.as_slice())?;
         drop(nodes);
-        let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        let mut label_index =
+            write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
         for label_id in label_ids {
             label_index.insert(label_id, id)?;
         }
@@ -118,7 +121,9 @@ impl GraphStore {
             };
             found
         };
-        let Some(record) = record else { return Ok(None) };
+        let Some(record) = record else {
+            return Ok(None);
+        };
         let labels = record
             .label_ids
             .iter()
@@ -196,7 +201,9 @@ impl GraphStore {
             };
             found
         };
-        let Some(record) = record else { return Ok(None) };
+        let Some(record) = record else {
+            return Ok(None);
+        };
         let label = resolve_label(txn, record.label_id)?;
         Ok(Some(Edge {
             id,
@@ -254,7 +261,10 @@ impl GraphStore {
         Ok(removed)
     }
 
-    pub fn delete_edge_in_txn(write_txn: &WriteTransaction, id: EdgeId) -> Result<bool, GraphError> {
+    pub fn delete_edge_in_txn(
+        write_txn: &WriteTransaction,
+        id: EdgeId,
+    ) -> Result<bool, GraphError> {
         let record_bytes: Option<Vec<u8>> = {
             let mut edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
             let removed = edges.remove(id.0)?.map(|guard| guard.value().to_vec());
@@ -296,7 +306,11 @@ impl GraphStore {
         Ok(existed)
     }
 
-    pub fn delete_node_in_txn(write_txn: &WriteTransaction, id: NodeId, detach: bool) -> Result<bool, GraphError> {
+    pub fn delete_node_in_txn(
+        write_txn: &WriteTransaction,
+        id: NodeId,
+        detach: bool,
+    ) -> Result<bool, GraphError> {
         let mut incident: Vec<EdgeId> = Vec::new();
         {
             let adj_out = write_txn.open_multimap_table(marsdb_storage::tables::ADJ_OUT)?;
@@ -323,14 +337,20 @@ impl GraphStore {
             return Ok(false);
         };
         let record: NodeRecord = decode(&removed_bytes)?;
-        let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        let mut label_index =
+            write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
         for label_id in record.label_ids {
             label_index.remove(label_id, id.0)?;
         }
         Ok(true)
     }
 
-    pub fn set_node_prop(&self, id: NodeId, key: &str, value: PropertyValue) -> Result<bool, GraphError> {
+    pub fn set_node_prop(
+        &self,
+        id: NodeId,
+        key: &str,
+        value: PropertyValue,
+    ) -> Result<bool, GraphError> {
         let write_txn = self.begin_write()?;
         let updated = Self::set_node_prop_in_txn(&write_txn, id, key, value)?;
         if updated {
@@ -352,7 +372,9 @@ impl GraphStore {
             let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
         let mut record: NodeRecord = decode(&bytes)?;
         record.props.insert(key.to_string(), value);
         let new_bytes = encode(&record)?;
@@ -361,7 +383,12 @@ impl GraphStore {
         Ok(true)
     }
 
-    pub fn set_edge_prop(&self, id: EdgeId, key: &str, value: PropertyValue) -> Result<bool, GraphError> {
+    pub fn set_edge_prop(
+        &self,
+        id: EdgeId,
+        key: &str,
+        value: PropertyValue,
+    ) -> Result<bool, GraphError> {
         let write_txn = self.begin_write()?;
         let updated = Self::set_edge_prop_in_txn(&write_txn, id, key, value)?;
         if updated {
@@ -383,7 +410,9 @@ impl GraphStore {
             let found = edges.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
         let mut record: EdgeRecord = decode(&bytes)?;
         record.props.insert(key.to_string(), value);
         let new_bytes = encode(&record)?;
@@ -392,13 +421,19 @@ impl GraphStore {
         Ok(true)
     }
 
-    pub fn remove_node_prop_in_txn(write_txn: &WriteTransaction, id: NodeId, key: &str) -> Result<bool, GraphError> {
+    pub fn remove_node_prop_in_txn(
+        write_txn: &WriteTransaction,
+        id: NodeId,
+        key: &str,
+    ) -> Result<bool, GraphError> {
         let bytes_opt: Option<Vec<u8>> = {
             let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
             let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
         let mut record: NodeRecord = decode(&bytes)?;
         record.props.remove(key);
         let new_bytes = encode(&record)?;
@@ -407,13 +442,19 @@ impl GraphStore {
         Ok(true)
     }
 
-    pub fn remove_edge_prop_in_txn(write_txn: &WriteTransaction, id: EdgeId, key: &str) -> Result<bool, GraphError> {
+    pub fn remove_edge_prop_in_txn(
+        write_txn: &WriteTransaction,
+        id: EdgeId,
+        key: &str,
+    ) -> Result<bool, GraphError> {
         let bytes_opt: Option<Vec<u8>> = {
             let edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
             let found = edges.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
         let mut record: EdgeRecord = decode(&bytes)?;
         record.props.remove(key);
         let new_bytes = encode(&record)?;
@@ -425,13 +466,19 @@ impl GraphStore {
     /// Adds `label` to `id`'s label set -- a no-op (not an error) if it's
     /// already there, same idempotent-add semantics real Cypher's `SET
     /// n:Label` has.
-    pub fn add_node_label_in_txn(write_txn: &WriteTransaction, id: NodeId, label: &str) -> Result<bool, GraphError> {
+    pub fn add_node_label_in_txn(
+        write_txn: &WriteTransaction,
+        id: NodeId,
+        label: &str,
+    ) -> Result<bool, GraphError> {
         let bytes_opt: Option<Vec<u8>> = {
             let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
             let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
         let mut record: NodeRecord = decode(&bytes)?;
         let label_id = intern_label(write_txn, label)?;
         if !record.label_ids.contains(&label_id) {
@@ -439,7 +486,8 @@ impl GraphStore {
             let new_bytes = encode(&record)?;
             let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
             nodes.insert(id.0, new_bytes.as_slice())?;
-            let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            let mut label_index =
+                write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             label_index.insert(label_id, id.0)?;
         }
         Ok(true)
@@ -448,21 +496,30 @@ impl GraphStore {
     /// Removes `label` from `id`'s label set -- a no-op (not an error) if
     /// it's not there (label unknown entirely, or known but not on this
     /// node), same as real Cypher's `REMOVE n:Label`.
-    pub fn remove_node_label_in_txn(write_txn: &WriteTransaction, id: NodeId, label: &str) -> Result<bool, GraphError> {
+    pub fn remove_node_label_in_txn(
+        write_txn: &WriteTransaction,
+        id: NodeId,
+        label: &str,
+    ) -> Result<bool, GraphError> {
         let bytes_opt: Option<Vec<u8>> = {
             let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
             let found = nodes.get(id.0)?.map(|g| g.value().to_vec());
             found
         };
-        let Some(bytes) = bytes_opt else { return Ok(false) };
-        let Some(label_id) = lookup_label_id(Txn::Write(write_txn), label)? else { return Ok(true) };
+        let Some(bytes) = bytes_opt else {
+            return Ok(false);
+        };
+        let Some(label_id) = lookup_label_id(Txn::Write(write_txn), label)? else {
+            return Ok(true);
+        };
         let mut record: NodeRecord = decode(&bytes)?;
         if let Some(pos) = record.label_ids.iter().position(|&l| l == label_id) {
             record.label_ids.remove(pos);
             let new_bytes = encode(&record)?;
             let mut nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
             nodes.insert(id.0, new_bytes.as_slice())?;
-            let mut label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+            let mut label_index =
+                write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             label_index.remove(label_id, id.0)?;
         }
         Ok(true)

@@ -44,7 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))?;
     }
 
-    let direct = db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS]->(f:Person) RETURN f.name")?;
+    let direct =
+        db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS]->(f:Person) RETURN f.name")?;
     println!("Alice's direct friends: {}", names(&direct));
 
     // Variable-length traversal, 1 to 2 hops out. The executor's
@@ -53,7 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // once here. No RETURN DISTINCT needed (MarsDB doesn't have that as
     // a general RETURN modifier yet, only inside an aggregate call like
     // count(DISTINCT x)).
-    let network = db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) RETURN f.name")?;
+    let network =
+        db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) RETURN f.name")?;
     println!("Alice's network within 2 hops: {}", names(&network));
 
     // Who has the most outgoing KNOWS edges?
@@ -63,7 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          RETURN name, friends ORDER BY friends DESC LIMIT 1",
     )?;
     if let Some(row) = popular.rows.first() {
-        println!("Most connected: {} ({} friends)", show(&row[0]), show(&row[1]));
+        println!(
+            "Most connected: {} ({} friends)",
+            show(&row[0]),
+            show(&row[1])
+        );
     }
 
     let nodes = ["Alice", "Bob", "Carol", "Dave", "Eve"];
@@ -72,7 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = show(v);
         nodes.iter().position(|n| *n == name).expect("known node")
     };
-    let edges: Vec<(usize, usize)> = all_edges.rows.iter().map(|row| (idx(&row[0]), idx(&row[1]))).collect();
+    let edges: Vec<(usize, usize)> = all_edges
+        .rows
+        .iter()
+        .map(|row| (idx(&row[0]), idx(&row[1])))
+        .collect();
     viz::graph_viz("social_graph.svg", "Alice's social network", &nodes, &edges)?;
     println!("\nwrote social_graph.svg");
 
@@ -80,7 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn names(result: &marsdb::QueryResult) -> String {
-    result.rows.iter().map(|row| show(&row[0])).collect::<Vec<_>>().join(", ")
+    result
+        .rows
+        .iter()
+        .map(|row| show(&row[0]))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn show(v: &marsdb::Value) -> String {
@@ -89,7 +104,9 @@ fn show(v: &marsdb::Value) -> String {
         marsdb::Value::Property(marsdb::PropertyValue::Int(i)) => i.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Float(f)) => f.to_string(),
         marsdb::Value::Property(marsdb::PropertyValue::Bool(b)) => b.to_string(),
-        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => "null".to_string(),
+        marsdb::Value::Property(marsdb::PropertyValue::Null) | marsdb::Value::Null => {
+            "null".to_string()
+        }
         other => format!("{other:?}"),
     }
 }

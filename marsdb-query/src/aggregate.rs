@@ -76,7 +76,12 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
         PropertyValue::Float(f) => HashKey::FloatBits(f.to_bits()),
         PropertyValue::String(s) => HashKey::Str(s.clone()),
         PropertyValue::Date(d) => HashKey::Date(*d),
-        PropertyValue::Duration { months, days, seconds, nanos } => HashKey::Duration(*months, *days, *seconds, *nanos),
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => HashKey::Duration(*months, *days, *seconds, *nanos),
     }
 }
 
@@ -98,12 +103,33 @@ fn literal_hash_key(lit: &Literal) -> HashKey {
 /// computed directly as the group's row count, independent of any per-row
 /// argument (see `resolve_grouped_rows`), so it isn't represented here.
 pub(crate) enum AggAcc {
-    Count { distinct: Option<HashSet<HashKey>>, n: i64 },
-    Sum { distinct: Option<HashSet<HashKey>>, total_int: i64, total_float: f64, saw_float: bool },
-    Avg { distinct: Option<HashSet<HashKey>>, total: f64, n: i64 },
-    Min { distinct: Option<HashSet<HashKey>>, best: Option<Value> },
-    Max { distinct: Option<HashSet<HashKey>>, best: Option<Value> },
-    Collect { distinct: Option<HashSet<HashKey>>, items: Vec<Value> },
+    Count {
+        distinct: Option<HashSet<HashKey>>,
+        n: i64,
+    },
+    Sum {
+        distinct: Option<HashSet<HashKey>>,
+        total_int: i64,
+        total_float: f64,
+        saw_float: bool,
+    },
+    Avg {
+        distinct: Option<HashSet<HashKey>>,
+        total: f64,
+        n: i64,
+    },
+    Min {
+        distinct: Option<HashSet<HashKey>>,
+        best: Option<Value>,
+    },
+    Max {
+        distinct: Option<HashSet<HashKey>>,
+        best: Option<Value>,
+    },
+    Collect {
+        distinct: Option<HashSet<HashKey>>,
+        items: Vec<Value>,
+    },
 }
 
 enum Numeric {
@@ -113,8 +139,12 @@ enum Numeric {
 
 fn numeric_value(v: &Value) -> Option<Numeric> {
     match v {
-        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(Numeric::Int(*i)),
-        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => Some(Numeric::Float(*f)),
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => {
+            Some(Numeric::Int(*i))
+        }
+        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => {
+            Some(Numeric::Float(*f))
+        }
         _ => None,
     }
 }
@@ -172,7 +202,10 @@ impl AggAcc {
     /// (computed separately, not through this accumulator at all)
     /// includes it. `fold` never sees `Value::Null`.
     pub(crate) fn fold(&mut self, v: &Value) -> Result<(), QueryError> {
-        debug_assert!(!matches!(v, Value::Null), "callers must skip Value::Null before calling fold");
+        debug_assert!(
+            !matches!(v, Value::Null),
+            "callers must skip Value::Null before calling fold"
+        );
         match self {
             AggAcc::Count { distinct, n } => {
                 if dedup_seen(distinct, v)? {
@@ -327,7 +360,10 @@ mod tests {
         let mut acc = AggAcc::identity("sum", false);
         acc.fold(&int(1)).unwrap();
         acc.fold(&int(2)).unwrap();
-        assert!(matches!(acc.finish(), Value::Property(PropertyValue::Int(3))));
+        assert!(matches!(
+            acc.finish(),
+            Value::Property(PropertyValue::Int(3))
+        ));
     }
 
     #[test]
@@ -343,11 +379,26 @@ mod tests {
 
     #[test]
     fn empty_contribution_results_match_cypher_conventions() {
-        assert!(matches!(AggAcc::identity("count", false).finish(), Value::Property(PropertyValue::Int(0))));
-        assert!(matches!(AggAcc::identity("sum", false).finish(), Value::Property(PropertyValue::Int(0))));
-        assert!(matches!(AggAcc::identity("avg", false).finish(), Value::Null));
-        assert!(matches!(AggAcc::identity("min", false).finish(), Value::Null));
-        assert!(matches!(AggAcc::identity("max", false).finish(), Value::Null));
+        assert!(matches!(
+            AggAcc::identity("count", false).finish(),
+            Value::Property(PropertyValue::Int(0))
+        ));
+        assert!(matches!(
+            AggAcc::identity("sum", false).finish(),
+            Value::Property(PropertyValue::Int(0))
+        ));
+        assert!(matches!(
+            AggAcc::identity("avg", false).finish(),
+            Value::Null
+        ));
+        assert!(matches!(
+            AggAcc::identity("min", false).finish(),
+            Value::Null
+        ));
+        assert!(matches!(
+            AggAcc::identity("max", false).finish(),
+            Value::Null
+        ));
         match AggAcc::identity("collect", false).finish() {
             Value::List(items) => assert!(items.is_empty()),
             other => panic!("expected empty list, got {other:?}"),
@@ -360,7 +411,10 @@ mod tests {
         acc.fold(&int(1)).unwrap();
         acc.fold(&int(1)).unwrap();
         acc.fold(&int(2)).unwrap();
-        assert!(matches!(acc.finish(), Value::Property(PropertyValue::Int(2))));
+        assert!(matches!(
+            acc.finish(),
+            Value::Property(PropertyValue::Int(2))
+        ));
     }
 
     #[test]
@@ -378,7 +432,13 @@ mod tests {
             min_acc.fold(&v).unwrap();
             max_acc.fold(&v).unwrap();
         }
-        assert!(matches!(min_acc.finish(), Value::Property(PropertyValue::Int(1))));
-        assert!(matches!(max_acc.finish(), Value::Property(PropertyValue::Int(9))));
+        assert!(matches!(
+            min_acc.finish(),
+            Value::Property(PropertyValue::Int(1))
+        ));
+        assert!(matches!(
+            max_acc.finish(),
+            Value::Property(PropertyValue::Int(9))
+        ));
     }
 }

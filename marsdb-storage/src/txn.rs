@@ -1,9 +1,9 @@
 use std::borrow::Borrow;
 
 use redb::{
-    AccessGuard, Key, MultimapRange, MultimapTable, MultimapTableDefinition, MultimapValue, ReadOnlyMultimapTable,
-    ReadOnlyTable, ReadTransaction, ReadableMultimapTable, ReadableTable, Range, Table, TableDefinition, Value,
-    WriteTransaction,
+    AccessGuard, Key, MultimapRange, MultimapTable, MultimapTableDefinition, MultimapValue, Range,
+    ReadOnlyMultimapTable, ReadOnlyTable, ReadTransaction, ReadableMultimapTable, ReadableTable,
+    Table, TableDefinition, Value, WriteTransaction,
 };
 
 use crate::error::StorageError;
@@ -59,7 +59,10 @@ pub enum TableHandle<'a, K: Key + 'static, V: Value + 'static> {
 }
 
 impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
-    pub fn get<'k>(&self, key: impl Borrow<K::SelfType<'k>>) -> Result<Option<AccessGuard<'_, V>>, StorageError> {
+    pub fn get<'k>(
+        &self,
+        key: impl Borrow<K::SelfType<'k>>,
+    ) -> Result<Option<AccessGuard<'_, V>>, StorageError> {
         Ok(match self {
             TableHandle::Write(t) => t.get(key)?,
             TableHandle::Read(t) => t.get(key)?,
@@ -80,7 +83,10 @@ pub enum MultimapTableHandle<'a, K: Key + 'static, V: Key + 'static> {
 }
 
 impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle<'a, K, V> {
-    pub fn get<'k>(&self, key: impl Borrow<K::SelfType<'k>>) -> Result<MultimapValue<'_, V>, StorageError> {
+    pub fn get<'k>(
+        &self,
+        key: impl Borrow<K::SelfType<'k>>,
+    ) -> Result<MultimapValue<'_, V>, StorageError> {
         Ok(match self {
             MultimapTableHandle::Write(t) => t.get(key)?,
             MultimapTableHandle::Read(t) => t.get(key)?,

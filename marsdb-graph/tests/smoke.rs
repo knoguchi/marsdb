@@ -52,9 +52,7 @@ fn delete_node_detach() {
     let store = GraphStore::open_memory().unwrap();
     let a = store.create_node(&["Person"], BTreeMap::new()).unwrap();
     let b = store.create_node(&["Person"], BTreeMap::new()).unwrap();
-    store
-        .create_edge("KNOWS", a, b, BTreeMap::new())
-        .unwrap();
+    store.create_edge("KNOWS", a, b, BTreeMap::new()).unwrap();
 
     let err = store.delete_node(a, false).unwrap_err();
     assert!(matches!(err, marsdb_graph::GraphError::NodeHasEdges(_)));
@@ -71,8 +69,12 @@ fn delete_node_detach() {
 #[test]
 fn label_index_tracks_multi_label_create_and_delete() {
     let store = GraphStore::open_memory().unwrap();
-    let post = store.create_node(&["Post", "Message"], BTreeMap::new()).unwrap();
-    let comment = store.create_node(&["Comment", "Message"], BTreeMap::new()).unwrap();
+    let post = store
+        .create_node(&["Post", "Message"], BTreeMap::new())
+        .unwrap();
+    let comment = store
+        .create_node(&["Comment", "Message"], BTreeMap::new())
+        .unwrap();
     let _person = store.create_node(&["Person"], BTreeMap::new()).unwrap();
 
     let messages = store.all_nodes(Some("Message")).unwrap();
@@ -112,7 +114,12 @@ fn date_and_duration_properties_round_trip_through_storage() {
     props.insert("date".to_string(), PropertyValue::Date(5397));
     props.insert(
         "duration".to_string(),
-        PropertyValue::Duration { months: 149, days: 14, seconds: 58390, nanos: 2 },
+        PropertyValue::Duration {
+            months: 149,
+            days: 14,
+            seconds: 58390,
+            nanos: 2,
+        },
     );
     let id = store.create_node(&["Val"], props).unwrap();
 
@@ -120,6 +127,11 @@ fn date_and_duration_properties_round_trip_through_storage() {
     assert_eq!(node.props.get("date"), Some(&PropertyValue::Date(5397)));
     assert_eq!(
         node.props.get("duration"),
-        Some(&PropertyValue::Duration { months: 149, days: 14, seconds: 58390, nanos: 2 })
+        Some(&PropertyValue::Duration {
+            months: 149,
+            days: 14,
+            seconds: 58390,
+            nanos: 2
+        })
     );
 }

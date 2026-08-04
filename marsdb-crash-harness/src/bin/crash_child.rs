@@ -9,12 +9,15 @@
 use std::io::Write;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: crash_child <db-path>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: crash_child <db-path>");
     let db = marsdb::Database::open(&path).expect("open db");
     let stdout = std::io::stdout();
     let mut n: i64 = 1;
     loop {
-        db.execute(&format!("CREATE (:Counter {{n: {n}}})")).expect("create");
+        db.execute(&format!("CREATE (:Counter {{n: {n}}})"))
+            .expect("create");
         let mut handle = stdout.lock();
         writeln!(handle, "OK {n}").ok();
         handle.flush().ok();

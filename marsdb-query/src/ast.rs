@@ -103,7 +103,11 @@ pub enum ReturnExpr {
     /// of the list". Same negative-counts-from-end rule as `Index`, but
     /// out-of-range bounds clamp instead of nulling out, and a start at or
     /// past the (clamped) end yields `[]` rather than erroring.
-    Slice(Box<ReturnExpr>, Option<Box<ReturnExpr>>, Option<Box<ReturnExpr>>),
+    Slice(
+        Box<ReturnExpr>,
+        Option<Box<ReturnExpr>>,
+        Option<Box<ReturnExpr>>,
+    ),
     /// `[x IN <source> WHERE <cond> | <project>]` — `WHERE`/`| project` are
     /// each independently optional (`[x IN list]` is a legal no-op
     /// identity-filter comprehension). `where_clause` is a `ReturnExpr`
@@ -192,7 +196,10 @@ pub enum ArithOp {
 /// a RETURN/WITH item list "has an aggregate" iff any item's top-level
 /// expression is `CountStar` or a `Call` whose name passes this check).
 pub fn is_aggregate_name(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(), "count" | "sum" | "avg" | "min" | "max" | "collect")
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "avg" | "min" | "max" | "collect"
+    )
 }
 
 #[derive(Debug, Clone)]

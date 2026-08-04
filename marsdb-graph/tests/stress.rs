@@ -43,25 +43,42 @@ fn stress_50k_node_chain_correctness() {
     }
 
     let all = store.all_nodes(Some("Item")).unwrap();
-    assert_eq!(all.len(), N as usize, "every created node must be scannable");
+    assert_eq!(
+        all.len(),
+        N as usize,
+        "every created node must be scannable"
+    );
 
     // Spot-check traversal correctness at start, middle, end — not just count.
     for &check_idx in &[0usize, N as usize / 2, N as usize - 2] {
-        let out = store.neighbors(ids[check_idx], Direction::Out, Some("NEXT")).unwrap();
+        let out = store
+            .neighbors(ids[check_idx], Direction::Out, Some("NEXT"))
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].other, ids[check_idx + 1]);
 
-        let inn = store.neighbors(ids[check_idx + 1], Direction::In, Some("NEXT")).unwrap();
+        let inn = store
+            .neighbors(ids[check_idx + 1], Direction::In, Some("NEXT"))
+            .unwrap();
         assert_eq!(inn.len(), 1);
         assert_eq!(inn[0].other, ids[check_idx]);
     }
 
     // Last node has no outgoing NEXT edge, first has no incoming.
     assert_eq!(
-        store.neighbors(*ids.last().unwrap(), Direction::Out, Some("NEXT")).unwrap().len(),
+        store
+            .neighbors(*ids.last().unwrap(), Direction::Out, Some("NEXT"))
+            .unwrap()
+            .len(),
         0
     );
-    assert_eq!(store.neighbors(ids[0], Direction::In, Some("NEXT")).unwrap().len(), 0);
+    assert_eq!(
+        store
+            .neighbors(ids[0], Direction::In, Some("NEXT"))
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -78,7 +95,9 @@ fn stress_supernode_fanout_10k() {
         let leaf = store.create_node(&["Leaf"], props).unwrap();
         // Alternate edge label to exercise label filtering at scale too.
         let label = if i % 2 == 0 { "EVEN" } else { "ODD" };
-        store.create_edge(label, center, leaf, BTreeMap::new()).unwrap();
+        store
+            .create_edge(label, center, leaf, BTreeMap::new())
+            .unwrap();
         leaves.insert(leaf);
     }
 
@@ -87,7 +106,9 @@ fn stress_supernode_fanout_10k() {
     let returned: HashSet<_> = all_out.iter().map(|e| e.other).collect();
     assert_eq!(returned, leaves);
 
-    let even_out = store.neighbors(center, Direction::Out, Some("EVEN")).unwrap();
+    let even_out = store
+        .neighbors(center, Direction::Out, Some("EVEN"))
+        .unwrap();
     assert_eq!(even_out.len(), FANOUT / 2);
 
     // Detach-delete the hub: every leaf's incoming edge must be gone too.
@@ -115,7 +136,10 @@ fn stress_random_create_delete_matches_oracle() {
         } else {
             let idx = rng.below(live.len());
             let id = live.swap_remove(idx);
-            assert!(store.delete_node(id, true).unwrap(), "oracle says {id:?} is live");
+            assert!(
+                store.delete_node(id, true).unwrap(),
+                "oracle says {id:?} is live"
+            );
         }
     }
 
@@ -127,5 +151,8 @@ fn stress_random_create_delete_matches_oracle() {
     );
     let scanned_ids: HashSet<_> = scanned.iter().map(|n| n.id).collect();
     let live_ids: HashSet<_> = live.into_iter().collect();
-    assert_eq!(scanned_ids, live_ids, "storage's live node set must match the oracle exactly");
+    assert_eq!(
+        scanned_ids, live_ids,
+        "storage's live node set must match the oracle exactly"
+    );
 }

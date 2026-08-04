@@ -57,7 +57,9 @@ fn build_fixture() -> Fixture {
     let mut springfield_props = BTreeMap::new();
     springfield_props.insert("id".into(), PropertyValue::Int(900));
     let springfield = store.create_node(&["City"], springfield_props).unwrap();
-    store.create_edge("IS_LOCATED_IN", alice, springfield, BTreeMap::new()).unwrap();
+    store
+        .create_edge("IS_LOCATED_IN", alice, springfield, BTreeMap::new())
+        .unwrap();
 
     let mut knows_props = BTreeMap::new();
     knows_props.insert("creationDate".into(), PropertyValue::Int(1_000));
@@ -66,35 +68,58 @@ fn build_fixture() -> Fixture {
     let mut post1_props = BTreeMap::new();
     post1_props.insert("id".into(), PropertyValue::Int(100));
     post1_props.insert("creationDate".into(), PropertyValue::Int(2_000));
-    post1_props.insert("content".into(), PropertyValue::String("Hello world".into()));
-    let post1 = store.create_node(&["Post", "Message"], post1_props).unwrap();
-    store.create_edge("HAS_CREATOR", post1, alice, BTreeMap::new()).unwrap();
+    post1_props.insert(
+        "content".into(),
+        PropertyValue::String("Hello world".into()),
+    );
+    let post1 = store
+        .create_node(&["Post", "Message"], post1_props)
+        .unwrap();
+    store
+        .create_edge("HAS_CREATOR", post1, alice, BTreeMap::new())
+        .unwrap();
 
     let mut comment1_props = BTreeMap::new();
     comment1_props.insert("id".into(), PropertyValue::Int(101));
     comment1_props.insert("creationDate".into(), PropertyValue::Int(2_100));
     // No `content` — exercises IS4's coalesce(content, imageFile).
     comment1_props.insert("imageFile".into(), PropertyValue::String("pic.png".into()));
-    let comment1 = store.create_node(&["Comment", "Message"], comment1_props).unwrap();
-    store.create_edge("REPLY_OF", comment1, post1, BTreeMap::new()).unwrap();
-    store.create_edge("HAS_CREATOR", comment1, bob, BTreeMap::new()).unwrap();
+    let comment1 = store
+        .create_node(&["Comment", "Message"], comment1_props)
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", comment1, post1, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("HAS_CREATOR", comment1, bob, BTreeMap::new())
+        .unwrap();
 
     let mut comment2_props = BTreeMap::new();
     comment2_props.insert("id".into(), PropertyValue::Int(102));
     comment2_props.insert("creationDate".into(), PropertyValue::Int(2_200));
     comment2_props.insert("content".into(), PropertyValue::String("I agree".into()));
-    let comment2 = store.create_node(&["Comment", "Message"], comment2_props).unwrap();
+    let comment2 = store
+        .create_node(&["Comment", "Message"], comment2_props)
+        .unwrap();
     // Replies to comment1, not post1 directly — exercises IS6's REPLY_OF*0..
     // walking more than one hop to reach the root Post.
-    store.create_edge("REPLY_OF", comment2, comment1, BTreeMap::new()).unwrap();
-    store.create_edge("HAS_CREATOR", comment2, carol, BTreeMap::new()).unwrap();
+    store
+        .create_edge("REPLY_OF", comment2, comment1, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("HAS_CREATOR", comment2, carol, BTreeMap::new())
+        .unwrap();
 
     let mut forum_props = BTreeMap::new();
     forum_props.insert("id".into(), PropertyValue::Int(500));
     forum_props.insert("title".into(), PropertyValue::String("Tech Forum".into()));
     let forum = store.create_node(&["Forum"], forum_props).unwrap();
-    store.create_edge("CONTAINER_OF", forum, post1, BTreeMap::new()).unwrap();
-    store.create_edge("HAS_MODERATOR", forum, alice, BTreeMap::new()).unwrap();
+    store
+        .create_edge("CONTAINER_OF", forum, post1, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("HAS_MODERATOR", forum, alice, BTreeMap::new())
+        .unwrap();
 
     Fixture {
         store,
@@ -109,9 +134,14 @@ fn build_fixture() -> Fixture {
     }
 }
 
-fn run_with_params(store: &GraphStore, cypher: &str, params: &HashMap<String, PropertyValue>) -> QueryResult {
+fn run_with_params(
+    store: &GraphStore,
+    cypher: &str,
+    params: &HashMap<String, PropertyValue>,
+) -> QueryResult {
     let mut stmt = parse(cypher).unwrap_or_else(|e| panic!("parse failed for {cypher:?}: {e}"));
-    substitute_params(&mut stmt, params).unwrap_or_else(|e| panic!("param substitution failed: {e}"));
+    substitute_params(&mut stmt, params)
+        .unwrap_or_else(|e| panic!("param substitution failed: {e}"));
     Executor::new(store)
         .execute(&stmt)
         .unwrap_or_else(|e| panic!("execute failed for {cypher:?}: {e}"))
@@ -146,7 +176,11 @@ fn is1_profile_of_a_person() {
          RETURN n.firstName AS firstName, n.lastName AS lastName, p.id AS cityId",
         &int_param(1),
     );
-    assert_eq!(result.rows.len(), 1, "IS1 must return exactly Alice's profile");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "IS1 must return exactly Alice's profile"
+    );
     assert_eq!(prop_str(&result.rows[0][0]), "Alice");
     assert_eq!(prop_str(&result.rows[0][1]), "Anderson");
     assert_eq!(prop_int(&result.rows[0][2]), 900);
@@ -179,7 +213,11 @@ fn is4_content_of_a_message() {
         "MATCH (m:Message {id: $id}) RETURN coalesce(m.content, m.imageFile) AS messageContent",
         &int_param(101),
     );
-    assert_eq!(result.rows.len(), 1, "IS4 must match :Message even though the node is only ever created as :Comment");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "IS4 must match :Message even though the node is only ever created as :Comment"
+    );
     assert_eq!(prop_str(&result.rows[0][0]), "pic.png");
 }
 
@@ -208,7 +246,11 @@ fn is6_forum_of_a_message() {
          RETURN f.id AS forumId, f.title AS forumTitle, mod.id AS moderatorId",
         &int_param(102),
     );
-    assert_eq!(result.rows.len(), 1, "IS6 must walk both REPLY_OF hops to reach the Post");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "IS6 must walk both REPLY_OF hops to reach the Post"
+    );
     assert_eq!(prop_int(&result.rows[0][0]), 500);
     assert_eq!(prop_str(&result.rows[0][1]), "Tech Forum");
     assert_eq!(prop_int(&result.rows[0][2]), 1);
@@ -263,7 +305,9 @@ fn is7_replies_of_a_message() {
         other => panic!("unexpected knowsFlag {other:?}"),
     }
 
-    f.store.create_edge("KNOWS", f.carol, f.bob, BTreeMap::new()).unwrap();
+    f.store
+        .create_edge("KNOWS", f.carol, f.bob, BTreeMap::new())
+        .unwrap();
     let with_knows = run_with_params(
         &f.store,
         "MATCH (m:Message {id: $id})<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(p:Person) \
@@ -272,7 +316,9 @@ fn is7_replies_of_a_message() {
         &int_param(101),
     );
     match &with_knows.rows[0][0] {
-        Value::Literal(Literal::Bool(b)) => assert!(*b, "Carol now KNOWS Bob, the flag must flip to true"),
+        Value::Literal(Literal::Bool(b)) => {
+            assert!(*b, "Carol now KNOWS Bob, the flag must flip to true")
+        }
         other => panic!("unexpected knowsFlag {other:?}"),
     }
 }

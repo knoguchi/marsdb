@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use marsdb_graph::{AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction};
+use marsdb_graph::{
+    AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction,
+};
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem,
-    SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
+    PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr,
+    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
+    WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -138,7 +141,11 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn execute_create(&self, write_txn: &WriteTransaction, patterns: &[Pattern]) -> Result<QueryResult, QueryError> {
+    fn execute_create(
+        &self,
+        write_txn: &WriteTransaction,
+        patterns: &[Pattern],
+    ) -> Result<QueryResult, QueryError> {
         // A standalone CREATE is a MATCH...CREATE tail run against a
         // single empty row -- `resolve_or_create_node` below never finds
         // any variable already bound in an empty `BindingRow`, so every
@@ -198,7 +205,8 @@ impl<'a> Executor<'a> {
                     }
 
                     let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
-                    let rel_props = self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row)?;
+                    let rel_props =
+                        self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row)?;
                     let (src, dst) = match rel.direction {
                         RelDirection::Right => (prev_id, node_id),
                         RelDirection::Left => (node_id, prev_id),
@@ -335,7 +343,10 @@ impl<'a> Executor<'a> {
         let plan = build_match_plan(&clause.pattern, &None, &carried_vars)?;
         let found = self.eval_plan(Txn::Write(write_txn), &plan, std::slice::from_ref(row))?;
         if !found.is_empty() {
-            return Ok(found.into_iter().map(|r| tag_merge_created(r, false)).collect());
+            return Ok(found
+                .into_iter()
+                .map(|r| tag_merge_created(r, false))
+                .collect());
         }
 
         // Nothing found — create exactly one new instance. Reuses
@@ -356,17 +367,18 @@ impl<'a> Executor<'a> {
                 new_row.insert(var.clone(), Binding::Node(node_id));
             }
             let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
-            let rel_props = self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row)?;
+            let rel_props =
+                self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row)?;
             let (src, dst) = match rel.direction {
                 RelDirection::Right => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
-                RelDirection::Either => {
-                    return Err(QueryError::Parse(
-                        "MERGE requires a directed relationship (-> or <-), not an undirected pattern".into(),
-                    ))
-                }
+                RelDirection::Either => return Err(QueryError::Parse(
+                    "MERGE requires a directed relationship (-> or <-), not an undirected pattern"
+                        .into(),
+                )),
             };
-            let edge_id = GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+            let edge_id =
+                GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
             if let Some(var) = &rel.var {
                 new_row.insert(var.clone(), Binding::Edge(edge_id));
             }
@@ -392,9 +404,15 @@ impl<'a> Executor<'a> {
         for row in rows.iter_mut() {
             let created = match row.remove(MERGE_CREATED_KEY) {
                 Some(Binding::Value(PropertyValue::Bool(b))) => b,
-                other => unreachable!("{MERGE_CREATED_KEY} tagged internally as Binding::Value(Bool), got {other:?}"),
+                other => unreachable!(
+                    "{MERGE_CREATED_KEY} tagged internally as Binding::Value(Bool), got {other:?}"
+                ),
             };
-            let items = if created { &clause.on_create } else { &clause.on_match };
+            let items = if created {
+                &clause.on_create
+            } else {
+                &clause.on_match
+            };
             for item in items {
                 apply_set_item(write_txn, row, item)?;
             }
@@ -451,89 +469,110 @@ impl<'a> Executor<'a> {
             let [QueryClause::Match(part)] = clauses else {
                 unreachable!("scan_limit_shortcut's own matches! already checked this shape");
             };
-            let var = part.pattern.start.var.as_deref().expect("checked by scan_limit_shortcut");
+            let var = part
+                .pattern
+                .start
+                .var
+                .as_deref()
+                .expect("checked by scan_limit_shortcut");
             let label = part.pattern.start.labels.first().map(String::as_str);
             let limit_usize = limit.expect("checked by scan_limit_shortcut").max(0) as usize;
             current_rows = self.scan(txn, var, label, &current_rows, Some(limit_usize))?;
         } else {
-        for clause in clauses {
-            match clause {
-                QueryClause::Match(part) => {
-                    current_rows = if part.shortest_path {
-                        // Not a LogicalPlan/eval_plan traversal at all —
-                        // see eval_shortest_path's docs.
-                        self.eval_shortest_path(txn, part, &current_rows)?
-                    } else if let Some(path_var) = &part.path_var {
-                        let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
-                        let plan = build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?;
-                        let mut rows = if part.optional {
-                            let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
-                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
-                        } else {
-                            self.eval_plan(txn, &plan, &current_rows)?
-                        };
-                        for row in &mut rows {
-                            let path_binding = assemble_path(&named_pattern, row);
-                            for key in &synthesized {
-                                row.remove(key);
+            for clause in clauses {
+                match clause {
+                    QueryClause::Match(part) => {
+                        current_rows = if part.shortest_path {
+                            // Not a LogicalPlan/eval_plan traversal at all —
+                            // see eval_shortest_path's docs.
+                            self.eval_shortest_path(txn, part, &current_rows)?
+                        } else if let Some(path_var) = &part.path_var {
+                            let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
+                            let plan = build_match_plan(
+                                &named_pattern,
+                                &part.where_clause,
+                                &carried_vars,
+                            )?;
+                            let mut rows = if part.optional {
+                                let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
+                                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                            } else {
+                                self.eval_plan(txn, &plan, &current_rows)?
+                            };
+                            for row in &mut rows {
+                                let path_binding = assemble_path(&named_pattern, row);
+                                for key in &synthesized {
+                                    row.remove(key);
+                                }
+                                row.insert(path_var.clone(), path_binding);
                             }
-                            row.insert(path_var.clone(), path_binding);
-                        }
-                        rows
-                    } else {
-                        let plan = build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
-                        if part.optional {
-                            let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
-                            self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                            rows
                         } else {
-                            self.eval_plan(txn, &plan, &current_rows)?
+                            let plan =
+                                build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?;
+                            if part.optional {
+                                let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
+                                self.eval_optional_part(txn, &plan, &current_rows, &new_vars)?
+                            } else {
+                                self.eval_plan(txn, &plan, &current_rows)?
+                            }
+                        };
+                        let mut new_vars = pattern_all_vars(&part.pattern);
+                        if let Some(path_var) = &part.path_var {
+                            new_vars.insert(path_var.clone());
                         }
-                    };
-                    let mut new_vars = pattern_all_vars(&part.pattern);
-                    if let Some(path_var) = &part.path_var {
-                        new_vars.insert(path_var.clone());
+                        current_rows = self.apply_with_or_carry(
+                            txn,
+                            &part.with,
+                            current_rows,
+                            new_vars,
+                            &mut carried_vars,
+                        )?;
                     }
-                    current_rows = self.apply_with_or_carry(txn, &part.with, current_rows, new_vars, &mut carried_vars)?;
-                }
-                QueryClause::Unwind(u) => {
-                    current_rows = self.eval_unwind(txn, u, &current_rows)?;
-                    current_rows = self.apply_with_or_carry(
-                        txn,
-                        &u.with,
-                        current_rows,
-                        HashSet::from([u.var.clone()]),
-                        &mut carried_vars,
-                    )?;
-                }
-                QueryClause::Merge(m) => {
-                    // MERGE always needs real `.insert`-capable write
-                    // access, whether or not the rest of the statement
-                    // would otherwise be read-only (e.g. `MERGE (n) RETURN
-                    // n`) — see `is_read_only`, which already accounts for
-                    // this by checking `clauses` too, so `txn` is
-                    // guaranteed to be `Txn::Write` here.
-                    let write_txn = require_write_txn(txn);
-                    current_rows = self.eval_merge(write_txn, m, &current_rows)?;
-                    current_rows = self.apply_with_or_carry(
-                        txn,
-                        &m.with,
-                        current_rows,
-                        pattern_all_vars(&m.pattern),
-                        &mut carried_vars,
-                    )?;
-                }
-                // A statement-leading WITH -- no pattern was matched, so
-                // there's nothing to seed `new_vars` with beyond what the
-                // WITH clause itself projects (`apply_with_or_carry`
-                // always takes the `Some(with)` branch here, never the
-                // "no WITH, just extend carried_vars" one, since `with` is
-                // always present on this variant by construction).
-                QueryClause::With(with) => {
-                    current_rows =
-                        self.apply_with_or_carry(txn, &Some(with.clone()), current_rows, HashSet::new(), &mut carried_vars)?;
+                    QueryClause::Unwind(u) => {
+                        current_rows = self.eval_unwind(txn, u, &current_rows)?;
+                        current_rows = self.apply_with_or_carry(
+                            txn,
+                            &u.with,
+                            current_rows,
+                            HashSet::from([u.var.clone()]),
+                            &mut carried_vars,
+                        )?;
+                    }
+                    QueryClause::Merge(m) => {
+                        // MERGE always needs real `.insert`-capable write
+                        // access, whether or not the rest of the statement
+                        // would otherwise be read-only (e.g. `MERGE (n) RETURN
+                        // n`) — see `is_read_only`, which already accounts for
+                        // this by checking `clauses` too, so `txn` is
+                        // guaranteed to be `Txn::Write` here.
+                        let write_txn = require_write_txn(txn);
+                        current_rows = self.eval_merge(write_txn, m, &current_rows)?;
+                        current_rows = self.apply_with_or_carry(
+                            txn,
+                            &m.with,
+                            current_rows,
+                            pattern_all_vars(&m.pattern),
+                            &mut carried_vars,
+                        )?;
+                    }
+                    // A statement-leading WITH -- no pattern was matched, so
+                    // there's nothing to seed `new_vars` with beyond what the
+                    // WITH clause itself projects (`apply_with_or_carry`
+                    // always takes the `Some(with)` branch here, never the
+                    // "no WITH, just extend carried_vars" one, since `with` is
+                    // always present on this variant by construction).
+                    QueryClause::With(with) => {
+                        current_rows = self.apply_with_or_carry(
+                            txn,
+                            &Some(with.clone()),
+                            current_rows,
+                            HashSet::new(),
+                            &mut carried_vars,
+                        )?;
+                    }
                 }
             }
-        }
         }
         // ORDER BY must see every matching row before LIMIT truncates —
         // sort, then take N, not the other way around. Only pre-truncate
@@ -576,7 +615,10 @@ impl<'a> Executor<'a> {
             // standalone CREATE already returns (not one blank row per
             // `current_rows`, which a synthetic `Tail::Return(vec![])`
             // would produce instead).
-            None => QueryResult { columns: vec![], rows: vec![] },
+            None => QueryResult {
+                columns: vec![],
+                rows: vec![],
+            },
             Some(Tail::Return(items, distinct)) => {
                 let projected = self.materialize_return(txn, items, &current_rows, *distinct)?;
                 if let Some(ob) = order_by {
@@ -596,15 +638,27 @@ impl<'a> Executor<'a> {
                     projected
                 }
             }
-            Some(Tail::Delete(vars, ret)) => self.materialize_delete(txn, vars, &current_rows, false, ret)?,
-            Some(Tail::DetachDelete(vars, ret)) => self.materialize_delete(txn, vars, &current_rows, true, ret)?,
+            Some(Tail::Delete(vars, ret)) => {
+                self.materialize_delete(txn, vars, &current_rows, false, ret)?
+            }
+            Some(Tail::DetachDelete(vars, ret)) => {
+                self.materialize_delete(txn, vars, &current_rows, true, ret)?
+            }
             Some(Tail::Set(items, ret)) => self.materialize_set(txn, items, &current_rows, ret)?,
-            Some(Tail::Remove(items, ret)) => self.materialize_remove(txn, items, &current_rows, ret)?,
+            Some(Tail::Remove(items, ret)) => {
+                self.materialize_remove(txn, items, &current_rows, ret)?
+            }
             Some(Tail::Create(patterns, ret)) => {
-                let updated_rows = self.materialize_create(require_write_txn(txn), patterns, &current_rows)?;
+                let updated_rows =
+                    self.materialize_create(require_write_txn(txn), patterns, &current_rows)?;
                 match ret {
-                    Some(rt) => self.materialize_return(txn, &rt.items, &updated_rows, rt.distinct)?,
-                    None => QueryResult { columns: vec![], rows: vec![] },
+                    Some(rt) => {
+                        self.materialize_return(txn, &rt.items, &updated_rows, rt.distinct)?
+                    }
+                    None => QueryResult {
+                        columns: vec![],
+                        rows: vec![],
+                    },
                 }
             }
         };
@@ -646,7 +700,12 @@ impl<'a> Executor<'a> {
         } else if let Some(with_limit) = with.limit {
             rows.truncate(with_limit.max(0) as usize);
         }
-        *carried_vars = with.items.iter().enumerate().map(with_item_output_name).collect();
+        *carried_vars = with
+            .items
+            .iter()
+            .enumerate()
+            .map(with_item_output_name)
+            .collect();
         Ok(rows)
     }
 
@@ -655,12 +714,19 @@ impl<'a> Executor<'a> {
     /// `UnwindClause`'s docs). Cross-joins each input row against every
     /// element of that row's resolved list, then applies the clause's own
     /// `WHERE`.
-    fn eval_unwind(&self, txn: Txn, clause: &UnwindClause, rows: &[BindingRow]) -> Result<Vec<BindingRow>, QueryError> {
+    fn eval_unwind(
+        &self,
+        txn: Txn,
+        clause: &UnwindClause,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>, QueryError> {
         let mut out = Vec::new();
         for row in rows {
             let elements: Vec<Binding> = match &clause.source {
                 UnwindSource::Var(name) => {
-                    let binding = row.get(name).ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                    let binding = row
+                        .get(name)
+                        .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
                     let Binding::List(items) = binding else {
                         return Err(QueryError::Parse(format!(
                             "'{name}' isn't a list — UNWIND needs a list (e.g. from collect())"
@@ -668,9 +734,10 @@ impl<'a> Executor<'a> {
                     };
                     items.iter().map(value_to_binding_restore).collect()
                 }
-                UnwindSource::List(literals) => {
-                    literals.iter().map(|lit| Binding::Value(literal_to_value(lit))).collect()
-                }
+                UnwindSource::List(literals) => literals
+                    .iter()
+                    .map(|lit| Binding::Value(literal_to_value(lit)))
+                    .collect(),
             };
             for element in elements {
                 let mut new_row = row.clone();
@@ -754,7 +821,9 @@ impl<'a> Executor<'a> {
         for row in rows {
             let start_id = require_bound_node(row, start_var)?;
             let end_id = require_bound_node(row, end_var)?;
-            let path = self.shortest_path_between(txn, start_id, end_id, direction, rel_label, min_hops, max_hops)?;
+            let path = self.shortest_path_between(
+                txn, start_id, end_id, direction, rel_label, min_hops, max_hops,
+            )?;
             let mut new_row = row.clone();
             let binding = match path {
                 Some(elems) => Binding::Path(elems),
@@ -878,9 +947,17 @@ impl<'a> Executor<'a> {
     /// later `QueryPart` can keep traversing from it; anything else
     /// (computed expressions) collapses to `Binding::Value`. Shared by the
     /// non-aggregating `materialize_with` path and grouping-key evaluation.
-    fn item_binding(&self, txn: Txn, expr: &ReturnExpr, row: &BindingRow) -> Result<Binding, QueryError> {
+    fn item_binding(
+        &self,
+        txn: Txn,
+        expr: &ReturnExpr,
+        row: &BindingRow,
+    ) -> Result<Binding, QueryError> {
         match expr {
-            ReturnExpr::Var(v) => row.get(v).cloned().ok_or_else(|| QueryError::UnboundVariable(v.clone())),
+            ReturnExpr::Var(v) => row
+                .get(v)
+                .cloned()
+                .ok_or_else(|| QueryError::UnboundVariable(v.clone())),
             other => {
                 let value = self.eval_return_expr(txn, other, row)?;
                 // `value_to_property_value` collapses Node/Edge/List/Path
@@ -925,7 +1002,10 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        Ok(top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect())
+        Ok(top_k_by(keyed, order_by, limit)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
     }
 
     /// Sorts an already-`materialize_return`d result for a non-aggregating
@@ -958,7 +1038,10 @@ impl<'a> Executor<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             keyed.push((keys, row));
         }
-        let rows = top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect();
+        let rows = top_k_by(keyed, order_by, limit)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
         Ok(QueryResult { columns, rows })
     }
 
@@ -980,8 +1063,12 @@ impl<'a> Executor<'a> {
     /// `Value::Null`, same as everywhere else null is represented).
     fn binding_to_value(&self, txn: Txn, b: &Binding) -> Result<Value, QueryError> {
         Ok(match b {
-            Binding::Node(id) => Value::Node(deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?),
-            Binding::Edge(id) => Value::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?),
+            Binding::Node(id) => Value::Node(deleted_entity_access(GraphStore::get_node_in_txn(
+                txn, *id,
+            )?)?),
+            Binding::Edge(id) => Value::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(
+                txn, *id,
+            )?)?),
             Binding::Value(PropertyValue::Null) => Value::Null,
             Binding::Value(pv) => Value::Property(pv.clone()),
             Binding::List(items) => Value::List(items.clone()),
@@ -994,13 +1081,21 @@ impl<'a> Executor<'a> {
     /// each element's full current record, same "keep just the id in the
     /// row, resolve to a full record only when materializing for display"
     /// split `Binding::Node`/`Edge` already use above.
-    fn resolve_path_elems(&self, txn: Txn, elems: &[PathBinding]) -> Result<Vec<PathElem>, QueryError> {
+    fn resolve_path_elems(
+        &self,
+        txn: Txn,
+        elems: &[PathBinding],
+    ) -> Result<Vec<PathElem>, QueryError> {
         elems
             .iter()
             .map(|e| {
                 Ok(match e {
-                    PathBinding::Node(id) => PathElem::Node(deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?),
-                    PathBinding::Edge(id) => PathElem::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?),
+                    PathBinding::Node(id) => PathElem::Node(deleted_entity_access(
+                        GraphStore::get_node_in_txn(txn, *id)?,
+                    )?),
+                    PathBinding::Edge(id) => PathElem::Edge(deleted_entity_access(
+                        GraphStore::get_edge_in_txn(txn, *id)?,
+                    )?),
                 })
             })
             .collect()
@@ -1087,7 +1182,9 @@ impl<'a> Executor<'a> {
             let group = &mut groups[group_idx];
             group.row_count += 1;
             for (i, item) in items.iter().enumerate() {
-                let ReturnExpr::Call { args, .. } = &item.expr else { continue };
+                let ReturnExpr::Call { args, .. } = &item.expr else {
+                    continue;
+                };
                 if !is_top_level_aggregate(&item.expr) {
                     continue;
                 }
@@ -1134,7 +1231,9 @@ impl<'a> Executor<'a> {
                         .finish();
                     value_to_binding(value)
                 } else {
-                    group.key_bindings[i].clone().expect("non-aggregate item must have a key binding")
+                    group.key_bindings[i]
+                        .clone()
+                        .expect("non-aggregate item must have a key binding")
                 };
                 row_out.push(binding);
             }
@@ -1153,10 +1252,21 @@ impl<'a> Executor<'a> {
     /// `false` for filtering purposes, but *only* at that final step, not
     /// internally, since `AND`/`OR`'s truth tables need to tell "false"
     /// and "unknown" apart to combine correctly.
-    fn eval_with_expr(&self, txn: Txn, expr: &WithExpr, row: &BindingRow) -> Result<Option<bool>, QueryError> {
+    fn eval_with_expr(
+        &self,
+        txn: Txn,
+        expr: &WithExpr,
+        row: &BindingRow,
+    ) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
-            WithExpr::And(l, r) => and3(self.eval_with_expr(txn, l, row)?, self.eval_with_expr(txn, r, row)?),
-            WithExpr::Or(l, r) => or3(self.eval_with_expr(txn, l, row)?, self.eval_with_expr(txn, r, row)?),
+            WithExpr::And(l, r) => and3(
+                self.eval_with_expr(txn, l, row)?,
+                self.eval_with_expr(txn, r, row)?,
+            ),
+            WithExpr::Or(l, r) => or3(
+                self.eval_with_expr(txn, l, row)?,
+                self.eval_with_expr(txn, r, row)?,
+            ),
             WithExpr::Not(e) => self.eval_with_expr(txn, e, row)?.map(|b| !b),
             WithExpr::Compare(lhs, op, lit) => {
                 let value = self.eval_return_expr(txn, lhs, row)?;
@@ -1195,7 +1305,10 @@ impl<'a> Executor<'a> {
             .enumerate()
             .map(|(i, row)| {
                 let mut r = row.clone();
-                r.insert(OPTIONAL_SEED_IDX_KEY.to_string(), Binding::Value(PropertyValue::Int(i as i64)));
+                r.insert(
+                    OPTIONAL_SEED_IDX_KEY.to_string(),
+                    Binding::Value(PropertyValue::Int(i as i64)),
+                );
                 r
             })
             .collect();
@@ -1204,7 +1317,9 @@ impl<'a> Executor<'a> {
         for mut row in results {
             let idx = match row.remove(OPTIONAL_SEED_IDX_KEY) {
                 Some(Binding::Value(PropertyValue::Int(i))) => i,
-                other => unreachable!("__seed_idx tagged internally as Binding::Value(Int), got {other:?}"),
+                other => unreachable!(
+                    "__seed_idx tagged internally as Binding::Value(Int), got {other:?}"
+                ),
             };
             by_idx.entry(idx).or_default().push(row);
         }
@@ -1239,7 +1354,9 @@ impl<'a> Executor<'a> {
                 Ok(seed.to_vec())
             }
             LogicalPlan::AllNodesScan { var } => self.scan(txn, var, None, seed, None),
-            LogicalPlan::NodeByLabelScan { var, label } => self.scan(txn, var, Some(label), seed, None),
+            LogicalPlan::NodeByLabelScan { var, label } => {
+                self.scan(txn, var, Some(label), seed, None)
+            }
             LogicalPlan::Expand {
                 input,
                 from_var,
@@ -1261,7 +1378,8 @@ impl<'a> Executor<'a> {
                         Some(Binding::Value(PropertyValue::Null)) => continue,
                         _ => return Err(QueryError::UnboundVariable(from_var.clone())),
                     };
-                    let entries = neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
+                    let entries =
+                        neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref())?;
                     for entry in entries {
                         let mut new_row = row.clone();
                         new_row.insert(to_var.clone(), Binding::Node(entry.other));
@@ -1306,7 +1424,12 @@ impl<'a> Executor<'a> {
                         depth += 1;
                         let mut next_frontier = Vec::new();
                         for node in frontier {
-                            let entries = neighbors_for_direction(txn, node, *direction, rel_label.as_deref())?;
+                            let entries = neighbors_for_direction(
+                                txn,
+                                node,
+                                *direction,
+                                rel_label.as_deref(),
+                            )?;
                             for entry in entries {
                                 if visited.insert(entry.other) {
                                     next_frontier.push(entry.other);
@@ -1394,7 +1517,12 @@ impl<'a> Executor<'a> {
     /// `HasLabel`/`VarEq` never produce "unknown" (they operate on real
     /// bound node/edge identity, not a possibly-null property), so they
     /// always return `Some`.
-    fn eval_expr(&self, txn: Txn, expr: &Expr, row: &BindingRow) -> Result<Option<bool>, QueryError> {
+    fn eval_expr(
+        &self,
+        txn: Txn,
+        expr: &Expr,
+        row: &BindingRow,
+    ) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
             Expr::And(l, r) => and3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
             Expr::Or(l, r) => or3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
@@ -1406,9 +1534,14 @@ impl<'a> Executor<'a> {
             // Always definite -- that's the whole point of IS NULL, so
             // this is the one `Expr` leaf that's always `Some`, same as
             // `HasLabel`/`VarEq` below.
-            Expr::IsNull(pa) => Some(matches!(self.lookup_prop(txn, pa, row)?, None | Some(PropertyValue::Null))),
+            Expr::IsNull(pa) => Some(matches!(
+                self.lookup_prop(txn, pa, row)?,
+                None | Some(PropertyValue::Null)
+            )),
             Expr::HasLabel(var, label) => {
-                let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 let Binding::Node(id) = binding else {
                     return Err(QueryError::UnboundVariable(var.clone()));
                 };
@@ -1416,8 +1549,12 @@ impl<'a> Executor<'a> {
                 Some(node.is_some_and(|n| n.labels.iter().any(|l| l == label)))
             }
             Expr::VarEq(a, b) => {
-                let ba = row.get(a).ok_or_else(|| QueryError::UnboundVariable(a.clone()))?;
-                let bb = row.get(b).ok_or_else(|| QueryError::UnboundVariable(b.clone()))?;
+                let ba = row
+                    .get(a)
+                    .ok_or_else(|| QueryError::UnboundVariable(a.clone()))?;
+                let bb = row
+                    .get(b)
+                    .ok_or_else(|| QueryError::UnboundVariable(b.clone()))?;
                 Some(match (ba, bb) {
                     (Binding::Node(x), Binding::Node(y)) => x == y,
                     (Binding::Edge(x), Binding::Edge(y)) => x == y,
@@ -1486,7 +1623,12 @@ impl<'a> Executor<'a> {
     /// reason -- `d.year`/`d.months`/etc are real component accessors
     /// (Temporal5's whole scenario shape, `WITH v.date AS d ... RETURN
     /// d.year`), not a stored property `lookup_prop` could ever find.
-    fn lookup_prop_value(&self, txn: Txn, pa: &PropAccess, row: &BindingRow) -> Result<Value, QueryError> {
+    fn lookup_prop_value(
+        &self,
+        txn: Txn,
+        pa: &PropAccess,
+        row: &BindingRow,
+    ) -> Result<Value, QueryError> {
         match row.get(&pa.var) {
             Some(Binding::Map(m)) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
             Some(Binding::Value(pv)) => Ok(match temporal_component(pv, &pa.prop) {
@@ -1511,7 +1653,11 @@ impl<'a> Executor<'a> {
         let columns = items
             .iter()
             .enumerate()
-            .map(|(i, item)| item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i)))
+            .map(|(i, item)| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| default_column_name(&item.expr, i))
+            })
             .collect();
         let mut out_rows = if !has_aggregate(items) {
             let mut out_rows = Vec::with_capacity(rows.len());
@@ -1553,7 +1699,9 @@ impl<'a> Executor<'a> {
     ) -> Result<Value, QueryError> {
         match expr {
             ReturnExpr::Var(var) => {
-                let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 self.binding_to_value(txn, binding)
             }
             ReturnExpr::Prop(pa) => self.lookup_prop_value(txn, pa, row),
@@ -1614,7 +1762,10 @@ impl<'a> Executor<'a> {
                 apply_arith(*op, &lv, &rv)
             }
             ReturnExpr::ListLit(items) => Ok(Value::List(
-                items.iter().map(|item| self.eval_return_expr(txn, item, row)).collect::<Result<Vec<_>, _>>()?,
+                items
+                    .iter()
+                    .map(|item| self.eval_return_expr(txn, item, row))
+                    .collect::<Result<Vec<_>, _>>()?,
             )),
             ReturnExpr::Index(base, index) => {
                 let base_v = self.eval_return_expr(txn, base, row)?;
@@ -1623,8 +1774,14 @@ impl<'a> Executor<'a> {
             }
             ReturnExpr::Slice(base, start, end) => {
                 let base_v = self.eval_return_expr(txn, base, row)?;
-                let start_v = start.as_deref().map(|s| self.eval_return_expr(txn, s, row)).transpose()?;
-                let end_v = end.as_deref().map(|e| self.eval_return_expr(txn, e, row)).transpose()?;
+                let start_v = start
+                    .as_deref()
+                    .map(|s| self.eval_return_expr(txn, s, row))
+                    .transpose()?;
+                let end_v = end
+                    .as_deref()
+                    .map(|e| self.eval_return_expr(txn, e, row))
+                    .transpose()?;
                 apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
             }
             ReturnExpr::ListComp {
@@ -1675,7 +1832,9 @@ impl<'a> Executor<'a> {
                     Value::List(items) => items,
                     Value::Null => return Ok(Value::Null),
                     other => {
-                        return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}")))
+                        return Err(QueryError::Parse(format!(
+                            "quantifier source must be a list, got {other:?}"
+                        )))
                     }
                 };
                 let mut preds = Vec::with_capacity(items.len());
@@ -1711,7 +1870,9 @@ impl<'a> Executor<'a> {
                 self.eval_return_expr_bool3(txn, l, row)?,
                 self.eval_return_expr_bool3(txn, r, row)?,
             ))),
-            ReturnExpr::Not(e) => Ok(bool3_to_value(self.eval_return_expr_bool3(txn, e, row)?.map(|b| !b))),
+            ReturnExpr::Not(e) => Ok(bool3_to_value(
+                self.eval_return_expr_bool3(txn, e, row)?.map(|b| !b),
+            )),
             ReturnExpr::Compare(l, op, r) => {
                 let lv = self.eval_return_expr(txn, l, row)?;
                 let rv = self.eval_return_expr(txn, r, row)?;
@@ -1762,7 +1923,9 @@ impl<'a> Executor<'a> {
         let mut deleted_edges = HashSet::new();
         for row in rows {
             for var in vars {
-                let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 match binding {
                     Binding::Node(id) => {
                         if deleted_nodes.insert(*id) {
@@ -1843,7 +2006,11 @@ impl<'a> Executor<'a> {
     }
 }
 
-fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem) -> Result<(), QueryError> {
+fn apply_set_item(
+    write_txn: &WriteTransaction,
+    row: &BindingRow,
+    item: &SetItem,
+) -> Result<(), QueryError> {
     match item {
         // `SET n.prop = null` *removes* the property in real Cypher (found
         // via TCK's Set2 "Set a Property to Null" scenarios, which this
@@ -1855,7 +2022,9 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
         // node's own props (e.g. this RETURN's own node-to-string
         // rendering), where a real missing property wouldn't.
         SetItem::Prop(pa, Literal::Null) => {
-            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            let binding = row
+                .get(&pa.var)
+                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
             match binding {
                 Binding::Node(id) => {
                     GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
@@ -1880,7 +2049,9 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
             }
         }
         SetItem::Prop(pa, lit) => {
-            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            let binding = row
+                .get(&pa.var)
+                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
             let value = literal_to_value(lit);
             match binding {
                 Binding::Node(id) => {
@@ -1899,7 +2070,9 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
             }
         }
         SetItem::Labels(var, labels) => {
-            let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+            let binding = row
+                .get(var)
+                .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
             match binding {
                 Binding::Node(id) => {
                     for label in labels {
@@ -1919,10 +2092,16 @@ fn apply_set_item(write_txn: &WriteTransaction, row: &BindingRow, item: &SetItem
     Ok(())
 }
 
-fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &RemoveItem) -> Result<(), QueryError> {
+fn apply_remove_item(
+    write_txn: &WriteTransaction,
+    row: &BindingRow,
+    item: &RemoveItem,
+) -> Result<(), QueryError> {
     match item {
         RemoveItem::Prop(pa) => {
-            let binding = row.get(&pa.var).ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
+            let binding = row
+                .get(&pa.var)
+                .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
             match binding {
                 Binding::Node(id) => {
                     GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
@@ -1943,7 +2122,9 @@ fn apply_remove_item(write_txn: &WriteTransaction, row: &BindingRow, item: &Remo
             }
         }
         RemoveItem::Labels(var, labels) => {
-            let binding = row.get(var).ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+            let binding = row
+                .get(var)
+                .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
             match binding {
                 Binding::Node(id) => {
                     for label in labels {
@@ -1999,7 +2180,12 @@ fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
 /// this to decide whether to open a `ReadTransaction` (no contention with
 /// concurrent readers or a concurrent writer) or a `WriteTransaction`.
 fn is_read_only(stmt: &Statement) -> bool {
-    let Statement::Match { tail: Some(Tail::Return(_, _)), clauses, .. } = stmt else {
+    let Statement::Match {
+        tail: Some(Tail::Return(_, _)),
+        clauses,
+        ..
+    } = stmt
+    else {
         return false;
     };
     !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_)))
@@ -2049,7 +2235,9 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
 /// The name a `WITH`/`RETURN` item is known by afterward — its alias, or
 /// a name derived from the expression (its bare var name, `col{i}`, etc).
 fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
-    item.alias.clone().unwrap_or_else(|| default_column_name(&item.expr, i))
+    item.alias
+        .clone()
+        .unwrap_or_else(|| default_column_name(&item.expr, i))
 }
 
 /// True iff `expr` is itself an aggregate call — `count(*)`, or a `Call`
@@ -2071,10 +2259,14 @@ fn is_top_level_aggregate(expr: &ReturnExpr) -> bool {
 fn contains_aggregate(expr: &ReturnExpr) -> bool {
     match expr {
         ReturnExpr::CountStar => true,
-        ReturnExpr::Call { name, args, .. } => is_aggregate_name(name) || args.iter().any(contains_aggregate),
+        ReturnExpr::Call { name, args, .. } => {
+            is_aggregate_name(name) || args.iter().any(contains_aggregate)
+        }
         ReturnExpr::Case { test, whens, else_ } => {
             test.as_deref().is_some_and(contains_aggregate)
-                || whens.iter().any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || whens
+                    .iter()
+                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
                 || else_.as_deref().is_some_and(contains_aggregate)
         }
         ReturnExpr::Arith(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
@@ -2089,9 +2281,9 @@ fn contains_aggregate(expr: &ReturnExpr) -> bool {
         // `UnwindClause`'s own filter, which never routes through this
         // check either; the source/project halves are the ones a real
         // TCK scenario nests an aggregate in (`size([x IN collect(r) ...])`).
-        ReturnExpr::ListComp { source, project, .. } => {
-            contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate)
-        }
+        ReturnExpr::ListComp {
+            source, project, ..
+        } => contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate),
         ReturnExpr::Quantifier { source, .. } => contains_aggregate(source),
         ReturnExpr::MapLit(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
         ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
@@ -2333,7 +2525,11 @@ fn require_bound_node(row: &BindingRow, var: &str) -> Result<NodeId, QueryError>
 /// answer "how did BFS first reach this node," not support any other
 /// traversal, so a plain `HashMap` (not a `LogicalPlan`/adjacency
 /// structure) is enough.
-fn reconstruct_path(parent: &HashMap<NodeId, (NodeId, EdgeId)>, start: NodeId, end: NodeId) -> Vec<PathBinding> {
+fn reconstruct_path(
+    parent: &HashMap<NodeId, (NodeId, EdgeId)>,
+    start: NodeId,
+    end: NodeId,
+) -> Vec<PathBinding> {
     let mut hops = Vec::new();
     let mut current = end;
     while current != start {
@@ -2378,7 +2574,9 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
         Value::Null => PropertyValue::Null,
         Value::Property(pv) => pv.clone(),
         Value::Literal(lit) => literal_to_value(lit),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => PropertyValue::Null,
+        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+            PropertyValue::Null
+        }
     }
 }
 
@@ -2433,7 +2631,10 @@ fn literal_to_value(lit: &Literal) -> PropertyValue {
 }
 
 fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
-    row.insert(MERGE_CREATED_KEY.to_string(), Binding::Value(PropertyValue::Bool(created)));
+    row.insert(
+        MERGE_CREATED_KEY.to_string(),
+        Binding::Value(PropertyValue::Bool(created)),
+    );
     row
 }
 
@@ -2553,7 +2754,9 @@ fn value_to_bool3(v: &Value) -> Result<Option<bool>, QueryError> {
     match v {
         Value::Null => Ok(None),
         Value::Literal(Literal::Bool(b)) | Value::Property(PropertyValue::Bool(b)) => Ok(Some(*b)),
-        other => Err(QueryError::Parse(format!("expected a boolean, got {other:?}"))),
+        other => Err(QueryError::Parse(format!(
+            "expected a boolean, got {other:?}"
+        ))),
     }
 }
 
@@ -2641,7 +2844,9 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Literal(la), Value::Property(pb)) => literal_to_value(la) == *pb,
         (Value::Node(na), Value::Node(nb)) => na.id == nb.id,
         (Value::Edge(ea), Value::Edge(eb)) => ea.id == eb.id,
-        (Value::List(la), Value::List(lb)) => la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y)),
+        (Value::List(la), Value::List(lb)) => {
+            la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y))
+        }
         _ => false,
     }
 }
@@ -2656,15 +2861,21 @@ enum ArithNum {
 
 fn as_arith_num(v: &Value) -> Option<ArithNum> {
     match v {
-        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => Some(ArithNum::Int(*i)),
-        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => Some(ArithNum::Float(*f)),
+        Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => {
+            Some(ArithNum::Int(*i))
+        }
+        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => {
+            Some(ArithNum::Float(*f))
+        }
         _ => None,
     }
 }
 
 fn as_arith_str(v: &Value) -> Option<&str> {
     match v {
-        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => Some(s.as_str()),
+        Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => {
+            Some(s.as_str())
+        }
         _ => None,
     }
 }
@@ -2738,13 +2949,23 @@ fn as_date(v: &Value) -> Option<i32> {
 
 fn as_duration(v: &Value) -> Option<temporal::DurationParts> {
     match v {
-        Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => Some((*months, *days, *seconds, *nanos)),
+        Value::Property(PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        }) => Some((*months, *days, *seconds, *nanos)),
         _ => None,
     }
 }
 
 fn duration_value((months, days, seconds, nanos): temporal::DurationParts) -> Value {
-    Value::Property(PropertyValue::Duration { months, days, seconds, nanos })
+    Value::Property(PropertyValue::Duration {
+        months,
+        days,
+        seconds,
+        nanos,
+    })
 }
 
 /// The `Date`/`Duration` cases of `+`/`-`/`*`/`/` -- tried before
@@ -2763,12 +2984,15 @@ fn duration_value((months, days, seconds, nanos): temporal::DurationParts) -> Va
 /// deliberately *not* handled, falling through to the same "not two
 /// numbers" error a truly nonsensical subtraction would already get.
 fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Value>, QueryError> {
-    let date_plus_duration = |d: i32, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
-        let (months, days, seconds, nanos) = dur;
-        temporal::add_duration_to_date(d, months, days, seconds, nanos, negate)
-            .map(|d| Value::Property(PropertyValue::Date(d)))
-            .ok_or_else(|| QueryError::Parse("date +/- duration produced an out-of-range date".into()))
-    };
+    let date_plus_duration =
+        |d: i32, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
+            let (months, days, seconds, nanos) = dur;
+            temporal::add_duration_to_date(d, months, days, seconds, nanos, negate)
+                .map(|d| Value::Property(PropertyValue::Date(d)))
+                .ok_or_else(|| {
+                    QueryError::Parse("date +/- duration produced an out-of-range date".into())
+                })
+        };
     Ok(match op {
         ArithOp::Add => {
             if let (Some(d), Some(dur)) = (as_date(a), as_duration(b)) {
@@ -2830,15 +3054,21 @@ fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
     // needed the way `map_value_as_property` has to for `.prop`.
     if let Value::Map(entries) = list {
         let Some(key) = as_arith_str(index) else {
-            return Err(QueryError::Parse(format!("a map index must be a string, got {index:?}")));
+            return Err(QueryError::Parse(format!(
+                "a map index must be a string, got {index:?}"
+            )));
         };
         return Ok(entries.get(key).cloned().unwrap_or(Value::Null));
     }
     let Value::List(items) = list else {
-        return Err(QueryError::Parse(format!("[] indexing needs a list or map, got {list:?}")));
+        return Err(QueryError::Parse(format!(
+            "[] indexing needs a list or map, got {list:?}"
+        )));
     };
     let Some(ArithNum::Int(i)) = as_arith_num(index) else {
-        return Err(QueryError::Parse(format!("a list index must be an integer, got {index:?}")));
+        return Err(QueryError::Parse(format!(
+            "a list index must be an integer, got {index:?}"
+        )));
     };
     let len = items.len() as i64;
     let i = if i < 0 { i + len } else { i };
@@ -2854,12 +3084,18 @@ fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
 /// past the (clamped) end yields `[]` rather than erroring
 /// (`[1,2,3][3..1]` is `[]`) -- both match real Cypher, and both were
 /// real TCK scenarios, not guessed behavior.
-fn apply_slice(list: &Value, start: Option<&Value>, end: Option<&Value>) -> Result<Value, QueryError> {
+fn apply_slice(
+    list: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+) -> Result<Value, QueryError> {
     if matches!(list, Value::Null) {
         return Ok(Value::Null);
     }
     let Value::List(items) = list else {
-        return Err(QueryError::Parse(format!("[..] slicing needs a list, got {list:?}")));
+        return Err(QueryError::Parse(format!(
+            "[..] slicing needs a list, got {list:?}"
+        )));
     };
     let len = items.len() as i64;
     let clamp = |i: i64| -> i64 {
@@ -2872,7 +3108,9 @@ fn apply_slice(list: &Value, start: Option<&Value>, end: Option<&Value>) -> Resu
             Some(Value::Null) => Ok(None),
             Some(other) => match as_arith_num(other) {
                 Some(ArithNum::Int(i)) => Ok(Some(clamp(i))),
-                _ => Err(QueryError::Parse(format!("a slice bound must be an integer, got {other:?}"))),
+                _ => Err(QueryError::Parse(format!(
+                    "a slice bound must be an integer, got {other:?}"
+                ))),
             },
         }
     };
@@ -2885,7 +3123,9 @@ fn apply_slice(list: &Value, start: Option<&Value>, end: Option<&Value>) -> Resu
     if start_idx >= end_idx {
         return Ok(Value::List(Vec::new()));
     }
-    Ok(Value::List(items[start_idx as usize..end_idx as usize].to_vec()))
+    Ok(Value::List(
+        items[start_idx as usize..end_idx as usize].to_vec(),
+    ))
 }
 
 fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
@@ -2910,10 +3150,14 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, QueryError> {
         // raw path object — path elements alternate node/edge/.../node,
         // so edge count is (elements.len() - 1) / 2.
         "length" => Ok(match args.first() {
-            Some(Value::Path(elems)) => Value::Property(PropertyValue::Int(((elems.len().max(1) - 1) / 2) as i64)),
+            Some(Value::Path(elems)) => {
+                Value::Property(PropertyValue::Int(((elems.len().max(1) - 1) / 2) as i64))
+            }
             Some(Value::Null) | None => Value::Null,
             Some(other) => {
-                return Err(QueryError::Parse(format!("length() expects a path, got {other:?}")))
+                return Err(QueryError::Parse(format!(
+                    "length() expects a path, got {other:?}"
+                )))
             }
         }),
         other => Err(QueryError::Parse(format!("unknown function: {other}"))),
@@ -3023,7 +3267,9 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
         | Value::List(_)
         | Value::Map(_)
         | Value::Path(_) => {
-            return Err(QueryError::Parse(format!("toInteger() cannot convert {v:?} to an integer")))
+            return Err(QueryError::Parse(format!(
+                "toInteger() cannot convert {v:?} to an integer"
+            )))
         }
     })
 }
@@ -3038,12 +3284,17 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
     let s = match v {
         Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => s.clone(),
         Value::Property(PropertyValue::Int(i)) | Value::Literal(Literal::Int(i)) => i.to_string(),
-        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => f.to_string(),
+        Value::Property(PropertyValue::Float(f)) | Value::Literal(Literal::Float(f)) => {
+            f.to_string()
+        }
         Value::Property(PropertyValue::Bool(b)) | Value::Literal(Literal::Bool(b)) => b.to_string(),
         Value::Property(PropertyValue::Date(d)) => temporal::format_date(*d),
-        Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => {
-            temporal::format_duration(*months, *days, *seconds, *nanos)
-        }
+        Value::Property(PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        }) => temporal::format_duration(*months, *days, *seconds, *nanos),
         Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
             return Ok(Value::Null);
         }
@@ -3051,7 +3302,9 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
         Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
-            return Err(QueryError::Parse(format!("toString() cannot convert {v:?} to a string")))
+            return Err(QueryError::Parse(format!(
+                "toString() cannot convert {v:?} to a string"
+            )))
         }
     };
     Ok(Value::Property(PropertyValue::String(s)))
@@ -3070,10 +3323,15 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
 /// return a clear error/`None` for those rather than guessing.
 fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if args.len() > 1 {
-        return Err(QueryError::Parse(format!("date() expects zero or one argument, got {}", args.len())));
+        return Err(QueryError::Parse(format!(
+            "date() expects zero or one argument, got {}",
+            args.len()
+        )));
     }
     let Some(arg) = args.first() else {
-        return Ok(Value::Property(PropertyValue::Date(temporal::today_epoch_day())));
+        return Ok(Value::Property(PropertyValue::Date(
+            temporal::today_epoch_day(),
+        )));
     };
     if matches!(arg, Value::Null) {
         return Ok(Value::Null);
@@ -3093,7 +3351,9 @@ fn date_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if let Value::Map(m) = arg {
         return Ok(Value::Property(PropertyValue::Date(date_from_map(m)?)));
     }
-    Err(QueryError::Parse(format!("date() doesn't support this argument: {arg:?}")))
+    Err(QueryError::Parse(format!(
+        "date() doesn't support this argument: {arg:?}"
+    )))
 }
 
 /// `date({year, month, day})` — the calendar construction form only (see
@@ -3107,28 +3367,40 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
         )));
     }
     let integer_field = |key: &str, value: &Value| {
-        value_as_i64(value).ok_or_else(|| QueryError::Parse(format!("date({{...}})'s '{key}' must be an integer")))
+        value_as_i64(value)
+            .ok_or_else(|| QueryError::Parse(format!("date({{...}})'s '{key}' must be an integer")))
     };
     let year_raw = integer_field(
         "year",
-        m.get("year").ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?,
+        m.get("year")
+            .ok_or_else(|| QueryError::Parse("date({...}) requires a 'year' key".into()))?,
     )?;
-    let year = i32::try_from(year_raw)
-        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'year' is out of range: {year_raw}")))?;
+    let year = i32::try_from(year_raw).map_err(|_| {
+        QueryError::Parse(format!(
+            "date({{...}})'s 'year' is out of range: {year_raw}"
+        ))
+    })?;
     let month_raw = match m.get("month") {
         Some(v) => integer_field("month", v)?,
         None => 1,
     };
-    let month = u32::try_from(month_raw)
-        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'month' is out of range: {month_raw}")))?;
+    let month = u32::try_from(month_raw).map_err(|_| {
+        QueryError::Parse(format!(
+            "date({{...}})'s 'month' is out of range: {month_raw}"
+        ))
+    })?;
     let day_raw = match m.get("day") {
         Some(v) => integer_field("day", v)?,
         None => 1,
     };
-    let day = u32::try_from(day_raw)
-        .map_err(|_| QueryError::Parse(format!("date({{...}})'s 'day' is out of range: {day_raw}")))?;
-    temporal::epoch_day_from_ymd(year, month, day)
-        .ok_or_else(|| QueryError::Parse(format!("{year:04}-{month:02}-{day:02} isn't a valid calendar date")))
+    let day = u32::try_from(day_raw).map_err(|_| {
+        QueryError::Parse(format!("date({{...}})'s 'day' is out of range: {day_raw}"))
+    })?;
+    temporal::epoch_day_from_ymd(year, month, day).ok_or_else(|| {
+        QueryError::Parse(format!(
+            "{year:04}-{month:02}-{day:02} isn't a valid calendar date"
+        ))
+    })
 }
 
 /// `duration(...)` — a string (ISO-8601 `'P...'` text, `temporal::
@@ -3138,7 +3410,10 @@ fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
 /// does).
 fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
     if args.len() != 1 {
-        return Err(QueryError::Parse(format!("duration() expects exactly one argument, got {}", args.len())));
+        return Err(QueryError::Parse(format!(
+            "duration() expects exactly one argument, got {}",
+            args.len()
+        )));
     }
     let arg = &args[0];
     if matches!(arg, Value::Null) {
@@ -3154,23 +3429,44 @@ fn duration_builtin(args: &[Value]) -> Result<Value, QueryError> {
     } else if let Value::Map(m) = arg {
         temporal::normalize_duration(duration_fields_from_map(m)?)
     } else {
-        return Err(QueryError::Parse(format!("duration() doesn't support this argument: {arg:?}")));
+        return Err(QueryError::Parse(format!(
+            "duration() doesn't support this argument: {arg:?}"
+        )));
     };
-    Ok(Value::Property(PropertyValue::Duration { months, days, seconds, nanos }))
+    Ok(Value::Property(PropertyValue::Duration {
+        months,
+        days,
+        seconds,
+        nanos,
+    }))
 }
 
-fn duration_fields_from_map(m: &BTreeMap<String, Value>) -> Result<temporal::DurationFields, QueryError> {
+fn duration_fields_from_map(
+    m: &BTreeMap<String, Value>,
+) -> Result<temporal::DurationFields, QueryError> {
     const ALLOWED: &[&str] = &[
-        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds",
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
+        "microseconds",
         "nanoseconds",
     ];
     if let Some(bad) = m.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
-        return Err(QueryError::Parse(format!("duration({{...}}) key '{bad}' isn't a recognized duration unit")));
+        return Err(QueryError::Parse(format!(
+            "duration({{...}}) key '{bad}' isn't a recognized duration unit"
+        )));
     }
     let field = |key: &str| -> Result<f64, QueryError> {
         match m.get(key) {
             None => Ok(0.0),
-            Some(v) => value_as_f64(v).ok_or_else(|| QueryError::Parse(format!("duration({{...}})'s '{key}' must be a number"))),
+            Some(v) => value_as_f64(v).ok_or_else(|| {
+                QueryError::Parse(format!("duration({{...}})'s '{key}' must be a number"))
+            }),
         }
     };
     Ok(temporal::DurationFields {
@@ -3211,9 +3507,13 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
     match pv {
         PropertyValue::Date(d) => temporal::date_component(*d, prop).map(PropertyValue::Int),
-        PropertyValue::Duration { months, days, seconds, nanos } => {
-            temporal::duration_component(*months, *days, *seconds, *nanos, prop).map(PropertyValue::Int)
-        }
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => temporal::duration_component(*months, *days, *seconds, *nanos, prop)
+            .map(PropertyValue::Int),
         _ => None,
     }
 }
@@ -3236,11 +3536,16 @@ fn apply_order_by(
     // this post-projection point.
     let order_by_col: Vec<Option<usize>> = order_by
         .iter()
-        .map(|(expr, _)| columns.iter().position(|c| *c == default_column_name(expr, 0)))
+        .map(|(expr, _)| {
+            columns
+                .iter()
+                .position(|c| *c == default_column_name(expr, 0))
+        })
         .collect();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for row in rows {
-        let row_map: HashMap<String, Value> = columns.iter().cloned().zip(row.iter().cloned()).collect();
+        let row_map: HashMap<String, Value> =
+            columns.iter().cloned().zip(row.iter().cloned()).collect();
         let keys = order_by
             .iter()
             .zip(&order_by_col)
@@ -3251,7 +3556,10 @@ fn apply_order_by(
             .collect::<Result<Vec<_>, _>>()?;
         keyed.push((keys, row));
     }
-    Ok(top_k_by(keyed, order_by, limit).into_iter().map(|(_, row)| row).collect())
+    Ok(top_k_by(keyed, order_by, limit)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
 }
 
 /// Same expression shape as `eval_return_expr`, but resolves `Var`/`Prop`
@@ -3259,7 +3567,10 @@ fn apply_order_by(
 /// `BindingRow` — no `WriteTransaction`/`GraphStore` access needed, since a
 /// projected `Value::Node`/`Value::Edge` already carries its full record
 /// (including props) from when it was first materialized.
-fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Result<Value, QueryError> {
+fn eval_projected_expr(
+    expr: &ReturnExpr,
+    row: &HashMap<String, Value>,
+) -> Result<Value, QueryError> {
     match expr {
         ReturnExpr::Var(name) => row
             .get(name)
@@ -3340,9 +3651,12 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let rv = eval_projected_expr(r, row)?;
             apply_arith(*op, &lv, &rv)
         }
-        ReturnExpr::ListLit(items) => {
-            Ok(Value::List(items.iter().map(|item| eval_projected_expr(item, row)).collect::<Result<Vec<_>, _>>()?))
-        }
+        ReturnExpr::ListLit(items) => Ok(Value::List(
+            items
+                .iter()
+                .map(|item| eval_projected_expr(item, row))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
         ReturnExpr::Index(base, index) => {
             let base_v = eval_projected_expr(base, row)?;
             let index_v = eval_projected_expr(index, row)?;
@@ -3350,8 +3664,14 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
         }
         ReturnExpr::Slice(base, start, end) => {
             let base_v = eval_projected_expr(base, row)?;
-            let start_v = start.as_deref().map(|s| eval_projected_expr(s, row)).transpose()?;
-            let end_v = end.as_deref().map(|e| eval_projected_expr(e, row)).transpose()?;
+            let start_v = start
+                .as_deref()
+                .map(|s| eval_projected_expr(s, row))
+                .transpose()?;
+            let end_v = end
+                .as_deref()
+                .map(|e| eval_projected_expr(e, row))
+                .transpose()?;
             apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
         }
         ReturnExpr::ListComp {
@@ -3398,7 +3718,11 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             let items = match source_v {
                 Value::List(items) => items,
                 Value::Null => return Ok(Value::Null),
-                other => return Err(QueryError::Parse(format!("quantifier source must be a list, got {other:?}"))),
+                other => {
+                    return Err(QueryError::Parse(format!(
+                        "quantifier source must be a list, got {other:?}"
+                    )))
+                }
             };
             let mut preds = Vec::with_capacity(items.len());
             for item in &items {
@@ -3433,13 +3757,18 @@ fn eval_projected_expr(expr: &ReturnExpr, row: &HashMap<String, Value>) -> Resul
             value_to_bool3(&eval_projected_expr(l, row)?)?,
             value_to_bool3(&eval_projected_expr(r, row)?)?,
         ))),
-        ReturnExpr::Not(e) => Ok(bool3_to_value(value_to_bool3(&eval_projected_expr(e, row)?)?.map(|b| !b))),
+        ReturnExpr::Not(e) => Ok(bool3_to_value(
+            value_to_bool3(&eval_projected_expr(e, row)?)?.map(|b| !b),
+        )),
         ReturnExpr::Compare(l, op, r) => {
             let lv = eval_projected_expr(l, row)?;
             let rv = eval_projected_expr(r, row)?;
             Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
         }
-        ReturnExpr::IsNull(e) => Ok(Value::Literal(Literal::Bool(matches!(eval_projected_expr(e, row)?, Value::Null)))),
+        ReturnExpr::IsNull(e) => Ok(Value::Literal(Literal::Bool(matches!(
+            eval_projected_expr(e, row)?,
+            Value::Null
+        )))),
     }
 }
 
@@ -3454,7 +3783,10 @@ fn dedup_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, QueryError> {
     let mut seen: HashSet<Vec<HashKey>> = HashSet::with_capacity(rows.len());
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let key = row.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?;
+        let key = row
+            .iter()
+            .map(value_hash_key)
+            .collect::<Result<Vec<_>, _>>()?;
         if seen.insert(key) {
             out.push(row);
         }
@@ -3537,7 +3869,9 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Some(PropertyValue::Float(x)), Some(PropertyValue::Int(y))) => {
             x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal)
         }
-        (Some(PropertyValue::Float(x)), Some(PropertyValue::Float(y))) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (Some(PropertyValue::Float(x)), Some(PropertyValue::Float(y))) => {
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
         (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
         (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
         (Some(PropertyValue::Date(x)), Some(PropertyValue::Date(y))) => x.cmp(&y),
@@ -3568,9 +3902,15 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
     let pb = value_to_comparable(b)?;
     Some(match (pa, pb) {
         (PropertyValue::Int(x), PropertyValue::Int(y)) => x.cmp(&y),
-        (PropertyValue::Int(x), PropertyValue::Float(y)) => (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal),
-        (PropertyValue::Float(x), PropertyValue::Int(y)) => x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal),
-        (PropertyValue::Float(x), PropertyValue::Float(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        (PropertyValue::Int(x), PropertyValue::Float(y)) => {
+            (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
+        (PropertyValue::Float(x), PropertyValue::Int(y)) => {
+            x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal)
+        }
+        (PropertyValue::Float(x), PropertyValue::Float(y)) => {
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
         (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(&y),
         (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(&y),
         // `Duration` deliberately has no arm here (falls through to
@@ -3626,7 +3966,11 @@ fn compare_values(a: &Value, op: CompareOp, b: &Value) -> Option<bool> {
 /// Cypher's ordinary "unknown" (a null operand, a null found while
 /// lexicographically comparing two lists, or a genuine type mismatch),
 /// not something to special-case to `false`.
-fn ordered_compare(a: &Value, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> Option<bool> {
+fn ordered_compare(
+    a: &Value,
+    b: &Value,
+    pred: impl Fn(std::cmp::Ordering) -> bool,
+) -> Option<bool> {
     if let (Some(x), Some(y)) = (value_as_f64(a), value_as_f64(b)) {
         return Some(x.partial_cmp(&y).map(pred).unwrap_or(false));
     }
@@ -3733,9 +4077,8 @@ fn fold_ternary_eq(mut results: impl Iterator<Item = Option<bool>>) -> Option<bo
 fn values_equal_numeric_aware(a: &Value, b: &Value) -> bool {
     match (as_arith_num(a), as_arith_num(b)) {
         (Some(ArithNum::Int(x)), Some(ArithNum::Int(y))) => x == y,
-        (Some(ArithNum::Int(x)), Some(ArithNum::Float(y))) | (Some(ArithNum::Float(y)), Some(ArithNum::Int(x))) => {
-            x as f64 == y
-        }
+        (Some(ArithNum::Int(x)), Some(ArithNum::Float(y)))
+        | (Some(ArithNum::Float(y)), Some(ArithNum::Int(x))) => x as f64 == y,
         (Some(ArithNum::Float(x)), Some(ArithNum::Float(y))) => x == y,
         _ => value_eq(a, b),
     }

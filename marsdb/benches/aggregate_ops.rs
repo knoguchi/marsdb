@@ -18,7 +18,8 @@ fn items_db(n: usize, num_groups: usize) -> Database {
         patterns.push(format!("(n{i}:Item {{idx: {i}, cat: {cat}}})"));
     }
     let db = Database::in_memory().unwrap();
-    db.execute(&format!("CREATE {}", patterns.join(", "))).unwrap();
+    db.execute(&format!("CREATE {}", patterns.join(", ")))
+        .unwrap();
     db
 }
 
@@ -65,7 +66,8 @@ fn bench_grouped_all_distinct(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 black_box(
-                    db.execute("MATCH (n:Item) WITH n.cat AS cat, count(n) AS c RETURN cat, c").unwrap(),
+                    db.execute("MATCH (n:Item) WITH n.cat AS cat, count(n) AS c RETURN cat, c")
+                        .unwrap(),
                 )
             });
         });
@@ -92,7 +94,12 @@ fn bench_count_distinct_all_distinct(c: &mut Criterion) {
     for n in [100usize, 1_000, 10_000] {
         let db = items_db(n, n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| black_box(db.execute("MATCH (n:Item) RETURN count(DISTINCT n.cat)").unwrap()));
+            b.iter(|| {
+                black_box(
+                    db.execute("MATCH (n:Item) RETURN count(DISTINCT n.cat)")
+                        .unwrap(),
+                )
+            });
         });
     }
     group.finish();

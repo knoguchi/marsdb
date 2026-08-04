@@ -37,7 +37,10 @@ fn traversal_with_label_filter() {
         &store,
         "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
     );
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:BLOCKS]->(c:Person {name: 'Carol'})");
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:BLOCKS]->(c:Person {name: 'Carol'})",
+    );
 
     let result = run(
         &store,
@@ -86,8 +89,18 @@ fn limit_clause_pushed_into_scan_edge_cases() {
     for i in 0..3 {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    assert_eq!(run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 0").rows.len(), 0);
-    assert_eq!(run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 100").rows.len(), 3);
+    assert_eq!(
+        run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 0")
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        run(&store, "MATCH (n:Item) RETURN n.idx LIMIT 100")
+            .rows
+            .len(),
+        3
+    );
     assert_eq!(run(&store, "MATCH (n) RETURN n LIMIT 2").rows.len(), 2);
 }
 
@@ -97,7 +110,10 @@ fn return_distinct_dedups_whole_row() {
     for city in ["A", "B", "A", "A", "B"] {
         run(&store, &format!("CREATE (n:City {{name: '{city}'}})"));
     }
-    let result = run(&store, "MATCH (n:City) RETURN DISTINCT n.name AS c ORDER BY c");
+    let result = run(
+        &store,
+        "MATCH (n:City) RETURN DISTINCT n.name AS c ORDER BY c",
+    );
     let names: Vec<String> = result
         .rows
         .iter()
@@ -145,7 +161,10 @@ fn bare_return_needs_no_match_clause() {
 #[test]
 fn detach_delete() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
     run(&store, "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n");
     let result = run(&store, "MATCH (n:Person) RETURN n.name");
     assert_eq!(result.rows.len(), 1);
@@ -206,10 +225,16 @@ fn multi_label_create_and_match() {
 #[test]
 fn coalesce_returns_first_non_null() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (a:Post {content: 'hello', imageFile: 'ignored.png'})");
+    run(
+        &store,
+        "CREATE (a:Post {content: 'hello', imageFile: 'ignored.png'})",
+    );
     run(&store, "CREATE (b:Post {imageFile: 'pic.png'})"); // no content prop
 
-    let result = run(&store, "MATCH (n:Post) RETURN coalesce(n.content, n.imageFile) AS x");
+    let result = run(
+        &store,
+        "MATCH (n:Post) RETURN coalesce(n.content, n.imageFile) AS x",
+    );
     let mut values: Vec<String> = result
         .rows
         .iter()
@@ -238,14 +263,20 @@ fn to_integer_parses_a_float_formatted_string_by_truncating() {
     // Regression: `toInteger('1.7')` used to fail straight to null since
     // the string-parse path only ever tried an i64 parse.
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [2, 2.9, '1.7'] AS things RETURN [n IN things | toInteger(n)] AS x");
+    let result = run(
+        &store,
+        "WITH [2, 2.9, '1.7'] AS things RETURN [n IN things | toInteger(n)] AS x",
+    );
     assert_eq!(list_ints(&result.rows[0][0]), vec![2, 2, 1]);
 }
 
 #[test]
 fn to_integer_on_an_unparseable_string_is_null_not_an_error() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH ['2', '2.9', 'foo'] AS numbers RETURN [n IN numbers | toInteger(n)] AS x");
+    let result = run(
+        &store,
+        "WITH ['2', '2.9', 'foo'] AS numbers RETURN [n IN numbers | toInteger(n)] AS x",
+    );
     match &result.rows[0][0] {
         Value::List(items) => {
             assert_eq!(int(&items[0]), 2);
@@ -269,7 +300,10 @@ fn case_when_then_else() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {age: 30})");
     run(&store, "CREATE (b:Person {age: 17})");
-    let result = run(&store, "MATCH (n:Person) RETURN CASE n.age WHEN 30 THEN 'thirty' ELSE 'other' END AS x");
+    let result = run(
+        &store,
+        "MATCH (n:Person) RETURN CASE n.age WHEN 30 THEN 'thirty' ELSE 'other' END AS x",
+    );
     let mut values: Vec<String> = result
         .rows
         .iter()
@@ -288,7 +322,10 @@ fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
     // property compared against `null` in a WHEN arm matches.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice'})"); // no `age` prop
-    let result = run(&store, "MATCH (n:Person) RETURN CASE n.age WHEN null THEN 'yes' ELSE 'no' END AS x");
+    let result = run(
+        &store,
+        "MATCH (n:Person) RETURN CASE n.age WHEN null THEN 'yes' ELSE 'no' END AS x",
+    );
     match &result.rows[0][0] {
         Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "yes"),
         other => panic!("unexpected value {other:?}"),
@@ -316,7 +353,14 @@ fn order_by_multi_key_against_aliases_not_raw_bindings() {
             other => panic!("unexpected value {other:?}"),
         })
         .collect();
-    assert_eq!(names, vec!["Alice".to_string(), "Charlie".to_string(), "Bob".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            "Alice".to_string(),
+            "Charlie".to_string(),
+            "Bob".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -325,7 +369,10 @@ fn order_by_then_limit_sorts_before_truncating() {
     for i in 0..5 {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x ORDER BY x DESC LIMIT 2");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx AS x ORDER BY x DESC LIMIT 2",
+    );
     let values: Vec<i64> = result
         .rows
         .iter()
@@ -348,7 +395,10 @@ fn order_by_then_limit_with_aggregation() {
     for i in 0..5 {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x, count(*) AS c ORDER BY x DESC LIMIT 2");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx AS x, count(*) AS c ORDER BY x DESC LIMIT 2",
+    );
     let values: Vec<i64> = result
         .rows
         .iter()
@@ -371,7 +421,10 @@ fn order_by_then_limit_zero_returns_nothing() {
     for i in 0..3 {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) RETURN n.idx AS x ORDER BY x LIMIT 0");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx AS x ORDER BY x LIMIT 0",
+    );
     assert_eq!(result.rows.len(), 0);
 }
 
@@ -442,7 +495,10 @@ fn nested_aggregate_inside_arithmetic_is_rejected_not_silently_wrong() {
     let store = GraphStore::open_memory().unwrap();
     let stmt = marsdb_query::parse("MATCH (n) RETURN 1 + count(n)").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("entire expression"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("entire expression"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -450,12 +506,21 @@ fn undirected_pattern_matches_either_direction() {
     let store = GraphStore::open_memory().unwrap();
     // a->b (created via Right direction), so from b's perspective it's an
     // incoming edge — an undirected MATCH from b must still find a.
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
 
-    let from_a = run(&store, "MATCH (n:Person {name: 'Alice'})-[:KNOWS]-(friend) RETURN friend.name");
+    let from_a = run(
+        &store,
+        "MATCH (n:Person {name: 'Alice'})-[:KNOWS]-(friend) RETURN friend.name",
+    );
     assert_eq!(from_a.rows.len(), 1);
 
-    let from_b = run(&store, "MATCH (n:Person {name: 'Bob'})-[:KNOWS]-(friend) RETURN friend.name");
+    let from_b = run(
+        &store,
+        "MATCH (n:Person {name: 'Bob'})-[:KNOWS]-(friend) RETURN friend.name",
+    );
     assert_eq!(from_b.rows.len(), 1);
     match &from_b.rows[0][0] {
         Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "Alice"),
@@ -472,7 +537,9 @@ fn undirected_pattern_dedupes_self_loop() {
     // creates a fresh node) — construct it directly via GraphStore instead.
     let store = GraphStore::open_memory().unwrap();
     let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
-    store.create_edge("KNOWS", alice, alice, BTreeMap::new()).unwrap();
+    store
+        .create_edge("KNOWS", alice, alice, BTreeMap::new())
+        .unwrap();
 
     let result = run(&store, "MATCH (n:Person)-[:KNOWS]-(friend) RETURN friend");
     assert_eq!(
@@ -502,11 +569,21 @@ fn hop_node_first_label_is_actually_filtered() {
     // handles the first label) -- so `(a)-[:R]->(b:Post)` would match ANY
     // labeled node at the far end of the hop, not just :Post ones.
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (a:Root {name: 'r'})-[:R]->(b:Post {name: 'post'})");
-    run(&store, "CREATE (a2:Root {name: 'r2'})-[:R]->(c:Comment {name: 'comment'})");
+    run(
+        &store,
+        "CREATE (a:Root {name: 'r'})-[:R]->(b:Post {name: 'post'})",
+    );
+    run(
+        &store,
+        "CREATE (a2:Root {name: 'r2'})-[:R]->(c:Comment {name: 'comment'})",
+    );
 
     let result = run(&store, "MATCH (a:Root)-[:R]->(b:Post) RETURN b.name");
-    assert_eq!(result.rows.len(), 1, "hop node's label filter must exclude the :Comment target");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "hop node's label filter must exclude the :Comment target"
+    );
     match &result.rows[0][0] {
         Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "post"),
         other => panic!("unexpected value {other:?}"),
@@ -528,14 +605,25 @@ fn variable_length_pattern_walks_reply_chain_to_root() {
     let p = store.create_node(&["Post", "Message"], props_p).unwrap();
     let mut props_c1 = BTreeMap::new();
     props_c1.insert("id".to_string(), marsdb_graph::PropertyValue::Int(2));
-    let c1 = store.create_node(&["Comment", "Message"], props_c1).unwrap();
+    let c1 = store
+        .create_node(&["Comment", "Message"], props_c1)
+        .unwrap();
     let mut props_c2 = BTreeMap::new();
     props_c2.insert("id".to_string(), marsdb_graph::PropertyValue::Int(3));
-    let c2 = store.create_node(&["Comment", "Message"], props_c2).unwrap();
-    store.create_edge("REPLY_OF", c1, p, BTreeMap::new()).unwrap();
-    store.create_edge("REPLY_OF", c2, c1, BTreeMap::new()).unwrap();
+    let c2 = store
+        .create_node(&["Comment", "Message"], props_c2)
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", c1, p, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", c2, c1, BTreeMap::new())
+        .unwrap();
 
-    let result = run(&store, "MATCH (m:Message {id: 3})-[:REPLY_OF*0..]->(p:Post) RETURN p.id");
+    let result = run(
+        &store,
+        "MATCH (m:Message {id: 3})-[:REPLY_OF*0..]->(p:Post) RETURN p.id",
+    );
     assert_eq!(result.rows.len(), 1);
     match &result.rows[0][0] {
         Value::Property(marsdb_graph::PropertyValue::Int(v)) => assert_eq!(*v, 1),
@@ -546,7 +634,10 @@ fn variable_length_pattern_walks_reply_chain_to_root() {
     // match the target label — not exercised by IS6 (a Comment never
     // has :Post too) but worth confirming: starting FROM the post with
     // *0.. must return the post itself at hop 0.
-    let from_post = run(&store, "MATCH (m:Message {id: 1})-[:REPLY_OF*0..]->(p:Post) RETURN p.id");
+    let from_post = run(
+        &store,
+        "MATCH (m:Message {id: 1})-[:REPLY_OF*0..]->(p:Post) RETURN p.id",
+    );
     assert_eq!(from_post.rows.len(), 1);
 }
 
@@ -562,12 +653,17 @@ fn variable_length_bounded_range_respects_max_hops() {
         ids.push(store.create_node(&["Item"], props).unwrap());
     }
     for i in 0..4 {
-        store.create_edge("NEXT", ids[i], ids[i + 1], BTreeMap::new()).unwrap();
+        store
+            .create_edge("NEXT", ids[i], ids[i + 1], BTreeMap::new())
+            .unwrap();
     }
 
     // From idx=0, *1..2 should reach idx=1 and idx=2 only (not 3, not 4;
     // not 0 itself since min_hops=1).
-    let result = run(&store, "MATCH (n:Item {idx: 0})-[:NEXT*1..2]->(m:Item) RETURN m.idx");
+    let result = run(
+        &store,
+        "MATCH (n:Item {idx: 0})-[:NEXT*1..2]->(m:Item) RETURN m.idx",
+    );
     let mut reached: Vec<i64> = result
         .rows
         .iter()
@@ -595,13 +691,18 @@ fn variable_length_unbounded_depth_cap_errors_not_truncates() {
         let mut props = BTreeMap::new();
         props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
         let next = store.create_node(&["Item"], props).unwrap();
-        store.create_edge("NEXT", prev, next, BTreeMap::new()).unwrap();
+        store
+            .create_edge("NEXT", prev, next, BTreeMap::new())
+            .unwrap();
         prev = next;
     }
 
     let stmt = parse("MATCH (n:Item {idx: 0})-[:NEXT*0..]->(m:Item) RETURN m.idx").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("depth cap"), "expected a depth-cap error, got: {err}");
+    assert!(
+        err.to_string().contains("depth cap"),
+        "expected a depth-cap error, got: {err}"
+    );
 }
 
 #[test]
@@ -624,27 +725,41 @@ fn with_chaining_mirrors_is2_shape() {
     // Bob) -- REPLY_OF*0.. must walk one hop to reach it.
     let store = GraphStore::open_memory().unwrap();
     let mut alice_props = BTreeMap::new();
-    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    alice_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".into()),
+    );
     let alice = store.create_node(&["Person"], alice_props).unwrap();
     let mut bob_props = BTreeMap::new();
-    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    bob_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Bob".into()),
+    );
     let bob = store.create_node(&["Person"], bob_props).unwrap();
 
     let mut m1_props = BTreeMap::new();
     m1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
     let m1 = store.create_node(&["Post"], m1_props).unwrap();
-    store.create_edge("HAS_CREATOR", m1, alice, BTreeMap::new()).unwrap();
+    store
+        .create_edge("HAS_CREATOR", m1, alice, BTreeMap::new())
+        .unwrap();
 
     let mut m2_props = BTreeMap::new();
     m2_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(2));
     let m2 = store.create_node(&["Comment"], m2_props).unwrap();
-    store.create_edge("HAS_CREATOR", m2, alice, BTreeMap::new()).unwrap();
+    store
+        .create_edge("HAS_CREATOR", m2, alice, BTreeMap::new())
+        .unwrap();
 
     let mut p1_props = BTreeMap::new();
     p1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(3));
     let p1 = store.create_node(&["Post"], p1_props).unwrap();
-    store.create_edge("HAS_CREATOR", p1, bob, BTreeMap::new()).unwrap();
-    store.create_edge("REPLY_OF", m2, p1, BTreeMap::new()).unwrap();
+    store
+        .create_edge("HAS_CREATOR", p1, bob, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", m2, p1, BTreeMap::new())
+        .unwrap();
 
     let result = run(
         &store,
@@ -658,7 +773,11 @@ fn with_chaining_mirrors_is2_shape() {
     );
 
     assert_eq!(result.columns, vec!["message_id", "post_id", "person_name"]);
-    assert_eq!(result.rows.len(), 2, "both of Alice's messages must resolve to a post+author");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "both of Alice's messages must resolve to a post+author"
+    );
 
     let extract = |row: &Vec<Value>| -> (i64, i64, String) {
         let message_id = match &row[0] {
@@ -717,7 +836,11 @@ fn with_boundary_limit_restricts_what_flows_into_next_match() {
         })
         .collect();
     values.sort();
-    assert_eq!(values, vec![3, 4], "only the top-2-by-idx rows from WITH should reach the second MATCH");
+    assert_eq!(
+        values,
+        vec![3, 4],
+        "only the top-2-by-idx rows from WITH should reach the second MATCH"
+    );
 }
 
 #[test]
@@ -753,26 +876,48 @@ fn optional_match_with_var_eq_mirrors_is7_shape() {
     m_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
     let m = store.create_node(&["Post", "Message"], m_props).unwrap();
     let original_author = store.create_node(&["Person"], BTreeMap::new()).unwrap();
-    store.create_edge("HAS_CREATOR", m, original_author, BTreeMap::new()).unwrap();
+    store
+        .create_edge("HAS_CREATOR", m, original_author, BTreeMap::new())
+        .unwrap();
 
     let mut p1_props = BTreeMap::new();
-    p1_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("KnowsAuthor".into()));
+    p1_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("KnowsAuthor".into()),
+    );
     let p1 = store.create_node(&["Person"], p1_props).unwrap();
     let mut c1_props = BTreeMap::new();
     c1_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(10));
-    let c1 = store.create_node(&["Comment", "Message"], c1_props).unwrap();
-    store.create_edge("REPLY_OF", c1, m, BTreeMap::new()).unwrap();
-    store.create_edge("HAS_CREATOR", c1, p1, BTreeMap::new()).unwrap();
-    store.create_edge("KNOWS", p1, original_author, BTreeMap::new()).unwrap();
+    let c1 = store
+        .create_node(&["Comment", "Message"], c1_props)
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", c1, m, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("HAS_CREATOR", c1, p1, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("KNOWS", p1, original_author, BTreeMap::new())
+        .unwrap();
 
     let mut p2_props = BTreeMap::new();
-    p2_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("StrangerAuthor".into()));
+    p2_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("StrangerAuthor".into()),
+    );
     let p2 = store.create_node(&["Person"], p2_props).unwrap();
     let mut c2_props = BTreeMap::new();
     c2_props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(20));
-    let c2 = store.create_node(&["Comment", "Message"], c2_props).unwrap();
-    store.create_edge("REPLY_OF", c2, m, BTreeMap::new()).unwrap();
-    store.create_edge("HAS_CREATOR", c2, p2, BTreeMap::new()).unwrap();
+    let c2 = store
+        .create_node(&["Comment", "Message"], c2_props)
+        .unwrap();
+    store
+        .create_edge("REPLY_OF", c2, m, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("HAS_CREATOR", c2, p2, BTreeMap::new())
+        .unwrap();
     // No KNOWS edge between p2 and original_author.
 
     let result = run(
@@ -802,8 +947,14 @@ fn optional_match_with_var_eq_mirrors_is7_shape() {
         (comment_id, name, knows)
     };
 
-    assert_eq!(extract(&result.rows[0]), (10, "KnowsAuthor".to_string(), true));
-    assert_eq!(extract(&result.rows[1]), (20, "StrangerAuthor".to_string(), false));
+    assert_eq!(
+        extract(&result.rows[0]),
+        (10, "KnowsAuthor".to_string(), true)
+    );
+    assert_eq!(
+        extract(&result.rows[1]),
+        (20, "StrangerAuthor".to_string(), false)
+    );
 
     let _ = (m, c1, c2, p1, p2, original_author);
 }
@@ -823,7 +974,11 @@ fn optional_match_null_pads_when_nothing_matches() {
          OPTIONAL MATCH (p)-[r:KNOWS]-(friend) \
          RETURN CASE r WHEN null THEN false ELSE true END AS knowsFlag",
     );
-    assert_eq!(result.rows.len(), 1, "the outer MATCH row must survive even with zero optional matches");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "the outer MATCH row must survive even with zero optional matches"
+    );
     match &result.rows[0][0] {
         Value::Literal(marsdb_query::Literal::Bool(b)) => assert!(!b),
         other => panic!("unexpected value {other:?}"),
@@ -837,7 +992,10 @@ fn optional_match_without_with_shares_scope() {
     // unlike two plain MATCHes, which require a WITH separator.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Item {name: 'a'})");
-    let result = run(&store, "MATCH (n:Item) OPTIONAL MATCH (n)-[:X]->(m) RETURN n.name");
+    let result = run(
+        &store,
+        "MATCH (n:Item) OPTIONAL MATCH (n)-[:X]->(m) RETURN n.name",
+    );
     assert_eq!(result.rows.len(), 1);
 }
 
@@ -888,8 +1046,16 @@ fn count_excludes_null_but_count_star_does_not() {
         "MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS cf, count(*) AS cs",
     );
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(int_value(&result.rows[0][0]), 2, "count(f) must exclude the null-padded row");
-    assert_eq!(int_value(&result.rows[0][1]), 5, "count(*) counts every row, including null-padded ones");
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        2,
+        "count(f) must exclude the null-padded row"
+    );
+    assert_eq!(
+        int_value(&result.rows[0][1]),
+        5,
+        "count(*) counts every row, including null-padded ones"
+    );
 }
 
 #[test]
@@ -898,25 +1064,41 @@ fn group_by_implicit_via_with() {
 
     let store = GraphStore::open_memory().unwrap();
     let mut alice_props = BTreeMap::new();
-    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    alice_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".into()),
+    );
     let alice = store.create_node(&["Person"], alice_props).unwrap();
     let mut bob_props = BTreeMap::new();
-    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    bob_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Bob".into()),
+    );
     let bob = store.create_node(&["Person"], bob_props).unwrap();
     for _ in 0..2 {
         let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+        store
+            .create_edge("OWNS", alice, item, BTreeMap::new())
+            .unwrap();
     }
     let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-    store.create_edge("OWNS", bob, item, BTreeMap::new()).unwrap();
+    store
+        .create_edge("OWNS", bob, item, BTreeMap::new())
+        .unwrap();
 
     let result = run(
         &store,
         "MATCH (p:Person)-[:OWNS]->(i:Item) WITH p.name AS name, count(i) AS c RETURN name, c ORDER BY name",
     );
     assert_eq!(result.rows.len(), 2);
-    assert_eq!((str_value(&result.rows[0][0]), int_value(&result.rows[0][1])), ("Alice".to_string(), 2));
-    assert_eq!((str_value(&result.rows[1][0]), int_value(&result.rows[1][1])), ("Bob".to_string(), 1));
+    assert_eq!(
+        (str_value(&result.rows[0][0]), int_value(&result.rows[0][1])),
+        ("Alice".to_string(), 2)
+    );
+    assert_eq!(
+        (str_value(&result.rows[1][0]), int_value(&result.rows[1][1])),
+        ("Bob".to_string(), 1)
+    );
 }
 
 #[test]
@@ -925,16 +1107,27 @@ fn group_by_implicit_via_return_no_with() {
 
     let store = GraphStore::open_memory().unwrap();
     let mut alice_props = BTreeMap::new();
-    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    alice_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".into()),
+    );
     let alice = store.create_node(&["Person"], alice_props).unwrap();
     for _ in 0..3 {
         let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+        store
+            .create_edge("OWNS", alice, item, BTreeMap::new())
+            .unwrap();
     }
 
-    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN p.name AS name, count(i) AS c");
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN p.name AS name, count(i) AS c",
+    );
     assert_eq!(result.rows.len(), 1);
-    assert_eq!((str_value(&result.rows[0][0]), int_value(&result.rows[0][1])), ("Alice".to_string(), 3));
+    assert_eq!(
+        (str_value(&result.rows[0][0]), int_value(&result.rows[0][1])),
+        ("Alice".to_string(), 3)
+    );
 }
 
 #[test]
@@ -945,12 +1138,20 @@ fn count_distinct_dedupes() {
     let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
     for cat in ["A", "A", "B"] {
         let mut props = BTreeMap::new();
-        props.insert("category".to_string(), marsdb_graph::PropertyValue::String(cat.into()));
+        props.insert(
+            "category".to_string(),
+            marsdb_graph::PropertyValue::String(cat.into()),
+        );
         let item = store.create_node(&["Item"], props).unwrap();
-        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+        store
+            .create_edge("OWNS", alice, item, BTreeMap::new())
+            .unwrap();
     }
 
-    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN count(DISTINCT i.category) AS c");
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN count(DISTINCT i.category) AS c",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(int_value(&result.rows[0][0]), 2);
 }
@@ -965,13 +1166,24 @@ fn collect_distinct_dedupes_nodes() {
     let store = GraphStore::open_memory().unwrap();
     let alice = store.create_node(&["Person"], BTreeMap::new()).unwrap();
     let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-    store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
-    store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+    store
+        .create_edge("OWNS", alice, item, BTreeMap::new())
+        .unwrap();
+    store
+        .create_edge("OWNS", alice, item, BTreeMap::new())
+        .unwrap();
 
-    let result = run(&store, "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN collect(DISTINCT i) AS items");
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:OWNS]->(i:Item) RETURN collect(DISTINCT i) AS items",
+    );
     assert_eq!(result.rows.len(), 1);
     match &result.rows[0][0] {
-        Value::List(items) => assert_eq!(items.len(), 1, "the same node reached via 2 edges must collect once"),
+        Value::List(items) => assert_eq!(
+            items.len(),
+            1,
+            "the same node reached via 2 edges must collect once"
+        ),
         other => panic!("expected a list, got {other:?}"),
     }
 }
@@ -984,7 +1196,11 @@ fn aggregate_over_empty_result_global() {
         "MATCH (n:NoSuchLabel) RETURN count(n) AS c, sum(n.x) AS s, avg(n.x) AS a, min(n.x) AS mn, max(n.x) AS mx, \
          collect(n.x) AS coll",
     );
-    assert_eq!(result.rows.len(), 1, "a global aggregate over zero rows must still emit one row");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "a global aggregate over zero rows must still emit one row"
+    );
     let row = &result.rows[0];
     assert_eq!(int_value(&row[0]), 0);
     assert_eq!(int_value(&row[1]), 0);
@@ -1000,8 +1216,15 @@ fn aggregate_over_empty_result_global() {
 #[test]
 fn aggregate_with_grouping_key_empty_result() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "MATCH (n:NoSuchLabel) RETURN n.type AS t, count(n) AS c");
-    assert_eq!(result.rows.len(), 0, "a grouping key present means zero groups over zero rows, not one");
+    let result = run(
+        &store,
+        "MATCH (n:NoSuchLabel) RETURN n.type AS t, count(n) AS c",
+    );
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "a grouping key present means zero groups over zero rows, not one"
+    );
 }
 
 #[test]
@@ -1031,16 +1254,26 @@ fn grouped_bare_var_stays_traversable_after_with() {
     // traversing from it, not collapse to a value-only binding.
     let store = GraphStore::open_memory().unwrap();
     let mut alice_props = BTreeMap::new();
-    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    alice_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".into()),
+    );
     let alice = store.create_node(&["Person"], alice_props).unwrap();
     for _ in 0..2 {
         let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+        store
+            .create_edge("OWNS", alice, item, BTreeMap::new())
+            .unwrap();
     }
     let mut co_props = BTreeMap::new();
-    co_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Acme".into()));
+    co_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Acme".into()),
+    );
     let acme = store.create_node(&["Company"], co_props).unwrap();
-    store.create_edge("WORKS_AT", alice, acme, BTreeMap::new()).unwrap();
+    store
+        .create_edge("WORKS_AT", alice, acme, BTreeMap::new())
+        .unwrap();
 
     let result = run(
         &store,
@@ -1061,8 +1294,15 @@ fn sum_avg_int_float_promotion() {
     for v in [1, 2, 3] {
         run(&store, &format!("CREATE (n:Item {{val: {v}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a");
-    assert_eq!(int_value(&result.rows[0][0]), 6, "sum of all-int inputs must stay Int");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a",
+    );
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        6,
+        "sum of all-int inputs must stay Int"
+    );
     match &result.rows[0][1] {
         Value::Property(marsdb_graph::PropertyValue::Float(f)) => assert!((f - 2.0).abs() < 1e-9),
         other => panic!("avg must always be a float, got {other:?}"),
@@ -1075,7 +1315,10 @@ fn sum_avg_promotes_to_float_when_any_input_is_float() {
     run(&store, "CREATE (n:Item {val: 1})");
     run(&store, "CREATE (n:Item {val: 2})");
     run(&store, "CREATE (n:Item {val: 1.5})");
-    let result = run(&store, "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN sum(n.val) AS s, avg(n.val) AS a",
+    );
     match &result.rows[0][0] {
         Value::Property(marsdb_graph::PropertyValue::Float(f)) => assert!((f - 4.5).abs() < 1e-9),
         other => panic!("expected a float sum, got {other:?}"),
@@ -1092,7 +1335,10 @@ fn min_max_on_non_orderable_errors() {
     run(&store, "CREATE (n:Item {idx: 1})");
     let stmt = parse("MATCH (n:Item) RETURN min(n) AS m").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("comparable"), "expected a comparability error, got: {err}");
+    assert!(
+        err.to_string().contains("comparable"),
+        "expected a comparability error, got: {err}"
+    );
 }
 
 #[test]
@@ -1101,16 +1347,23 @@ fn nested_aggregate_rejected() {
     run(&store, "CREATE (n:Item {idx: 1})");
     let stmt = parse("MATCH (n:Item) RETURN count(sum(n.idx)) AS c").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("aggregate"), "expected an aggregate-nesting error, got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("aggregate"),
+        "expected an aggregate-nesting error, got: {err}"
+    );
 }
 
 #[test]
 fn aggregate_not_top_level_rejected() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (n:Item {idx: 1})");
-    let stmt = parse("MATCH (n:Item) RETURN CASE n.idx WHEN 1 THEN count(n) ELSE 0 END AS x").unwrap();
+    let stmt =
+        parse("MATCH (n:Item) RETURN CASE n.idx WHEN 1 THEN count(n) ELSE 0 END AS x").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("aggregate"), "expected a top-level-aggregate error, got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("aggregate"),
+        "expected a top-level-aggregate error, got: {err}"
+    );
 }
 
 #[test]
@@ -1127,13 +1380,18 @@ fn var_expand_depth_cap_error_survives_aggregation() {
         let mut props = BTreeMap::new();
         props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
         let next = store.create_node(&["Item"], props).unwrap();
-        store.create_edge("NEXT", prev, next, BTreeMap::new()).unwrap();
+        store
+            .create_edge("NEXT", prev, next, BTreeMap::new())
+            .unwrap();
         prev = next;
     }
 
     let stmt = parse("MATCH (n:Item {idx: 0})-[:NEXT*0..]->(m:Item) RETURN count(m) AS c").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("depth cap"), "expected a depth-cap error, got: {err}");
+    assert!(
+        err.to_string().contains("depth cap"),
+        "expected a depth-cap error, got: {err}"
+    );
 }
 
 #[test]
@@ -1142,23 +1400,37 @@ fn with_where_filters_on_aggregate_result() {
 
     let store = GraphStore::open_memory().unwrap();
     let mut alice_props = BTreeMap::new();
-    alice_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Alice".into()));
+    alice_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".into()),
+    );
     let alice = store.create_node(&["Person"], alice_props).unwrap();
     let mut bob_props = BTreeMap::new();
-    bob_props.insert("name".to_string(), marsdb_graph::PropertyValue::String("Bob".into()));
+    bob_props.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Bob".into()),
+    );
     let bob = store.create_node(&["Person"], bob_props).unwrap();
     for _ in 0..3 {
         let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-        store.create_edge("OWNS", alice, item, BTreeMap::new()).unwrap();
+        store
+            .create_edge("OWNS", alice, item, BTreeMap::new())
+            .unwrap();
     }
     let item = store.create_node(&["Item"], BTreeMap::new()).unwrap();
-    store.create_edge("OWNS", bob, item, BTreeMap::new()).unwrap();
+    store
+        .create_edge("OWNS", bob, item, BTreeMap::new())
+        .unwrap();
 
     let result = run(
         &store,
         "MATCH (p:Person)-[:OWNS]->(i:Item) WITH p, count(i) AS c WHERE c > 1 RETURN p.name AS name, c",
     );
-    assert_eq!(result.rows.len(), 1, "only Alice's group (count 3) should survive c > 1");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "only Alice's group (count 3) should survive c > 1"
+    );
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(int_value(&result.rows[0][1]), 3);
 }
@@ -1169,7 +1441,10 @@ fn with_where_filters_without_aggregation() {
     for i in [5, 15, 25] {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y");
+    let result = run(
+        &store,
+        "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y",
+    );
     let vals: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
     assert_eq!(vals, vec![15, 25]);
 }
@@ -1180,7 +1455,10 @@ fn with_where_and_or_not() {
     for i in [5, 15, 25, 35] {
         run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
     }
-    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 AND NOT y > 30 RETURN y ORDER BY y");
+    let result = run(
+        &store,
+        "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 AND NOT y > 30 RETURN y ORDER BY y",
+    );
     let vals: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
     assert_eq!(vals, vec![15, 25]);
 }
@@ -1198,7 +1476,10 @@ fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
     let mut people = Vec::new();
     for name in names {
         let mut props = BTreeMap::new();
-        props.insert("name".to_string(), marsdb_graph::PropertyValue::String(name.into()));
+        props.insert(
+            "name".to_string(),
+            marsdb_graph::PropertyValue::String(name.into()),
+        );
         people.push(store.create_node(&["Person"], props).unwrap());
     }
     // Alice: 3 posts, Bob: 2 posts, Carol: 1 post, Dave: 0 posts.
@@ -1208,7 +1489,9 @@ fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
             let mut props = BTreeMap::new();
             props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(i));
             let post = store.create_node(&["Post"], props).unwrap();
-            store.create_edge("HAS_CREATOR", post, *person, BTreeMap::new()).unwrap();
+            store
+                .create_edge("HAS_CREATOR", post, *person, BTreeMap::new())
+                .unwrap();
         }
     }
 
@@ -1221,7 +1504,11 @@ fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
          ORDER BY postCount DESC \
          LIMIT 2",
     );
-    assert_eq!(result.rows.len(), 2, "Dave (0 posts) filtered by WHERE, then LIMIT 2 of the remaining 3");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "Dave (0 posts) filtered by WHERE, then LIMIT 2 of the remaining 3"
+    );
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(int_value(&result.rows[0][1]), 3);
     match &result.rows[0][2] {
@@ -1250,7 +1537,10 @@ fn match_create_connects_two_already_existing_nodes() {
     let people = run(&store, "MATCH (n:Person) RETURN n.name");
     assert_eq!(people.rows.len(), 2);
 
-    let result = run(&store, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name");
+    let result = run(
+        &store,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(str_value(&result.rows[0][1]), "Bob");
@@ -1261,9 +1551,15 @@ fn match_create_adds_new_node_to_bound_node() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice'})");
 
-    run(&store, "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:OWNS]->(i:Item {name: 'Widget'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:OWNS]->(i:Item {name: 'Widget'})",
+    );
 
-    let result = run(&store, "MATCH (a:Person)-[:OWNS]->(i:Item) RETURN a.name, i.name");
+    let result = run(
+        &store,
+        "MATCH (a:Person)-[:OWNS]->(i:Item) RETURN a.name, i.name",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(str_value(&result.rows[0][1]), "Widget");
@@ -1278,17 +1574,28 @@ fn match_create_runs_once_per_matched_row() {
 
     run(&store, "MATCH (p:Person) CREATE (p)-[:HAS_LOG]->(l:Log)");
 
-    let result = run(&store, "MATCH (p:Person)-[:HAS_LOG]->(l:Log) RETURN count(*)");
-    assert_eq!(int_value(&result.rows[0][0]), 3, "one new Log node per matched Person row");
+    let result = run(
+        &store,
+        "MATCH (p:Person)-[:HAS_LOG]->(l:Log) RETURN count(*)",
+    );
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        3,
+        "one new Log node per matched Person row"
+    );
 }
 
 #[test]
 fn match_create_rejects_relabeling_bound_node() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice'})");
-    let stmt = parse("MATCH (a:Person {name: 'Alice'}) CREATE (a:Employee)-[:X]->(b:Item)").unwrap();
+    let stmt =
+        parse("MATCH (a:Person {name: 'Alice'}) CREATE (a:Employee)-[:X]->(b:Item)").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("already bound"), "expected an already-bound error, got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
 }
 
 #[test]
@@ -1327,9 +1634,16 @@ fn with_chaining_disjoint_second_match_cross_joins_carried_var() {
         "MATCH (a:Left) WITH a MATCH (b:Right) RETURN a.name AS leftName, b.name AS rightName \
          ORDER BY leftName, rightName",
     );
-    assert_eq!(result.rows.len(), 4, "2 Left x 2 Right must cross-join to 4 rows, not drop `a`");
-    let pairs: Vec<(String, String)> =
-        result.rows.iter().map(|r| (str_value(&r[0]), str_value(&r[1]))).collect();
+    assert_eq!(
+        result.rows.len(),
+        4,
+        "2 Left x 2 Right must cross-join to 4 rows, not drop `a`"
+    );
+    let pairs: Vec<(String, String)> = result
+        .rows
+        .iter()
+        .map(|r| (str_value(&r[0]), str_value(&r[1])))
+        .collect();
     assert_eq!(
         pairs,
         vec![
@@ -1352,7 +1666,10 @@ fn optional_match_disjoint_pattern_does_not_panic() {
     run(&store, "CREATE (:Left {name: 'Alice'})");
     run(&store, "CREATE (:Right {name: 'X'})");
 
-    let result = run(&store, "MATCH (a:Left) OPTIONAL MATCH (c:Right) RETURN a.name, c.name");
+    let result = run(
+        &store,
+        "MATCH (a:Left) OPTIONAL MATCH (c:Right) RETURN a.name, c.name",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "Alice");
     assert_eq!(str_value(&result.rows[0][1]), "X");
@@ -1371,7 +1688,10 @@ fn string_literal_escaped_backslash_and_common_escapes() {
     // Cypher source (raw string below is literal, no extra doubling
     // needed): `\\` is one escaped backslash, `\t`/`\n` are tab/newline.
     let store = GraphStore::open_memory().unwrap();
-    run(&store, r"CREATE (:Path {p: 'C:\\Users\\x', tab: 'a\tb', nl: 'a\nb'})");
+    run(
+        &store,
+        r"CREATE (:Path {p: 'C:\\Users\\x', tab: 'a\tb', nl: 'a\nb'})",
+    );
     let result = run(&store, "MATCH (n:Path) RETURN n.p, n.tab, n.nl");
     assert_eq!(str_value(&result.rows[0][0]), r"C:\Users\x");
     assert_eq!(str_value(&result.rows[0][1]), "a\tb");
@@ -1405,8 +1725,15 @@ fn unwind_cross_joins_against_existing_rows() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {name: 'Alice'})");
     run(&store, "CREATE (:Person {name: 'Bob'})");
-    let result = run(&store, "MATCH (p:Person) UNWIND [1, 2] AS n RETURN p.name AS name, n ORDER BY name, n");
-    let pairs: Vec<(String, i64)> = result.rows.iter().map(|r| (str_value(&r[0]), int_value(&r[1]))).collect();
+    let result = run(
+        &store,
+        "MATCH (p:Person) UNWIND [1, 2] AS n RETURN p.name AS name, n ORDER BY name, n",
+    );
+    let pairs: Vec<(String, i64)> = result
+        .rows
+        .iter()
+        .map(|r| (str_value(&r[0]), int_value(&r[1])))
+        .collect();
     assert_eq!(
         pairs,
         vec![
@@ -1426,8 +1753,14 @@ fn unwind_collected_nodes_restores_graph_identity() {
     // further (m.name) after the UNWIND, which only works with real graph
     // identity, not a frozen snapshot value.
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(c:Person {name: 'Carol'})");
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(c:Person {name: 'Carol'})",
+    );
     let result = run(
         &store,
         "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(f:Person) WITH collect(f) AS friends \
@@ -1440,7 +1773,10 @@ fn unwind_collected_nodes_restores_graph_identity() {
 #[test]
 fn unwind_own_where_filters_without_needing_a_second_with() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "UNWIND [1, 2, 3, 4, 5] AS x WHERE x > 2 RETURN x ORDER BY x");
+    let result = run(
+        &store,
+        "UNWIND [1, 2, 3, 4, 5] AS x WHERE x > 2 RETURN x ORDER BY x",
+    );
     let values: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
     assert_eq!(values, vec![3, 4, 5]);
 }
@@ -1462,19 +1798,33 @@ fn merge_single_node_creates_then_reuses() {
     run(&store, "MERGE (n:Person {name: 'Alice'})");
     run(&store, "MERGE (n:Person {name: 'Alice'})");
     let result = run(&store, "MATCH (n:Person) RETURN count(*)");
-    assert_eq!(int_value(&result.rows[0][0]), 1, "second MERGE must reuse, not create a duplicate");
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        1,
+        "second MERGE must reuse, not create a duplicate"
+    );
 }
 
 #[test]
 fn merge_one_hop_both_endpoints_bound_reuses_existing_edge() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})");
+    run(
+        &store,
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+    );
     run(
         &store,
         "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (b:Person {name: 'Bob'}) MERGE (a)-[:KNOWS]->(b)",
     );
-    let result = run(&store, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*)");
-    assert_eq!(int_value(&result.rows[0][0]), 1, "must reuse the existing edge, not create a 2nd one");
+    let result = run(
+        &store,
+        "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*)",
+    );
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        1,
+        "must reuse the existing edge, not create a 2nd one"
+    );
 }
 
 #[test]
@@ -1486,7 +1836,10 @@ fn merge_one_hop_both_endpoints_bound_creates_missing_edge() {
         &store,
         "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (b:Person {name: 'Bob'}) MERGE (a)-[:KNOWS]->(b)",
     );
-    let result = run(&store, "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)");
+    let result = run(
+        &store,
+        "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)",
+    );
     assert_eq!(int_value(&result.rows[0][0]), 1);
     // No new nodes -- both endpoints already existed, only the edge is new.
     let nodes = run(&store, "MATCH (n:Person) RETURN count(*)");
@@ -1502,34 +1855,62 @@ fn merge_one_fresh_endpoint_does_not_reuse_an_unconnected_matching_node() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {name: 'Alice'})");
     run(&store, "CREATE (:Person {name: 'Bob'})"); // unconnected to Alice
-    run(&store, "MATCH (a:Person {name: 'Alice'}) MERGE (a)-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MATCH (a:Person {name: 'Alice'}) MERGE (a)-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
 
     let bobs = run(&store, "MATCH (n:Person {name: 'Bob'}) RETURN count(*)");
-    assert_eq!(int_value(&bobs.rows[0][0]), 2, "must create a 2nd Bob, not reuse the unconnected one");
-    let connected =
-        run(&store, "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)");
+    assert_eq!(
+        int_value(&bobs.rows[0][0]),
+        2,
+        "must create a 2nd Bob, not reuse the unconnected one"
+    );
+    let connected = run(
+        &store,
+        "MATCH (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'}) RETURN count(*)",
+    );
     assert_eq!(int_value(&connected.rows[0][0]), 1);
 }
 
 #[test]
 fn merge_standalone_both_endpoints_fresh() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
-    run(&store, "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+    run(
+        &store,
+        "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
+    run(
+        &store,
+        "MERGE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
     let nodes = run(&store, "MATCH (n:Person) RETURN count(*)");
-    assert_eq!(int_value(&nodes.rows[0][0]), 2, "2nd MERGE must reuse both nodes and the edge, not duplicate");
-    let edges = run(&store, "MATCH (:Person)-[:KNOWS]->(:Person) RETURN count(*)");
+    assert_eq!(
+        int_value(&nodes.rows[0][0]),
+        2,
+        "2nd MERGE must reuse both nodes and the edge, not duplicate"
+    );
+    let edges = run(
+        &store,
+        "MATCH (:Person)-[:KNOWS]->(:Person) RETURN count(*)",
+    );
     assert_eq!(int_value(&edges.rows[0][0]), 1);
 }
 
 #[test]
 fn merge_on_create_and_on_match_fire_on_the_right_rows() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2");
+    run(
+        &store,
+        "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2",
+    );
     let after_create = run(&store, "MATCH (n:Person) RETURN n.seen");
     assert_eq!(int_value(&after_create.rows[0][0]), 1);
 
-    run(&store, "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2");
+    run(
+        &store,
+        "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.seen = 1 ON MATCH SET n.seen = 2",
+    );
     let after_match = run(&store, "MATCH (n:Person) RETURN n.seen");
     assert_eq!(int_value(&after_match.rows[0][0]), 2);
 }
@@ -1547,7 +1928,10 @@ fn merge_unconstrained_node_pattern_errors() {
 #[test]
 fn merge_two_hop_pattern_errors_at_parse_time() {
     let err = parse("MERGE (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("one relationship hop"));
+    assert!(err
+        .to_string()
+        .to_lowercase()
+        .contains("one relationship hop"));
 }
 
 #[test]
@@ -1602,8 +1986,14 @@ fn named_path_capture_with_anonymous_relationships() {
     // still track them internally (synthesized names), and they must not
     // leak into the output row (only `p` should be bound/returned here).
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})");
-    let result = run(&store, "MATCH p = (a:Person {name: 'Alice'})-[]->(b:Person) RETURN p");
+    run(
+        &store,
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})",
+    );
+    let result = run(
+        &store,
+        "MATCH p = (a:Person {name: 'Alice'})-[]->(b:Person) RETURN p",
+    );
     let elems = path_elems(&result.rows[0][0]);
     assert_eq!(elems.len(), 3);
     assert_eq!(node_name(&elems[0]), "Alice");
@@ -1614,7 +2004,10 @@ fn named_path_capture_with_anonymous_relationships() {
 fn shortest_path_finds_the_actual_shortest_not_just_a_path() {
     let store = GraphStore::open_memory().unwrap();
     // Direct 1-hop route.
-    run(&store, "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Dave'})");
+    run(
+        &store,
+        "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Dave'})",
+    );
     // Longer 3-hop route between the *same* two people -- MATCH...CREATE,
     // not a chained plain CREATE, so the trailing (:Person{name:'Dave'})
     // token reuses the existing Dave instead of silently creating a 2nd
@@ -1631,8 +2024,16 @@ fn shortest_path_finds_the_actual_shortest_not_just_a_path() {
         "MATCH (a:Person {name: 'Alice'}) OPTIONAL MATCH (d:Person {name: 'Dave'}) \
          OPTIONAL MATCH p = shortestPath((a)-[:KNOWS*]-(d)) RETURN length(p)",
     );
-    assert_eq!(result.rows.len(), 1, "only one Dave -- must not have duplicated it");
-    assert_eq!(int_value(&result.rows[0][0]), 1, "must pick the 1-hop route, not the 3-hop one");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "only one Dave -- must not have duplicated it"
+    );
+    assert_eq!(
+        int_value(&result.rows[0][0]),
+        1,
+        "must pick the 1-hop route, not the 3-hop one"
+    );
 }
 
 #[test]
@@ -1653,7 +2054,9 @@ fn shortest_path_returns_null_when_unreachable() {
 fn shortest_path_requires_both_endpoints_already_bound() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {name: 'Alice'})");
-    let stmt = parse("MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]-(z:Person)) RETURN p").unwrap();
+    let stmt =
+        parse("MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]-(z:Person)) RETURN p")
+            .unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("shortestpath"));
 }
@@ -1728,7 +2131,10 @@ fn with_binds_a_node_as_a_real_node_not_null() {
 #[test]
 fn list_index_by_position() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN list[0], list[2]");
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN list[0], list[2]",
+    );
     assert_eq!(int(&result.rows[0][0]), 1);
     assert_eq!(int(&result.rows[0][1]), 3);
 }
@@ -1773,14 +2179,20 @@ fn list_comprehension_filter_and_project() {
 #[test]
 fn list_comprehension_project_only() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [1, 2, 3] AS list RETURN [x IN list | x * 2] AS y");
+    let result = run(
+        &store,
+        "WITH [1, 2, 3] AS list RETURN [x IN list | x * 2] AS y",
+    );
     assert_eq!(list_ints(&result.rows[0][0]), vec![2, 4, 6]);
 }
 
 #[test]
 fn list_comprehension_filter_only() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x > 2] AS y");
+    let result = run(
+        &store,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN [x IN list WHERE x > 2] AS y",
+    );
     assert_eq!(list_ints(&result.rows[0][0]), vec![3, 4, 5]);
 }
 
@@ -1822,7 +2234,10 @@ fn list_comprehension_plain_list_with_bare_identifier_is_not_misparsed_as_a_comp
 #[test]
 fn quantifier_all_true_and_false() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS a, all(x IN [1, 2, 3] WHERE x > 1) AS b");
+    let result = run(
+        &store,
+        "RETURN all(x IN [1, 2, 3] WHERE x > 0) AS a, all(x IN [1, 2, 3] WHERE x > 1) AS b",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(!bool_val(&result.rows[0][1]));
 }
@@ -1830,7 +2245,10 @@ fn quantifier_all_true_and_false() {
 #[test]
 fn quantifier_any_true_and_false() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN any(x IN [1, 2, 3] WHERE x > 2) AS a, any(x IN [1, 2, 3] WHERE x > 5) AS b");
+    let result = run(
+        &store,
+        "RETURN any(x IN [1, 2, 3] WHERE x > 2) AS a, any(x IN [1, 2, 3] WHERE x > 5) AS b",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(!bool_val(&result.rows[0][1]));
 }
@@ -1845,7 +2263,10 @@ fn quantifier_none_on_empty_list_is_true() {
 #[test]
 fn quantifier_single_counts_exact_matches() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS a, single(x IN [1, 2, 2] WHERE x = 2) AS b");
+    let result = run(
+        &store,
+        "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS a, single(x IN [1, 2, 2] WHERE x = 2) AS b",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(!bool_val(&result.rows[0][1]));
 }
@@ -1875,11 +2296,17 @@ fn quantifier_three_valued_null_propagation() {
     assert!(!bool_val(&all.rows[0][1]));
     assert!(matches!(all.rows[0][2], Value::Null));
 
-    let any = run(&store, "RETURN any(x IN [null] WHERE x = 2) AS a, any(x IN [2, null] WHERE x = 2) AS b");
+    let any = run(
+        &store,
+        "RETURN any(x IN [null] WHERE x = 2) AS a, any(x IN [2, null] WHERE x = 2) AS b",
+    );
     assert!(matches!(any.rows[0][0], Value::Null));
     assert!(bool_val(&any.rows[0][1]));
 
-    let none = run(&store, "RETURN none(x IN [null] WHERE x = 2) AS a, none(x IN [2, null] WHERE x = 2) AS b");
+    let none = run(
+        &store,
+        "RETURN none(x IN [null] WHERE x = 2) AS a, none(x IN [2, null] WHERE x = 2) AS b",
+    );
     assert!(matches!(none.rows[0][0], Value::Null));
     assert!(!bool_val(&none.rows[0][1]));
 
@@ -1950,7 +2377,10 @@ fn boolean_expr_and_or_xor_not() {
 #[test]
 fn boolean_expr_comparison_as_return_value() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN 1 = 1 AS a, 1 < 2 AS b, 2 > 3 AS c, 'ab' STARTS WITH 'a' AS d");
+    let result = run(
+        &store,
+        "RETURN 1 = 1 AS a, 1 < 2 AS b, 2 > 3 AS c, 'ab' STARTS WITH 'a' AS d",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(bool_val(&result.rows[0][1]));
     assert!(!bool_val(&result.rows[0][2]));
@@ -2007,7 +2437,10 @@ fn with_where_comparison_followed_by_order_by_still_parses() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Item {idx: 20})");
     run(&store, "CREATE (:Item {idx: 5})");
-    let result = run(&store, "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y");
+    let result = run(
+        &store,
+        "MATCH (n:Item) WITH n.idx AS y WHERE y > 10 RETURN y ORDER BY y",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(int(&result.rows[0][0]), 20);
 }
@@ -2023,7 +2456,10 @@ fn return_expr_or_immediately_before_order_by_does_not_swallow_order() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Item {idx: 2})");
     run(&store, "CREATE (:Item {idx: 1})");
-    let result = run(&store, "MATCH (n:Item) RETURN n.idx = 1 OR n.idx = 2 AS x, n.idx ORDER BY n.idx DESC");
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx = 1 OR n.idx = 2 AS x, n.idx ORDER BY n.idx DESC",
+    );
     assert_eq!(result.rows.len(), 2);
     assert_eq!(int(&result.rows[0][1]), 2);
     assert_eq!(int(&result.rows[1][1]), 1);
@@ -2036,7 +2472,10 @@ fn list_equality_is_structural_not_null() {
     // PropertyValue::Null -- every list/map `=`/`<>` comparison silently
     // became `null` regardless of actual content.
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN [1, 2] = [1, 2] AS a, [1, 2] = [1, 3] AS b, [null] = [1] AS c");
+    let result = run(
+        &store,
+        "RETURN [1, 2] = [1, 2] AS a, [1, 2] = [1, 3] AS b, [null] = [1] AS c",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(!bool_val(&result.rows[0][1]));
     assert!(matches!(result.rows[0][2], Value::Null));
@@ -2045,7 +2484,10 @@ fn list_equality_is_structural_not_null() {
 #[test]
 fn list_ordering_is_lexicographic() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN [1, 0] >= [1] AS a, [1, null] >= [1] AS b, [1, 2] >= [1, null] AS c");
+    let result = run(
+        &store,
+        "RETURN [1, 0] >= [1] AS a, [1, null] >= [1] AS b, [1, 2] >= [1, null] AS c",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(bool_val(&result.rows[0][1]));
     assert!(matches!(result.rows[0][2], Value::Null));
@@ -2068,7 +2510,10 @@ fn type_mismatch_comparison_semantics_differ_by_operator() {
     // and STARTS WITH/ENDS WITH/CONTAINS on a non-string operand is also
     // null, not false.
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN (1 = 'a') AS a, (1 <> 'a') AS b, ('1.0' < 1.0) AS c, ('abc' STARTS WITH true) AS d");
+    let result = run(
+        &store,
+        "RETURN (1 = 'a') AS a, (1 <> 'a') AS b, ('1.0' < 1.0) AS c, ('abc' STARTS WITH true) AS d",
+    );
     assert!(!bool_val(&result.rows[0][0]));
     assert!(bool_val(&result.rows[0][1]));
     assert!(matches!(result.rows[0][2], Value::Null));
@@ -2089,14 +2534,20 @@ fn is_not_null_pattern_where_excludes_missing_property() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {name: 'Alice'})");
     run(&store, "CREATE (:Person)");
-    let result = run(&store, "MATCH (n:Person) WHERE n.name IS NOT NULL RETURN n.name");
+    let result = run(
+        &store,
+        "MATCH (n:Person) WHERE n.name IS NOT NULL RETURN n.name",
+    );
     assert_eq!(result.rows.len(), 1);
 }
 
 #[test]
 fn is_null_return_expr() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN null IS NULL AS a, 1 IS NULL AS b, 1 IS NOT NULL AS c");
+    let result = run(
+        &store,
+        "RETURN null IS NULL AS a, 1 IS NULL AS b, 1 IS NOT NULL AS c",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(!bool_val(&result.rows[0][1]));
     assert!(bool_val(&result.rows[0][2]));
@@ -2118,7 +2569,10 @@ fn list_comprehension_bare_where_now_parses() {
     // x`/`WHERE true`) failed to parse. Now that boolean logic is a real
     // ReturnExpr, this works.
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [true, false, true] AS list RETURN [x IN list WHERE x] AS y");
+    let result = run(
+        &store,
+        "WITH [true, false, true] AS list RETURN [x IN list WHERE x] AS y",
+    );
     match &result.rows[0][0] {
         Value::List(items) => assert_eq!(items.len(), 2),
         other => panic!("expected a List, got {other:?}"),
@@ -2131,7 +2585,10 @@ fn quantifier_bare_where_now_parses() {
     // vacuously true regardless of the WHERE condition (real Cypher
     // semantics, already covered by quantifier_none_on_empty_list_is_true).
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN none(x IN [] WHERE true) AS a, none(x IN [] WHERE false) AS b");
+    let result = run(
+        &store,
+        "RETURN none(x IN [] WHERE true) AS a, none(x IN [] WHERE false) AS b",
+    );
     assert!(bool_val(&result.rows[0][0]));
     assert!(bool_val(&result.rows[0][1]));
 }
@@ -2141,7 +2598,10 @@ fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     // Regression guard: unlike single-element indexing, out-of-range slice
     // bounds clamp to [0, len] rather than producing null.
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "WITH [1, 2, 3] AS list RETURN list[-100..100], list[5..10]");
+    let result = run(
+        &store,
+        "WITH [1, 2, 3] AS list RETURN list[-100..100], list[5..10]",
+    );
     assert_eq!(list_ints(&result.rows[0][0]), vec![1, 2, 3]);
     assert_eq!(list_ints(&result.rows[0][1]), Vec::<i64>::new());
 }
@@ -2153,10 +2613,15 @@ fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
 fn temporal_str(v: &Value) -> String {
     match v {
         Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
-        Value::Property(marsdb_graph::PropertyValue::Date(d)) => marsdb_query::temporal::format_date(*d),
-        Value::Property(marsdb_graph::PropertyValue::Duration { months, days, seconds, nanos }) => {
-            marsdb_query::temporal::format_duration(*months, *days, *seconds, *nanos)
+        Value::Property(marsdb_graph::PropertyValue::Date(d)) => {
+            marsdb_query::temporal::format_date(*d)
         }
+        Value::Property(marsdb_graph::PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        }) => marsdb_query::temporal::format_duration(*months, *days, *seconds, *nanos),
         other => panic!("expected String/Date/Duration, got {other:?}"),
     }
 }
@@ -2208,7 +2673,10 @@ fn date_string_week_date_form_is_rejected_not_misparsed() {
     let store = GraphStore::open_memory().unwrap();
     let stmt = parse("RETURN date('2015-W30-2')").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("date"), "expected a clear date-parse error, got: {err}");
+    assert!(
+        err.to_string().contains("date"),
+        "expected a clear date-parse error, got: {err}"
+    );
 }
 
 #[test]
@@ -2222,7 +2690,10 @@ fn temporal_constructors_reject_malformed_inputs_and_wrong_arity() {
         "RETURN duration('P1D', 'P2D')",
     ] {
         let stmt = parse(query).unwrap();
-        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+        assert!(
+            Executor::new(&store).execute(&stmt).is_err(),
+            "{query} must fail"
+        );
     }
 }
 
@@ -2236,7 +2707,10 @@ fn date_map_requires_in_range_integer_fields() {
         "RETURN date({year: 2020, month: 1, day: 4294967297})",
     ] {
         let stmt = parse(query).unwrap();
-        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+        assert!(
+            Executor::new(&store).execute(&stmt).is_err(),
+            "{query} must fail"
+        );
     }
 }
 
@@ -2262,7 +2736,10 @@ fn date_component_access_via_stored_property() {
     // Date round-trips through storage), then access components off a
     // WITH-projected scalar.
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (:Val {date: date({year: 1984, month: 10, day: 11})})");
+    run(
+        &store,
+        "CREATE (:Val {date: date({year: 1984, month: 10, day: 11})})",
+    );
     let result = run(
         &store,
         "MATCH (v:Val) WITH v.date AS d \
@@ -2302,7 +2779,10 @@ fn duration_construct_from_map_normalizes_and_formats() {
 #[test]
 fn duration_construct_from_string() {
     let store = GraphStore::open_memory().unwrap();
-    let result = run(&store, "RETURN duration('P14DT16H12M'), duration('P0.75M'), duration('P2.5W')");
+    let result = run(
+        &store,
+        "RETURN duration('P14DT16H12M'), duration('P0.75M'), duration('P2.5W')",
+    );
     let row = &result.rows[0];
     assert_eq!(temporal_str(&row[0]), "P14DT16H12M");
     assert_eq!(temporal_str(&row[1]), "P22DT19H51M49.5S");
@@ -2450,7 +2930,10 @@ fn to_string_rejects_invalid_types() {
         "MATCH p = ()-[:T]->() RETURN toString(p)",
     ] {
         let stmt = parse(query).unwrap();
-        assert!(Executor::new(&store).execute(&stmt).is_err(), "{query} must fail");
+        assert!(
+            Executor::new(&store).execute(&stmt).is_err(),
+            "{query} must fail"
+        );
     }
 
     let result = run(&store, "RETURN toString(null)");
@@ -2464,7 +2947,10 @@ fn stored_date_survives_the_storage_round_trip() {
     // real reason PropertyValue got a first-class Date variant instead of
     // reusing Int/String -- see PropertyValue's own doc comment.
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE ({created: date({year: 1984, month: 10, day: 11})})");
+    run(
+        &store,
+        "CREATE ({created: date({year: 1984, month: 10, day: 11})})",
+    );
     let result = run(&store, "MATCH (n) RETURN n.created");
     assert_eq!(temporal_str(&result.rows[0][0]), "1984-10-11");
 }
@@ -2479,7 +2965,10 @@ fn create_with_unsupported_list_property_errors_clearly_not_silently_nulls() {
     let store = GraphStore::open_memory().unwrap();
     let stmt = parse("CREATE (n {tags: [1, 2, 3]})").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().contains("property"), "expected a clear error, got: {err}");
+    assert!(
+        err.to_string().contains("property"),
+        "expected a clear error, got: {err}"
+    );
 }
 
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
@@ -2492,7 +2981,10 @@ fn set_then_return_sees_the_just_set_value() {
     // same real-Cypher shape as TCK's Set2.feature scenario [1].
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (n:A {property1: 'orig'})");
-    let result = run(&store, "MATCH (n:A) SET n.property1 = 'updated' RETURN n.property1");
+    let result = run(
+        &store,
+        "MATCH (n:A) SET n.property1 = 'updated' RETURN n.property1",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "updated");
 }
@@ -2523,7 +3015,10 @@ fn delete_then_return_computed_value_not_the_deleted_var() {
     // scenario [1]: "Undirected expand followed by delete and count".
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:A)-[:R]->(b:B)");
-    let result = run(&store, "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c");
+    let result = run(
+        &store,
+        "MATCH (a)-[r]-(b) DELETE r, a, b RETURN count(*) AS c",
+    );
     assert_eq!(int_value(&result.rows[0][0]), 2);
     // The delete itself really happened -- nothing left to match.
     let remaining = run(&store, "MATCH (n) RETURN n");
@@ -2546,12 +3041,19 @@ fn delete_then_return_the_deleted_var_itself_errors_not_panics() {
     run(&store, "CREATE (n:A {p: 1})");
     let stmt = parse("MATCH (n:A) DELETE n RETURN n").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("no longer exists"),
+        "expected a deleted-entity error, got: {err}"
+    );
     // A failed statement rolls back its whole write transaction (see
     // `Executor::execute`'s abort-on-error path) -- the delete itself must
     // NOT have taken effect, same as any other error mid-statement.
     let remaining = run(&store, "MATCH (n:A) RETURN n");
-    assert_eq!(remaining.rows.len(), 1, "a failed statement must roll back, not partially apply its delete");
+    assert_eq!(
+        remaining.rows.len(),
+        1,
+        "a failed statement must roll back, not partially apply its delete"
+    );
 }
 
 #[test]
@@ -2563,23 +3065,38 @@ fn delete_then_return_a_property_of_the_deleted_var_errors() {
     run(&store, "CREATE (n {num: 0})");
     let stmt = parse("MATCH (n) DELETE n RETURN n.num").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("no longer exists"),
+        "expected a deleted-entity error, got: {err}"
+    );
 
     let store2 = GraphStore::open_memory().unwrap();
     run(&store2, "CREATE ()-[:T {num: 0}]->()");
     let stmt2 = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
     let err2 = Executor::new(&store2).execute(&stmt2).unwrap_err();
-    assert!(err2.to_string().to_lowercase().contains("no longer exists"), "expected a deleted-entity error, got: {err2}");
+    assert!(
+        err2.to_string().to_lowercase().contains("no longer exists"),
+        "expected a deleted-entity error, got: {err2}"
+    );
 }
 
 #[test]
 fn detach_delete_then_return() {
     let store = GraphStore::open_memory().unwrap();
-    run(&store, "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})");
-    let result = run(&store, "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN 42 AS num");
+    run(
+        &store,
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
+    );
+    let result = run(
+        &store,
+        "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN 42 AS num",
+    );
     // `42` is a bare literal, not a node/edge property -- eval_return_expr
     // yields Value::Literal here, not Value::Property.
-    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(42))));
+    assert!(matches!(
+        &result.rows[0][0],
+        Value::Literal(marsdb_query::Literal::Int(42))
+    ));
     let remaining = run(&store, "MATCH (n:Person) RETURN n.name");
     assert_eq!(remaining.rows.len(), 1);
     assert_eq!(str_value(&remaining.rows[0][0]), "Bob");
@@ -2607,7 +3124,10 @@ fn remove_then_return() {
     match &result.rows[0][0] {
         Value::Node(node) => {
             assert!(!node.props.contains_key("p1"));
-            assert_eq!(int_value(&Value::Property(node.props.get("p2").unwrap().clone())), 2);
+            assert_eq!(
+                int_value(&Value::Property(node.props.get("p2").unwrap().clone())),
+                2
+            );
         }
         other => panic!("expected a node, got {other:?}"),
     }
@@ -2630,7 +3150,10 @@ fn set_then_return_distinct_dedups() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:A)-[:R]->(x:X {tag: 'same'})");
     run(&store, "CREATE (b:A)-[:R]->(y:X {tag: 'same'})");
-    let result = run(&store, "MATCH (a:A)-[:R]->(x:X) SET a.touched = true RETURN DISTINCT x.tag");
+    let result = run(
+        &store,
+        "MATCH (a:A)-[:R]->(x:X) SET a.touched = true RETURN DISTINCT x.tag",
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(str_value(&result.rows[0][0]), "same");
 }
@@ -2648,7 +3171,10 @@ fn set_then_return_with_param_substitution() {
     let mut stmt = marsdb_query::parse("MATCH (n:A) SET n.p = 2 RETURN $newp AS x").unwrap();
     marsdb_query::substitute_params(&mut stmt, &params).unwrap();
     let result = Executor::new(&store).execute(&stmt).unwrap();
-    assert!(matches!(&result.rows[0][0], Value::Literal(marsdb_query::Literal::Int(99))));
+    assert!(matches!(
+        &result.rows[0][0],
+        Value::Literal(marsdb_query::Literal::Int(99))
+    ));
     let after = run(&store, "MATCH (n:A) RETURN n.p");
     assert_eq!(int_value(&after.rows[0][0]), 2);
 }
@@ -2667,8 +3193,17 @@ fn set_property_to_null_removes_it_not_stores_a_null_value() {
     let result = run(&store, "MATCH (n:A) SET n.property1 = null RETURN n");
     match &result.rows[0][0] {
         Value::Node(node) => {
-            assert!(!node.props.contains_key("property1"), "property1 must be gone, not null: {:?}", node.props);
-            assert_eq!(int_value(&Value::Property(node.props.get("property2").unwrap().clone())), 46);
+            assert!(
+                !node.props.contains_key("property1"),
+                "property1 must be gone, not null: {:?}",
+                node.props
+            );
+            assert_eq!(
+                int_value(&Value::Property(
+                    node.props.get("property2").unwrap().clone()
+                )),
+                46
+            );
         }
         other => panic!("expected a node, got {other:?}"),
     }
@@ -2683,13 +3218,22 @@ fn set_and_remove_on_a_null_binding_are_silent_no_ops() {
     // "isn't a node" error. TCK's Set1/Set3/Remove1/Remove2 "Ignore null
     // when setting/removing property/label" scenarios.
     let store = GraphStore::open_memory().unwrap();
-    let prop_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a.num = 42 RETURN a");
+    let prop_set = run(
+        &store,
+        "OPTIONAL MATCH (a:DoesNotExist) SET a.num = 42 RETURN a",
+    );
     assert!(matches!(prop_set.rows[0][0], Value::Null));
     let label_set = run(&store, "OPTIONAL MATCH (a:DoesNotExist) SET a:L RETURN a");
     assert!(matches!(label_set.rows[0][0], Value::Null));
-    let prop_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a.num RETURN a");
+    let prop_remove = run(
+        &store,
+        "OPTIONAL MATCH (a:DoesNotExist) REMOVE a.num RETURN a",
+    );
     assert!(matches!(prop_remove.rows[0][0], Value::Null));
-    let label_remove = run(&store, "OPTIONAL MATCH (a:DoesNotExist) REMOVE a:L RETURN a");
+    let label_remove = run(
+        &store,
+        "OPTIONAL MATCH (a:DoesNotExist) REMOVE a:L RETURN a",
+    );
     assert!(matches!(label_remove.rows[0][0], Value::Null));
 }
 

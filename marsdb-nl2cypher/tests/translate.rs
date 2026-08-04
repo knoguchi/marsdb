@@ -12,13 +12,24 @@ struct FakeLlmClient {
 
 impl FakeLlmClient {
     fn new(responses: Vec<&str>) -> Self {
-        Self { responses: RefCell::new(responses.into_iter().map(String::from).collect::<Vec<_>>().into_iter()) }
+        Self {
+            responses: RefCell::new(
+                responses
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ),
+        }
     }
 }
 
 impl LlmClient for FakeLlmClient {
     fn complete(&self, _prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
-        self.responses.borrow_mut().next().ok_or_else(|| "FakeLlmClient: no more scripted responses".into())
+        self.responses
+            .borrow_mut()
+            .next()
+            .ok_or_else(|| "FakeLlmClient: no more scripted responses".into())
     }
 }
 
@@ -48,7 +59,10 @@ fn translate_repairs_after_one_bad_attempt() {
     ]);
     let schema = SchemaSummary::default();
     let cypher = translate(&client, &schema, "who knows whom?").unwrap();
-    assert_eq!(cypher, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name");
+    assert_eq!(
+        cypher,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name"
+    );
 }
 
 #[test]
@@ -69,20 +83,38 @@ fn translate_gives_up_after_the_repair_attempt_also_fails() {
 #[test]
 fn introspect_schema_reports_labels_rel_types_and_properties() {
     let db = Database::in_memory().unwrap();
-    db.execute("CREATE (:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})").unwrap();
+    db.execute(
+        "CREATE (:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})",
+    )
+    .unwrap();
     db.execute("CREATE (:Company {name: 'Acme'})").unwrap();
 
     let schema = introspect_schema(&db).unwrap();
 
-    let person = schema.node_labels.iter().find(|l| l.label == "Person").expect("Person label present");
+    let person = schema
+        .node_labels
+        .iter()
+        .find(|l| l.label == "Person")
+        .expect("Person label present");
     assert_eq!(person.count, 2);
-    assert_eq!(person.properties, vec!["age".to_string(), "name".to_string()]);
+    assert_eq!(
+        person.properties,
+        vec!["age".to_string(), "name".to_string()]
+    );
 
-    let company = schema.node_labels.iter().find(|l| l.label == "Company").expect("Company label present");
+    let company = schema
+        .node_labels
+        .iter()
+        .find(|l| l.label == "Company")
+        .expect("Company label present");
     assert_eq!(company.count, 1);
     assert_eq!(company.properties, vec!["name".to_string()]);
 
-    let knows = schema.rel_types.iter().find(|r| r.rel_type == "KNOWS").expect("KNOWS rel type present");
+    let knows = schema
+        .rel_types
+        .iter()
+        .find(|r| r.rel_type == "KNOWS")
+        .expect("KNOWS rel type present");
     assert_eq!(knows.count, 1);
     assert_eq!(knows.properties, vec!["since".to_string()]);
 }

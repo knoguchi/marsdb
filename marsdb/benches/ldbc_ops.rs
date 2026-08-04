@@ -46,8 +46,10 @@ fn bench_optional_match(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 black_box(
-                    db.execute("MATCH (n:Item) OPTIONAL MATCH (n)-[:R]->(m:Item) RETURN n.idx, m.idx")
-                        .unwrap(),
+                    db.execute(
+                        "MATCH (n:Item) OPTIONAL MATCH (n)-[:R]->(m:Item) RETURN n.idx, m.idx",
+                    )
+                    .unwrap(),
                 )
             });
         });
@@ -81,9 +83,21 @@ fn bench_variable_length(c: &mut Criterion) {
     let db_25 = chain_db(25);
     let mut group = c.benchmark_group("variable_length_by_max_hops");
     for (label, db, cypher) in [
-        ("1..5", &db_1000, "MATCH (n:Item {idx: 0})-[:R*1..5]->(m:Item) RETURN m.idx"),
-        ("1..30", &db_1000, "MATCH (n:Item {idx: 0})-[:R*1..30]->(m:Item) RETURN m.idx"),
-        ("0..unbounded_25node_chain", &db_25, "MATCH (n:Item {idx: 0})-[:R*0..]->(m:Item) RETURN m.idx"),
+        (
+            "1..5",
+            &db_1000,
+            "MATCH (n:Item {idx: 0})-[:R*1..5]->(m:Item) RETURN m.idx",
+        ),
+        (
+            "1..30",
+            &db_1000,
+            "MATCH (n:Item {idx: 0})-[:R*1..30]->(m:Item) RETURN m.idx",
+        ),
+        (
+            "0..unbounded_25node_chain",
+            &db_25,
+            "MATCH (n:Item {idx: 0})-[:R*0..]->(m:Item) RETURN m.idx",
+        ),
     ] {
         group.bench_with_input(BenchmarkId::from_parameter(label), &cypher, |b, cypher| {
             b.iter(|| black_box(db.execute(cypher).unwrap()));

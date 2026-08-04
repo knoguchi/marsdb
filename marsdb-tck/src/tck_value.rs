@@ -18,8 +18,14 @@ pub enum TckScalar {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TckValue {
-    Node { labels: BTreeSet<String>, props: BTreeMap<String, TckScalar> },
-    Rel { rel_type: String, props: BTreeMap<String, TckScalar> },
+    Node {
+        labels: BTreeSet<String>,
+        props: BTreeMap<String, TckScalar>,
+    },
+    Rel {
+        rel_type: String,
+        props: BTreeMap<String, TckScalar>,
+    },
     List(Vec<TckValue>),
     Scalar(TckScalar),
     Null,
@@ -37,11 +43,16 @@ pub fn tck_eq(a: &TckValue, b: &TckValue, list_order_matters: bool) -> bool {
                 return false;
             }
             if list_order_matters {
-                xs.iter().zip(ys).all(|(x, y)| tck_eq(x, y, list_order_matters))
+                xs.iter()
+                    .zip(ys)
+                    .all(|(x, y)| tck_eq(x, y, list_order_matters))
             } else {
                 let mut remaining: Vec<&TckValue> = ys.iter().collect();
                 for x in xs {
-                    let Some(pos) = remaining.iter().position(|y| tck_eq(x, y, list_order_matters)) else {
+                    let Some(pos) = remaining
+                        .iter()
+                        .position(|y| tck_eq(x, y, list_order_matters))
+                    else {
                         return false;
                     };
                     remaining.remove(pos);
@@ -58,11 +69,19 @@ pub fn value_to_tck(v: &Value) -> TckValue {
         Value::Null => TckValue::Null,
         Value::Node(n) => TckValue::Node {
             labels: n.labels.iter().cloned().collect(),
-            props: n.props.iter().map(|(k, v)| (k.clone(), property_to_scalar(v))).collect(),
+            props: n
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), property_to_scalar(v)))
+                .collect(),
         },
         Value::Edge(e) => TckValue::Rel {
             rel_type: e.label.clone(),
-            props: e.props.iter().map(|(k, v)| (k.clone(), property_to_scalar(v))).collect(),
+            props: e
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), property_to_scalar(v)))
+                .collect(),
         },
         Value::Property(p) => match p {
             PropertyValue::Null => TckValue::Null,
@@ -77,10 +96,15 @@ pub fn value_to_tck(v: &Value) -> TckValue {
         // real, pre-existing limitation of this comparator, not new here.
         Value::Map(m) => TckValue::Node {
             labels: BTreeSet::new(),
-            props: m.iter().filter_map(|(k, v)| value_to_scalar(v).map(|s| (k.clone(), s))).collect(),
+            props: m
+                .iter()
+                .filter_map(|(k, v)| value_to_scalar(v).map(|s| (k.clone(), s)))
+                .collect(),
         },
         Value::Literal(lit) => literal_to_tck(lit),
-        Value::Path(_) => TckValue::Scalar(TckScalar::Str("<path -- not TCK-comparable in v1>".to_string())),
+        Value::Path(_) => TckValue::Scalar(TckScalar::Str(
+            "<path -- not TCK-comparable in v1>".to_string(),
+        )),
     }
 }
 
@@ -117,9 +141,14 @@ fn property_to_scalar(p: &PropertyValue) -> TckScalar {
         // comparison line up, matching `format_property`'s equivalent
         // choice in `marsdb-cli`.
         PropertyValue::Date(d) => TckScalar::Str(marsdb::temporal::format_date(*d)),
-        PropertyValue::Duration { months, days, seconds, nanos } => {
-            TckScalar::Str(marsdb::temporal::format_duration(*months, *days, *seconds, *nanos))
-        }
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => TckScalar::Str(marsdb::temporal::format_duration(
+            *months, *days, *seconds, *nanos,
+        )),
     }
 }
 
@@ -143,11 +172,17 @@ fn literal_to_tck(lit: &marsdb::Literal) -> TckValue {
 /// literal syntax is small and Cypher-like, close to (but not reused
 /// from) `marsdb-query`'s own literal grammar.
 pub fn parse_cell(text: &str) -> Result<TckValue, String> {
-    let mut p = CellParser { chars: text.trim().chars().collect(), pos: 0 };
+    let mut p = CellParser {
+        chars: text.trim().chars().collect(),
+        pos: 0,
+    };
     let v = p.parse_value()?;
     p.skip_ws();
     if p.pos != p.chars.len() {
-        return Err(format!("trailing input after value: {:?}", &p.chars[p.pos..].iter().collect::<String>()));
+        return Err(format!(
+            "trailing input after value: {:?}",
+            &p.chars[p.pos..].iter().collect::<String>()
+        ));
     }
     Ok(v)
 }
@@ -174,7 +209,11 @@ impl CellParser {
             self.pos += 1;
             Ok(())
         } else {
-            Err(format!("expected {c:?} at position {}, got {:?}", self.pos, self.peek()))
+            Err(format!(
+                "expected {c:?} at position {}, got {:?}",
+                self.pos,
+                self.peek()
+            ))
         }
     }
 
@@ -201,7 +240,11 @@ impl CellParser {
                 return Ok(val);
             }
         }
-        Err(format!("unrecognized value at position {}: {:?}", self.pos, self.chars.get(self.pos..)))
+        Err(format!(
+            "unrecognized value at position {}: {:?}",
+            self.pos,
+            self.chars.get(self.pos..)
+        ))
     }
 
     fn parse_string(&mut self) -> Result<String, String> {
@@ -261,9 +304,13 @@ impl CellParser {
         }
         let text: String = self.chars[start..self.pos].iter().collect();
         if is_float {
-            text.parse::<f64>().map(|f| TckValue::Scalar(TckScalar::Float(f))).map_err(|e| e.to_string())
+            text.parse::<f64>()
+                .map(|f| TckValue::Scalar(TckScalar::Float(f)))
+                .map_err(|e| e.to_string())
         } else {
-            text.parse::<i64>().map(|i| TckValue::Scalar(TckScalar::Int(i))).map_err(|e| e.to_string())
+            text.parse::<i64>()
+                .map(|i| TckValue::Scalar(TckScalar::Int(i)))
+                .map_err(|e| e.to_string())
         }
     }
 
@@ -284,7 +331,11 @@ impl CellParser {
             labels.insert(self.parse_identifier());
             self.skip_ws();
         }
-        let props = if self.peek() == Some('{') { self.parse_props()? } else { BTreeMap::new() };
+        let props = if self.peek() == Some('{') {
+            self.parse_props()?
+        } else {
+            BTreeMap::new()
+        };
         self.expect(')')?;
         Ok(TckValue::Node { labels, props })
     }
@@ -311,7 +362,11 @@ impl CellParser {
                 self.parse_identifier();
                 self.skip_ws();
             }
-            let props = if self.peek() == Some('{') { self.parse_props()? } else { BTreeMap::new() };
+            let props = if self.peek() == Some('{') {
+                self.parse_props()?
+            } else {
+                BTreeMap::new()
+            };
             self.expect(']')?;
             Ok(TckValue::Rel { rel_type, props })
         } else {
@@ -341,7 +396,10 @@ impl CellParser {
         // separate "Map" TckValue variant since nothing needs to tell
         // them apart for v1 comparison purposes.
         let props = self.parse_props()?;
-        Ok(TckValue::Node { labels: BTreeSet::new(), props })
+        Ok(TckValue::Node {
+            labels: BTreeSet::new(),
+            props,
+        })
     }
 
     fn parse_props(&mut self) -> Result<BTreeMap<String, TckScalar>, String> {
@@ -381,13 +439,21 @@ mod tests {
 
     #[test]
     fn parses_plain_node() {
-        assert_eq!(parse_cell("()").unwrap(), TckValue::Node { labels: BTreeSet::new(), props: BTreeMap::new() });
+        assert_eq!(
+            parse_cell("()").unwrap(),
+            TckValue::Node {
+                labels: BTreeSet::new(),
+                props: BTreeMap::new()
+            }
+        );
     }
 
     #[test]
     fn parses_labeled_node_with_props() {
         let v = parse_cell("(:A:B {name: 'b', age: 30})").unwrap();
-        let TckValue::Node { labels, props } = v else { panic!("expected a node") };
+        let TckValue::Node { labels, props } = v else {
+            panic!("expected a node")
+        };
         assert_eq!(labels, BTreeSet::from(["A".to_string(), "B".to_string()]));
         assert_eq!(props.get("name"), Some(&TckScalar::Str("b".to_string())));
         assert_eq!(props.get("age"), Some(&TckScalar::Int(30)));
@@ -396,7 +462,9 @@ mod tests {
     #[test]
     fn parses_relationship() {
         let v = parse_cell("[:KNOWS {since: 2020}]").unwrap();
-        let TckValue::Rel { rel_type, props } = v else { panic!("expected a rel") };
+        let TckValue::Rel { rel_type, props } = v else {
+            panic!("expected a rel")
+        };
         assert_eq!(rel_type, "KNOWS");
         assert_eq!(props.get("since"), Some(&TckScalar::Int(2020)));
     }
@@ -404,7 +472,9 @@ mod tests {
     #[test]
     fn parses_nested_list() {
         let v = parse_cell("['a', 'b', 'c']").unwrap();
-        let TckValue::List(items) = v else { panic!("expected a list") };
+        let TckValue::List(items) = v else {
+            panic!("expected a list")
+        };
         assert_eq!(items.len(), 3);
         assert_eq!(items[0], TckValue::Scalar(TckScalar::Str("a".to_string())));
     }
@@ -412,13 +482,22 @@ mod tests {
     #[test]
     fn parses_null_and_bools() {
         assert_eq!(parse_cell("null").unwrap(), TckValue::Null);
-        assert_eq!(parse_cell("true").unwrap(), TckValue::Scalar(TckScalar::Bool(true)));
-        assert_eq!(parse_cell("false").unwrap(), TckValue::Scalar(TckScalar::Bool(false)));
+        assert_eq!(
+            parse_cell("true").unwrap(),
+            TckValue::Scalar(TckScalar::Bool(true))
+        );
+        assert_eq!(
+            parse_cell("false").unwrap(),
+            TckValue::Scalar(TckScalar::Bool(false))
+        );
     }
 
     #[test]
     fn parses_negative_float() {
-        assert_eq!(parse_cell("-3.14").unwrap(), TckValue::Scalar(TckScalar::Float(-3.14)));
+        assert_eq!(
+            parse_cell("-3.14").unwrap(),
+            TckValue::Scalar(TckScalar::Float(-3.14))
+        );
     }
 
     #[test]

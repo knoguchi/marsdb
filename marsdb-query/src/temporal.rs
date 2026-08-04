@@ -51,7 +51,8 @@ fn date_from_epoch_day(epoch_day: i32) -> NaiveDate {
 /// part of this module already makes.
 pub fn today_epoch_day() -> i32 {
     let today = chrono::Utc::now().date_naive();
-    epoch_day_from_ymd(today.year(), today.month(), today.day()).expect("today is always a valid date")
+    epoch_day_from_ymd(today.year(), today.month(), today.day())
+        .expect("today is always a valid date")
 }
 
 pub fn format_date(epoch_day: i32) -> String {
@@ -88,7 +89,11 @@ pub fn parse_date(s: &str) -> Option<i32> {
         }
     } else {
         match s.len() {
-            8 => (s[0..4].parse().ok()?, s[4..6].parse().ok()?, s[6..8].parse().ok()?),
+            8 => (
+                s[0..4].parse().ok()?,
+                s[4..6].parse().ok()?,
+                s[6..8].parse().ok()?,
+            ),
             6 => (s[0..4].parse().ok()?, s[4..6].parse().ok()?, 1),
             4 => (s[0..4].parse().ok()?, 1, 1),
             _ => return None,
@@ -150,11 +155,22 @@ pub fn date_component(epoch_day: i32, prop: &str) -> Option<i64> {
 /// "adding a Duration to a value with less precision than the Duration
 /// provides truncates to that lower precision" -- Date's precision floor
 /// is one day.
-pub fn add_duration_to_date(epoch_day: i32, months: i64, days: i64, seconds: i64, nanos: i32, negate: bool) -> Option<i32> {
+pub fn add_duration_to_date(
+    epoch_day: i32,
+    months: i64,
+    days: i64,
+    seconds: i64,
+    nanos: i32,
+    negate: bool,
+) -> Option<i32> {
     let total_ns: i128 = seconds as i128 * NANOS_PER_SEC + nanos as i128;
     let extra_days = (total_ns / (86_400 * NANOS_PER_SEC)) as i64;
     let days = days + extra_days;
-    let (months, days) = if negate { (-months, -days) } else { (months, days) };
+    let (months, days) = if negate {
+        (-months, -days)
+    } else {
+        (months, days)
+    };
     let d = date_from_epoch_day(epoch_day);
     let with_months = if months >= 0 {
         d.checked_add_months(chrono::Months::new(months as u32))?
@@ -211,7 +227,8 @@ pub fn normalize_duration(f: DurationFields) -> DurationParts {
     // scenario (`nanosecond: 789`, never a fractional nanosecond) --
     // `.trunc()`, not `.round()`, so a hypothetical fractional input
     // doesn't get a phantom extra nanosecond rounded in.
-    let extra_nanos = (f.milliseconds * 1_000_000.0 + f.microseconds * 1_000.0 + f.nanoseconds).trunc() as i128;
+    let extra_nanos =
+        (f.milliseconds * 1_000_000.0 + f.microseconds * 1_000.0 + f.nanoseconds).trunc() as i128;
     cascade(months_f, days_f, seconds_f, extra_nanos)
 }
 
@@ -249,8 +266,14 @@ fn cascade(months_f: f64, days_f: f64, seconds_f: f64, extra_nanos: i128) -> Dur
 pub fn add_duration(a: DurationParts, b: DurationParts) -> DurationParts {
     let months = a.0 + b.0;
     let days = a.1 + b.1;
-    let total_ns = a.2 as i128 * NANOS_PER_SEC + a.3 as i128 + b.2 as i128 * NANOS_PER_SEC + b.3 as i128;
-    (months, days, (total_ns / NANOS_PER_SEC) as i64, (total_ns % NANOS_PER_SEC) as i32)
+    let total_ns =
+        a.2 as i128 * NANOS_PER_SEC + a.3 as i128 + b.2 as i128 * NANOS_PER_SEC + b.3 as i128;
+    (
+        months,
+        days,
+        (total_ns / NANOS_PER_SEC) as i64,
+        (total_ns % NANOS_PER_SEC) as i32,
+    )
 }
 
 pub fn negate_duration(a: DurationParts) -> DurationParts {
@@ -289,7 +312,13 @@ pub fn scale_duration(a: DurationParts, factor: f64) -> DurationParts {
 /// `*OfX` fields (`monthsOfYear`, `secondsOfMinute`, ...) are each the
 /// same computation's *remainder* instead of its quotient -- literally
 /// "what `d.<prop>` would be, mod the next unit up".
-pub fn duration_component(months: i64, days: i64, seconds: i64, nanos: i32, prop: &str) -> Option<i64> {
+pub fn duration_component(
+    months: i64,
+    days: i64,
+    seconds: i64,
+    nanos: i32,
+    prop: &str,
+) -> Option<i64> {
     let total_ns: i128 = seconds as i128 * NANOS_PER_SEC + nanos as i128;
     Some(match prop {
         "years" => months / 12,
@@ -375,7 +404,12 @@ fn format_seconds_fraction(secs: i64, nanos: i32) -> String {
     while frac.ends_with('0') {
         frac.pop();
     }
-    format!("{}{}.{}", if negative { "-" } else { "" }, secs.unsigned_abs(), frac)
+    format!(
+        "{}{}.{}",
+        if negative { "-" } else { "" },
+        secs.unsigned_abs(),
+        frac
+    )
 }
 
 /// Parses an ISO-8601 duration string (`P[nY][nM][nW][nD][T[nH][nM][nS]]`,
@@ -451,7 +485,11 @@ fn scan_number_unit_pairs(s: &str) -> Option<Vec<(f64, char)>> {
             return None;
         }
         let &unit = chars.get(i)?;
-        let value = chars[start..i].iter().collect::<String>().parse::<f64>().ok()?;
+        let value = chars[start..i]
+            .iter()
+            .collect::<String>()
+            .parse::<f64>()
+            .ok()?;
         out.push((value, unit));
         i += 1;
     }
@@ -463,23 +501,39 @@ mod tests {
     use super::*;
 
     fn du(months: f64, days: f64, hours: f64, minutes: f64, seconds: f64) -> DurationParts {
-        normalize_duration(DurationFields { months, days, hours, minutes, seconds, ..Default::default() })
+        normalize_duration(DurationFields {
+            months,
+            days,
+            hours,
+            minutes,
+            seconds,
+            ..Default::default()
+        })
     }
 
     #[test]
     fn construct_basic() {
-        assert_eq!(format_duration_parts(du(0.0, 14.0, 16.0, 12.0, 0.0)), "P14DT16H12M");
+        assert_eq!(
+            format_duration_parts(du(0.0, 14.0, 16.0, 12.0, 0.0)),
+            "P14DT16H12M"
+        );
     }
 
     #[test]
     fn construct_fractional_months() {
-        let d = normalize_duration(DurationFields { months: 0.75, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            months: 0.75,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "P22DT19H51M49.5S");
     }
 
     #[test]
     fn construct_fractional_weeks() {
-        let d = normalize_duration(DurationFields { weeks: 2.5, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            weeks: 2.5,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "P17DT12H");
     }
 
@@ -499,36 +553,58 @@ mod tests {
 
     #[test]
     fn construct_sub_second() {
-        let d = normalize_duration(DurationFields { days: 14.0, seconds: 70.0, milliseconds: 1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            days: 14.0,
+            seconds: 70.0,
+            milliseconds: 1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "P14DT1M10.001S");
     }
 
     #[test]
     fn construct_minutes_fraction() {
-        let d = normalize_duration(DurationFields { minutes: 1.5, seconds: 1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            minutes: 1.5,
+            seconds: 1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT1M31S");
     }
 
     #[test]
     fn parse_string_p14dt16h12m() {
-        assert_eq!(format_duration_parts(parse_duration("P14DT16H12M").unwrap()), "P14DT16H12M");
+        assert_eq!(
+            format_duration_parts(parse_duration("P14DT16H12M").unwrap()),
+            "P14DT16H12M"
+        );
     }
 
     #[test]
     fn parse_string_p0_75m() {
-        assert_eq!(format_duration_parts(parse_duration("P0.75M").unwrap()), "P22DT19H51M49.5S");
+        assert_eq!(
+            format_duration_parts(parse_duration("P0.75M").unwrap()),
+            "P22DT19H51M49.5S"
+        );
     }
 
     #[test]
     fn parse_string_pt0_75m() {
-        assert_eq!(format_duration_parts(parse_duration("PT0.75M").unwrap()), "PT45S");
+        assert_eq!(
+            format_duration_parts(parse_duration("PT0.75M").unwrap()),
+            "PT45S"
+        );
     }
 
     #[test]
     fn malformed_temporal_strings_are_rejected_without_panicking() {
         assert_eq!(parse_date("123é4"), None);
         for malformed in ["P", "PT", "Pgarbage", "P1Ygarbage", "P1Y2", "P1.2.3Y"] {
-            assert_eq!(parse_duration(malformed), None, "{malformed} must be rejected");
+            assert_eq!(
+                parse_duration(malformed),
+                None,
+                "{malformed} must be rejected"
+            );
         }
     }
 
@@ -543,21 +619,47 @@ mod tests {
     #[test]
     fn scale_duration_by_half() {
         let base = (149, 14, 58390, 1);
-        assert_eq!(format_duration_parts(scale_duration(base, 0.5)), "P6Y2M22DT13H21M8S");
-        assert_eq!(format_duration_parts(scale_duration(base, 2.0)), "P24Y10M28DT32H26M20.000000002S");
+        assert_eq!(
+            format_duration_parts(scale_duration(base, 0.5)),
+            "P6Y2M22DT13H21M8S"
+        );
+        assert_eq!(
+            format_duration_parts(scale_duration(base, 2.0)),
+            "P24Y10M28DT32H26M20.000000002S"
+        );
     }
 
     #[test]
     fn negative_seconds_fraction() {
-        let d = normalize_duration(DurationFields { seconds: 2.0, milliseconds: -1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            seconds: 2.0,
+            milliseconds: -1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT1.999S");
-        let d = normalize_duration(DurationFields { seconds: -2.0, milliseconds: 1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            seconds: -2.0,
+            milliseconds: 1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT-1.999S");
-        let d = normalize_duration(DurationFields { seconds: -2.0, milliseconds: -1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            seconds: -2.0,
+            milliseconds: -1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT-2.001S");
-        let d = normalize_duration(DurationFields { seconds: 60.0, milliseconds: -1.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            seconds: 60.0,
+            milliseconds: -1.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT59.999S");
-        let d = normalize_duration(DurationFields { minutes: 12.0, seconds: -60.0, ..Default::default() });
+        let d = normalize_duration(DurationFields {
+            minutes: 12.0,
+            seconds: -60.0,
+            ..Default::default()
+        });
         assert_eq!(format_duration_parts(d), "PT11M");
     }
 

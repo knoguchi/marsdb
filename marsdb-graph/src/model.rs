@@ -56,7 +56,12 @@ pub enum PropertyValue {
     /// "-1.999 seconds" is `seconds: -1, nanos: -999_000_000`, not
     /// `seconds: -2, nanos: 1_000_000`, which would make the same
     /// duration representable two different ways.
-    Duration { months: i64, days: i64, seconds: i64, nanos: i32 },
+    Duration {
+        months: i64,
+        days: i64,
+        seconds: i64,
+        nanos: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
