@@ -65,17 +65,17 @@ partially-created pattern if the process dies mid-statement.
 | Parse + execute, 10-hop `CREATE` | 3.58 ms |
 | Parse + execute, 100-hop `CREATE` | 4.75 ms |
 | Parse + execute, 1,000-hop `CREATE` | 15.9 ms |
-| `MATCH (n)-[:R]->(m) RETURN m.idx LIMIT 10`, 100-node dataset | 267 µs |
-| Same query, 1,000-node dataset | 2.66 ms |
-| Same query, 10,000-node dataset | 27.9 ms |
+| `MATCH (n)-[:R]->(m) RETURN m.idx LIMIT 10`, 100-node dataset | 30.4 µs |
+| Same query, 1,000-node dataset | 138 µs |
+| Same query, 10,000-node dataset | 1.284 ms |
 | `MATCH (n:Label) RETURN n LIMIT 10` (no hop/WHERE/ORDER BY), 100-node dataset | 19.2 µs |
 | Same query, 1,000-node dataset | 20.8 µs |
 | Same query, 10,000-node dataset | 20.9 µs |
 | Same query, 100,000-node dataset | 22.4 µs |
 
-The last four rows are the one shape `execute_match` pushes `LIMIT`
-straight into the storage scan for (no hop, no `WHERE`, no `ORDER BY` —
-see the Architecture section in `README.md`). The result: flat, ~19-22 µs
+The last four rows push `LIMIT` through the pull pipeline straight into the
+storage scan (no hop, no `WHERE`, no `ORDER BY` — see the Architecture
+section in `README.md`). The result: flat, ~19-22 µs
 regardless of dataset size, a ~1,000x-larger table costing barely 17% more
 — confirming it really does stop at the first `LIMIT` matches, not scan
 the whole table first. This needed two things to actually hold: the
@@ -88,17 +88,14 @@ the index walk itself; the first version of this table showed
 `.take(limit)` on the multimap iterator itself fixed it — the numbers
 above are post-fix.
 
-The `MATCH (n)-[:R]->(m) ... LIMIT 10` row above (with a hop) does *not*
-qualify for this push-down — `execute_match` only takes the shortcut for a
-zero-hop scan, since a hop's `Expand` could still filter out rows the raw
-scan can't predict — and its cost still scales with dataset size like any
-other 1-hop query (linear, ~10x per 10x rows). Its absolute numbers moved
-up since this table was first measured (2026-08-02: 228 µs / 2.03 ms /
-21.0 ms) — most plausibly because `Expand` now always binds an internal
-edge variable, even for an unnamed relationship, to enforce edge
-isomorphism (added a few PRs after that original measurement; see
-`marsdb-query/src/planner.rs`'s `prior_rel_vars` docs) — not from anything
-in this PR specifically, which doesn't touch that code path at all.
+The 1-hop query now benefits from streaming too: the scan supplies node ids
+without decoding every node record, and `Expand` produces one row at a time.
+Once ten rows survive the pipeline, `LIMIT 10` stops requesting input. The
+previous materializing executor measured 267 µs / 2.66 ms / 27.9 ms for the
+same sizes, so this change is about 8.8x / 19.3x / 21.7x faster. It still
+scales with dataset size because the unindexed starting-node scan must
+discover candidate ids; property indexes and optimizer-selected seeks are a
+separate tranche.
 
 ## LDBC-era features (`marsdb/benches/ldbc_ops.rs`)
 
