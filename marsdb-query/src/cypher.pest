@@ -275,8 +275,11 @@ with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_comparison | ("(" ~ with
 // widening for chained comparisons.
 with_comparison   = { add_expr ~ compare_op ~ add_expr }
 
-detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
-delete_clause         = { ^"DELETE" ~ identifier ~ ("," ~ identifier)* }
+// Any expression, not just a bare identifier -- real Cypher's DELETE
+// target can be `list[0]`, `map.key`, a whole named path (deletes every
+// node/edge in it), etc. (`executor::materialize_delete`/`delete_value`).
+detach_delete_clause = { ^"DETACH" ~ ^"DELETE" ~ return_expr ~ ("," ~ return_expr)* }
+delete_clause         = { ^"DELETE" ~ return_expr ~ ("," ~ return_expr)* }
 // Order matters: `prop_access` (`n.prop`) is tried first -- both start with
 // an `identifier`, and only backtrack to `set_label_item` (`n:Label`) if
 // the "." doesn't match. RHS is a full `return_expr` (not `literal`) --
