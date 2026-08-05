@@ -364,6 +364,22 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         // Same `InvalidAggregation` rule as RETURN's own ORDER BY (see the
         // `Statement::Match` arm above) -- TCK's WithOrderBy2 [25].
         let with_aggregates = crate::executor::has_aggregate(&with.items);
+        // Real Cypher lets a non-aggregating, non-`DISTINCT` `WITH`'s own
+        // `ORDER BY` see both the pre-WITH scope and the new aliases, not
+        // just the projected names (`WITH a.count AS count ORDER BY
+        // a.count` -- `a` isn't projected but is still a valid sort key,
+        // TCK's With4 [6]/WithSkipLimit3 [3]/Return4 [9,11]) -- same
+        // merged-scope reasoning `where_clause` above already has, and
+        // for the identical reason: aggregation/`DISTINCT` both collapse
+        // many pre-WITH rows into one output row, so there's no single
+        // pre-WITH scope left to fall back to there.
+        let order_scope = if with_aggregates || with.distinct {
+            projected.clone()
+        } else {
+            let mut merged = input.clone();
+            merged.extend(projected.iter().map(|(k, v)| (k.clone(), v.clone())));
+            merged
+        };
         for (expr, _) in order_by {
             if with_aggregates {
                 // Repeating a WITH item's expression verbatim (see the
@@ -381,7 +397,7 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
                      aggregating",
                 ));
             }
-            infer_expr(expr, &projected)?;
+            infer_expr(expr, &order_scope)?;
         }
     }
     Ok(projected)
@@ -733,10 +749,28 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_scalarish(&infer_expr(index, scope)?, "list index")?;
             match infer_expr(base, scope)? {
                 Kind::List(element) => *element,
-                Kind::Unknown => Kind::Unknown,
+                // `map['key']` -- real Cypher's dynamic map-field access
+                // (`apply_index`'s own runtime already fully supports
+                // this, only this compile-time check was too narrow).
+                // The result could be any value the map happens to hold
+                // at that key -- `Kind::Scalar`, same imprecise fallback
+                // `keys`/`labels`/etc already use elsewhere, not worth a
+                // per-key type model.
+                Kind::Map => Kind::Scalar,
+                // `Scalar` is deliberately tolerated here too, not just
+                // `Unknown` -- a `null`-valued base types as `Scalar` in
+                // this imprecise `Kind` system (see `ReturnExpr::Lit`'s
+                // own arm), and indexing into `null` is `null` at
+                // runtime (`apply_index`'s own early check), not an
+                // error. A genuinely wrong scalar (e.g. a bound integer)
+                // still gets `apply_index`'s real `QueryError::Type` at
+                // runtime -- same "defer to the runtime check" tolerance
+                // every other `Kind::Scalar` case in this module already
+                // gives.
+                Kind::Unknown | Kind::Scalar => Kind::Unknown,
                 other => {
                     return Err(semantic(format!(
-                        "index base is {}, not a list",
+                        "index base is {}, not a list or map",
                         kind_name(&other)
                     )))
                 }

@@ -793,24 +793,23 @@ impl<'a> Executor<'a> {
         row: &BindingRow,
         guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
-        // Validate every token before doing any graph work (search or
-        // create) — an unconstrained node pattern that isn't already bound
-        // would otherwise let the search below silently "match" every
-        // node in the graph (AllNodesScan, no Filter), which is a
-        // wrong-answer footgun, not a helpful default.
-        require_mergeable(&clause.pattern.start, row)?;
         // The bare-already-bound-start and reused-relationship-variable
         // cases are rejected at compile time (`semantic::bind_merge`),
         // not only here -- a zero-row MATCH would otherwise skip both
         // entirely even though real Cypher's `VariableAlreadyBound` is a
-        // structural/scope error, not a data-dependent one.
-        for (rel, node) in &clause.pattern.hops {
+        // structural/scope error, not a data-dependent one. A completely
+        // unconstrained, unbound token (bare `MERGE (a)`, no label/
+        // property) is real, valid Cypher -- searches for/creates any
+        // node with no constraints at all (TCK's Merge1 [1]), not an
+        // error; an earlier version of this codebase treated it as an
+        // "ambiguous shape" mistake to reject, which real Cypher's own
+        // TCK disproves.
+        for (rel, _node) in &clause.pattern.hops {
             if rel.hop_range.is_some() {
                 return Err(QueryError::Semantic(
                     "MERGE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                 ));
             }
-            require_mergeable(node, row)?;
         }
         // A MERGE pattern's own inline `{...}` property evaluating to
         // null can never be searched-or-created consistently: a null
@@ -1212,15 +1211,25 @@ impl<'a> Executor<'a> {
             carried_vars.extend(new_vars);
             return Ok(rows);
         };
+        // Only cloned when actually needed below (ORDER BY on a
+        // non-aggregating, non-`DISTINCT` WITH) -- avoids the copy on
+        // every other WITH shape.
+        let pre_with_rows =
+            (with.order_by.is_some() && !has_aggregate(&with.items) && !with.distinct)
+                .then(|| rows.clone());
         let mut rows = self.materialize_with(txn, with, &rows)?;
         if let Some(with_order_by) = &with.order_by {
+            // Only a non-aggregating, non-`DISTINCT` WITH keeps a 1:1 row
+            // correspondence with its pre-WITH input -- see
+            // `apply_order_by_bindings`'s own docs on why that's exactly
+            // when ORDER BY can also see the pre-WITH scope.
             rows = self.apply_order_by_bindings(
                 txn,
                 rows,
+                pre_with_rows.as_deref(),
                 &with.items,
                 with_order_by,
-                with.skip,
-                with.limit,
+                (with.skip, with.limit),
             )?;
         } else {
             let skip_n = with.skip.unwrap_or(0).max(0) as usize;
@@ -1546,11 +1555,21 @@ impl<'a> Executor<'a> {
         &self,
         txn: Txn,
         rows: Vec<BindingRow>,
+        // `Some`, same length as `rows`, only for a non-aggregating,
+        // non-`DISTINCT` WITH (1:1 row correspondence with the pre-WITH
+        // input) -- lets ORDER BY see both the pre-WITH scope and the
+        // new aliases, matching `where_clause`'s own merge (real Cypher:
+        // `WITH a.count AS count ORDER BY a.count`, `a` isn't projected
+        // but is still a valid sort key, TCK's With4 [6]). `None` for an
+        // aggregating/`DISTINCT` WITH -- many pre-WITH rows collapse
+        // into one output row there, so no single pre-WITH scope exists
+        // to merge in.
+        pre_with_rows: Option<&[BindingRow]>,
         with_items: &[ReturnItem],
         order_by: &[(ReturnExpr, SortDir)],
-        skip: Option<i64>,
-        limit: Option<i64>,
+        skip_limit: (Option<i64>, Option<i64>),
     ) -> Result<Vec<BindingRow>, QueryError> {
+        let (skip, limit) = skip_limit;
         // Same reasoning as `apply_order_by`'s `order_by_col` shortcut: an
         // ORDER BY item that repeats a WITH item's expression verbatim
         // (`WITH sum(x) AS s ORDER BY sum(x)`, TCK's WithOrderBy4 [11])
@@ -1572,8 +1591,17 @@ impl<'a> Executor<'a> {
             })
             .collect();
         let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let value_map = self.binding_row_to_value_map(txn, &row)?;
+        for (i, row) in rows.into_iter().enumerate() {
+            let mut value_map = self.binding_row_to_value_map(txn, &row)?;
+            if let Some(pre) = pre_with_rows {
+                // Pre-WITH names fill in gaps only -- a new alias with the
+                // same name already occupies that key in `value_map` and
+                // must keep winning (matches `materialize_with`'s own
+                // "new aliases shadow same-named old bindings" rule).
+                for (k, v) in self.binding_row_to_value_map(txn, &pre[i])? {
+                    value_map.entry(k).or_insert(v);
+                }
+            }
             let keys = order_by
                 .iter()
                 .zip(&order_by_output)
@@ -3793,26 +3821,6 @@ fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
         Binding::Value(PropertyValue::Bool(created)),
     );
     row
-}
-
-/// Rejects a `MERGE` pattern token that's neither already bound in `row`
-/// nor constrained by any label/property — matching or creating it would
-/// mean guessing at "any node," which this codebase's "error on an
-/// ambiguous shape" stance treats as a mistake to catch (not a silent
-/// "match/create arbitrarily" default). Called before any graph work, not
-/// just before the create-fallback branch — an unconstrained, unbound
-/// token would otherwise let `eval_merge`'s search phase silently "match"
-/// every node in the graph (`AllNodesScan`, no `Filter`) instead of
-/// erroring.
-fn require_mergeable(node: &NodePattern, row: &BindingRow) -> Result<(), QueryError> {
-    let already_bound = node.var.as_ref().is_some_and(|v| row.contains_key(v));
-    if !already_bound && node.labels.is_empty() && node.props.is_empty() {
-        return Err(QueryError::Semantic(
-            "MERGE requires a label or property to match/create by — an unconstrained node pattern is ambiguous"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 /// `Either` (undirected `-[r:TYPE]-`) has no single storage-level call —

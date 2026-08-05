@@ -22,10 +22,16 @@ pub fn parse(input: &str) -> Result<Statement, QueryError> {
 
 /// Parses a `;`-separated batch of one or more statements (e.g.
 /// `"CREATE (a); CREATE (b); MATCH (n) RETURN n"`). A `;` inside a string
-/// literal doesn't split anything — see `queries`' grammar comment.
+/// literal doesn't split anything — see `queries`' grammar comment. A
+/// single genuinely-trailing `;` is allowed (stripped here, in Rust,
+/// before parsing) -- `queries` itself deliberately has no trailing
+/// `";"?` of its own; see its grammar comment for the real ambiguity that
+/// caused.
 pub fn parse_many(input: &str) -> Result<Vec<Statement>, QueryError> {
-    let mut pairs =
-        CypherParser::parse(Rule::queries, input).map_err(|e| QueryError::Syntax(e.to_string()))?;
+    let trimmed = input.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    let mut pairs = CypherParser::parse(Rule::queries, trimmed)
+        .map_err(|e| QueryError::Syntax(e.to_string()))?;
     let queries_pair = pairs.next().expect("queries rule always produces one pair");
     queries_pair
         .into_inner()

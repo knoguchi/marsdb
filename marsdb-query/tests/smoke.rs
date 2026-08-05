@@ -3021,14 +3021,105 @@ fn merge_on_create_and_on_match_fire_on_the_right_rows() {
     assert_eq!(int_value(&after_match.rows[0][0]), 2);
 }
 
+/// `MERGE (a)` -- a completely unconstrained, unbound node pattern (no
+/// label/property) is real, valid Cypher (TCK's Merge1 [1]): searches
+/// for/creates any node with no constraints at all. An earlier version of
+/// this codebase treated this as an "ambiguous shape" mistake to reject,
+/// which real Cypher's own TCK disproves.
 #[test]
-fn merge_unconstrained_node_pattern_errors() {
-    let err = parse("MERGE (n) RETURN n").and_then(|stmt| {
-        let store = GraphStore::open_memory().unwrap();
-        Executor::new(&store).execute(&stmt)
-    });
-    let err = err.unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("ambiguous"));
+fn merge_unconstrained_node_pattern_creates_then_matches() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(&store, "MERGE (a) RETURN count(*) AS n");
+    assert_eq!(int(&result.rows[0][0]), 1);
+    assert_eq!(
+        int(&run(&store, "MATCH (n) RETURN count(*) AS c").rows[0][0]),
+        1
+    );
+
+    // A second MERGE (a) must match the existing node, not create a
+    // second one.
+    run(&store, "MERGE (a)");
+    assert_eq!(
+        int(&run(&store, "MATCH (n) RETURN count(*) AS c").rows[0][0]),
+        1
+    );
+}
+
+/// `parse_many`'s `queries` grammar used to have `~ ";"? ~ EOI` at the
+/// end -- with a genuinely-trailing `;`, `(";" ~ statement)*` greedily
+/// consumed it as one more separator, needing a `statement` after it;
+/// since `match_stmt` can match zero-width, an empty string satisfied
+/// that, producing a spurious extra empty statement that then failed its
+/// own "needs a tail" validation. Caught via the TCK's binary-tree named-
+/// graph fixture, a real multi-statement file that ends with `;`.
+#[test]
+fn parse_many_tolerates_a_trailing_semicolon() {
+    assert_eq!(marsdb_query::parse_many("CREATE (a);").unwrap().len(), 1);
+    assert_eq!(marsdb_query::parse_many("CREATE (a)").unwrap().len(), 1);
+    assert_eq!(
+        marsdb_query::parse_many("CREATE (a); CREATE (b);")
+            .unwrap()
+            .len(),
+        2
+    );
+    // A semicolon inside a string literal must not get mis-split either.
+    assert_eq!(
+        marsdb_query::parse_many("RETURN ';' AS x;").unwrap().len(),
+        1
+    );
+}
+
+/// `map['key']` -- real Cypher's dynamic map-field access, previously
+/// rejected at compile time even though `apply_index`'s runtime already
+/// fully supported it. `null['key']` must still be `null`, not an error
+/// (a `null`-valued base types as `Kind::Scalar` in this codebase's
+/// imprecise `Kind` system, deliberately tolerated here the same way
+/// every other `Kind::Scalar` case is).
+#[test]
+fn map_index_access() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "WITH {a: 1, b: 2} AS m RETURN m['a'] AS value");
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    let result = run(
+        &store,
+        "WITH null AS expr, 'x' AS idx RETURN expr[idx] AS value",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+}
+
+/// A `MATCH`/`MERGE` pattern's inline `{key: value}` can be any
+/// expression, not just a literal -- a bound variable (TCK's Merge1 [8])
+/// compiles to `Expr::GeneralCompare` (a generic post-scan filter,
+/// evaluated per-row) instead of the index-seek-eligible
+/// `Expr::Compare(_, _, Literal)` shape a real literal still gets.
+#[test]
+fn pattern_property_accepts_a_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({var: 42}), ({var: 'not42'})");
+
+    let result = run(&store, "WITH 42 AS x MATCH (n {var: x}) RETURN n.var");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 42);
+}
+
+/// A non-aggregating, non-`DISTINCT` `WITH`'s own `ORDER BY` sees both
+/// the pre-WITH scope and the new aliases, not just the projected names
+/// -- `WITH a.count AS count ORDER BY a.count` (`a` isn't projected but
+/// is still a valid sort key), matching `WHERE`'s own already-
+/// implemented merged-scope rule (TCK's With4 [6]/WithSkipLimit3 [3]).
+#[test]
+fn with_order_by_sees_pre_with_scope() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "UNWIND range(0, 15) AS i CREATE ({count: i})");
+
+    let result = run(
+        &store,
+        "MATCH (a) WITH a.count AS count ORDER BY a.count SKIP 10 LIMIT 10 RETURN count",
+    );
+    let vals: Vec<i64> = result.rows.iter().map(|row| int(&row[0])).collect();
+    assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
 }
 
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no

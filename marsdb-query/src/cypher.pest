@@ -22,7 +22,17 @@ query = { SOI ~ statement ~ ";"? ~ EOI }
 // alone (the openCypher TCK's own `having executed:` convention) is
 // handled by splitting on statement boundaries before parsing, not by
 // loosening this rule -- see `marsdb-tck`'s own setup-execution code.
-queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
+// Deliberately NO trailing `";"?` here (unlike `query` above) -- with one,
+// `(";" ~ statement)*` greedily consumes a genuinely-trailing `;` as one
+// more separator, needing a `statement` after it to complete that
+// repetition; since `match_stmt` can match zero-width, an empty string
+// satisfies that, producing a spurious extra empty statement that then
+// fails its own "needs a tail" validation (a real bug this caused,
+// caught via `marsdb-tck`'s named-graph fixture loading, which batches a
+// real multi-statement file that happens to end with `;`). `parse_many`
+// strips a trailing `;` (and trailing whitespace) from its input itself,
+// in Rust, before parsing -- unambiguous there, unlike in this grammar.
+queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 
 // `create_index_stmt` tried before `create_stmt` -- both start with
 // `^"CREATE"`, but `pattern` always starts with `(`, never `INDEX`, so
