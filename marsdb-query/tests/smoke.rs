@@ -6046,6 +6046,54 @@ fn create_followed_directly_by_set_no_with() {
     assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
 }
 
+/// Any of `SET`/`DELETE`/`CREATE`/`MERGE` can chain directly into any
+/// other one of them, `WITH` or not (TCK's Merge1/Merge5/Merge9, e.g.
+/// `CREATE (a), (b) MERGE (a)-[:X]->(b) RETURN count(a)`) -- previously
+/// only `WITH` was a valid thing to chain a mutating clause into.
+#[test]
+fn mutating_clauses_chain_directly_into_each_other_no_with_needed() {
+    let store = GraphStore::open_memory().unwrap();
+
+    // CREATE directly into MERGE.
+    let result = run(
+        &store,
+        "CREATE (a), (b) MERGE (a)-[:X]->(b) RETURN count(a)",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    // DELETE directly into MERGE.
+    run(&store, "CREATE (:A {num: 1}), (:A {num: 2})");
+    let result = run(&store, "MATCH (a:A) DELETE a MERGE (a2:A) RETURN a2.num");
+    assert!(result.rows.iter().all(|row| matches!(row[0], Value::Null)));
+
+    // CREATE, MERGE, and CREATE again, all directly chained.
+    let result = run(
+        &store,
+        "CREATE (a:P), (b:Q) MERGE (a)-[:KNOWS]->(b) CREATE (b)-[:KNOWS]->(c:R) RETURN count(*)",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// Real Cypher allows `ON MATCH`/`ON CREATE` in either order, not just
+/// `ON CREATE` before `ON MATCH` -- a repeated one of the same kind is
+/// still a real error (TCK's Merge4).
+#[test]
+fn merge_on_match_on_create_either_order() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+    run(
+        &store,
+        "MATCH () MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2",
+    );
+    let result = run(&store, "MATCH (a:L) RETURN labels(a)");
+    let mut labels = list_str_values(&result.rows[0][0]);
+    labels.sort();
+    assert_eq!(labels, vec!["L".to_string(), "M2".to_string()]);
+
+    // A repeated ON CREATE is rejected at parse time, not execution.
+    assert!(parse("MERGE (a:L) ON CREATE SET a:M1 ON CREATE SET a:M2").is_err());
+}
+
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
 // MATCH...CREATE followed directly by a RETURN in the same statement) ---
 
