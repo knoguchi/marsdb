@@ -610,6 +610,15 @@ pub enum QueryClause {
     /// `Set` above (TCK's Remove3 "Persistence of remove clause side
     /// effects").
     Remove(Vec<RemoveItem>),
+    /// `CREATE ...` immediately followed by `WITH` -- same positive-
+    /// lookahead reasoning as `Set` above, but unlike `Set`/`Delete`/
+    /// `Remove`, CREATE *does* change row bindings (each pattern's
+    /// fresh/reused node-and-relationship vars) -- `execute_match`'s
+    /// clause loop reuses `materialize_create` (the exact same function
+    /// `Tail::Create`/`Executor::execute_create` already call) and
+    /// extends `carried_vars` with every pattern's own vars, same as
+    /// `Merge`'s own binding-changing clause already does.
+    Create(Vec<Pattern>),
 }
 
 #[derive(Debug, Clone)]

@@ -3551,6 +3551,52 @@ fn multi_type_relationship_pattern() {
     assert!(Executor::new(&store4).execute(&stmt).is_err());
 }
 
+/// `CREATE ... WITH ...` -- continues the query past the mutation
+/// instead of only ever being the very last (optionally RETURN-followed)
+/// thing in a statement (TCK's Create3/Match4/Match5/Match6 fixtures,
+/// e.g. `CREATE (a) WITH a WITH * CREATE (b) CREATE (a)<-[:T]-(b)`).
+/// Unlike `SET`/`DELETE`/`REMOVE`-as-clause, CREATE genuinely changes
+/// row bindings (each pattern's own vars) -- confirmed here by the
+/// second CREATE seeing the first CREATE's own binding (`a`), and by a
+/// `WITH *` in between correctly carrying it forward.
+#[test]
+fn create_followed_by_with_continues_the_query() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(
+        &store,
+        "CREATE (a) WITH a WITH * CREATE (b) CREATE (a)<-[:T]-(b)",
+    );
+    assert!(result.rows.is_empty());
+
+    let nodes = run(&store, "MATCH (n) RETURN count(n) AS c");
+    assert_eq!(int(&nodes.rows[0][0]), 2);
+    let rels = run(&store, "MATCH ()-[r:T]->() RETURN count(r) AS c");
+    assert_eq!(int(&rels.rows[0][0]), 1);
+
+    // CREATE followed by WITH *, UNWIND, and another CREATE -- the
+    // second CREATE's new nodes must each see the first CREATE's own
+    // binding across the UNWIND fan-out.
+    let store2 = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store2,
+        "CREATE (a {var: 'start'})
+         WITH *
+         UNWIND range(1, 5) AS i
+         CREATE (n {var: i})-[:T]->(a)
+         RETURN count(n) AS c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 5);
+
+    // The pre-existing standalone `CREATE ... RETURN ...`/bare-CREATE
+    // shapes (PR #106) must still work unaffected.
+    let result = run(&store2, "CREATE (node) RETURN labels(node)");
+    assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
+    run(&store2, "CREATE (:X), (:Y)");
+    let result = run(&store2, "MATCH (n:X) RETURN count(n) AS c");
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already

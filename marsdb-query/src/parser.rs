@@ -242,6 +242,15 @@ fn parse_clause(pair: Pair<Rule>) -> Result<Vec<QueryClause>, QueryError> {
                 .collect();
             Ok(vec![QueryClause::Remove(items)])
         }
+        Rule::create_as_clause => {
+            let create_stmt_pair = inner
+                .into_inner()
+                .next()
+                .expect("create_as_clause has a create_stmt");
+            Ok(vec![QueryClause::Create(parse_create_patterns(
+                create_stmt_pair,
+            )?)])
+        }
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
 }

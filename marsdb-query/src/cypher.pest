@@ -131,7 +131,7 @@ match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~ lim
 // only ever prefers this alternative when a real `WITH` is definitely
 // next, never when the same `set_clause` text is followed by anything
 // else) -- no change to, or regression risk for, the pre-existing path.
-clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | delete_as_clause | remove_as_clause | match_part }
+clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | delete_as_clause | remove_as_clause | create_as_clause | match_part }
 set_as_clause = { set_clause ~ &with_clause }
 // Same positive-lookahead technique as `set_as_clause` above, applied to
 // DELETE/DETACH DELETE/REMOVE -- TCK's Delete6/Remove3 "Persistence of
@@ -141,6 +141,16 @@ set_as_clause = { set_clause ~ &with_clause }
 // (DELETE/REMOVE followed by RETURN or nothing) are unaffected.
 delete_as_clause  = { (detach_delete_clause | delete_clause) ~ &with_clause }
 remove_as_clause  = { remove_clause ~ &with_clause }
+// Same positive-lookahead technique again, applied to CREATE -- TCK's
+// Create3/Match4/Match5/Match6 fixtures routinely chain a leading
+// `CREATE (...) WITH ... UNWIND ... CREATE (...) WITH ...` sequence,
+// which the pre-existing `mutating_tail`/top-level `create_stmt_only`
+// paths only ever let be the very last (optionally RETURN-followed)
+// thing in a statement. Same non-regression argument: only fires when a
+// real `WITH` is definitely next, so a terminal `CREATE`/`CREATE ...
+// RETURN` (via `mutating_tail`) and a truly bare top-level `CREATE` (via
+// `create_stmt_only`) are both unaffected.
+create_as_clause  = { create_stmt ~ &with_clause }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 
