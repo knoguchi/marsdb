@@ -530,9 +530,7 @@ fn parse_order_by_clause(pair: Pair<Rule>) -> Result<Vec<(ReturnExpr, SortDir)>,
 
 fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
     let n_pair = pair.into_inner().next().expect("LIMIT has an int_literal");
-    let n = n_pair
-        .as_str()
-        .parse::<i64>()
+    let n = parse_int_literal(n_pair.as_str())
         .map_err(|_| QueryError::Syntax("invalid LIMIT value".into()))?;
     if n < 0 {
         return Err(QueryError::Syntax("LIMIT can't be negative".into()));
@@ -542,9 +540,7 @@ fn parse_limit_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
 
 fn parse_skip_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
     let n_pair = pair.into_inner().next().expect("SKIP has an int_literal");
-    let n = n_pair
-        .as_str()
-        .parse::<i64>()
+    let n = parse_int_literal(n_pair.as_str())
         .map_err(|_| QueryError::Syntax("invalid SKIP value".into()))?;
     if n < 0 {
         return Err(QueryError::Syntax("SKIP can't be negative".into()));
@@ -1361,8 +1357,9 @@ fn parse_map_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// something -- an unrecognized escape (e.g. `\q`) errors here rather
 /// than silently dropping the backslash or passing it through, matching
 /// this codebase's stance elsewhere (error on an untested shape, don't
-/// guess). No `\uXXXX` unicode escapes -- not needed yet, noted as a gap
-/// in the README alongside the other documented Cypher-coverage gaps.
+/// guess). `\uXXXX` is exactly 4 hex digits (a BMP code point, real
+/// Cypher's own escape width -- not the 8-digit `\UXXXXXXXX` some other
+/// languages have).
 fn unescape_string(s: &str) -> Result<String, QueryError> {
     if !s.contains('\\') {
         return Ok(s.to_string());
@@ -1383,6 +1380,21 @@ fn unescape_string(s: &str) -> Result<String, QueryError> {
             Some('t') => out.push('\t'),
             Some('b') => out.push('\u{8}'),
             Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let digits: String = (&mut chars).take(4).collect();
+                if digits.len() != 4 {
+                    return Err(QueryError::Syntax(
+                        "\\u escape needs exactly 4 hex digits".into(),
+                    ));
+                }
+                let code = u32::from_str_radix(&digits, 16).map_err(|_| {
+                    QueryError::Syntax(format!("\\u{digits} isn't 4 valid hex digits"))
+                })?;
+                let ch = char::from_u32(code).ok_or_else(|| {
+                    QueryError::Syntax(format!("\\u{digits} isn't a valid Unicode code point"))
+                })?;
+                out.push(ch);
+            }
             Some(other) => {
                 return Err(QueryError::Syntax(format!(
                     "unrecognized string escape '\\{other}'"
@@ -1398,15 +1410,48 @@ fn unescape_string(s: &str) -> Result<String, QueryError> {
     Ok(out)
 }
 
+/// `int_literal = { "-"? ~ (("0x" ~ hex+) | ("0o" ~ oct+) | dec+) }` --
+/// parses the unsigned magnitude as `u64` first regardless of base, then
+/// applies the sign, rather than handing the whole (possibly `0x`/`0o`-
+/// prefixed) string straight to `str::parse::<i64>()` (which only
+/// understands plain decimal). Magnitude-first also correctly handles
+/// `i64::MIN` (`-9223372036854775808`/`-0x8000000000000000`): its
+/// magnitude, `2^63`, doesn't fit in a *positive* `i64` at all, only in
+/// `u64`, and `i64::MIN`'s own negation would itself overflow (`i64`'s
+/// range is asymmetric) -- special-cased via the two's-complement
+/// identity instead of negating.
+fn parse_int_literal(s: &str) -> Result<i64, QueryError> {
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let magnitude: u64 = if let Some(hex) = rest.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
+    } else if let Some(oct) = rest.strip_prefix("0o") {
+        u64::from_str_radix(oct, 8)
+    } else {
+        rest.parse::<u64>()
+    }
+    .map_err(|_| QueryError::Syntax("invalid integer literal".into()))?;
+    let out_of_range = || QueryError::Syntax("integer literal out of range".into());
+    if neg {
+        if magnitude == 1u64 << 63 {
+            Ok(i64::MIN)
+        } else {
+            i64::try_from(magnitude)
+                .ok()
+                .and_then(i64::checked_neg)
+                .ok_or_else(out_of_range)
+        }
+    } else {
+        i64::try_from(magnitude).map_err(|_| out_of_range())
+    }
+}
+
 fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
     let inner = pair.into_inner().next().expect("literal has one child");
     Ok(match inner.as_rule() {
-        Rule::int_literal => Literal::Int(
-            inner
-                .as_str()
-                .parse()
-                .map_err(|_| QueryError::Syntax("invalid integer literal".into()))?,
-        ),
+        Rule::int_literal => Literal::Int(parse_int_literal(inner.as_str())?),
         Rule::float_literal => {
             let f: f64 = inner
                 .as_str()
