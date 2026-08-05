@@ -3686,6 +3686,26 @@ fn chained_comparisons_fold_into_and() {
     assert!(!bool_val(&result.rows[0][1]));
 }
 
+/// `IS [NOT] NULL` binds *tighter* than a surrounding comparison -- `false
+/// = true IS NULL` is `false = (true IS NULL)`, not `(false = true) IS
+/// NULL`. Real Cypher's own precedence rule (TCK's Precedence1 [8]/[23]).
+#[test]
+fn is_null_binds_tighter_than_comparison() {
+    let store = GraphStore::open_memory().unwrap();
+    // true IS NULL == false, so false = false == true.
+    let result = run(&store, "RETURN false = true IS NULL AS a");
+    assert!(bool_val(&result.rows[0][0]));
+
+    // Both sides describe the same precedence via different groupings --
+    // must agree regardless of operator or null-ness.
+    let result = run(
+        &store,
+        "WITH 1 AS a, null AS b \
+         RETURN (a = b IS NULL) = (a = (b IS NULL)) AS eq",
+    );
+    assert!(bool_val(&result.rows[0][0]));
+}
+
 #[test]
 fn list_comprehension_bare_where_now_parses() {
     // Regression: previously `filter_expr`'s WHERE reused WithExpr, which

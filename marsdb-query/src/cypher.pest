@@ -186,13 +186,14 @@ kw_not = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
 // (`island`, `nullable`, ...).
 kw_is   = @{ ^"IS" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_null = @{ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_") }
-// A chain of 1+ comparisons (`1 < x < 10`), or a single `IS [NOT] NULL`
-// check -- never both on the same operand (real Cypher doesn't chain
-// IS NULL with a comparison operator either). The chain-vs-single-op
-// distinction is resolved in `parser.rs` (fold adjacent pairs with AND),
-// not here.
-compare_expr    = { add_expr ~ ((compare_op ~ add_expr)+ | is_null_suffix)? }
-is_null_suffix  = { kw_is ~ kw_not? ~ kw_null }
+// A chain of 0+ comparisons (`1 < x < 10`), each operand its own
+// `null_predicate_expr` -- real Cypher's `IS [NOT] NULL` binds *tighter*
+// than a comparison (`false = true IS NULL` is `false = (true IS NULL)`,
+// not `(false = true) IS NULL`), so it lives on the operand, not as a
+// suffix on the whole chain like an earlier version of this rule had it.
+compare_expr        = { null_predicate_expr ~ (compare_op ~ null_predicate_expr)* }
+null_predicate_expr = { add_expr ~ is_null_suffix? }
+is_null_suffix       = { kw_is ~ kw_not? ~ kw_null }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
 mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }

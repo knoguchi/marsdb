@@ -790,38 +790,31 @@ fn parse_bool_not_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     }
 }
 
-/// `compare_expr = { add_expr ~ ((compare_op ~ add_expr)+ | is_null_suffix)? }`
-/// -- either a chain of 1+ `compare_op ~ add_expr` pairs, a single
-/// `is_null_suffix`, or neither. A chain folds into nested `And`s of
-/// each *adjacent* pair (`a op0 b op1 c` -> `(a op0 b) AND (b op1 c)`,
-/// real Cypher's own chained-comparison semantics) -- note this means a
-/// middle operand like `b` is evaluated twice, harmless since no
-/// `ReturnExpr` form has side effects.
+/// `compare_expr = { null_predicate_expr ~ (compare_op ~ null_predicate_expr)* }`
+/// -- a chain of 0+ `compare_op ~ null_predicate_expr` pairs. A chain
+/// folds into nested `And`s of each *adjacent* pair (`a op0 b op1 c` ->
+/// `(a op0 b) AND (b op1 c)`, real Cypher's own chained-comparison
+/// semantics) -- note this means a middle operand like `b` is evaluated
+/// twice, harmless since no `ReturnExpr` form has side effects.
 fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let first = parse_add_expr(
+    let first = parse_null_predicate_expr(
         inner
             .next()
-            .expect("compare_expr has at least one add_expr"),
+            .expect("compare_expr has at least one null_predicate_expr"),
     )?;
-    let Some(next) = inner.next() else {
-        return Ok(first);
-    };
-    if next.as_rule() == Rule::is_null_suffix {
-        return Ok(parse_is_null_suffix(next, first));
-    }
-    // A chain: `next` is the first compare_op, and the remaining pairs
-    // alternate compare_op, add_expr, compare_op, add_expr, ...
     let mut operands = vec![first];
-    let mut ops = vec![parse_compare_op(next)];
-    loop {
-        operands.push(parse_add_expr(
-            inner.next().expect("compare_op has a following add_expr"),
+    let mut ops = Vec::new();
+    while let Some(op_pair) = inner.next() {
+        ops.push(parse_compare_op(op_pair));
+        operands.push(parse_null_predicate_expr(
+            inner
+                .next()
+                .expect("compare_op has a following null_predicate_expr"),
         )?);
-        match inner.next() {
-            Some(op_pair) => ops.push(parse_compare_op(op_pair)),
-            None => break,
-        }
+    }
+    if ops.is_empty() {
+        return Ok(operands.into_iter().next().expect("operands is non-empty"));
     }
     let mut pairs = operands.windows(2).zip(&ops).map(|(pair, op)| {
         ReturnExpr::Compare(Box::new(pair[0].clone()), *op, Box::new(pair[1].clone()))
@@ -833,6 +826,18 @@ fn parse_compare_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         acc = ReturnExpr::And(Box::new(acc), Box::new(next));
     }
     Ok(acc)
+}
+
+/// `null_predicate_expr = { add_expr ~ is_null_suffix? }` -- `IS [NOT]
+/// NULL` binds to a single operand, tighter than a surrounding
+/// comparison (see `compare_expr`'s grammar comment).
+fn parse_null_predicate_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let operand = parse_add_expr(inner.next().expect("null_predicate_expr has an add_expr"))?;
+    match inner.next() {
+        Some(suffix) => Ok(parse_is_null_suffix(suffix, operand)),
+        None => Ok(operand),
+    }
 }
 
 /// `is_null_suffix = { kw_is ~ kw_not? ~ kw_null }` -- `kw_not`'s
