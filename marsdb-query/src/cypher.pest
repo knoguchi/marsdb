@@ -56,7 +56,17 @@ union_stmt = { match_stmt ~ (union_op ~ match_stmt)+ }
 union_op   = { ^"UNION" ~ all_kw? }
 all_kw     = { ^"ALL" }
 
-create_stmt = { ^"CREATE" ~ pattern ~ ("," ~ pattern)* }
+// A repeated `CREATE` keyword is accepted as an alternate pattern
+// separator alongside `,` -- real Cypher allows chaining multiple
+// `CREATE` clauses in one statement, each seeing bindings from every
+// earlier one (`CREATE (a),(b) CREATE (a)-[:T]->(b)`, the same "later
+// pattern's tokens can reference an earlier pattern's variable" scope
+// `materialize_create`'s own row-threading already provides for a plain
+// comma-separated pattern list -- letting `CREATE` itself be one of the
+// separators needs no executor change at all, `parse_create_patterns`
+// already just collects every `pattern` child regardless of what
+// separated it).
+create_stmt = { ^"CREATE" ~ pattern ~ (("," | ^"CREATE") ~ pattern)* }
 
 // `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE` -- deliberately the
 // older, simpler single-property syntax (not the newer `CREATE INDEX FOR

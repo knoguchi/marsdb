@@ -55,6 +55,34 @@ fn line_and_block_comments_are_ignored() {
     assert_eq!(nums, vec![1, 2]);
 }
 
+/// Real Cypher allows chaining multiple `CREATE` clauses in one
+/// statement, each seeing bindings from every earlier one -- a repeated
+/// `CREATE` keyword is just another pattern separator, same as `,`. A
+/// real gap found via the openCypher TCK's own fixture convention
+/// (`CREATE (a {..}), (b {..})\nCREATE (a)-[:T]->(b)`, common enough to
+/// cause real, previously-misdiagnosed wrong-result bugs when a test
+/// harness naively ran each line as an independent statement instead,
+/// losing the shared `a`/`b` bindings and creating disconnected nodes).
+#[test]
+fn chained_create_clauses_share_scope() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a {name: 'a'}), (b {name: 'b'})\nCREATE (a)-[:T]->(b)",
+    );
+    let result = run(&store, "MATCH p = ({name: 'a'})-->({name: 'b'}) RETURN p");
+    assert_eq!(result.rows.len(), 1);
+
+    // Three-deep chaining, not just two.
+    let store2 = GraphStore::open_memory().unwrap();
+    run(
+        &store2,
+        "CREATE (a {n: 1})\nCREATE (b {n: 2})\nCREATE (a)-[:T]->(b)",
+    );
+    let result2 = run(&store2, "MATCH ({n: 1})-->({n: 2}) RETURN 1");
+    assert_eq!(result2.rows.len(), 1);
+}
+
 #[test]
 fn traversal_with_label_filter() {
     let store = GraphStore::open_memory().unwrap();
