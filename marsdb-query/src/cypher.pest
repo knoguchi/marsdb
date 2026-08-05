@@ -101,7 +101,19 @@ match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~ lim
 // Cypher allows this (e.g. `WITH [1,2,3] AS list RETURN list[1..3]`, the
 // exact shape most of the TCK's list scenarios use), needing no MATCH at
 // all since it's just projecting/aliasing values, not reading the graph.
-clause        = { unwind_clause | merge_clause | with_clause | match_part }
+// `set_as_clause` -- `SET` immediately followed by `WITH` (real Cypher:
+// `MATCH (n) SET n.x = 1 WITH n WHERE ... RETURN ...`, continuing the
+// query past the mutation instead of only ever allowing one trailing
+// `RETURN` right after it, TCK's Set6 "Persistence of set clause side
+// effects" scenarios). The positive lookahead `&with_clause` (zero-width,
+// doesn't consume) is what keeps this from ever firing for the existing
+// `SET ... RETURN`/bare-`SET`-with-nothing-after shapes -- both of those
+// still flow through `mutating_tail` below exactly as before (`clause*`
+// only ever prefers this alternative when a real `WITH` is definitely
+// next, never when the same `set_clause` text is followed by anything
+// else) -- no change to, or regression risk for, the pre-existing path.
+clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | match_part }
+set_as_clause = { set_clause ~ &with_clause }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 

@@ -3185,6 +3185,47 @@ fn with_where_bare_label_predicate() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// `SET ... WITH ...` -- continues the query past the mutation instead
+/// of only ever allowing one trailing `RETURN` right after it (TCK's
+/// Set6 [5]). `QueryClause::Set` doesn't change any row's bindings, only
+/// the underlying graph -- confirmed here by the SET's own side effect
+/// (all 5 nodes incremented) being independent of the later WHERE filter
+/// only letting 3 of them through to the final RETURN.
+#[test]
+fn set_followed_by_with_continues_the_query() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 1..=5 {
+        run(&store, &format!("CREATE (:N {{num: {i}}})"));
+    }
+
+    let result = run(
+        &store,
+        "MATCH (n:N) SET n.num = n.num + 1 WITH n WHERE n.num % 2 = 0 RETURN n.num AS num",
+    );
+    let mut vals: Vec<i64> = result.rows.iter().map(|row| int(&row[0])).collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 4, 6]);
+
+    // The SET's own side effect applies to every matched row, not just
+    // the ones that survive the later WHERE filter.
+    let all = run(&store, "MATCH (n:N) RETURN n.num");
+    let mut all_vals: Vec<i64> = all.rows.iter().map(|row| int(&row[0])).collect();
+    all_vals.sort();
+    assert_eq!(all_vals, vec![2, 3, 4, 5, 6]);
+
+    // The pre-existing `SET ... RETURN` (no WITH) shape must still work
+    // unaffected -- this is the grammar's positive-lookahead safety net
+    // (`set_as_clause` only ever fires when a real WITH is definitely
+    // next), not just a coincidence.
+    let result = run(&store, "MATCH (n:N {num: 2}) SET n.num = 100 RETURN n.num");
+    assert_eq!(int(&result.rows[0][0]), 100);
+
+    // A bare terminal SET with nothing after must still work too.
+    run(&store, "MATCH (n:N {num: 3}) SET n.num = 200");
+    let result = run(&store, "MATCH (n:N {num: 200}) RETURN count(*) AS c");
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already

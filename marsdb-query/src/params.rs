@@ -63,6 +63,14 @@ fn substitute_query_clause(
         QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
         QueryClause::Merge(m) => substitute_merge_clause(m, params),
         QueryClause::With(with) => substitute_with_clause(with, params),
+        QueryClause::Set(items) => {
+            for item in items {
+                if let SetItem::Prop(_, value) = item {
+                    substitute_return_expr(value, params)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
