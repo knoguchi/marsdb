@@ -274,19 +274,47 @@ fn parse_merge_clause(pair: Pair<Rule>) -> Result<MergeClause, QueryError> {
     let mut with = None;
     for p in inner {
         match p.as_rule() {
-            Rule::on_create_clause => {
-                on_create = p
+            // `merge_set_clause = { on_create_clause | on_match_clause }`
+            // -- either order, but real Cypher rejects a repeated `ON
+            // CREATE`/`ON MATCH` on the same MERGE (checked here, not the
+            // grammar, which permissively allows `merge_set_clause*` in
+            // any order/count -- same "grammar permissive, parser
+            // enforces the exact constraint" split as `UNION`/`UNION ALL`
+            // consistency). `on_create_clause`/`on_match_clause` both
+            // require at least one `set_item`, so a non-empty `Vec` here
+            // reliably means "already seen one", not just "default".
+            Rule::merge_set_clause => {
+                let inner_clause = p
                     .into_inner()
-                    .filter(|p| p.as_rule() == Rule::set_item)
-                    .map(parse_set_item)
-                    .collect::<Result<_, _>>()?;
-            }
-            Rule::on_match_clause => {
-                on_match = p
-                    .into_inner()
-                    .filter(|p| p.as_rule() == Rule::set_item)
-                    .map(parse_set_item)
-                    .collect::<Result<_, _>>()?;
+                    .next()
+                    .expect("merge_set_clause has an on_create_clause or on_match_clause");
+                match inner_clause.as_rule() {
+                    Rule::on_create_clause => {
+                        if !on_create.is_empty() {
+                            return Err(QueryError::Syntax(
+                                "MERGE can have at most one ON CREATE SET clause".into(),
+                            ));
+                        }
+                        on_create = inner_clause
+                            .into_inner()
+                            .filter(|p| p.as_rule() == Rule::set_item)
+                            .map(parse_set_item)
+                            .collect::<Result<_, _>>()?;
+                    }
+                    Rule::on_match_clause => {
+                        if !on_match.is_empty() {
+                            return Err(QueryError::Syntax(
+                                "MERGE can have at most one ON MATCH SET clause".into(),
+                            ));
+                        }
+                        on_match = inner_clause
+                            .into_inner()
+                            .filter(|p| p.as_rule() == Rule::set_item)
+                            .map(parse_set_item)
+                            .collect::<Result<_, _>>()?;
+                    }
+                    r => unreachable!("unexpected merge_set_clause child rule {r:?}"),
+                }
             }
             Rule::with_clause => with = Some(parse_with_clause(p)?),
             r => unreachable!("unexpected merge_clause child rule {r:?}"),

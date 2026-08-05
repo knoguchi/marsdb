@@ -48,7 +48,7 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 //
 // A bare top-level `CREATE ...` with nothing meaningful after it --
 // `Statement::Create`'s own dedicated (if functionally equivalent, see
-// below) path. The `!(return_clause | chainable_after_create)` negative
+// below) path. The `!(return_clause | chainable_clause_follows)` negative
 // lookahead is what keeps this from ever firing for `CREATE (n) RETURN
 // n`/`CREATE (n) WITH n ...`/`CREATE (n) SET n.x = 1` (real, common
 // Cypher -- TCK's Graph3 "Node labels", e.g. `CREATE (node) RETURN
@@ -67,7 +67,7 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 // observable about its result, only which `Statement`/`Tail`/
 // `QueryClause` variant represents it internally.
 statement = { explain_stmt | create_index_stmt | create_stmt_only | union_stmt | match_stmt }
-create_stmt_only = { create_stmt ~ !(return_clause | chainable_after_create) }
+create_stmt_only = { create_stmt ~ !(return_clause | chainable_clause_follows) }
 
 // `EXPLAIN <statement>` -- never wraps another `explain_stmt` (real Cypher's
 // own `EXPLAIN EXPLAIN ...` isn't valid either), so the inner alternative
@@ -135,32 +135,24 @@ match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~ lim
 // next, never when the same `set_clause` text is followed by anything
 // else) -- no change to, or regression risk for, the pre-existing path.
 clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | delete_as_clause | remove_as_clause | create_as_clause | match_part }
-set_as_clause = { set_clause ~ &with_clause }
-// Same positive-lookahead technique as `set_as_clause` above, applied to
-// DELETE/DETACH DELETE/REMOVE -- TCK's Delete6/Remove3 "Persistence of
-// .../REMOVE ... WITH ..." scenarios need these to continue the query too,
-// not just SET. Same non-regression argument: only fires when a real
-// `WITH` is definitely next, so the pre-existing `mutating_tail` paths
-// (DELETE/REMOVE followed by RETURN or nothing) are unaffected.
-delete_as_clause  = { (detach_delete_clause | delete_clause) ~ &with_clause }
-remove_as_clause  = { remove_clause ~ &with_clause }
-// Same positive-lookahead technique again, applied to CREATE -- TCK's
-// Create3/Match4/Match5/Match6 fixtures routinely chain a leading
-// `CREATE (...) WITH ... UNWIND ... CREATE (...) WITH ...` sequence,
-// and Set1 [6]/[7] chain `CREATE (a {...}) SET a.prop = ...` with no
-// `WITH` at all between the two -- both need CREATE to be a real
-// mid-statement clause, not only ever the very last (optionally
-// RETURN-followed) thing in a statement. The lookahead is `&
-// chainable_after_create` (any clause CREATE could sensibly run into:
-// `WITH`, or another mutating clause), not just `&with_clause` --
-// widened for the SET-with-no-WITH case, not narrowed. Same non-
-// regression argument as before: only fires when one of those is
-// definitely next, so a terminal `CREATE`/`CREATE ... RETURN` (via
-// `mutating_tail`) and a truly bare top-level `CREATE` (via
-// `create_stmt_only`, which uses the same lookahead, negated) are both
-// unaffected.
-create_as_clause  = { create_stmt ~ &chainable_after_create }
-chainable_after_create = { with_clause | set_clause | detach_delete_clause | delete_clause | remove_clause | create_stmt }
+// Positive-lookahead technique used by all four `_as_clause` rules below
+// -- `&chainable_clause_follows` only ever fires when one of these is
+// definitely next, so the pre-existing terminal/`RETURN`-followed shapes
+// (via `mutating_tail`, or `create_stmt_only` for a bare `CREATE`, both
+// of which use the same set negated) are unaffected either way; `|`
+// never backtracks into trying the pre-existing path instead just
+// because something *later* fails to parse, so getting this set right
+// matters more than it would for an ordinary ordered choice. Real Cypher
+// lets any of `SET`/`DELETE`/`DETACH DELETE`/`REMOVE`/`CREATE`/`MERGE`
+// chain directly into any other one of them, `WITH` or not (TCK's Set6/
+// Delete6/Remove3 needed `WITH` specifically; Merge1/Merge5/Merge9 chain
+// `CREATE`/`DELETE`/`MERGE` directly into each other with no `WITH` at
+// all, e.g. `CREATE (a), (b) MERGE (a)-[:X]->(b) RETURN count(a)`).
+chainable_clause_follows = { with_clause | set_clause | detach_delete_clause | delete_clause | remove_clause | create_stmt | merge_clause }
+set_as_clause = { set_clause ~ &chainable_clause_follows }
+delete_as_clause  = { (detach_delete_clause | delete_clause) ~ &chainable_clause_follows }
+remove_as_clause  = { remove_clause ~ &chainable_clause_follows }
+create_as_clause  = { create_stmt ~ &chainable_clause_follows }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 
@@ -202,7 +194,16 @@ unwind_source = { return_expr }
 // capped at 1 in parser.rs (whole-pattern atomicity across multiple
 // simultaneously-unbound hops isn't attempted in v1 -- see
 // executor::eval_merge's docs).
-merge_clause      = { ^"MERGE" ~ pattern ~ on_create_clause? ~ on_match_clause? ~ with_clause? }
+// `merge_set_clause*` (not a fixed `on_create_clause? ~ on_match_clause?`
+// order) -- real Cypher allows `ON MATCH`/`ON CREATE` in either order
+// (TCK's Merge4 [1]/[2], `ON MATCH SET ... ON CREATE SET ...`), grammar-
+// level repetition here since a fixed pest sequence can't express "either
+// order, each at most once" directly -- `parser::parse_merge_clause`
+// itself rejects a repeated `ON CREATE`/`ON MATCH` (real Cypher error),
+// the same "grammar permissive, parser enforces the exact constraint"
+// split this codebase already uses for `UNION`/`UNION ALL` consistency.
+merge_clause      = { ^"MERGE" ~ pattern ~ merge_set_clause* ~ with_clause? }
+merge_set_clause  = { on_create_clause | on_match_clause }
 on_create_clause  = { ^"ON" ~ ^"CREATE" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 on_match_clause   = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
 
