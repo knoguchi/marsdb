@@ -224,6 +224,13 @@ scenario (a `Duration` internal-representation edge case, not a wrong
 answer — see [CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact
 explanation).
 
+## Recent Grammar Improvements
+
+- Support for chaining any mutating clause directly into each other without requiring WITH
+- Support for ON MATCH/ON CREATE in either order in MERGE clauses  
+- Enhanced temporal builtin functions with transaction/statement/realtime variants
+- Improved handling of parenthesized variable targets in SET clauses
+
 ## Roadmap
 
 - List-valued `$parameters`, to unblock `UNWIND $items AS x` with a

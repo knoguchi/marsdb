@@ -723,7 +723,22 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     | "localtime.truncate"
                     | "time.truncate"
                     | "localdatetime.truncate"
-                    | "datetime.truncate" => Kind::Scalar,
+                    | "datetime.truncate"
+                    | "date.transaction"
+                    | "date.statement"
+                    | "date.realtime"
+                    | "localtime.transaction"
+                    | "localtime.statement"
+                    | "localtime.realtime"
+                    | "time.transaction"
+                    | "time.statement"
+                    | "time.realtime"
+                    | "localdatetime.transaction"
+                    | "localdatetime.statement"
+                    | "localdatetime.realtime"
+                    | "datetime.transaction"
+                    | "datetime.statement"
+                    | "datetime.realtime" => Kind::Scalar,
                     "length" => {
                         if let Some(kind) = arg_kinds.first() {
                             require_compatible_kind(kind, &Kind::Path, "length() argument")?;
