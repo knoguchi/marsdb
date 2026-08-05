@@ -17,43 +17,43 @@ scope.
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
-| clauses/create | 78 | 45 | 0 | 2 | 31 | 0 | 57.7% |
-| clauses/delete | 41 | 20 | 0 | 0 | 21 | 0 | 48.8% |
-| clauses/match | 381 | 273 | 0 | 0 | 73 | 35 | 71.7% |
-| clauses/match-where | 34 | 15 | 0 | 0 | 19 | 0 | 44.1% |
-| clauses/merge | 75 | 26 | 0 | 2 | 47 | 0 | 34.7% |
-| clauses/remove | 33 | 18 | 0 | 0 | 15 | 0 | 54.5% |
-| clauses/return | 63 | 32 | 0 | 1 | 30 | 0 | 50.8% |
-| clauses/return-orderby | 35 | 25 | 0 | 0 | 8 | 2 | 71.4% |
-| clauses/return-skip-limit | 31 | 25 | 0 | 0 | 6 | 0 | 80.6% |
-| clauses/set | 53 | 23 | 0 | 0 | 30 | 0 | 43.4% |
+| clauses/create | 78 | 75 | 0 | 1 | 2 | 0 | 96.2% |
+| clauses/delete | 41 | 37 | 0 | 0 | 4 | 0 | 90.2% |
+| clauses/match | 381 | 341 | 0 | 0 | 29 | 11 | 89.5% |
+| clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
+| clauses/merge | 75 | 59 | 0 | 0 | 16 | 0 | 78.7% |
+| clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
+| clauses/return | 63 | 48 | 0 | 1 | 13 | 1 | 76.2% |
+| clauses/return-orderby | 35 | 28 | 0 | 0 | 5 | 2 | 80.0% |
+| clauses/return-skip-limit | 31 | 27 | 0 | 0 | 4 | 0 | 87.1% |
+| clauses/set | 53 | 38 | 0 | 0 | 15 | 0 | 71.7% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/unwind | 14 | 9 | 0 | 0 | 3 | 2 | 64.3% |
-| clauses/with | 29 | 11 | 0 | 0 | 17 | 1 | 37.9% |
-| clauses/with-orderBy | 292 | 166 | 0 | 0 | 124 | 2 | 56.8% |
-| clauses/with-skip-limit | 9 | 4 | 0 | 0 | 5 | 0 | 44.4% |
-| clauses/with-where | 19 | 2 | 0 | 0 | 17 | 0 | 10.5% |
-| expressions/aggregation | 35 | 25 | 0 | 0 | 10 | 0 | 71.4% |
-| expressions/boolean | 150 | 140 | 0 | 0 | 10 | 0 | 93.3% |
-| expressions/comparison | 72 | 54 | 0 | 0 | 18 | 0 | 75.0% |
+| clauses/unwind | 14 | 12 | 0 | 0 | 0 | 2 | 85.7% |
+| clauses/with | 29 | 21 | 0 | 0 | 7 | 1 | 72.4% |
+| clauses/with-orderBy | 292 | 283 | 0 | 0 | 7 | 2 | 96.9% |
+| clauses/with-skip-limit | 9 | 8 | 0 | 0 | 1 | 0 | 88.9% |
+| clauses/with-where | 19 | 17 | 0 | 0 | 2 | 0 | 89.5% |
+| expressions/aggregation | 35 | 29 | 0 | 0 | 6 | 0 | 82.9% |
+| expressions/boolean | 150 | 150 | 0 | 0 | 0 | 0 | 100.0% |
+| expressions/comparison | 72 | 62 | 0 | 0 | 10 | 0 | 86.1% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
-| expressions/graph | 61 | 40 | 0 | 7 | 14 | 0 | 65.6% |
-| expressions/list | 185 | 121 | 0 | 2 | 55 | 7 | 65.4% |
-| expressions/literals | 131 | 71 | 0 | 0 | 51 | 9 | 54.2% |
-| expressions/map | 44 | 16 | 0 | 6 | 17 | 5 | 36.4% |
+| expressions/graph | 61 | 55 | 0 | 0 | 6 | 0 | 90.2% |
+| expressions/list | 185 | 170 | 0 | 0 | 8 | 7 | 91.9% |
+| expressions/literals | 131 | 125 | 0 | 0 | 0 | 6 | 95.4% |
+| expressions/map | 44 | 32 | 0 | 0 | 7 | 5 | 72.7% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/null | 44 | 37 | 0 | 0 | 1 | 6 | 84.1% |
+| expressions/null | 44 | 38 | 0 | 0 | 0 | 6 | 86.4% |
 | expressions/path | 7 | 2 | 0 | 0 | 5 | 0 | 28.6% |
-| expressions/pattern | 50 | 19 | 0 | 0 | 31 | 0 | 38.0% |
-| expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
-| expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
-| expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 963 | 1 | 15 | 25 | 0 | 95.9% |
-| expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
+| expressions/pattern | 50 | 39 | 0 | 0 | 11 | 0 | 78.0% |
+| expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
+| expressions/quantifier | 604 | 596 | 0 | 0 | 8 | 0 | 98.7% |
+| expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
+| expressions/temporal | 1004 | 984 | 1 | 3 | 16 | 0 | 98.0% |
+| expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
-| useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2901** | **1** | **36** | **873** | **69** | **74.8%** |
+| useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
+| **TOTAL** | **3880** | **3601** | **1** | **8** | **227** | **43** | **92.8%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -97,10 +97,22 @@ offsets, e.g. Stockholm in 1818 resolves to `+00:53:28`). `Time` still
 only accepts a fixed offset — it carries no calendar date, so a named
 zone's DST-dependent offset has nothing to resolve against, a real
 structural limit of the type rather than a missing feature. The remaining
-`unexp` scenarios are unrelated, smaller gaps: list-valued temporal
-properties (MarsDB's node/edge properties are scalar-only, see
-`PropertyValue`'s own doc comment) and the alternate ISO-8601 combined
-date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`).
+temporal `unexp`/`reject` scenarios are narrow, specific gaps: dates
+outside `chrono`'s representable range (`'-999999999-01-01'`) and the
+alternate ISO-8601 combined date-time duration syntax
+(`duration('P2012-02-02T14:37:21.545')`, as opposed to the plain
+`'P1Y2M3DT4H5M6S'` form, which is fully supported).
+
+The remaining non-temporal `unexp` scenarios are each their own narrow,
+specific gap, not one common cause: `Return2 [14]` (returning the *type*
+of an already-deleted relationship — MarsDB's `DeletedEntityAccess` check
+fires eagerly on any access to a deleted entity, real Cypher's own `type()`
+apparently doesn't need the record itself so it's exempt), `Create1 [19]`
+(adding a label-existence predicate on an already-bound node is accepted
+here, real Cypher rejects it), and `MatchWhere1 [12,13,15]` (a path-length
+predicate and an aggregate used directly inside pattern-level `WHERE`,
+both real Cypher restrictions this codebase doesn't enforce at compile
+time).
 
 ## Clauses
 
@@ -108,43 +120,56 @@ date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`).
 backslash-escaped string literals (`\' \" \\ \n \r \t \b \f`),
 `MATCH`/`OPTIONAL MATCH`, undirected (`-[r:TYPE]-`), bracketless
 (`-->`/`<--`/`--`, the anonymous-untyped-relationship shorthand — brackets
-are only needed at all to carry a var/type/range/props), and
-variable-length (`[:TYPE*min..max]`) relationship patterns. `CREATE`
-requires an explicit relationship type on every hop (`-[:KNOWS]->`,
-`-->` alone is rejected with a clear semantic error) — unlike `MATCH`,
-where an untyped hop legitimately means "any relationship," a brand new
-edge with no type is meaningless, matching real Cypher's own rule.
-`WHERE` (including the
-string predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`, a user-typed label
-predicate `WHERE n:Label`/`n:Label1:Label2`, a property compared against
-*another* property rather than a constant `WHERE a.id = b.id`, and
-node/relationship identity comparison `WHERE a = b`/`WHERE a <> b` — only
-`=`/`<>` are meaningful for identity, no ordering exists between two
-nodes/relationships, so `WHERE a < b` is a real error), one `WITH`
-boundary per statement (projection/rename, its own `WHERE`/
-`WITH...WHERE`/`ORDER BY`/`LIMIT`), `RETURN`/`DELETE`/`DETACH DELETE`/
-`SET`/`REMOVE`/`MATCH ... CREATE` (adds an edge between two
-already-matched nodes — a node token whose variable is already bound
-reuses that node instead of creating a new one). `SET`/`REMOVE` cover
-both properties (`SET n.prop = 'x'`/`REMOVE n.prop`) and labels
-(`SET n:Label`/`REMOVE n:Label`); `SET n.prop = null` removes the
-property rather than storing a literal null, matching real Cypher.
-`DELETE`/`DETACH DELETE`/`SET`/`REMOVE`/`MATCH ... CREATE` can each
-optionally be followed by one trailing `RETURN` in the same statement
-(`MATCH (n) SET n.prop = 1 RETURN n`, `MATCH (n) DELETE n RETURN
-count(n)`) — the shape the real TCK scenarios for these clauses
-overwhelmingly use. Not yet supported: chaining more than one mutating
-clause before the final `RETURN`, or a `WITH` between the mutating
-clause and that `RETURN`.
+are only needed at all to carry a var/type/range/props), multi-type
+(`[:A|B]`/`[:A|:B]`, both separator forms — matches if the edge's type is
+any of the listed alternatives), and variable-length (`[:TYPE*min..max]`)
+relationship patterns. `CREATE`/`MERGE` require exactly one explicit
+relationship type on every hop (`-[:KNOWS]->`, `-->` or `-[:A|B]->` alone
+is rejected with a clear semantic error) — unlike `MATCH`, where an
+untyped/multi-typed hop legitimately means "any relationship"/"any of
+these," a brand new edge can't be ambiguous about which single type it
+gets, matching real Cypher's own rule. `WHERE` (including the string
+predicates `STARTS WITH`/`ENDS WITH`/`CONTAINS`, a user-typed label
+predicate `WHERE n:Label`/`n:Label1:Label2` — also usable as a general
+expression anywhere one is, not just `WHERE` (`RETURN a:B AS result`) —
+a property compared against *another* property rather than a constant
+`WHERE a.id = b.id`, node/relationship identity comparison
+`WHERE a = b`/`WHERE a <> b` — only `=`/`<>` are meaningful for identity,
+no ordering exists between two nodes/relationships, so `WHERE a < b` is a
+real error — and a pattern predicate used as a boolean expression,
+`WHERE (n)-[:REL]->()`, existential and negatable/AND/OR-combinable,
+correlated against whatever's already bound: `WHERE (n)-[]->(m)` with
+both `n`/`m` already bound by an outer `MATCH` means "is there a real edge
+between these two specific nodes," not "does `n` have any outgoing edge
+at all"), any number of chained `WITH` boundaries per statement
+(projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER BY`/`LIMIT`,
+and `WITH *` — every currently-bound variable carries forward unchanged,
+optionally alongside more items), `RETURN`/`RETURN *`/`DELETE`/
+`DETACH DELETE`/`SET`/`REMOVE`/
+`MATCH ... CREATE` (adds an edge between two already-matched nodes — a
+node token whose variable is already bound reuses that node instead of
+creating a new one) or a standalone `CREATE ... RETURN ...` with no
+preceding `MATCH` at all. `SET`/`REMOVE` cover both properties
+(`SET n.prop = 'x'`/`REMOVE n.prop`) and labels (`SET n:Label`/
+`REMOVE n:Label`); `SET n.prop = null` removes the property rather than
+storing a literal null, matching real Cypher. `CREATE`/`SET`/`DELETE`/
+`DETACH DELETE`/`REMOVE` can each optionally be followed by one trailing
+`RETURN` in the same statement (`MATCH (n) SET n.prop = 1 RETURN n`,
+`MATCH (n) DELETE n RETURN count(n)`), *or* continue the query past the
+mutation via a `WITH` (`MATCH (n) SET n.prop = 1 WITH n WHERE ...
+RETURN ...`) — real Cypher allows arbitrarily chaining these, not just
+one mutating clause immediately before a single terminal `RETURN`.
 
 Multi-key `ORDER BY`, `SKIP`/`LIMIT` (on both `RETURN` and `WITH`; `SKIP`
 always applies after `ORDER BY` and before `LIMIT` regardless of clause
 order in the query text, matching real Cypher), `CASE`, and implicit-GROUP-BY aggregation
 (`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
-`DISTINCT` inside an aggregate call). `RETURN DISTINCT` (result-set-level
-dedup of the whole projected row, applied after grouping for an
-aggregating `RETURN` — a separate mechanism from `DISTINCT` inside one
-aggregate call, which only affects that aggregate's own accumulation).
+`DISTINCT` inside an aggregate call — including grouping/`DISTINCT` by a
+list or map value, structurally, not just a scalar). `RETURN DISTINCT`
+(result-set-level dedup of the whole projected row, applied after
+grouping for an aggregating `RETURN` — a separate mechanism from
+`DISTINCT` inside one aggregate call, which only affects that aggregate's
+own accumulation).
 
 Built-in scalar functions: `coalesce()`, `toInteger()`/`toFloat()`/
 `toString()`/`toBoolean()`, `keys()`/`labels()`/`type()`/`properties()`/
@@ -167,29 +192,39 @@ Two independent `MATCH` parts across one `WITH` boundary
 cross-joined against existing rows; its own `WHERE` works without needing
 a second `WITH`) — `<list>` is an inline Cypher-text list literal
 (`[1, 2, 'a', $p]`) or a variable bound by a preceding
-`WITH ... collect(...)`; `UNWIND $param` where `$param` itself names a
-list isn't supported yet (no list-valued parameters — every `$param` is a
-single scalar). `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...]`
+`WITH ... collect(...)`/a list-valued node or relationship property;
+`UNWIND $param` where `$param` itself names a list isn't supported yet
+(no list-valued *parameters* — every `$param` is a single scalar; a
+list-valued *property* is a different, already-supported thing, see
+below). `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...]`
 (match-or-create: tries the pattern as an ordinary MATCH first, creates
 exactly one new instance if nothing matched) — capped at one relationship
-hop (`MERGE (n:Label {props})` or `MERGE (a)-[:TYPE]->(b)`); an
-unconstrained node pattern that isn't already bound (`MERGE (n)`, no
-label or property) is rejected rather than matching/creating arbitrarily.
-Named-path capture (`MATCH p = (a)-[:KNOWS]->(b) RETURN p`, fixed-hop
-patterns only) and `shortestPath((a)-[:TYPE*..N]-(b))` (real
+hop (`MERGE (n:Label {props})` or `MERGE (a)-[:TYPE]->(b)`); a completely
+unconstrained node pattern (`MERGE (n)`, no label or property) is valid,
+real Cypher too — searches for/creates any node with no constraints at
+all. Named-path capture (`MATCH p = (a)-[:KNOWS]->(b) RETURN p`,
+fixed-hop patterns only) and `shortestPath((a)-[:TYPE*..N]-(b))` (real
 shortest-path search via BFS, not just the first path found — both
 endpoints must already be matched by a preceding clause), plus
 `length(p)` to measure one.
 
 ## Expressions
 
-Arithmetic (`+ - * / %`, real precedence — `* / %` bind tighter than
-`+ -`, explicit `(...)` grouping to override it) in `RETURN`/`WITH`
-items, `ORDER BY` keys, and function arguments — `+` also concatenates
-two strings; an aggregate can't be nested inside a wrapping arithmetic
-expression (`1 + count(x)` is rejected, not silently wrong — `count(x)`
-alone as a whole return item is fine); not yet usable inside a `WHERE`
-clause's comparison operands, only in `RETURN`/`WITH`/`ORDER BY`.
+Arithmetic (`+ - * / %`, plus `^` exponentiation and general unary minus
+— real precedence: unary minus binds tightest, then `^` (left-
+associative — `4 ^ 3 ^ 2` is `(4 ^ 3) ^ 2`, confirmed against the TCK's
+own fixture, not assumed from general math convention, which is
+right-associative and would be wrong here), then `* / %`, then `+ -`,
+explicit `(...)` grouping to override any of it) in `RETURN`/`WITH`
+items, `ORDER BY` keys, function arguments, and a pattern-level `WHERE`'s
+comparison operands (`WHERE n.x + 1 = 6`, via the same general-expression
+comparison form map/date comparisons already use, see below) — `+` also
+concatenates two strings, or appends/prepends/concatenates when either
+side is a list (`[1,2] + 3` is `[1,2,3]`, `[1,2] + [3]` is `[1,2,3]`);
+`^` always produces a float, even for two integer operands, matching real
+Cypher's own rule. An aggregate can't be nested inside a wrapping
+arithmetic expression (`1 + count(x)` is rejected, not silently wrong —
+`count(x)` alone as a whole return item is fine).
 
 List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
 from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
@@ -234,18 +269,26 @@ propagate "unknown" rather than collapsing it to `false`) — `CASE`'s
 definite yes/no, not "unknown".
 
 A general comparison operator (`x > d`, `1 + 1 = 2`) is valid anywhere a
-`RETURN`/`WITH` expression is, not just `WHERE` (needed to express
-`date1 > date2`, since `WHERE`'s comparison RHS is literal-only) —
-including a correctly three-valued (`null`-propagating) `List`/`Map`
-equality and lexicographic `List` ordering, and a `NaN`-safe
-`<`/`<=`/`>`/`>=` that returns `false` (not `null`) the way real Cypher
-does. `{key: <expr>, ...}` map literals are a general expression
-(`RETURN {a: 1, b: 2}`, `WITH {x: 1} AS m RETURN m.x`, `map['key']`
-dynamic access) usable anywhere a `RETURN`/`WITH` expression is,
-including as a `CREATE`/`MERGE` pattern's inline property map value
-(`CREATE (n {tags: [1,2,3]})` now parses — though MarsDB's storage layer
-still can't persist a list/map-valued property, so that specific example
-fails at execution time with a clear error, not silently as `null`).
+`RETURN`/`WITH` expression is, not just `WHERE` — including a correctly
+three-valued (`null`-propagating) `List`/`Map` equality and lexicographic
+`List` ordering, and a `NaN`-safe `<`/`<=`/`>`/`>=` that returns `false`
+(not `null`) the way real Cypher does. `{key: <expr>, ...}` map literals
+are a general expression (`RETURN {a: 1, b: 2}`, `WITH {x: 1} AS m RETURN
+m.x`, `map['key']` dynamic access) usable anywhere a `RETURN`/`WITH`
+expression is, including as a `CREATE`/`MERGE` pattern's inline property
+map value.
+
+A list-valued node/edge property (`CREATE (n {tags: [1, 2, 3]})`, real
+Cypher/Neo4j's own "homogeneous array property" shape) is fully
+supported and round-trips as a genuine list, not an opaque scalar —
+`n.tags[0]`, `size(n.tags)`, `x IN n.tags`, and `UNWIND n.tags AS x` all
+work transparently on it, the same as a list literal or `collect()`
+result. A *map*-valued property (`CREATE (n {tags: {a: 1}})`) is still a
+real error, not silently null — matching real Cypher, which only ever
+allows scalars or homogeneous scalar arrays as a stored property, never a
+nested map. Grouping/`DISTINCT` by a map value (including one containing
+a list) also works, hashed by its sorted `(key, value)` entries so
+`{a: 1, b: 2}` and `{b: 2, a: 1}` correctly group together.
 
 ## Temporal types
 
@@ -360,11 +403,9 @@ clock half for a clock-scale one.
 
 **Not** supported: named timezones for `Time` (only `DateTime` can hold
 one — see above); the alternate ISO-8601 combined date-time duration
-syntax (`duration('P2012-02-02T14:37:21.545')`); list-valued temporal
-properties (`n.dates = [date(), date()]` — MarsDB's node/edge properties
-are scalar-only, see `PropertyValue`'s own doc comment). See
-`marsdb-query/src/temporal.rs`'s module doc comment for the same list
-in code.
+syntax (`duration('P2012-02-02T14:37:21.545')`); dates outside `chrono`'s
+representable range. See `marsdb-query/src/temporal.rs`'s module doc
+comment for the same list in code.
 
 ## Indexes & EXPLAIN
 
@@ -406,7 +447,7 @@ one hand-crafted grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()`
 checkpoint — see `marsdb-query/tests/smoke.rs`), comma-separated patterns
 *within one* `MATCH`/`CREATE` clause beyond a single linear chain (general
 cross-joins — different from the cross-join WITH-chaining above, which
-works), chaining past one `WITH` boundary, `MERGE` patterns with more than
+works), `MERGE` patterns with more than
 one relationship hop (whole-pattern atomicity across multiple
 simultaneously-unbound hops isn't attempted), named-path capture over a
 variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain

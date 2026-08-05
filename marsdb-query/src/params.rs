@@ -410,5 +410,15 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
                 "${name}: passing a temporal value as a query parameter isn't supported yet"
             )))
         }
+        // Same "no literal syntax to substitute to" gap as the temporal
+        // variants above -- there's no `Literal::List`, general list
+        // values are only ever reachable via `ReturnExpr::ListLit`
+        // (built from real list-literal syntax `[1, 2, 3]`), not as a
+        // `$param` substitution target.
+        PropertyValue::List(_) => {
+            return Err(QueryError::Type(format!(
+                "${name}: passing a list value as a query parameter isn't supported yet"
+            )))
+        }
     })
 }

@@ -1811,7 +1811,7 @@ impl<'a> Executor<'a> {
                 txn, *id,
             )?)?),
             Binding::Value(PropertyValue::Null) => Value::Null,
-            Binding::Value(pv) => Value::Property(pv.clone()),
+            Binding::Value(pv) => property_value_to_value(pv.clone()),
             Binding::List(items) => Value::List(items.clone()),
             Binding::Map(m) => Value::Map(m.clone()),
             Binding::Path(elems) => Value::Path(self.resolve_path_elems(txn, elems)?),
@@ -2706,7 +2706,7 @@ impl<'a> Executor<'a> {
             ))),
             Some(_) => Ok(match self.lookup_prop(txn, pa, row)? {
                 Some(PropertyValue::Null) | None => Value::Null,
-                Some(pv) => Value::Property(pv),
+                Some(pv) => property_value_to_value(pv),
             }),
             None => Err(QueryError::UnboundVariable(pa.var.clone())),
         }
@@ -3801,21 +3801,31 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
                     .into(),
             ))
         }
-        // Same stance as `Path` above -- see `value_hash_key`'s matching
-        // `Value::Map` arm.
-        Binding::Map(_) => {
-            return Err(QueryError::Type(
-                "grouping or using DISTINCT with a map value isn't supported".into(),
-            ))
-        }
+        // Same canonical-sorted-entries encoding as `value_hash_key`'s
+        // matching `Value::Map` arm (a `BTreeMap` already iterates in
+        // sorted key order).
+        Binding::Map(m) => HashKey::List(
+            m.iter()
+                .map(|(k, v)| -> Result<HashKey, QueryError> {
+                    Ok(HashKey::List(vec![
+                        HashKey::Str(k.clone()),
+                        value_hash_key(v)?,
+                    ]))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
     })
 }
 
 /// Converts a finished `AggAcc::finish()` result to the `Binding` it's
 /// carried as through a `WITH` boundary — `collect()`'s `Value::List`
-/// needs `Binding::List` (no list variant in `PropertyValue`, the
-/// storage-layer type `Binding::Value` wraps), everything else collapses
-/// to `Binding::Value` same as any other computed WITH item.
+/// needs `Binding::List`, not `Binding::Value(PropertyValue::List(_))`:
+/// `Binding::List` carries full `Value` elements (a `Node`/`Edge`'s real
+/// id, restorable graph identity), while `PropertyValue::List` is the
+/// flatter, storage-format shape (scalar elements only) -- collapsing a
+/// `collect()` of nodes down to that would lose the ability to keep
+/// traversing from them after the `WITH`. Everything else collapses to
+/// `Binding::Value` same as any other computed WITH item.
 fn value_to_binding(v: Value) -> Binding {
     match v {
         Value::List(items) => Binding::List(items),
@@ -3975,38 +3985,74 @@ fn reconstruct_path(
 /// `Binding::Value` — used by `item_binding` for a computed (non-bare-var)
 /// WITH/RETURN item. `Value::Node`/`Edge` can't occur here in practice (no
 /// non-aggregate `ReturnExpr` form produces one except `Var`, which takes
-/// the bare-variable path instead). `Value::List` can't occur here either
-/// — `collect()` only ever appears in an aggregating item list, which
-/// `has_aggregate` routes to `resolve_grouped_rows`/`Binding::List`
-/// instead of through `item_binding` at all. Both fall back to `Null`
-/// rather than needing a fallible signature for an unreachable case.
+/// the bare-variable path instead), and a bare `collect()` result is
+/// routed to `Binding::List` before reaching here (see `has_aggregate`) --
+/// both still fall back to `Null` rather than needing a fallible signature
+/// for an unreachable case. `Value::List` genuinely *can* reach here now,
+/// though (`WITH n.numbers + [4] AS x` -- a real computed list expression,
+/// not a bare `collect()`, once list-valued properties round-trip through
+/// `lookup_prop_value` as real `Value::List`s) -- recurses per-element,
+/// same as `value_to_storable_property`'s own list handling.
 fn value_to_property_value(v: &Value) -> PropertyValue {
     match v {
         Value::Null => PropertyValue::Null,
         Value::Property(pv) => pv.clone(),
         Value::Literal(lit) => literal_to_value(lit),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
-            PropertyValue::Null
+        Value::List(items) => {
+            PropertyValue::List(items.iter().map(value_to_property_value).collect())
         }
+        Value::Node(_) | Value::Edge(_) | Value::Map(_) | Value::Path(_) => PropertyValue::Null,
     }
 }
 
 /// `eval_props_to_values`'s stricter cousin of `value_to_property_value`
-/// above -- a CREATE prop value that evaluates to a list/map/node/edge/
-/// path is a real, reportable error (`None` here), not a silent `Null`.
+/// above -- a CREATE/SET prop value that evaluates to a node/edge/path/map
+/// is a real, reportable error (`None` here), not a silent `Null`.
 /// `value_to_property_value`'s silent-`Null` fallback is correct at *its*
-/// call sites (a WITH-projected scalar, where a `Value::List`/`Map` genuinely
-/// can't occur — see its own doc comment) but was never meant for CREATE's
-/// prop map, where a list/map literal is a real, everyday thing to write
-/// (`CREATE (n {tags: [1, 2, 3]})`) that MarsDB's storage layer just
-/// doesn't support persisting yet -- silently storing `null` instead
-/// would be a wrong answer, not a graceful degradation.
+/// call sites (a WITH-projected scalar, where those shapes genuinely can't
+/// occur — see its own doc comment) but was never meant for CREATE/SET's
+/// prop value, where writing one of those is a real, everyday mistake
+/// (`CREATE (n {tags: some_node})`) that should say so, not silently store
+/// `null`. `Value::List` *is* storable (`PropertyValue::List`, real
+/// Cypher/Neo4j's own "homogeneous array property" shape) -- recurses
+/// per-element, so a list containing something unstorable (a nested list
+/// isn't rejected here, since no TCK scenario tests that restriction and
+/// nothing about `PropertyValue::List`'s own storage format requires it,
+/// but a node/edge/path/map element still correctly fails the whole list).
 fn value_to_storable_property(v: &Value) -> Option<PropertyValue> {
     match v {
         Value::Null => Some(PropertyValue::Null),
         Value::Property(pv) => Some(pv.clone()),
         Value::Literal(lit) => Some(literal_to_value(lit)),
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => None,
+        Value::List(items) => Some(PropertyValue::List(
+            items
+                .iter()
+                .map(value_to_storable_property)
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Value::Node(_) | Value::Edge(_) | Value::Map(_) | Value::Path(_) => None,
+    }
+}
+
+/// `value_to_storable_property`'s inverse -- turns a raw stored/bound
+/// `PropertyValue` back into a real `Value`, the read-time counterpart
+/// every property-access site (`lookup_prop_value`, `binding_to_value`,
+/// `eval_projected_expr`'s node/edge prop arms) needs. A scalar wraps as
+/// `Value::Property` exactly as before; `PropertyValue::List` becomes a
+/// genuine `Value::List` (not `Value::Property(PropertyValue::List(_))`)
+/// so every existing list operation (`size()`, `tail()`, indexing, `IN`,
+/// `UNWIND`, ...) -- all of which pattern-match on `Value::List`
+/// specifically -- works transparently on a property-sourced list the
+/// same as a list literal/`collect()` result, with no special-casing
+/// needed anywhere else. `PropertyValue::Null` collapses to `Value::Null`,
+/// matching every other property-read site's existing null convention.
+fn property_value_to_value(pv: PropertyValue) -> Value {
+    match pv {
+        PropertyValue::Null => Value::Null,
+        PropertyValue::List(items) => {
+            Value::List(items.into_iter().map(property_value_to_value).collect())
+        }
+        other => Value::Property(other),
     }
 }
 
@@ -5105,13 +5151,13 @@ fn properties_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
         Some(Value::Node(n)) => Value::Map(
             n.props
                 .iter()
-                .map(|(k, v)| (k.clone(), Value::Property(v.clone())))
+                .map(|(k, v)| (k.clone(), property_value_to_value(v.clone())))
                 .collect(),
         ),
         Some(Value::Edge(e)) => Value::Map(
             e.props
                 .iter()
-                .map(|(k, v)| (k.clone(), Value::Property(v.clone())))
+                .map(|(k, v)| (k.clone(), property_value_to_value(v.clone())))
                 .collect(),
         ),
         Some(Value::Map(m)) => Value::Map(m.clone()),
@@ -5585,7 +5631,8 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
             | PropertyValue::LocalTime(_)
             | PropertyValue::Time { .. }
             | PropertyValue::LocalDateTime { .. }
-            | PropertyValue::DateTime { .. },
+            | PropertyValue::DateTime { .. }
+            | PropertyValue::List(_),
         )
         | Value::Node(_)
         | Value::Edge(_)
@@ -5642,7 +5689,12 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
         Value::Literal(Literal::Param(name)) => {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
-        Value::Node(_) | Value::Edge(_) | Value::List(_) | Value::Map(_) | Value::Path(_) => {
+        Value::Property(PropertyValue::List(_))
+        | Value::Node(_)
+        | Value::Edge(_)
+        | Value::List(_)
+        | Value::Map(_)
+        | Value::Path(_) => {
             return Err(QueryError::Type(format!(
                 "toString() cannot convert {v:?} to a string"
             )))
@@ -7320,11 +7372,11 @@ fn eval_projected_expr(
                 Value::Map(m) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
                 Value::Node(n) => Ok(match n.props.get(&pa.prop).cloned() {
                     Some(PropertyValue::Null) | None => Value::Null,
-                    Some(v) => Value::Property(v),
+                    Some(v) => property_value_to_value(v),
                 }),
                 Value::Edge(e) => Ok(match e.props.get(&pa.prop).cloned() {
                     Some(PropertyValue::Null) | None => Value::Null,
-                    Some(v) => Value::Property(v),
+                    Some(v) => property_value_to_value(v),
                 }),
                 // `d.year`/`d.months`/etc component access on a `Date`/
                 // `Duration` in projected/ORDER BY position -- mirrors
@@ -7668,13 +7720,14 @@ fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::Ordering {
 
 fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    // `List` has no `PropertyValue` to fall back on via `value_to_comparable`
-    // (a list is a query-layer-only `Value` shape) -- delegate to its own
-    // recursive comparator before reaching the scalar-only match below,
-    // which would otherwise silently treat every pair of lists as "equal"
-    // (found via TCK's ReturnOrderBy1 `[10]`/WithOrderBy1 `[10]`: `ORDER BY
-    // <list column>` produced no reordering at all, ASC and DESC alike --
-    // a stable sort over an always-`Equal` comparator is a no-op).
+    // Real Cypher orders two lists lexicographically (element-by-element,
+    // shorter-is-less on a common prefix), a genuinely different rule
+    // from any single scalar comparison -- delegate to its own recursive
+    // comparator before reaching the scalar-only match below, which would
+    // otherwise silently treat every pair of lists as "equal" (found via
+    // TCK's ReturnOrderBy1 `[10]`/WithOrderBy1 `[10]`: `ORDER BY <list
+    // column>` produced no reordering at all, ASC and DESC alike -- a
+    // stable sort over an always-`Equal` comparator is a no-op).
     if let (Value::List(_), Value::List(_)) = (a, b) {
         return list_cmp_asc(a, b);
     }

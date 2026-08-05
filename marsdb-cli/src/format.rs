@@ -85,6 +85,10 @@ fn format_property(p: &PropertyValue) -> String {
             nanos,
             zone,
         } => marsdb::temporal::format_date_time(*epoch_seconds, *nanos, &to_temporal_tz(zone)),
+        PropertyValue::List(items) => {
+            let cells: Vec<String> = items.iter().map(format_property).collect();
+            format!("[{}]", cells.join(", "))
+        }
     }
 }
 

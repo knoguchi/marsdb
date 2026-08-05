@@ -19,9 +19,10 @@ pub struct EdgeId(pub u64);
 /// fine, but a plain `Int` and a `Date` would then be indistinguishable
 /// once read back (Temporal4's "store a date, read it back, it must
 /// still print/compare/access-components as a date" scenarios need that
-/// distinction to survive the storage boundary, not just live in the
-/// query layer's own `Value` the way `Value::List` does -- see that
-/// type's own doc comment for the contrasting case). `LocalTime`/`Time`/
+/// distinction to survive the storage boundary, unlike a `Map`-valued
+/// property, which genuinely has no dedicated storage variant and is
+/// rejected outright -- see `marsdb-query::executor::
+/// value_to_storable_property`). `LocalTime`/`Time`/
 /// `LocalDateTime`/`DateTime` (Cypher's other four temporal types) follow
 /// the same reasoning below. `Time` only accepts a *fixed* UTC offset --
 /// it carries no calendar date, so a named zone's DST-dependent offset
@@ -108,6 +109,15 @@ pub enum PropertyValue {
         nanos: i32,
         zone: TzId,
     },
+    /// A homogeneous array of scalars (real Cypher/Neo4j's own property
+    /// restriction: a stored list property can hold any of the scalar
+    /// variants above, all the same variant, never `Null`-mixed-with-a-
+    /// type, another `List`, or a map -- enforced where a `Value::List`
+    /// is converted to a storable `PropertyValue`, in `marsdb-query`, not
+    /// here; this crate just stores whatever `Vec<PropertyValue>` it's
+    /// given). Appended last (see this enum's own doc comment on why
+    /// variant order is a real, one-way storage-compat constraint).
+    List(Vec<PropertyValue>),
 }
 
 /// A `DateTime`'s zone: a fixed UTC offset, or a named IANA timezone

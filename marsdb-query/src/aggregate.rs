@@ -67,14 +67,20 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
                     .into(),
             ))
         }
-        // Same stance as `Path` above -- a map has no natural total order/
-        // hash convention this codebase has picked yet, and no real usage
-        // needs grouping/DISTINCT by a whole map value.
-        Value::Map(_) => {
-            return Err(QueryError::Type(
-                "grouping or using DISTINCT with a map value isn't supported".into(),
-            ))
-        }
+        // A `BTreeMap` already iterates in sorted key order, so this is a
+        // deterministic, canonical key regardless of the map literal's
+        // own written order (`{a: 1, b: 2}` and `{b: 2, a: 1}` must hash
+        // equal) -- each entry becomes its own 2-element `HashKey::List`
+        // (key, value), all wrapped in one outer list (TCK's With5 [2]/
+        // Return5 [1,3,4], grouping/DISTINCT by a map that itself
+        // contains a list).
+        Value::Map(m) => HashKey::List(
+            m.iter()
+                .map(|(k, v)| -> Result<HashKey, QueryError> {
+                    Ok(HashKey::List(vec![HashKey::Str(k.clone()), value_hash_key(v)?]))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
     })
 }
 
@@ -106,6 +112,9 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
             nanos,
             ..
         } => HashKey::DateTimeInstant(*epoch_seconds, *nanos),
+        PropertyValue::List(items) => {
+            HashKey::List(items.iter().map(property_value_hash_key).collect())
+        }
     }
 }
 

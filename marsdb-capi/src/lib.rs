@@ -314,6 +314,16 @@ fn push_property_json(out: &mut String, p: &PropertyValue) {
             out,
             &marsdb::temporal::format_date_time(*epoch_seconds, *nanos, &to_temporal_tz(zone)),
         ),
+        PropertyValue::List(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_property_json(out, item);
+            }
+            out.push(']');
+        }
     }
 }
 
