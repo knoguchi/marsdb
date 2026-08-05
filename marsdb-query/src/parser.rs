@@ -154,25 +154,6 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         }
     }
 
-    // Mirrors real Cypher's rule that multiple reading clauses need a WITH
-    // between them. OPTIONAL MATCH and UNWIND are both exempt from the
-    // WITH-separation requirement (matching real Cypher: `MATCH (a)
-    // OPTIONAL MATCH (b) ...` and `MATCH (a) UNWIND [1,2] AS x ...` are
-    // both valid without a WITH between them — they continue in the same
-    // scope rather than starting a fresh reading context).
-    for i in 0..clauses.len() {
-        let (QueryClause::Match(part), Some(QueryClause::Match(next))) =
-            (&clauses[i], clauses.get(i + 1))
-        else {
-            continue;
-        };
-        if part.with.is_none() && !next.optional {
-            return Err(QueryError::Syntax(
-                "multiple MATCH clauses must be separated by WITH".into(),
-            ));
-        }
-    }
-
     // A missing tail is only valid when a MERGE clause is present (a bare
     // `MERGE (n:Label)`, a pure write with nothing to return — same as
     // standalone CREATE). Otherwise a missing tail is almost certainly a

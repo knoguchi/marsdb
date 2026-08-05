@@ -1677,10 +1677,61 @@ fn with_boundary_limit_restricts_what_flows_into_next_match() {
     );
 }
 
+/// Real Cypher allows chained plain `MATCH` clauses with no `WITH`
+/// between them (an implicit join on any shared variable, e.g. TCK's
+/// Match5 `[1]`: `MATCH (a:A) MATCH (a)-[:LIKES*]->(c) RETURN c.name`) --
+/// an earlier version of this parser wrongly required `WITH` there,
+/// based on a mistaken assumption about real Cypher's own rule (only
+/// OPTIONAL MATCH/UNWIND were exempted, when in fact plain MATCH needs no
+/// exemption at all). The executor's `carried_vars` threading already
+/// handled this correctly regardless -- the parser-level check was the
+/// only thing blocking it.
 #[test]
-fn multiple_match_without_with_is_rejected() {
-    let err = parse("MATCH (a:Item) MATCH (b:Item) RETURN a").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("with"));
+fn multiple_match_without_with_is_allowed() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {name: 'a'})-[:LIKES]->(:B {name: 'b'})");
+    run(&store, "CREATE (:A {name: 'a2'})");
+
+    let result = run(
+        &store,
+        "MATCH (a:A) MATCH (a)-[:LIKES]->(b) RETURN a.name, b.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (
+            Value::Property(marsdb_graph::PropertyValue::String(a)),
+            Value::Property(marsdb_graph::PropertyValue::String(b)),
+        ) => {
+            assert_eq!(a, "a");
+            assert_eq!(b, "b");
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// Two paths are equal iff they visit the same nodes/relationships in the
+/// same order -- `value_eq` had no `Value::Path` arm at all before this,
+/// so any two paths were unconditionally unequal via `=` (fell through to
+/// the catch-all `_ => false`). TCK's Comparison1 [14]: a self-loop
+/// traversed forward vs backward is the same path (same single node,
+/// same single relationship) either way.
+#[test]
+fn path_equality_compares_nodes_and_relationships_not_always_false() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (n:A)-[:LOOP]->(n)");
+
+    let result = run(
+        &store,
+        "MATCH p1 = (:A)-->() MATCH p2 = (:A)<--() RETURN p1 = p2",
+    );
+    assert!(bool_val(&result.rows[0][0]));
+
+    run(&store, "CREATE (:B)-[:X]->(:C)");
+    let result = run(
+        &store,
+        "MATCH p1 = (:A)-->() MATCH p2 = (:B)-->(:C) RETURN p1 = p2",
+    );
+    assert!(!bool_val(&result.rows[0][0]));
 }
 
 #[test]
