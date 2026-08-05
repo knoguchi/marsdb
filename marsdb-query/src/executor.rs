@@ -3284,6 +3284,112 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            SetItem::MapAssign { var, value, merge } => {
+                let binding = row
+                    .get(var)
+                    .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
+                // Same null-is-a-no-op rule as the property arm above.
+                if matches!(binding, Binding::Value(PropertyValue::Null)) {
+                    return Ok(());
+                }
+                let node_id = if let Binding::Node(id) = binding {
+                    Some(*id)
+                } else {
+                    None
+                };
+                let edge_id = if let Binding::Edge(id) = binding {
+                    Some(*id)
+                } else {
+                    None
+                };
+                if node_id.is_none() && edge_id.is_none() {
+                    return Err(QueryError::UnboundVariable(format!(
+                        "'{var}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding"
+                    )));
+                }
+                let map_value = self.eval_return_expr(txn, value, row)?;
+                // A map literal is the common case, but real Cypher also
+                // allows `SET r = a`/`SET r += a` where `a` is itself a
+                // bound node/relationship -- copies its properties, same
+                // as a map built from them would (TCK's Merge6 [6]/
+                // Merge7 [4], "Copying properties from node").
+                let entries = match map_value {
+                    Value::Map(entries) => entries,
+                    Value::Node(n) => n
+                        .props
+                        .into_iter()
+                        .map(|(k, v)| (k, property_value_to_value(v)))
+                        .collect(),
+                    Value::Edge(e) => e
+                        .props
+                        .into_iter()
+                        .map(|(k, v)| (k, property_value_to_value(v)))
+                        .collect(),
+                    other => {
+                        return Err(QueryError::Type(format!(
+                            "SET {var} = ...{} needs a map, node, or relationship, got {other:?}",
+                            if *merge { " (+=)" } else { "" }
+                        )))
+                    }
+                };
+                // `SET n = {...}` (`merge: false`) replaces every existing
+                // property -- delete whatever's already there first, not
+                // just overwrite the map's own keys, or a key n already
+                // had that the map doesn't mention would wrongly survive
+                // (TCK's Set4 [2]/[3]/[4]).
+                if !merge {
+                    let existing_keys: Vec<String> = if let Some(id) = node_id {
+                        deleted_entity_access(GraphStore::get_node_in_txn(txn, id)?)?
+                            .props
+                            .into_keys()
+                            .collect()
+                    } else {
+                        deleted_entity_access(GraphStore::get_edge_in_txn(
+                            txn,
+                            edge_id.expect("node_id or edge_id is Some, checked above"),
+                        )?)?
+                        .props
+                        .into_keys()
+                        .collect()
+                    };
+                    for key in existing_keys {
+                        if let Some(id) = node_id {
+                            GraphStore::remove_node_prop_in_txn(write_txn, id, &key)?;
+                        }
+                        if let Some(id) = edge_id {
+                            GraphStore::remove_edge_prop_in_txn(write_txn, id, &key)?;
+                        }
+                    }
+                }
+                // Either way, apply the map's own entries -- a `null`
+                // value removes that one key (real Cypher's rule, same
+                // "null means remove" convention `SetItem::Prop` already
+                // has -- TCK's Set5 [4]), anything else sets it.
+                for (key, entry_value) in entries {
+                    if matches!(entry_value, Value::Null) {
+                        if let Some(id) = node_id {
+                            GraphStore::remove_node_prop_in_txn(write_txn, id, &key)?;
+                        }
+                        if let Some(id) = edge_id {
+                            GraphStore::remove_edge_prop_in_txn(write_txn, id, &key)?;
+                        }
+                        continue;
+                    }
+                    let pv = value_to_storable_property(&entry_value).ok_or_else(|| {
+                        QueryError::Type(format!(
+                            "property '{key}' can't be stored -- MarsDB's node/edge properties are \
+                             limited to null/bool/int/float/string/date/duration/list; a map/node/\
+                             edge/path value (got {entry_value:?}) isn't storable"
+                        ))
+                    })?;
+                    if let Some(id) = node_id {
+                        GraphStore::set_node_prop_in_txn(write_txn, id, &key, pv.clone())?;
+                    }
+                    if let Some(id) = edge_id {
+                        GraphStore::set_edge_prop_in_txn(write_txn, id, &key, pv)?;
+                    }
+                }
+            }
         }
         Ok(())
     }

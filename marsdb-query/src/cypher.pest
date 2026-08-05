@@ -480,8 +480,24 @@ delete_clause         = { ^"DELETE" ~ return_expr ~ ("," ~ return_expr)* }
 // ' was here'`), same as `CREATE`'s own inline `{...}` prop values
 // already are (`map_expr`/`Executor::eval_props_to_values`).
 set_clause     = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
-set_item       = { (prop_access ~ "=" ~ return_expr) | set_label_item }
-set_label_item = { identifier ~ (":" ~ identifier)+ }
+// `prop_access`-based tried first -- `set_map_merge`/`set_map_replace`'s
+// own bare-`identifier` LHS would otherwise need to fail on the `.` that
+// follows before backtracking to `prop_access` anyway, so trying the far
+// more common shape first just avoids that extra failed attempt, not a
+// correctness requirement (a bare `identifier` alternative failing to
+// find `+=`/`=` right after it is a clean failure, not a partial-match
+// trap, so the ordering among these four is safe either way).
+set_item        = { (prop_access ~ "=" ~ return_expr) | set_label_item | set_map_merge | set_map_replace }
+set_label_item  = { identifier ~ (":" ~ identifier)+ }
+// `SET n += {...}` -- merges the map's own keys into n's existing
+// properties (a `null` value removes that one key, anything else sets
+// it; keys n already has that aren't mentioned in the map are left
+// untouched) -- TCK's Set5 "Set multiple properties with a map".
+set_map_merge   = { identifier ~ "+=" ~ return_expr }
+// `SET n = {...}` -- replaces n's *entire* property set with the map's
+// (any existing key not present in the map is removed) -- TCK's Set4
+// "Set all properties with a map".
+set_map_replace = { identifier ~ "=" ~ return_expr }
 
 remove_clause   = { ^"REMOVE" ~ remove_item ~ ("," ~ remove_item)* }
 remove_item     = { prop_access | set_label_item }

@@ -412,6 +412,16 @@ pub enum SetItem {
     /// `SET n:A:B` — adds each label to the node's label set (idempotent,
     /// not an error if already present).
     Labels(String, Vec<String>),
+    /// `SET n = {...}` (`merge: false`, replaces every existing property)
+    /// or `SET n += {...}` (`merge: true`, only overrides/adds/removes
+    /// -- a `null` value -- the map's own listed keys, everything else on
+    /// `n` stays as-is). `value` must evaluate to a `Value::Map` — TCK's
+    /// Set4/Set5.
+    MapAssign {
+        var: String,
+        value: ReturnExpr,
+        merge: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

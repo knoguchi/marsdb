@@ -97,6 +97,9 @@ fn explain_clause(
                     .map(|item| match item {
                         SetItem::Prop(pa, value) => format!("{}.{} = {value:?}", pa.var, pa.prop),
                         SetItem::Labels(var, labels) => format!("{var}:{}", labels.join(":")),
+                        SetItem::MapAssign { var, value, merge } => {
+                            format!("{var} {}= {value:?}", if *merge { "+" } else { "" })
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -300,6 +303,9 @@ fn explain_tail(tail: &Tail) -> String {
                     // literal.
                     SetItem::Prop(pa, value) => format!("{}.{} = {value:?}", pa.var, pa.prop),
                     SetItem::Labels(var, labels) => format!("{var}:{}", labels.join(":")),
+                    SetItem::MapAssign { var, value, merge } => {
+                        format!("{var} {}= {value:?}", if *merge { "+" } else { "" })
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
