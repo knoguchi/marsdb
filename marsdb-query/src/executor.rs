@@ -973,7 +973,7 @@ impl<'a> Executor<'a> {
                     current_rows = if part.shortest_path {
                         // Not a LogicalPlan/eval_plan traversal at all —
                         // see eval_shortest_path's docs.
-                        self.eval_shortest_path(txn, part, &current_rows)?
+                        self.eval_shortest_path(txn, part, &current_rows, guard)?
                     } else if let Some(path_var) = &part.path_var {
                         let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
                         let plan = apply_index_seeks(
@@ -1410,6 +1410,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         part: &QueryPart,
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let Some(path_var) = &part.path_var else {
             // Nothing names the result, so there's nothing to bind and no
@@ -1462,7 +1463,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &part.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_expr(txn, where_clause, &row)? == Some(true) {
+                if self.eval_expr(txn, where_clause, &row, guard)? == Some(true) {
                     filtered.push(row);
                 }
             }
@@ -2234,7 +2235,7 @@ impl<'a> Executor<'a> {
                         done = true;
                         return Some(Err(error));
                     }
-                    match self.eval_expr(txn, predicate, &row) {
+                    match self.eval_expr(txn, predicate, &row, guard) {
                         Ok(Some(true)) => return Some(Ok(row)),
                         Ok(_) => continue,
                         Err(error) => {
@@ -2475,11 +2476,18 @@ impl<'a> Executor<'a> {
         txn: Txn,
         expr: &Expr,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
-            Expr::And(l, r) => and3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
-            Expr::Or(l, r) => or3(self.eval_expr(txn, l, row)?, self.eval_expr(txn, r, row)?),
-            Expr::Not(e) => self.eval_expr(txn, e, row)?.map(|b| !b),
+            Expr::And(l, r) => and3(
+                self.eval_expr(txn, l, row, guard)?,
+                self.eval_expr(txn, r, row, guard)?,
+            ),
+            Expr::Or(l, r) => or3(
+                self.eval_expr(txn, l, row, guard)?,
+                self.eval_expr(txn, r, row, guard)?,
+            ),
+            Expr::Not(e) => self.eval_expr(txn, e, row, guard)?.map(|b| !b),
             Expr::Compare(pa, op, lit) => {
                 let prop_value = self.lookup_prop(txn, pa, row)?;
                 compare(&prop_value, *op, lit)
@@ -2535,6 +2543,34 @@ impl<'a> Executor<'a> {
                 Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null))
             }
             Expr::GeneralBare(e) => self.eval_return_expr_bool3(txn, e, row)?,
+            // `WHERE (n)-[:REL]->()` etc (TCK's Pattern1) -- existential:
+            // true iff at least one real match of `pattern` exists, with
+            // every already-bound named endpoint (`n`, and `m` in `(n)-->
+            // (m)` when `m` is also bound by an earlier MATCH) held fixed
+            // to this row's own binding rather than searched freely.
+            // `semantic::bind_pattern_predicate` already rejected any
+            // named endpoint that ISN'T already bound (real Cypher's
+            // UndefinedVariable), so every named var here is safe to seed.
+            // Reuses the exact same `build_match_plan` "already-bound var
+            // -> Seed, not a fresh scan" mechanism `eval_merge`'s own
+            // "try as an ordinary MATCH first" half already relies on --
+            // for a one-hop pattern this is a real connected-subgraph
+            // search (Expand + Filter), not an isolated per-node check.
+            // `Some(1)`-limited: existence is all that's needed, so
+            // there's no reason to enumerate every match.
+            Expr::Pattern(pattern) => {
+                let carried_vars: HashSet<String> = row.keys().cloned().collect();
+                let plan =
+                    apply_index_seeks(build_match_plan(pattern, &None, &carried_vars)?, txn)?;
+                let found = self.eval_plan_with_limit(
+                    txn,
+                    &plan,
+                    std::slice::from_ref(row),
+                    guard,
+                    Some(1),
+                )?;
+                Some(!found.is_empty())
+            }
         })
     }
 

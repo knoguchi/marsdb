@@ -1604,6 +1604,7 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
                 .next()
                 .expect("general_bare_expr has a null_predicate_expr"),
         )?)),
+        Rule::pattern_predicate_expr => Ok(Expr::Pattern(parse_pattern(inner)?)),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
     }
 }

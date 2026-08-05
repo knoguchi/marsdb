@@ -594,7 +594,36 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             let kind = infer_expr(e, scope)?;
             require_boolean_predicate_kind(&kind, "WHERE predicate")
         }
+        Expr::Pattern(pattern) => validate_pattern_predicate(pattern, scope),
     }
+}
+
+/// `WHERE (n)-[r:REL]->(m)` etc (TCK's Pattern1) -- every named endpoint
+/// must already be bound; unlike `bind_match_pattern` (a real MATCH's own
+/// pattern, which introduces new variables), a pattern predicate never
+/// does -- real Cypher's `UndefinedVariable` for anything it doesn't
+/// recognize (TCK's Pattern1 [10] outline, `MATCH (n) WHERE (n)-[r]->(a)
+/// RETURN n` with `a` never bound elsewhere). `require_kind`'s own
+/// `lookup` already produces exactly that "references undefined
+/// variable" error for an unbound name, so no separate check is needed.
+/// An anonymous (var-less) token is always fine, same as any ordinary
+/// MATCH pattern.
+fn validate_pattern_predicate(pattern: &Pattern, scope: &Scope) -> Result<(), QueryError> {
+    if let Some(var) = &pattern.start.var {
+        require_kind(scope, var, &Kind::Node, "pattern predicate node")?;
+    }
+    validate_props(&pattern.start.props, scope)?;
+    for (rel, node) in &pattern.hops {
+        if let Some(var) = &rel.var {
+            require_kind(scope, var, &Kind::Edge, "pattern predicate relationship")?;
+        }
+        validate_props(&rel.props, scope)?;
+        if let Some(var) = &node.var {
+            require_kind(scope, var, &Kind::Node, "pattern predicate node")?;
+        }
+        validate_props(&node.props, scope)?;
+    }
+    Ok(())
 }
 
 fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> {

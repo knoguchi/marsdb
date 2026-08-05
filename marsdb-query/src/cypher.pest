@@ -477,7 +477,23 @@ and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
 // Never index-seek-eligible (see `planner::apply_index_seeks`, which
 // only recognizes the narrower `Expr::Compare`) -- always a generic
 // post-scan `Filter`, same as `PropCompare` already is.
-unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | general_is_null_expr | general_comparison | ("(" ~ expr ~ ")") | general_bare_expr }
+// `pattern_predicate_expr` tried before the parenthesized-grouping/
+// `general_bare_expr` alternatives (both of which can also start with
+// `(`) -- required so a real pattern predicate always gets first crack
+// at matching its own full `(n)-[...]->(...)` shape. This matters
+// because of `unary_expr`'s own ordered-choice semantics: if
+// `general_bare_expr` were tried first, it would greedily match just
+// the leading `(n)` (a parenthesized bare identifier) and stop there,
+// leaving `-[...]->...` unconsumed -- once one alternative *succeeds*
+// (even partially), `|` doesn't backtrack into trying a different one,
+// it's only a later, structurally-required token elsewhere that could
+// still fail the overall parse. `pattern_predicate_expr` requires at
+// least one hop (`+`, not `*`) so a bare zero-hop `(n)` (TCK's Pattern1
+// [11], "self pattern") deliberately does NOT match here -- it falls
+// through to `general_bare_expr` instead, same as before this rule
+// existed.
+unary_expr    = { (^"NOT" ~ unary_expr) | pattern_predicate_expr | is_null_expr | comparison | label_predicate | var_compare | general_is_null_expr | general_comparison | ("(" ~ expr ~ ")") | general_bare_expr }
+pattern_predicate_expr = { node_pattern ~ (rel_pattern ~ node_pattern)+ }
 general_comparison    = { add_expr ~ compare_op ~ add_expr }
 general_is_null_expr  = { add_expr ~ is_null_suffix }
 // Final fallback -- same reasoning/shape as `with_bare_expr`, reused here

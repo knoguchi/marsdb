@@ -3287,6 +3287,70 @@ fn remove_followed_by_with_continues_the_query() {
     assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
 }
 
+fn node_labels(v: &Value) -> Vec<String> {
+    let Value::Node(node) = v else {
+        panic!("expected a node, got {v:?}");
+    };
+    node.labels.clone()
+}
+
+/// `WHERE (n)-[:REL]->()` used as a boolean predicate (TCK's Pattern1) --
+/// existential: true iff a real match exists, without binding a fresh
+/// row per match (unlike an ordinary `MATCH`). Covers the existential/
+/// negated/conjunction shapes and the two-already-bound-endpoints shape
+/// (`(n)-->(m)`, both `n`/`m` from an outer `MATCH (n), (m)`); the
+/// compile-time rejection of a pattern predicate introducing a brand
+/// new, never-bound variable is `pattern_predicate_introducing_new_variable_is_rejected` below.
+#[test]
+fn pattern_predicate_in_where() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A)-[:REL1]->(b:B), (b)-[:REL2]->(a), (a)-[:REL3]->(:C), (a)-[:REL1]->(:D)",
+    );
+
+    let result = run(&store, "MATCH (n) WHERE (n)-[]->() RETURN n");
+    let mut labels: Vec<Vec<String>> = result.rows.iter().map(|r| node_labels(&r[0])).collect();
+    labels.sort();
+    assert_eq!(labels, vec![vec!["A".to_string()], vec!["B".to_string()]]);
+
+    let result = run(&store, "MATCH (n) WHERE (n)-[:REL1*]->() RETURN n");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(node_labels(&result.rows[0][0]), vec!["A".to_string()]);
+
+    let result = run(&store, "MATCH (n), (m) WHERE (n)-[]->(m) RETURN n, m");
+    assert_eq!(result.rows.len(), 4);
+
+    let result = run(&store, "MATCH (n) WHERE NOT (n)-[:REL2]-() RETURN n");
+    let mut labels: Vec<Vec<String>> = result.rows.iter().map(|r| node_labels(&r[0])).collect();
+    labels.sort();
+    assert_eq!(labels, vec![vec!["C".to_string()], vec!["D".to_string()]]);
+
+    let result = run(
+        &store,
+        "MATCH (n) WHERE (n)-[:REL1]-() AND (n)-[:REL3]-() RETURN n",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(node_labels(&result.rows[0][0]), vec!["A".to_string()]);
+}
+
+/// TCK's Pattern1 [10] outline -- a pattern predicate's endpoint that was
+/// never bound anywhere else (`a` here) is a compile-time error, not a
+/// pattern that silently matches anything.
+#[test]
+fn pattern_predicate_introducing_new_variable_is_rejected() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N)");
+    let stmt = parse("MATCH (n) WHERE (n)-[r]->(a) RETURN n").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string()
+            .to_lowercase()
+            .contains("undefined variable"),
+        "expected an undefined-variable error, got: {err}"
+    );
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already

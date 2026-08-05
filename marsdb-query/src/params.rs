@@ -210,6 +210,7 @@ fn substitute_expr(
         }
         Expr::GeneralIsNull(e) => substitute_return_expr(e, params)?,
         Expr::GeneralBare(e) => substitute_return_expr(e, params)?,
+        Expr::Pattern(pattern) => substitute_pattern(pattern, params)?,
     }
     Ok(())
 }
