@@ -65,7 +65,9 @@ pub enum LogicalPlan {
         from_var: String,
         to_var: String,
         rel_var: Option<String>,
-        rel_label: Option<String>,
+        /// Empty means untyped (any relationship matches); more than one
+        /// means "any of these" (`[:A|B]`).
+        rel_labels: Vec<String>,
         direction: ExpandDirection,
     },
     /// `[:TYPE*min..max]` — BFS from each input row's bound node instead of
@@ -78,7 +80,7 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         from_var: String,
         to_var: String,
-        rel_label: Option<String>,
+        rel_labels: Vec<String>,
         direction: ExpandDirection,
         min_hops: u32,
         max_hops: Option<u32>,

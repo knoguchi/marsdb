@@ -230,11 +230,13 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
         }
         // Same reasoning as CREATE's own check -- MERGE might need to
         // *create* this relationship on no-match, and a brand new edge
-        // with no type is meaningless (TCK's Merge5 [24]).
-        if rel.rel_type.is_none() {
+        // with no type (or more than one -- which one would it get?) is
+        // meaningless (TCK's Merge5 [24]).
+        if rel.rel_types.len() != 1 {
             return Err(semantic(
-                "MERGE requires an explicit relationship type (e.g. -[:KNOWS]->) -- an untyped \
-                 relationship pattern can't be created if the MERGE doesn't find a match",
+                "MERGE requires exactly one explicit relationship type (e.g. -[:KNOWS]->) -- an \
+                 untyped or multi-typed relationship pattern can't be created if the MERGE \
+                 doesn't find a match",
             ));
         }
     }
@@ -272,14 +274,15 @@ fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), Query
         if let Some(var) = &node.var {
             bind_kind(scope, var, Kind::Node, "CREATE node")?;
         }
-        // Unlike MATCH (where an untyped hop just means "any relationship"),
-        // CREATE always makes exactly one new relationship, and a brand
-        // new edge with no type is meaningless -- real Cypher requires an
-        // explicit `:TYPE` here, it's never inferred/defaulted.
-        if rel.rel_type.is_none() {
+        // Unlike MATCH (where an untyped/multi-typed hop just means "any
+        // of these"), CREATE always makes exactly one new relationship,
+        // and a brand new edge needs exactly one type -- real Cypher
+        // requires a single explicit `:TYPE` here, never inferred,
+        // defaulted, or a `|`-alternative list.
+        if rel.rel_types.len() != 1 {
             return Err(semantic(
-                "CREATE requires an explicit relationship type (e.g. -[:KNOWS]->) -- unlike MATCH, \
-                 an untyped relationship pattern can't be created",
+                "CREATE requires exactly one explicit relationship type (e.g. -[:KNOWS]->) -- \
+                 unlike MATCH, an untyped or multi-typed relationship pattern can't be created",
             ));
         }
         validate_props(&rel.props, scope)?;

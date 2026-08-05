@@ -272,7 +272,7 @@ enum PathBinding {
 
 struct ShortestPathSpec<'a> {
     direction: ExpandDirection,
-    rel_label: Option<&'a str>,
+    rel_labels: &'a [String],
     min_hops: u32,
     max_hops: Option<u32>,
 }
@@ -280,7 +280,7 @@ struct ShortestPathSpec<'a> {
 struct VarExpandSpec<'a> {
     from_var: &'a str,
     to_var: &'a str,
-    rel_label: Option<&'a str>,
+    rel_labels: &'a [String],
     direction: ExpandDirection,
     min_hops: u32,
     max_hops: Option<u32>,
@@ -629,7 +629,10 @@ impl<'a> Executor<'a> {
                         row.insert(var.clone(), Binding::Node(node_id));
                     }
 
-                    let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
+                    let rel_label = rel.rel_types.first().cloned().expect(
+                        "CREATE relationship has exactly one type -- checked by \
+                         semantic::bind_create_pattern",
+                    );
                     let rel_props =
                         self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row)?;
                     let (src, dst) = match rel.direction {
@@ -875,7 +878,9 @@ impl<'a> Executor<'a> {
             if let Some(var) = &node.var {
                 new_row.insert(var.clone(), Binding::Node(node_id));
             }
-            let rel_label = rel.rel_type.clone().unwrap_or_else(|| "REL".to_string());
+            let rel_label = rel.rel_types.first().cloned().expect(
+                "MERGE relationship has exactly one type -- checked by semantic::bind_merge",
+            );
             let rel_props =
                 self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row)?;
             let (src, dst) = match rel.direction {
@@ -1460,7 +1465,7 @@ impl<'a> Executor<'a> {
             RelDirection::Left => ExpandDirection::In,
             RelDirection::Either => ExpandDirection::Either,
         };
-        let rel_label = rel.rel_type.as_deref();
+        let rel_labels = &rel.rel_types;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1472,7 +1477,7 @@ impl<'a> Executor<'a> {
                 end_id,
                 ShortestPathSpec {
                     direction,
-                    rel_label,
+                    rel_labels,
                     min_hops,
                     max_hops,
                 },
@@ -1525,7 +1530,7 @@ impl<'a> Executor<'a> {
             depth += 1;
             let mut next_frontier = Vec::new();
             for node in frontier {
-                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_label)? {
+                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_labels)? {
                     if entry.other == end {
                         parent.insert(entry.other, (node, entry.edge_id));
                         return Ok(Some(reconstruct_path(&parent, start, end)));
@@ -2140,7 +2145,7 @@ impl<'a> Executor<'a> {
                 from_var,
                 to_var,
                 rel_var,
-                rel_label,
+                rel_labels,
                 direction,
             } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
@@ -2184,7 +2189,7 @@ impl<'a> Executor<'a> {
                             return Some(Err(QueryError::UnboundVariable(from_var.clone())));
                         }
                     };
-                    match neighbors_for_direction(txn, from_id, *direction, rel_label.as_deref()) {
+                    match neighbors_for_direction(txn, from_id, *direction, rel_labels) {
                         Ok(entries) => current = Some((row, entries.into_iter())),
                         Err(error) => {
                             done = true;
@@ -2198,7 +2203,7 @@ impl<'a> Executor<'a> {
                 input,
                 from_var,
                 to_var,
-                rel_label,
+                rel_labels,
                 direction,
                 min_hops,
                 max_hops,
@@ -2226,7 +2231,7 @@ impl<'a> Executor<'a> {
                         VarExpandSpec {
                             from_var,
                             to_var,
-                            rel_label: rel_label.as_deref(),
+                            rel_labels,
                             direction: *direction,
                             min_hops: *min_hops,
                             max_hops: *max_hops,
@@ -2463,7 +2468,7 @@ impl<'a> Executor<'a> {
             depth += 1;
             let mut next_frontier = Vec::new();
             for (node, used_edges) in frontier {
-                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_label)? {
+                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_labels)? {
                     guard.relationship_expansion()?;
                     if used_edges.contains(&entry.edge_id) {
                         continue;
@@ -4031,23 +4036,43 @@ fn tag_merge_created(mut row: BindingRow, created: bool) -> BindingRow {
 /// `Either` (undirected `-[r:TYPE]-`) has no single storage-level call —
 /// query both directions and dedupe by `edge_id` (a self-loop would
 /// otherwise appear twice, once from each direction's adjacency table).
+/// Multiple `rel_labels` (`[:A|B]`) has no single storage-level call
+/// either — `GraphStore::neighbors_in_txn` only ever filters by one label
+/// at a time, so this makes one call per type (per direction) and
+/// dedupes by `edge_id` across all of them, same technique as `Either`
+/// above (an edge whose type is in `rel_labels` is only ever returned by
+/// exactly one of those per-type calls, so the only real duplication risk
+/// is the same direction-crossing one `Either` already handles). Empty
+/// `rel_labels` means untyped — matches any relationship, same as
+/// `neighbors_in_txn`'s own `None` behavior.
 fn neighbors_for_direction(
     txn: Txn,
     node: NodeId,
     direction: ExpandDirection,
-    rel_label: Option<&str>,
+    rel_labels: &[String],
 ) -> Result<Vec<AdjEntry>, QueryError> {
-    Ok(match direction {
-        ExpandDirection::Out => GraphStore::neighbors_in_txn(txn, node, Direction::Out, rel_label)?,
-        ExpandDirection::In => GraphStore::neighbors_in_txn(txn, node, Direction::In, rel_label)?,
-        ExpandDirection::Either => {
-            let mut out = GraphStore::neighbors_in_txn(txn, node, Direction::Out, rel_label)?;
-            let inbound = GraphStore::neighbors_in_txn(txn, node, Direction::In, rel_label)?;
-            let seen: HashSet<EdgeId> = out.iter().map(|e| e.edge_id).collect();
-            out.extend(inbound.into_iter().filter(|e| !seen.contains(&e.edge_id)));
-            out
+    let dirs: &[Direction] = match direction {
+        ExpandDirection::Out => &[Direction::Out],
+        ExpandDirection::In => &[Direction::In],
+        ExpandDirection::Either => &[Direction::Out, Direction::In],
+    };
+    let mut out = Vec::new();
+    let mut seen: HashSet<EdgeId> = HashSet::new();
+    let label_filters: Vec<Option<&str>> = if rel_labels.is_empty() {
+        vec![None]
+    } else {
+        rel_labels.iter().map(|l| Some(l.as_str())).collect()
+    };
+    for label in label_filters {
+        for &dir in dirs {
+            for entry in GraphStore::neighbors_in_txn(txn, node, dir, label)? {
+                if seen.insert(entry.edge_id) {
+                    out.push(entry);
+                }
+            }
         }
-    })
+    }
+    Ok(out)
 }
 
 /// Three-valued: `None` is Cypher's "unknown", not `false` -- any

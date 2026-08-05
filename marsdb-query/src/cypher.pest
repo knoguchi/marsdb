@@ -510,7 +510,10 @@ rel_right_bare  = { "-->" }
 rel_left_bare   = { "<--" }
 rel_either_bare = { "--" }
 rel_var     = { identifier }
-rel_type    = { ":" ~ identifier }
+// `[:A]`/`[:A|B]`/`[:A|:B]` -- real Cypher accepts either separator form
+// (a `:` before every subsequent alternative, or only before the first),
+// matched if the edge's type is any one of them.
+rel_type    = { ":" ~ identifier ~ ("|" ~ ":"? ~ identifier)* }
 // Variable-length hop count: `*`, `*N`, `*N..`, `*N..M`, `*..M`. Captured
 // as raw text and parsed directly in parser.rs rather than broken into
 // sub-rules — simpler than distinguishing "*N" (exact) from "*N.." (N or

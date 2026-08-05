@@ -342,12 +342,12 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             from_var,
             to_var,
             rel_var,
-            rel_label,
+            rel_labels,
             direction,
         } => {
             out.push(format!(
                 "{pad}Expand({from_var}){}({to_var})",
-                rel_arrow(*direction, rel_var, rel_label)
+                rel_arrow(*direction, rel_var, rel_labels)
             ));
             format_plan(input, depth + 1, out);
         }
@@ -355,7 +355,7 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             input,
             from_var,
             to_var,
-            rel_label,
+            rel_labels,
             direction,
             min_hops,
             max_hops,
@@ -366,7 +366,7 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             };
             out.push(format!(
                 "{pad}VarExpand({from_var}){}({to_var})",
-                rel_arrow_var(*direction, rel_label, &hops)
+                rel_arrow_var(*direction, rel_labels, &hops)
             ));
             format_plan(input, depth + 1, out);
         }
@@ -380,9 +380,9 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
 fn rel_arrow(
     direction: ExpandDirection,
     rel_var: &Option<String>,
-    rel_label: &Option<String>,
+    rel_labels: &[String],
 ) -> String {
-    let inner = rel_label_text(rel_var, rel_label);
+    let inner = rel_label_text(rel_var, rel_labels);
     match direction {
         ExpandDirection::Out => format!("-[{inner}]->"),
         ExpandDirection::In => format!("<-[{inner}]-"),
@@ -390,14 +390,8 @@ fn rel_arrow(
     }
 }
 
-fn rel_arrow_var(direction: ExpandDirection, rel_label: &Option<String>, hops: &str) -> String {
-    let inner = format!(
-        "{}{hops}",
-        rel_label
-            .as_deref()
-            .map(|l| format!(":{l}"))
-            .unwrap_or_default()
-    );
+fn rel_arrow_var(direction: ExpandDirection, rel_labels: &[String], hops: &str) -> String {
+    let inner = format!("{}{hops}", rel_labels_text(rel_labels));
     match direction {
         ExpandDirection::Out => format!("-[{inner}]->"),
         ExpandDirection::In => format!("<-[{inner}]-"),
@@ -405,7 +399,16 @@ fn rel_arrow_var(direction: ExpandDirection, rel_label: &Option<String>, hops: &
     }
 }
 
-fn rel_label_text(rel_var: &Option<String>, rel_label: &Option<String>) -> String {
+/// `[:A|B]` -- joined with `|`, empty means untyped (no `:` at all).
+fn rel_labels_text(rel_labels: &[String]) -> String {
+    if rel_labels.is_empty() {
+        String::new()
+    } else {
+        format!(":{}", rel_labels.join("|"))
+    }
+}
+
+fn rel_label_text(rel_var: &Option<String>, rel_labels: &[String]) -> String {
     // `rel_var` here is `LogicalPlan::Expand`'s `rel_var` -- always some
     // name, even for a pattern the user wrote with none at all
     // (`build_match_plan` synthesizes an internal `__anonN` so it can
@@ -414,11 +417,11 @@ fn rel_label_text(rel_var: &Option<String>, rel_label: &Option<String>) -> Strin
     // binding that leaked out; only a real user-written var is worth
     // surfacing here.
     let user_var = rel_var.as_deref().filter(|v| !v.starts_with("__anon"));
-    match (user_var, rel_label) {
-        (Some(v), Some(l)) => format!("{v}:{l}"),
-        (Some(v), None) => v.to_string(),
-        (None, Some(l)) => format!(":{l}"),
-        (None, None) => String::new(),
+    let labels = rel_labels_text(rel_labels);
+    match user_var {
+        Some(v) if labels.is_empty() => v.to_string(),
+        Some(v) => format!("{v}{labels}"),
+        None => labels,
     }
 }
 
