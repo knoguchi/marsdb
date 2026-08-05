@@ -3425,6 +3425,53 @@ pub(crate) fn has_aggregate(items: &[ReturnItem]) -> bool {
     items.iter().any(|item| contains_aggregate(&item.expr))
 }
 
+/// True iff `expr` contains a call to `rand()` anywhere inside it, at any
+/// depth -- same traversal shape as `contains_aggregate`, used only to
+/// reject `rand()` as (part of) an aggregate's own argument (see
+/// `validate_return_items`); `rand()` elsewhere in a query is completely
+/// fine.
+fn contains_rand_call(expr: &ReturnExpr) -> bool {
+    match expr {
+        ReturnExpr::Call { name, args, .. } => {
+            name.eq_ignore_ascii_case("rand") || args.iter().any(contains_rand_call)
+        }
+        ReturnExpr::Case { test, whens, else_ } => {
+            test.as_deref().is_some_and(contains_rand_call)
+                || whens
+                    .iter()
+                    .any(|(w, t)| contains_rand_call(w) || contains_rand_call(t))
+                || else_.as_deref().is_some_and(contains_rand_call)
+        }
+        ReturnExpr::Arith(l, _, r) => contains_rand_call(l) || contains_rand_call(r),
+        ReturnExpr::ListLit(items) => items.iter().any(contains_rand_call),
+        ReturnExpr::Index(base, index) => contains_rand_call(base) || contains_rand_call(index),
+        ReturnExpr::Slice(base, start, end) => {
+            contains_rand_call(base)
+                || start.as_deref().is_some_and(contains_rand_call)
+                || end.as_deref().is_some_and(contains_rand_call)
+        }
+        ReturnExpr::ListComp {
+            source, project, ..
+        } => contains_rand_call(source) || project.as_deref().is_some_and(contains_rand_call),
+        ReturnExpr::Quantifier { source, .. } => contains_rand_call(source),
+        ReturnExpr::MapLit(entries) => entries.iter().any(|(_, v)| contains_rand_call(v)),
+        ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
+            contains_rand_call(l) || contains_rand_call(r)
+        }
+        ReturnExpr::Not(e) => contains_rand_call(e),
+        ReturnExpr::Compare(l, _, r) => contains_rand_call(l) || contains_rand_call(r),
+        ReturnExpr::IsNull(e) => contains_rand_call(e),
+        ReturnExpr::In(needle, haystack) => {
+            contains_rand_call(needle) || contains_rand_call(haystack)
+        }
+        ReturnExpr::CountStar
+        | ReturnExpr::Var(_)
+        | ReturnExpr::Prop(_)
+        | ReturnExpr::Lit(_)
+        | ReturnExpr::HasLabel(..) => false,
+    }
+}
+
 /// Validates a RETURN/WITH item list before any row is processed: every
 /// aggregate call has exactly one argument (`count(*)`, the zero-argument
 /// form, is `CountStar`, a separate variant — never reaches the `Call`
@@ -3448,6 +3495,19 @@ pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryErr
                 if contains_aggregate(&args[0]) {
                     return Err(QueryError::Semantic(format!(
                         "aggregate function '{name}' can't take another aggregate as an argument"
+                    )));
+                }
+                // `count(rand())` etc -- an aggregate's argument must be
+                // deterministic per row for grouping/re-execution to have
+                // well-defined semantics, which `rand()` (a fresh value on
+                // every call, see its own docs) fundamentally breaks. Real
+                // Cypher rejects this at compile time (TCK's Return6
+                // [15], `NonConstantExpression`), not just "whatever value
+                // it happens to produce."
+                if contains_rand_call(&args[0]) {
+                    return Err(QueryError::Semantic(format!(
+                        "aggregate function '{name}' can't take a non-deterministic expression \
+                         (e.g. rand()) as an argument"
                     )));
                 }
             }
@@ -4638,8 +4698,28 @@ fn call_builtin(
                 ))),
             },
         },
+        "rand" => Ok(Value::Property(PropertyValue::Float(rand_f64()))),
         other => Err(QueryError::Semantic(format!("unknown function: {other}"))),
     }
+}
+
+/// `rand()` -- a fresh pseudo-random `f64` in `[0, 1)` on every call (no
+/// memoization like `now()`/`date()`'s `NowSnapshot` -- real Cypher's
+/// `rand()` is independently random each time it's evaluated, even
+/// multiple times in the same query). No external RNG crate: combines an
+/// atomic per-process counter with `RandomState`'s own already-randomized
+/// per-construction seed (the same source `HashMap`'s DoS-resistant
+/// default hasher draws from), good enough for a general-purpose
+/// `rand()` without pulling in a dependency for one function.
+fn rand_f64() -> f64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    let bits = hasher.finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 fn keys_builtin(arg: Option<&Value>) -> Result<Value, QueryError> {
