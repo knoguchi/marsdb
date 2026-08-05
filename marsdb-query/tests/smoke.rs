@@ -3953,6 +3953,47 @@ fn rand_inside_an_aggregate_argument_is_rejected() {
     assert!(bool_val(&result.rows[0][0]));
 }
 
+/// `+` is also real Cypher's list concatenation/append/prepend operator
+/// (`[1,2] + [3]` concatenates, `[1,2] + 3`/`3 + [1,2]` appends/prepends
+/// the scalar) -- `apply_arith`/`ReturnExpr::Arith`'s semantic check both
+/// only ever handled numbers/strings before this, unconditionally
+/// rejecting any list operand.
+#[test]
+fn plus_concatenates_and_appends_lists() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(&store, "RETURN [1, 10, 100] + [4, 5] AS foo");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            let ints: Vec<i64> = items.iter().map(int).collect();
+            assert_eq!(ints, vec![1, 10, 100, 4, 5]);
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+
+    let result = run(&store, "RETURN [false, true] + false AS foo");
+    match &result.rows[0][0] {
+        Value::List(items) => assert_eq!(items.len(), 3),
+        other => panic!("expected a List, got {other:?}"),
+    }
+
+    let result = run(&store, "RETURN 0 + [1, 2] AS foo");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            let ints: Vec<i64> = items.iter().map(int).collect();
+            assert_eq!(ints, vec![0, 1, 2]);
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+
+    // Non-`+` operators must still reject a list at compile time.
+    let stmt = parse("RETURN [1, 2] - 1").unwrap();
+    let err = Executor::new(&store)
+        .execute(&stmt)
+        .expect_err("subtracting from a list must be rejected");
+    assert!(format!("{err}").contains("cannot use a list"));
+}
+
 /// Real Cypher's float literal grammar has three shapes beyond plain
 /// `digits.digits`: a leading-dot form with no integer part (`.1`), and
 /// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).

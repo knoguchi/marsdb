@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    is_aggregate_name, Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, RemoveItem,
-    ReturnExpr, ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause,
-    WithExpr,
+    is_aggregate_name, ArithOp, Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause,
+    RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause,
+    WithClause, WithExpr,
 };
 use crate::QueryError;
 
@@ -707,10 +707,20 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             }
             unify_many(&result_kinds)
         }
-        ReturnExpr::Arith(left, _, right) => {
-            require_scalarish(&infer_expr(left, scope)?, "arithmetic operand")?;
-            require_scalarish(&infer_expr(right, scope)?, "arithmetic operand")?;
-            Kind::Scalar
+        ReturnExpr::Arith(left, op, right) => {
+            let lk = infer_expr(left, scope)?;
+            let rk = infer_expr(right, scope)?;
+            // `+` alone also means real Cypher's list concatenation/
+            // append/prepend (`[1,2] + [3]`, `[1,2] + 3`, `3 + [1,2]`) --
+            // `-`/`*`/`/`/`%` have no defined meaning for a list, so
+            // those still reject one outright via `require_scalarish`.
+            if *op == ArithOp::Add && (matches!(lk, Kind::List(_)) || matches!(rk, Kind::List(_))) {
+                Kind::List(Box::new(Kind::Scalar))
+            } else {
+                require_scalarish(&lk, "arithmetic operand")?;
+                require_scalarish(&rk, "arithmetic operand")?;
+                Kind::Scalar
+            }
         }
         ReturnExpr::ListLit(items) => {
             let kinds = items

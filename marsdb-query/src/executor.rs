@@ -4174,6 +4174,30 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
         return Ok(Value::Null);
     }
     if op == ArithOp::Add {
+        // Real Cypher's list concatenation/append/prepend via `+` --
+        // `[1,2] + [3]` concatenates, `[1,2] + 3`/`3 + [1,2]` appends/
+        // prepends the scalar. Only `+` has this meaning for a list;
+        // every other `ArithOp` still rejects one via the numeric-only
+        // fallback below (and at compile time, `semantic.rs`'s own
+        // `ReturnExpr::Arith` check).
+        match (a, b) {
+            (Value::List(xs), Value::List(ys)) => {
+                let mut combined = xs.clone();
+                combined.extend(ys.iter().cloned());
+                return Ok(Value::List(combined));
+            }
+            (Value::List(xs), scalar) => {
+                let mut combined = xs.clone();
+                combined.push(scalar.clone());
+                return Ok(Value::List(combined));
+            }
+            (scalar, Value::List(ys)) => {
+                let mut combined = vec![scalar.clone()];
+                combined.extend(ys.iter().cloned());
+                return Ok(Value::List(combined));
+            }
+            _ => {}
+        }
         if let (Some(sa), Some(sb)) = (as_arith_str(a), as_arith_str(b)) {
             return Ok(Value::Property(PropertyValue::String(format!("{sa}{sb}"))));
         }
