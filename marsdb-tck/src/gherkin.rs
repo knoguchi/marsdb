@@ -53,6 +53,7 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
         pos: 0,
     };
     let mut feature_name = String::new();
+    let mut background: (Option<InitialGraph>, Vec<String>) = (None, Vec::new());
     let mut out = Vec::new();
 
     while let Some(line) = cursor.peek() {
@@ -73,19 +74,64 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
             continue;
         }
         if trimmed.starts_with("Scenario:") || trimmed.starts_with("Scenario Outline:") {
-            match parse_scenario(&mut cursor, &feature_name) {
+            match parse_scenario(&mut cursor, &feature_name, &background) {
                 Ok((scenario, Some(examples))) => out.extend(expand_outline(scenario, &examples)),
                 Ok((scenario, None)) => out.push(Ok(scenario)),
                 Err(e) => out.push(Err(e)),
             }
             continue;
         }
-        // Anything else at this level (e.g. a Background: block, not used
-        // anywhere in the vendored files as of the pinned commit) --
-        // skip the line rather than fail the whole file.
+        if trimmed.starts_with("Background:") {
+            // A shared setup block every `Scenario:`/`Scenario Outline:`
+            // in this file implicitly runs before its own steps (real
+            // Gherkin semantics) -- if it fails to parse, fall back to no
+            // background rather than failing the whole file; each
+            // scenario then fails on its own missing `Given` instead of
+            // silently mis-running (same degrade-gracefully stance as
+            // every other unrecognized-step case here).
+            background = parse_background(&mut cursor).unwrap_or_default();
+            continue;
+        }
+        // Anything else at this level -- skip the line rather than fail
+        // the whole file.
         cursor.pos += 1;
     }
     out
+}
+
+/// `Given .../And having executed:` steps only -- confirmed by grepping
+/// every vendored `Background:` block, none use params/procedures/other
+/// step shapes `parse_scenario`'s own loop handles.
+fn parse_background(cursor: &mut Cursor) -> Result<(Option<InitialGraph>, Vec<String>), String> {
+    cursor.pos += 1; // consume the `Background:` line itself
+    let mut initial_graph = None;
+    let mut setup_cypher = Vec::new();
+    while let Some(raw) = cursor.peek() {
+        let line = raw.trim();
+        if line.is_empty() {
+            cursor.pos += 1;
+            continue;
+        }
+        if line.starts_with("Scenario:")
+            || line.starts_with("Scenario Outline:")
+            || line.starts_with('@')
+            || line.starts_with("Feature:")
+        {
+            break;
+        }
+        if let Some(rest) = strip_given(line) {
+            initial_graph = Some(parse_initial_graph(rest)?);
+            cursor.pos += 1;
+        } else if line.starts_with("And having executed:")
+            || line.starts_with("And after having executed:")
+        {
+            cursor.pos += 1;
+            setup_cypher.push(cursor.read_block()?);
+        } else {
+            cursor.pos += 1;
+        }
+    }
+    Ok((initial_graph, setup_cypher))
 }
 
 struct Cursor<'a> {
@@ -201,6 +247,7 @@ type Examples = (Vec<String>, Vec<Vec<String>>);
 fn parse_scenario(
     cursor: &mut Cursor,
     feature_name: &str,
+    background: &(Option<InitialGraph>, Vec<String>),
 ) -> Result<(Scenario, Option<Examples>), String> {
     let header = cursor
         .peek_trimmed()
@@ -337,7 +384,13 @@ fn parse_scenario(
         }
     }
 
-    let initial_graph = initial_graph.ok_or("scenario has no Given ... graph step")?;
+    // A `Background:` block's own `Given .../And having executed:` run
+    // before the scenario's own -- real Gherkin semantics. A scenario
+    // that has no `Given` of its own inherits the background's.
+    let initial_graph = initial_graph
+        .or_else(|| background.0.clone())
+        .ok_or("scenario has no Given ... graph step")?;
+    let setup_cypher: Vec<String> = background.1.iter().cloned().chain(setup_cypher).collect();
     let query = query.ok_or("scenario has no primary When executing query: step")?;
     let expected = expected.ok_or("scenario has no Then ... assertion")?;
     let scenario = Scenario {

@@ -3992,6 +3992,22 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::List(la), Value::List(lb)) => {
             la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y))
         }
+        // Two paths are equal iff they visit the same nodes/relationships
+        // in the same order (real Cypher's own path-equality rule) --
+        // element-wise identity, same `.id` comparison `Value::Node`/
+        // `Value::Edge` above already use. Previously fell through to the
+        // catch-all `_ => false` (any two paths were unconditionally
+        // unequal, even two bindings of the identical path) -- unreachable
+        // until two independently-MATCHed paths could be compared via `=`
+        // in one statement (TCK's Comparison1 [14]).
+        (Value::Path(pa), Value::Path(pb)) => {
+            pa.len() == pb.len()
+                && pa.iter().zip(pb).all(|(x, y)| match (x, y) {
+                    (PathElem::Node(na), PathElem::Node(nb)) => na.id == nb.id,
+                    (PathElem::Edge(ea), PathElem::Edge(eb)) => ea.id == eb.id,
+                    _ => false,
+                })
+        }
         _ => false,
     }
 }
