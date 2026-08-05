@@ -319,7 +319,11 @@ pub struct NodePattern {
 #[derive(Debug, Clone)]
 pub struct RelPattern {
     pub var: Option<String>,
-    pub rel_type: Option<String>,
+    /// `[:A]` -- one element; `[:A|B]`/`[:A|:B]` (real Cypher accepts
+    /// either separator form) -- more than one, matched if the edge's
+    /// type is ANY of them (TCK's Match2 [6]/Match3 [8], Pattern1 [13]).
+    /// Empty means untyped (`[]`/`[r]`, any type matches).
+    pub rel_types: Vec<String>,
     pub props: Vec<(String, ReturnExpr)>,
     pub direction: RelDirection,
     /// `[:TYPE*min..max]` — `None` means a fixed single hop (existing

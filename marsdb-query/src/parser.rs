@@ -1377,20 +1377,18 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
         r => unreachable!("unexpected rel_pattern child rule {r:?}"),
     };
     let mut var = None;
-    let mut rel_type = None;
+    let mut rel_types = Vec::new();
     let mut props = Vec::new();
     let mut hop_range = None;
     for p in inner.into_inner() {
         match p.as_rule() {
             Rule::rel_var => var = Some(p.as_str().to_string()),
+            // `rel_type = { ":" ~ identifier ~ ("|" ~ ":"? ~ identifier)* }`
+            // -- `:`/`|` are inline literals (no named `Pair`), so this
+            // rule's own children are a flat sequence of `identifier`s,
+            // one per alternative type.
             Rule::rel_type => {
-                rel_type = Some(
-                    p.into_inner()
-                        .next()
-                        .expect("rel_type has an identifier")
-                        .as_str()
-                        .to_string(),
-                )
+                rel_types = p.into_inner().map(|id| id.as_str().to_string()).collect()
             }
             Rule::rel_range => hop_range = Some(parse_rel_range(p.as_str())?),
             Rule::map_expr => props = parse_map_expr_as_props(p)?,
@@ -1399,7 +1397,7 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
     }
     Ok(RelPattern {
         var,
-        rel_type,
+        rel_types,
         props,
         direction,
         hop_range,

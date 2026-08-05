@@ -3512,6 +3512,45 @@ fn with_star_carries_every_bound_variable() {
     );
 }
 
+/// `[:A|B]`/`[:A|:B]` -- a relationship pattern matches if the edge's
+/// type is any of the listed alternatives (TCK's Match2 [6]/Match3 [8],
+/// Pattern1 [13]'s undirected pattern-predicate form). CREATE/MERGE
+/// still require exactly one explicit type -- a brand new edge can't be
+/// ambiguous about which type it gets.
+#[test]
+fn multi_type_relationship_pattern() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a {name: 'A'}), (b {name: 'B'}), (c {name: 'C'}), \
+         (a)-[:KNOWS]->(b), (a)-[:HATES]->(c), (a)-[:WONDERS]->(c)",
+    );
+
+    let result = run(&store, "MATCH (n)-[r:KNOWS|HATES]->(x) RETURN r");
+    assert_eq!(result.rows.len(), 2);
+
+    // `:T|:T` -- the colon before subsequent alternatives is optional,
+    // both forms mean the same thing.
+    let store2 = GraphStore::open_memory().unwrap();
+    run(&store2, "CREATE (a)-[:T]->(b)");
+    let result = run(&store2, "MATCH (a)-[:T|:T]->(b) RETURN a, b");
+    assert_eq!(result.rows.len(), 1);
+
+    // Untyped (`[]`/`[r]`) is unaffected -- still matches any type.
+    let store3 = GraphStore::open_memory().unwrap();
+    run(&store3, "CREATE (a)-[:X]->(b)");
+    let result = run(&store3, "MATCH (a)-[r]->(b) RETURN r");
+    assert_eq!(result.rows.len(), 1);
+
+    // CREATE/MERGE reject a multi-type target -- which type would the
+    // new edge get?
+    let store4 = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (a)-[:A|B]->(b)").unwrap();
+    assert!(Executor::new(&store4).execute(&stmt).is_err());
+    let stmt = parse("MATCH (a), (b) MERGE (a)-[:A|B]->(b)").unwrap();
+    assert!(Executor::new(&store4).execute(&stmt).is_err());
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already
