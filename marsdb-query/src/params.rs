@@ -65,9 +65,7 @@ fn substitute_query_clause(
         QueryClause::With(with) => substitute_with_clause(with, params),
         QueryClause::Set(items) => {
             for item in items {
-                if let SetItem::Prop(_, value) = item {
-                    substitute_return_expr(value, params)?;
-                }
+                substitute_set_item(item, params)?;
             }
             Ok(())
         }
@@ -89,15 +87,30 @@ fn substitute_query_clause(
     }
 }
 
+/// Shared by every `SetItem` list this file substitutes into (`SET`'s own
+/// `QueryClause`/`Tail` forms, and `MERGE`'s `ON CREATE`/`ON MATCH SET`)
+/// -- `Labels` has no `$param`-able position (a label name is always a
+/// bare identifier), `Prop`/`MapAssign` both carry exactly one
+/// `ReturnExpr` value to recurse into.
+fn substitute_set_item(
+    item: &mut SetItem,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
+    match item {
+        SetItem::Prop(_, value) | SetItem::MapAssign { value, .. } => {
+            substitute_return_expr(value, params)
+        }
+        SetItem::Labels(..) => Ok(()),
+    }
+}
+
 fn substitute_merge_clause(
     m: &mut MergeClause,
     params: &HashMap<String, PropertyValue>,
 ) -> Result<(), QueryError> {
     substitute_pattern(&mut m.pattern, params)?;
     for item in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
-        if let SetItem::Prop(_, value) = item {
-            substitute_return_expr(value, params)?;
-        }
+        substitute_set_item(item, params)?;
     }
     if let Some(with) = &mut m.with {
         substitute_with_clause(with, params)?;
@@ -244,9 +257,7 @@ fn substitute_tail(
         }
         Tail::Set(items, ret) => {
             for item in items {
-                if let SetItem::Prop(_, value) = item {
-                    substitute_return_expr(value, params)?;
-                }
+                substitute_set_item(item, params)?;
             }
             substitute_return_tail(ret, params)?;
         }

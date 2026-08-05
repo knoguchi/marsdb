@@ -5943,6 +5943,54 @@ fn create_with_unsupported_map_property_errors_clearly_not_silently_nulls() {
     );
 }
 
+/// `SET n = {...}` replaces every existing property (removing any key
+/// not in the map); `SET n += {...}` merges instead (only the map's own
+/// keys change, a `null` value removes just that key, everything else on
+/// `n` stays untouched) -- TCK's Set4/Set5. Both also accept a bound
+/// node/relationship as the RHS, not just a map literal (`SET r = a`
+/// copies `a`'s own properties -- TCK's Merge6 [6]/Merge7 [4]).
+#[test]
+fn set_map_assign_replace_and_merge() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X {name: 'A', name2: 'B'})");
+
+    // `=` replaces everything -- `name2` is gone, `baz` is new.
+    let result = run(
+        &store,
+        "MATCH (n:X {name: 'A'}) SET n = {name: 'B', baz: 'C'} RETURN n",
+    );
+    let Value::Node(node) = &result.rows[0][0] else {
+        panic!("expected a node");
+    };
+    assert_eq!(node.props.len(), 2);
+    assert_eq!(
+        node.props.get("name"),
+        Some(&marsdb_graph::PropertyValue::String("B".to_string()))
+    );
+    assert_eq!(
+        node.props.get("baz"),
+        Some(&marsdb_graph::PropertyValue::String("C".to_string()))
+    );
+    assert!(!node.props.contains_key("name2"));
+
+    // `+=` merges -- existing untouched keys survive.
+    run(&store, "CREATE (:Y {name: 'A'})");
+    let result = run(
+        &store,
+        "MATCH (n:Y {name: 'A'}) SET n += {name2: 'B'} RETURN n",
+    );
+    let Value::Node(node) = &result.rows[0][0] else {
+        panic!("expected a node");
+    };
+    assert_eq!(node.props.len(), 2);
+
+    // Copying properties from a bound node, not just a map literal.
+    run(&store, "CREATE (:P {name: 'A'}), (:Q)");
+    run(&store, "MATCH (p:P), (q:Q) SET q = p");
+    let result = run(&store, "MATCH (q:Q) RETURN q.name");
+    assert_eq!(str_value(&result.rows[0][0]), "A");
+}
+
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
 // MATCH...CREATE followed directly by a RETURN in the same statement) ---
 

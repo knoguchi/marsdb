@@ -796,6 +796,39 @@ fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
             let (var, labels) = parse_set_label_item(first);
             Ok(SetItem::Labels(var, labels))
         }
+        Rule::set_map_merge => {
+            let mut parts = first.into_inner();
+            let var = parts
+                .next()
+                .expect("set_map_merge has a var identifier")
+                .as_str()
+                .to_string();
+            let value =
+                parse_return_expr(parts.next().expect("set_map_merge has a return_expr value"))?;
+            Ok(SetItem::MapAssign {
+                var,
+                value,
+                merge: true,
+            })
+        }
+        Rule::set_map_replace => {
+            let mut parts = first.into_inner();
+            let var = parts
+                .next()
+                .expect("set_map_replace has a var identifier")
+                .as_str()
+                .to_string();
+            let value = parse_return_expr(
+                parts
+                    .next()
+                    .expect("set_map_replace has a return_expr value"),
+            )?;
+            Ok(SetItem::MapAssign {
+                var,
+                value,
+                merge: false,
+            })
+        }
         r => unreachable!("unexpected set_item child rule {r:?}"),
     }
 }

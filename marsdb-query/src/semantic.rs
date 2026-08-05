@@ -579,6 +579,11 @@ fn validate_set_item(item: &SetItem, scope: &Scope) -> Result<(), QueryError> {
             Ok(())
         }
         SetItem::Labels(var, _) => require_kind(scope, var, &Kind::Node, "SET label target"),
+        SetItem::MapAssign { var, value, .. } => {
+            require_graph(scope, var, "SET map-assignment target")?;
+            infer_expr(value, scope)?;
+            Ok(())
+        }
     }
 }
 
