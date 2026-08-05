@@ -546,6 +546,14 @@ pub enum QueryClause {
     /// already carries (that one follows a real pattern match; this one
     /// has nothing preceding it at all).
     With(WithClause),
+    /// `SET ...` immediately followed by `WITH` -- continues the query
+    /// past the mutation instead of only ever allowing one trailing
+    /// `RETURN` (the pre-existing `Tail::Set`'s own `ReturnTail`).
+    /// Doesn't itself change any row's bindings, only the underlying
+    /// graph -- `execute_match`'s clause loop applies each item per row
+    /// and passes `current_rows` through unchanged, same as `Merge`
+    /// already does for its own non-binding side effects.
+    Set(Vec<SetItem>),
 }
 
 #[derive(Debug, Clone)]

@@ -95,6 +95,11 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
                     QueryClause::Unwind(clause) => bind_unwind(clause, &mut scope)?,
                     QueryClause::Merge(clause) => bind_merge(clause, &mut scope)?,
                     QueryClause::With(with) => scope = project_with(with, &scope)?,
+                    QueryClause::Set(items) => {
+                        for item in items {
+                            validate_set_item(item, &scope)?;
+                        }
+                    }
                 }
             }
 

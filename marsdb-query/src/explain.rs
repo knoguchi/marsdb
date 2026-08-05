@@ -89,6 +89,20 @@ fn explain_clause(
             explain_with_projection(with, carried_vars, out);
             Ok(())
         }
+        QueryClause::Set(items) => {
+            out.push(format!(
+                "SET {}",
+                items
+                    .iter()
+                    .map(|item| match item {
+                        SetItem::Prop(pa, value) => format!("{}.{} = {value:?}", pa.var, pa.prop),
+                        SetItem::Labels(var, labels) => format!("{var}:{}", labels.join(":")),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            Ok(())
+        }
     }
 }
 

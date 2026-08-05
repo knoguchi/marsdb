@@ -194,6 +194,18 @@ fn parse_clause(pair: Pair<Rule>) -> Result<Vec<QueryClause>, QueryError> {
         Rule::unwind_clause => Ok(vec![QueryClause::Unwind(parse_unwind_clause(inner)?)]),
         Rule::merge_clause => Ok(vec![QueryClause::Merge(parse_merge_clause(inner)?)]),
         Rule::with_clause => Ok(vec![QueryClause::With(parse_with_clause(inner)?)]),
+        Rule::set_as_clause => {
+            let set_clause_pair = inner
+                .into_inner()
+                .next()
+                .expect("set_as_clause has a set_clause");
+            let items = set_clause_pair
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::set_item)
+                .map(parse_set_item)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(vec![QueryClause::Set(items)])
+        }
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
 }

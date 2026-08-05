@@ -1060,6 +1060,23 @@ impl<'a> Executor<'a> {
                         &mut carried_vars,
                     )?;
                 }
+                // `SET ... WITH ...` -- same real `.set_*_prop_in_txn`
+                // write access `materialize_set`'s own per-row loop
+                // already needs (guaranteed `Txn::Write` here for the
+                // same reason its own docs give). Doesn't change any
+                // row's bindings, only mutates the underlying graph --
+                // `current_rows`/`carried_vars` both pass through
+                // unchanged, the following `clause` (always a `WITH`,
+                // see `set_as_clause`'s grammar) handles its own
+                // projection/`WHERE`/`ORDER BY` normally from there.
+                QueryClause::Set(items) => {
+                    let write_txn = require_write_txn(txn);
+                    for row in &current_rows {
+                        for item in items {
+                            self.apply_set_item(txn, write_txn, row, item)?;
+                        }
+                    }
+                }
             }
             guard.check_intermediate_rows(current_rows.len())?;
         }
@@ -3331,28 +3348,31 @@ pub fn is_read_only(stmt: &Statement) -> bool {
         return parts.iter().all(is_read_only);
     }
     let Statement::Match {
-        tail: Some(Tail::Return(_, _)),
+        tail: Some(Tail::Return(_, _)) | Some(Tail::ReturnStar(_)),
         clauses,
         ..
     } = stmt
     else {
         return false;
     };
-    !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_)))
+    !clauses
+        .iter()
+        .any(|c| matches!(c, QueryClause::Merge(_) | QueryClause::Set(_)))
 }
 
-/// Recovers the real `&WriteTransaction` from a `Txn` for the two
-/// `execute_match` tail arms (`DELETE`/`SET`) that need `.insert`/
+/// Recovers the real `&WriteTransaction` from a `Txn` for `execute_match`
+/// tail/clause arms (`DELETE`/`SET`, both the terminal-tail and
+/// `QueryClause::Set`'s own mid-statement form) that need `.insert`/
 /// `.remove`, not just `Txn`'s read-only `get`/`iter`. Panics if given
-/// `Txn::Read` — which can't happen: `Tail::Delete`/`DetachDelete`/`Set`
-/// make `is_read_only` return `false`, so `Executor::execute` always opens
-/// a `WriteTransaction` (and thus `Txn::Write`) before reaching this path.
+/// `Txn::Read` — which can't happen: any of these make `is_read_only`
+/// return `false`, so `Executor::execute` always opens a
+/// `WriteTransaction` (and thus `Txn::Write`) before reaching this path.
 fn require_write_txn(txn: Txn<'_>) -> &WriteTransaction {
     let Txn::Write(write_txn) = txn else {
         unreachable!(
-            "materialize_delete/materialize_set only reached via the write-dispatch path in \
-             Executor::execute — is_read_only(stmt) is false for any statement with a Delete/ \
-             DetachDelete/Set tail, so execute always opens a WriteTransaction for these"
+            "materialize_delete/materialize_set/QueryClause::Set only reached via the \
+             write-dispatch path in Executor::execute — is_read_only(stmt) is false for any \
+             statement with one of these, so execute always opens a WriteTransaction for them"
         )
     };
     write_txn
