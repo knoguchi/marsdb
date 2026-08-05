@@ -1073,11 +1073,11 @@ fn parse_atom_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
         Rule::prop_access => Ok(ReturnExpr::Prop(parse_prop_access(inner))),
         Rule::literal => Ok(ReturnExpr::Lit(parse_literal(inner)?)),
         Rule::identifier => Ok(ReturnExpr::Var(inner.as_str().to_string())),
-        Rule::label_check_expr => {
+        Rule::label_check_expr | Rule::atom_label_predicate => {
             let mut parts = inner.into_inner();
             let var = parts
                 .next()
-                .expect("label_check_expr has a var identifier")
+                .expect("label_check_expr/atom_label_predicate has a var identifier")
                 .as_str()
                 .to_string();
             let labels = parts.map(|p| p.as_str().to_string()).collect();

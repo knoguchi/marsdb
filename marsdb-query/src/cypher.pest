@@ -278,7 +278,21 @@ slice_range     = { return_expr? ~ ".." ~ return_expr? }
 // `function_call` itself can't match `duration.between(...)`'s dotted
 // name (its own `identifier` stops at the `.`, then expects `(` and
 // fails), so ordered choice backtracks past it too.
-atom_expr   = { case_expr | quantifier_expr | function_call | qualified_function_call | list_expr | map_expr | prop_access | literal | identifier | label_check_expr | ("(" ~ return_expr ~ ")") }
+// `atom_label_predicate` (`a:B`, `a:A:B` -- true iff the bound node/
+// relationship has every listed label) is tried before the bare
+// `identifier` fallback, same reasoning as `prop_access`/`literal` above
+// it -- both start with a bare `identifier`, but `identifier` alone
+// would greedily match just the name and leave `:B` unconsumed (`|`
+// never backtracks out of an alternative that already succeeded), so
+// the more specific shape needs first crack. Real Cypher allows a label
+// check as a general expression anywhere, not just in `WHERE` (TCK's
+// Graph5 "Node and edge label expressions", e.g. `RETURN a, a:B AS
+// result`) -- `label_predicate`/`with_label_predicate` are this same
+// shape's own mirrors for pattern-level `WHERE` and `WITH`'s `WHERE`,
+// kept as separate rules for the same reason those two are already
+// separate from each other, not a new restriction.
+atom_expr   = { case_expr | quantifier_expr | function_call | qualified_function_call | list_expr | map_expr | prop_access | literal | atom_label_predicate | identifier | label_check_expr | ("(" ~ return_expr ~ ")") }
+atom_label_predicate = { identifier ~ (":" ~ identifier)+ }
 // `duration.between(a, b)`/`.inDays(...)`/`.inMonths(...)`/
 // `.inSeconds(...)`, `date.truncate(...)`/etc -- Cypher's namespaced
 // temporal functions. Reuses `call_args` (no `*`/`DISTINCT` are

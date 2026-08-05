@@ -517,6 +517,7 @@ fn validate_delete_target(expr: &ReturnExpr, scope: &Scope) -> Result<(), QueryE
                 | ReturnExpr::In(..)
                 | ReturnExpr::MapLit(..)
                 | ReturnExpr::ListLit(..)
+                | ReturnExpr::HasLabel(..)
         )
     {
         return Err(semantic(

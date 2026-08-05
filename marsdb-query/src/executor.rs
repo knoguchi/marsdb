@@ -2922,9 +2922,23 @@ impl<'a> Executor<'a> {
                             labels.iter().all(|l| node.labels.contains(l)),
                         )))
                     }
+                    // `r:TYPE` -- a relationship has exactly one type, so
+                    // this is just an equality check, not a set-membership
+                    // one; a conjunctive `r:A:B` (only reachable from
+                    // general expression position, never real Cypher's own
+                    // pattern-level `WHERE` -- relationships can't carry
+                    // more than one type) is trivially always false unless
+                    // every listed name is the same one type (TCK's Graph5
+                    // "Node and edge label expressions" [2]).
+                    Binding::Edge(id) => {
+                        let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
+                        Ok(Value::Literal(Literal::Bool(
+                            labels.iter().all(|l| edge.label == *l),
+                        )))
+                    }
                     Binding::Value(PropertyValue::Null) => Ok(Value::Null),
                     other => Err(QueryError::Type(format!(
-                        "'{var}' isn't a node — (n:Label) needs a node binding, got {other:?}"
+                        "'{var}' isn't a node or relationship — (n:Label) needs one, got {other:?}"
                     ))),
                 }
             }
