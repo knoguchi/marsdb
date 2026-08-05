@@ -169,12 +169,22 @@ fn property_to_scalar(p: &PropertyValue) -> TckScalar {
         PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
+            zone,
         } => TckScalar::Str(marsdb::temporal::format_date_time(
             *epoch_seconds,
             *nanos,
-            *offset_seconds,
+            &to_temporal_tz(zone),
         )),
+    }
+}
+
+/// `marsdb::TzId` <-> `marsdb::temporal::TzId` -- two independent,
+/// same-shaped types (`temporal.rs` deliberately doesn't depend on
+/// `marsdb_graph`), converted at this formatting boundary.
+fn to_temporal_tz(zone: &marsdb::TzId) -> marsdb::temporal::TzId {
+    match zone {
+        marsdb::TzId::Offset(o) => marsdb::temporal::TzId::Offset(*o),
+        marsdb::TzId::Named(name) => marsdb::temporal::TzId::Named(name.clone()),
     }
 }
 

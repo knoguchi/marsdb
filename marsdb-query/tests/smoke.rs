@@ -3369,6 +3369,16 @@ fn list_slice_out_of_range_bounds_clamp_instead_of_null() {
     assert_eq!(list_ints(&result.rows[0][1]), Vec::<i64>::new());
 }
 
+/// `marsdb_graph::TzId` <-> `marsdb_query::temporal::TzId` -- two
+/// independent, same-shaped types (`temporal.rs` deliberately doesn't
+/// depend on `marsdb_graph`), converted at this test-helper boundary.
+fn to_temporal_tz(zone: &marsdb_graph::TzId) -> marsdb_query::temporal::TzId {
+    match zone {
+        marsdb_graph::TzId::Offset(o) => marsdb_query::temporal::TzId::Offset(*o),
+        marsdb_graph::TzId::Named(name) => marsdb_query::temporal::TzId::Named(name.clone()),
+    }
+}
+
 /// Renders a `Date`/`Duration`/`String` `Value` as text via the same
 /// `marsdb_query::temporal` formatting functions the CLI/TCK output paths
 /// use, so these tests check the exact ISO-8601 text a user would see,
@@ -3399,8 +3409,10 @@ fn temporal_str(v: &Value) -> String {
         Value::Property(marsdb_graph::PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
-        }) => marsdb_query::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
+            zone,
+        }) => {
+            marsdb_query::temporal::format_date_time(*epoch_seconds, *nanos, &to_temporal_tz(zone))
+        }
         other => panic!("expected a temporal/String value, got {other:?}"),
     }
 }
@@ -3934,23 +3946,171 @@ fn date_time_construct_from_map_and_string() {
 }
 
 #[test]
-fn datetime_named_timezone_is_rejected_not_silently_wrong() {
+fn datetime_named_timezone_construction_and_parsing() {
     let store = GraphStore::open_memory().unwrap();
-    let stmt = parse("RETURN datetime('2015-07-21T21:40:32.142[Europe/Stockholm]')").unwrap();
+    // Map construction, string parsing (with and without an explicit
+    // offset alongside the bracket), and DST-aware resolution (October
+    // = standard time, ordinalDay 202 = July = summer time) -- TCK's
+    // Temporal1 [10] / Temporal2 [6].
+    let result = run(
+        &store,
+        "RETURN toString(datetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31, \
+         second: 14, nanosecond: 645876123, timezone: 'Europe/Stockholm'})), \
+         toString(datetime({year: 1984, ordinalDay: 202, hour: 12, minute: 31, second: 14, \
+         nanosecond: 645876123, timezone: 'Europe/Stockholm'})), \
+         toString(datetime('2015-07-21T21:40:32.142+02:00[Europe/Stockholm]')), \
+         toString(datetime('2015-07-21T21:40:32.142[Europe/London]'))",
+    );
+    let row = &result.rows[0];
+    assert_eq!(
+        temporal_str(&row[0]),
+        "1984-10-11T12:31:14.645876123+01:00[Europe/Stockholm]"
+    );
+    assert_eq!(
+        temporal_str(&row[1]),
+        "1984-07-20T12:31:14.645876123+02:00[Europe/Stockholm]"
+    );
+    assert_eq!(
+        temporal_str(&row[2]),
+        "2015-07-21T21:40:32.142+02:00[Europe/Stockholm]"
+    );
+    // No explicit offset at all -- derived purely from the zone (BST).
+    assert_eq!(
+        temporal_str(&row[3]),
+        "2015-07-21T21:40:32.142+01:00[Europe/London]"
+    );
+
+    // `.timezone` is the zone name; `.offset` is the resolved offset --
+    // the two diverge only for a `Named` zone. TCK's Temporal5 [6].
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 11, day: 11, hour: 12, timezone: 'Europe/Stockholm'}) AS d \
+         RETURN d.timezone, d.offset",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "Europe/Stockholm");
+    assert_eq!(temporal_str(&result.rows[0][1]), "+01:00");
+}
+
+/// `TIME` has no calendar date, so a named zone's DST-dependent offset
+/// has nothing to resolve against -- unlike `DATETIME`, it still only
+/// accepts a fixed UTC offset. A real, deliberately narrow scope line,
+/// not a silent wrong answer.
+#[test]
+fn time_named_timezone_is_rejected_not_silently_wrong() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN time('21:40:32.142[Europe/Stockholm]')").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(
         err.to_string().contains("named timezone"),
         "expected a named-timezone error, got: {err}"
     );
 
-    let stmt2 =
-        parse("RETURN datetime({year: 2020, month: 1, day: 1, timezone: 'Europe/Stockholm'})")
-            .unwrap();
+    let stmt2 = parse("RETURN time({hour: 12, timezone: 'Europe/Stockholm'})").unwrap();
     let err2 = Executor::new(&store).execute(&stmt2).unwrap_err();
     assert!(
         err2.to_string().contains("named timezone"),
         "expected a named-timezone error, got: {err2}"
     );
+}
+
+/// `time({time: namedZoneDateTime})` -- no *explicit* `timezone` key, the
+/// zone was just carried through from the projected base -- silently
+/// degrades to the resolved offset instead of erroring, unlike an
+/// explicit named-zone request. TCK's Temporal3 [3] row 125.
+#[test]
+fn time_projected_from_a_named_zone_base_degrades_to_plain_offset() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: 'Europe/Stockholm'}) AS other \
+         RETURN toString(time({time: other})), toString(time(other))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:00+01:00");
+    assert_eq!(temporal_str(&result.rows[0][1]), "12:00+01:00");
+}
+
+/// Projecting a `Named`-zone base with an *explicit* `timezone` override
+/// shifts the wall-clock to preserve the same instant -- the target
+/// offset is resolved *for the actual target date* (which the `day`
+/// override can move to a different DST period than the base's own
+/// date), not the base's original instant. A real bug found and fixed
+/// this session: an earlier version resolved both the "from" and "to"
+/// offsets against stale/inconsistent dates, producing wrong instants.
+/// TCK's Temporal3 [9]/[10] (a representative sample of the row shapes).
+#[test]
+fn datetime_shift_into_named_zone_resolves_offsets_for_the_target_date() {
+    let store = GraphStore::open_memory().unwrap();
+    // Time-with-offset base, fresh year/month/day, explicit shift.
+    let result = run(
+        &store,
+        "WITH time({hour: 12, minute: 31, second: 14, microsecond: 645876, timezone: '+01:00'}) AS other \
+         RETURN toString(datetime({year: 1984, month: 10, day: 11, time: other, second: 42, \
+         timezone: 'Pacific/Honolulu'}))",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-10-11T01:31:42.645876-10:00[Pacific/Honolulu]"
+    );
+    // Named-zone-base shifted into a *different* named zone, where the
+    // `day` override moves the result across a DST boundary for the
+    // *base's own* zone too (Stockholm: standard time in October, but
+    // summer time by the overridden March 28) -- the "from" offset used
+    // for the shift must reflect the *target* date, not the base's
+    // original (October) instant.
+    let result = run(
+        &store,
+        "WITH localdatetime({year: 1984, week: 10, dayOfWeek: 3, hour: 12, minute: 31, second: 14, \
+         millisecond: 645}) AS otherDate, \
+         datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: 'Europe/Stockholm'}) AS otherTime \
+         RETURN toString(datetime({date: otherDate, time: otherTime, day: 28, second: 42, \
+         timezone: 'Pacific/Honolulu'}))",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-03-28T00:00:42-10:00[Pacific/Honolulu]"
+    );
+}
+
+/// With *no* explicit `timezone` override, a `Named`-zone base's zone
+/// identity is preserved as-is and the wall-clock is *not* shifted, even
+/// if a `day` override moves the result across a DST boundary for that
+/// same zone -- the displayed offset is simply re-resolved for the new
+/// date, the local time itself never changes. A real bug found and fixed
+/// this session: an earlier version always re-resolved and shifted
+/// whenever the zone's real offset differed for the new date, even
+/// without an explicit override. TCK's Temporal3 [10] rows 336/337.
+#[test]
+fn datetime_no_override_preserves_zone_identity_without_shifting() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH localdatetime({year: 1984, week: 10, dayOfWeek: 3, hour: 12, minute: 31, second: 14, \
+         millisecond: 645}) AS otherDate, \
+         datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: 'Europe/Stockholm'}) AS otherTime \
+         RETURN toString(datetime({date: otherDate, time: otherTime, day: 28, second: 42}))",
+    );
+    // Same 12:00 wall-clock as the base, just re-displayed with the
+    // zone's real (now summer-time) offset for the new date -- not
+    // shifted to a different hour.
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1984-03-28T12:00:42+02:00[Europe/Stockholm]"
+    );
+}
+
+/// `datetime(otherLocalDateTime)` -- a bare `LocalDateTime` argument has
+/// no zone of its own, defaults to UTC -- TCK's Temporal3 [11].
+#[test]
+fn datetime_construct_from_bare_local_date_time_defaults_to_utc() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH localdatetime({year: 1984, week: 10, dayOfWeek: 3, hour: 12, minute: 31, second: 14, \
+         millisecond: 645}) AS other \
+         RETURN toString(datetime(other)), toString(datetime({datetime: other}))",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "1984-03-07T12:31:14.645Z");
+    assert_eq!(temporal_str(&result.rows[0][1]), "1984-03-07T12:31:14.645Z");
 }
 
 /// `Time`'s comparison is by the UTC-equivalent instant-of-day, not the

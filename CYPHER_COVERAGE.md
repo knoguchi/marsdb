@@ -49,11 +49,11 @@ scope.
 | expressions/precedence | 104 | 56 | 0 | 0 | 48 | 0 | 53.8% |
 | expressions/quantifier | 604 | 532 | 0 | 0 | 72 | 0 | 88.1% |
 | expressions/string | 32 | 29 | 0 | 0 | 3 | 0 | 90.6% |
-| expressions/temporal | 1004 | 845 | 1 | 132 | 26 | 0 | 84.2% |
+| expressions/temporal | 1004 | 963 | 1 | 15 | 25 | 0 | 95.9% |
 | expressions/typeConversion | 47 | 43 | 0 | 1 | 3 | 0 | 91.5% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 0 | 0 | 0 | 19 | 0 | 0.0% |
-| **TOTAL** | **3880** | **2783** | **1** | **153** | **874** | **69** | **71.7%** |
+| **TOTAL** | **3880** | **2901** | **1** | **36** | **873** | **69** | **74.8%** |
 
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
@@ -89,13 +89,18 @@ and quarter-date forms, both as map keys and as strings), component
 access, arithmetic, comparison, and cross-type conversion (`date(anExisting
 DateTime)`, etc.) are all supported for every one of the six temporal
 types, not just `Date`/`Duration` — see [Temporal types](#temporal-types)
-below. The remaining `unexp` scenarios are almost entirely one deliberate
-scope cut: `LOCAL TIME`/`TIME`/`LOCAL DATETIME`/`DATETIME` only support a
-*fixed* UTC offset (`'+01:00'`), not a named timezone (`'Europe/
-Stockholm'`), which would need a real IANA timezone database (no DST/
-zone-rule awareness anywhere in `marsdb-query::temporal`) — those
-scenarios fail at runtime with a clear "named timezone" error, not
-silently.
+below. `DateTime` also supports named IANA timezones (`'Europe/
+Stockholm'`), not just a fixed UTC offset, via `chrono-tz`'s embedded
+database — real, DST-aware offset resolution, not a fixed lookup table
+(`chrono-tz`'s IANA data even covers pre-standardization local-mean-time
+offsets, e.g. Stockholm in 1818 resolves to `+00:53:28`). `Time` still
+only accepts a fixed offset — it carries no calendar date, so a named
+zone's DST-dependent offset has nothing to resolve against, a real
+structural limit of the type rather than a missing feature. The remaining
+`unexp` scenarios are unrelated, smaller gaps: list-valued temporal
+properties (MarsDB's node/edge properties are scalar-only, see
+`PropertyValue`'s own doc comment) and the alternate ISO-8601 combined
+date-time duration syntax (`duration('P2012-02-02T14:37:21.545')`).
 
 ## Clauses
 
@@ -247,10 +252,15 @@ fails at execution time with a clear error, not silently as `null`).
 All six Cypher temporal types are supported: `Date`, `Duration`,
 `LocalTime`, `Time`, `LocalDateTime`, `DateTime` (each a first-class
 `PropertyValue` storage variant, not `Int`/`String` reused — see
-`marsdb-graph/src/model.rs`'s doc comment). `Time`/`DateTime` only accept
-a *fixed* UTC offset (`'+01:00'`, `{timezone: '+01:00'}`) — a named
-timezone (`'Europe/Stockholm'`) is rejected with a clear error, not
-misparsed; see the gap list below.
+`marsdb-graph/src/model.rs`'s doc comment). `DateTime` accepts either a
+*fixed* UTC offset (`'+01:00'`, `{timezone: '+01:00'}`) or a named IANA
+timezone (`'Europe/Stockholm'`, `{timezone: 'Europe/Stockholm'}`), stored
+as `marsdb_graph::TzId` (`Offset(i32)` or `Named(String)`) — a `Named`
+zone's real offset is never cached, it's re-resolved on demand via
+`chrono-tz` for whichever instant it's needed at, since the same zone has
+different offsets across a DST transition. `Time` only accepts a fixed
+offset — no calendar date to resolve a named zone's DST-dependent offset
+against, a real structural limit of the type, not a missing feature.
 
 Construction: `date()`/`localtime()`/`time()`/`localdatetime()`/
 `datetime()` with no arguments (the current UTC value); from a string,
@@ -348,11 +358,11 @@ base's own millisecond/microsecond digits rather than resetting them).
 once for a calendar-scale unit (resetting time to midnight) or just the
 clock half for a clock-scale one.
 
-**Not** supported: named timezones (`'Europe/Stockholm'`) for `Time`/
-`DateTime` — needs a real IANA timezone database (DST transition rules,
-zone-name lookup), deliberately out of scope, no dependency pulled in
-for it; the alternate ISO-8601 combined date-time duration syntax
-(`duration('P2012-02-02T14:37:21.545')`). See
+**Not** supported: named timezones for `Time` (only `DateTime` can hold
+one — see above); the alternate ISO-8601 combined date-time duration
+syntax (`duration('P2012-02-02T14:37:21.545')`); list-valued temporal
+properties (`n.dates = [date(), date()]` — MarsDB's node/edge properties
+are scalar-only, see `PropertyValue`'s own doc comment). See
 `marsdb-query/src/temporal.rs`'s module doc comment for the same list
 in code.
 
