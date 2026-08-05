@@ -3916,6 +3916,43 @@ fn create_inline_null_property_is_never_stored() {
     assert!(!bool_val(&result.rows[0][1]));
 }
 
+/// `rand()` -- a fresh pseudo-random float in `[0, 1)` on every call, no
+/// memoization (unlike `now()`/`date()`'s per-query `NowSnapshot`).
+#[test]
+fn rand_returns_a_fresh_value_in_zero_one_each_call() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "UNWIND range(0, 9) AS i RETURN rand() AS r");
+    let vals: Vec<f64> = result.rows.iter().map(|row| as_float(&row[0])).collect();
+    for v in &vals {
+        assert!((0.0..1.0).contains(v), "rand() out of range: {v}");
+    }
+    // Vanishingly unlikely all 10 calls collide if it's actually random.
+    let distinct: std::collections::HashSet<u64> = vals.iter().map(|v| v.to_bits()).collect();
+    assert!(
+        distinct.len() > 1,
+        "rand() returned the same value every call"
+    );
+}
+
+/// `count(rand())` -- an aggregate's argument must be deterministic per
+/// row for grouping to have well-defined semantics, which `rand()`
+/// fundamentally breaks. Real Cypher rejects this at compile time (TCK's
+/// Return6 [15]).
+#[test]
+fn rand_inside_an_aggregate_argument_is_rejected() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN count(rand())").unwrap();
+    let err = Executor::new(&store)
+        .execute(&stmt)
+        .expect_err("rand() as an aggregate argument must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("non-deterministic"), "unexpected error: {msg}");
+
+    // rand() elsewhere (not inside an aggregate call) is completely fine.
+    let result = run(&store, "RETURN rand() < 2.0 AS x");
+    assert!(bool_val(&result.rows[0][0]));
+}
+
 /// Real Cypher's float literal grammar has three shapes beyond plain
 /// `digits.digits`: a leading-dot form with no integer part (`.1`), and
 /// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).

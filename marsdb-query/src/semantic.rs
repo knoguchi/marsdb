@@ -685,7 +685,7 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     "range" | "split" => Kind::List(Box::new(Kind::Scalar)),
                     "toupper" | "upper" | "tolower" | "lower" | "trim" | "ltrim" | "rtrim"
                     | "replace" | "substring" | "left" | "right" | "abs" | "ceil" | "floor"
-                    | "round" | "sqrt" | "sign" => Kind::Scalar,
+                    | "round" | "sqrt" | "sign" | "rand" => Kind::Scalar,
                     // Polymorphic over string/list -- the input's own kind
                     // (if known) is the output's kind too.
                     "reverse" => arg_kinds.first().cloned().unwrap_or(Kind::Unknown),
