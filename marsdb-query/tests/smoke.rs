@@ -308,6 +308,61 @@ fn where_var_compare_with_ordering_operator_is_a_syntax_error() {
     assert!(msg.contains("only = and <>"), "unexpected error: {msg}");
 }
 
+/// MATCH's own bare `WHERE` widened to the same general-expression power
+/// `WITH`'s `WHERE` already had (`Expr::GeneralCompare`) -- a function
+/// call operand, not just `prop_access op (prop_access | literal)`.
+#[test]
+fn where_general_comparison_allows_a_function_call_operand() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {id: '1'})");
+    run(&store, "CREATE (:N {id: '2'})");
+
+    let result = run(&store, "MATCH (n) WHERE toInteger(n.id) = 1 RETURN n.id");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "1"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// Same widening, but the comparison's LHS is an edge-typed builtin
+/// (`type(r)`), a shape the old `comparison = prop_access ~ ...` rule
+/// couldn't parse at all.
+#[test]
+fn where_general_comparison_allows_type_of_relationship() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N)-[:KNOWS]->(:N)");
+    run(&store, "CREATE (:N)-[:LIKES]->(:N)");
+
+    let result = run(
+        &store,
+        "MATCH ()-[r]->() WHERE type(r) = 'KNOWS' RETURN type(r)",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "KNOWS"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `WHERE n.val + 0 IS NULL` -- an arithmetic operand, not just
+/// `prop_access IS NULL` (`Expr::GeneralIsNull`, mirrors
+/// `WithExpr::IsNull`); a missing property propagates `Null` through `+`,
+/// same null-propagation arithmetic already has everywhere else.
+#[test]
+fn where_general_is_null_checks_an_arithmetic_expression() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {name: 'a', val: 5})");
+    run(&store, "CREATE (:N {name: 'b'})");
+
+    let result = run(&store, "MATCH (n) WHERE n.val + 0 IS NULL RETURN n.name");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "b"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
 #[test]
 fn skip_alone_drops_the_first_n_rows_after_order_by() {
     let store = GraphStore::open_memory().unwrap();

@@ -378,6 +378,14 @@ fn format_expr(expr: &Expr) -> String {
         Expr::IsNull(pa) => format!("{}.{} IS NULL", pa.var, pa.prop),
         Expr::HasLabel(var, label) => format!("{var}:{label}"),
         Expr::VarEq(a, b) => format!("{a} = {b}"),
+        // Operands are a general `ReturnExpr` (function calls, arithmetic,
+        // ...) -- same `Debug` fallback DELETE/SET already use above, for
+        // the same reason (no dedicated formatter for the full expression
+        // grammar here).
+        Expr::GeneralCompare(l, op, r) => {
+            format!("{l:?} {} {r:?}", format_compare_op(*op))
+        }
+        Expr::GeneralIsNull(e) => format!("{e:?} IS NULL"),
     }
 }
 

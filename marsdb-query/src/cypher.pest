@@ -394,7 +394,19 @@ and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
 // (no dot) -- tried after `comparison`/`is_null_expr` (which require a
 // dot) so ordered choice backtracks cleanly off the missing dot, then
 // distinguishes on `:` (label_predicate) vs a `compare_op` (var_compare).
-unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | ("(" ~ expr ~ ")") }
+// `general_is_null_expr`/`general_comparison` tried last, as the catch-
+// all for anything none of the narrower rules above matched (a function
+// call, arithmetic, a bare non-colon/non-compare-op identifier, ...) --
+// same `add_expr`-operand shape `with_is_null_expr`/`with_comparison`
+// already use for WITH's own WHERE, reused here for a bare MATCH's WHERE
+// (real Cypher: `WHERE toInteger(n.id) = 1`, `WHERE r IS NULL` for a
+// whole bound var, not just `n.prop IS NULL`, are both legal there too).
+// Never index-seek-eligible (see `planner::apply_index_seeks`, which
+// only recognizes the narrower `Expr::Compare`) -- always a generic
+// post-scan `Filter`, same as `PropCompare` already is.
+unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | general_is_null_expr | general_comparison | ("(" ~ expr ~ ")") }
+general_comparison    = { add_expr ~ compare_op ~ add_expr }
+general_is_null_expr  = { add_expr ~ is_null_suffix }
 // RHS is `prop_access` too, not just `literal` -- real Cypher's WHERE
 // routinely compares two properties (`a.id = b.id`), not just a property
 // against a constant. Only the `literal` shape is eligible for the
