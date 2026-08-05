@@ -186,6 +186,11 @@ fn substitute_expr(
         Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
         Expr::VarEq(_, _) => {}
+        Expr::GeneralCompare(lhs, _, rhs) => {
+            substitute_return_expr(lhs, params)?;
+            substitute_return_expr(rhs, params)?;
+        }
+        Expr::GeneralIsNull(e) => substitute_return_expr(e, params)?,
     }
     Ok(())
 }

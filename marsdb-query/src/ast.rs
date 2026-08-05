@@ -67,6 +67,23 @@ pub enum Expr {
     /// (`PropCompare`) or two arbitrary values (`WithExpr::Compare`,
     /// post-projection only).
     VarEq(String, String),
+    /// `WHERE toInteger(n.id) = 1`, `WHERE r.weight * 2 > n.threshold`,
+    /// ... -- any comparison whose operand isn't the narrower
+    /// `prop_access`/`literal` shape `Compare`/`PropCompare` cover
+    /// (a function call, arithmetic, a bare variable compared to
+    /// something, ...). Same operand type `WithExpr::Compare` uses
+    /// (`ReturnExpr`, built from the shared `add_expr` grammar rule), but
+    /// this variant keeps pattern-level `Expr`'s own pre-projection
+    /// evaluation context (`Executor::eval_expr`, against the raw
+    /// `BindingRow`, not a post-projection value map) -- never eligible
+    /// for the planner's index-seek fusion, always a generic post-scan
+    /// filter, same as `PropCompare`.
+    GeneralCompare(ReturnExpr, CompareOp, ReturnExpr),
+    /// `WHERE r IS NULL` (a whole bound variable, e.g. checking an
+    /// `OPTIONAL MATCH` miss) or `WHERE toInteger(n.id) IS NULL` -- unlike
+    /// `IsNull`, the operand isn't restricted to a bare `prop_access`.
+    /// Mirrors `WithExpr::IsNull` exactly, just evaluated pre-projection.
+    GeneralIsNull(ReturnExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]

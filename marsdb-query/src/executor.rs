@@ -2390,6 +2390,14 @@ impl<'a> Executor<'a> {
                     _ => false,
                 })
             }
+            Expr::GeneralCompare(lhs, op, rhs) => {
+                let lv = self.eval_return_expr(txn, lhs, row)?;
+                let rv = self.eval_return_expr(txn, rhs, row)?;
+                compare_values(&lv, *op, &rv)
+            }
+            Expr::GeneralIsNull(e) => {
+                Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null))
+            }
         })
     }
 

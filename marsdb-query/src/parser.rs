@@ -1408,9 +1408,43 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
         Rule::comparison => parse_comparison(inner),
         Rule::label_predicate => Ok(parse_label_predicate(inner)),
         Rule::var_compare => parse_var_compare(inner),
+        Rule::general_is_null_expr => parse_general_is_null_expr(inner),
+        Rule::general_comparison => parse_general_comparison(inner),
         Rule::expr => parse_expr(inner),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
     }
+}
+
+/// `general_is_null_expr = { add_expr ~ is_null_suffix }` -- mirrors
+/// `parse_with_is_null_expr`, just building the pattern-level `Expr`
+/// instead of `WithExpr`.
+fn parse_general_is_null_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
+    let mut inner = pair.into_inner();
+    let operand = parse_add_expr(inner.next().expect("general_is_null_expr has an add_expr"))?;
+    let suffix = inner
+        .next()
+        .expect("general_is_null_expr has an is_null_suffix");
+    let is_not = suffix.into_inner().any(|p| p.as_rule() == Rule::kw_not);
+    let is_null = Expr::GeneralIsNull(operand);
+    Ok(if is_not {
+        Expr::Not(Box::new(is_null))
+    } else {
+        is_null
+    })
+}
+
+/// `general_comparison = { add_expr ~ compare_op ~ add_expr }` -- mirrors
+/// `parse_with_comparison`, just building the pattern-level `Expr` instead
+/// of `WithExpr`. Only reached when `comparison`'s narrower
+/// `prop_access ~ compare_op ~ (prop_access | literal)` shape doesn't
+/// match, so this never steals eligibility from the planner's index-seek
+/// fusion.
+fn parse_general_comparison(pair: Pair<Rule>) -> Result<Expr, QueryError> {
+    let mut inner = pair.into_inner();
+    let lhs = parse_add_expr(inner.next().expect("general_comparison has a lhs add_expr"))?;
+    let op = parse_compare_op(inner.next().expect("general_comparison has a compare_op"));
+    let rhs = parse_add_expr(inner.next().expect("general_comparison has a rhs add_expr"))?;
+    Ok(Expr::GeneralCompare(lhs, op, rhs))
 }
 
 /// `comparison = { prop_access ~ compare_op ~ (prop_access | literal) }` --

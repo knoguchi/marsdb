@@ -532,6 +532,15 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             require_graph(scope, left, "identity predicate")?;
             require_graph(scope, right, "identity predicate")
         }
+        Expr::GeneralCompare(left, _, right) => {
+            infer_expr(left, scope)?;
+            infer_expr(right, scope)?;
+            Ok(())
+        }
+        Expr::GeneralIsNull(e) => {
+            infer_expr(e, scope)?;
+            Ok(())
+        }
     }
 }
 
