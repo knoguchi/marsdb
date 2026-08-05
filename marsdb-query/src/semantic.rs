@@ -417,6 +417,7 @@ fn validate_tail(tail: &Option<Tail>, scope: &mut Scope) -> Result<Scope, QueryE
                             | ReturnExpr::Not(..)
                             | ReturnExpr::Compare(..)
                             | ReturnExpr::IsNull(..)
+                            | ReturnExpr::In(..)
                             | ReturnExpr::MapLit(..)
                             | ReturnExpr::ListLit(..)
                     )
@@ -664,7 +665,14 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     // enforces with a clear `QueryError::Type`, so no
                     // additional structural check is added here beyond
                     // "the call itself is a recognized function."
-                    "keys" | "labels" | "id" | "size" | "exists" => Kind::Scalar,
+                    // `keys`/`labels` each return a *list* of strings, not
+                    // a scalar -- real Cypher needs this to be `Kind::
+                    // List` so `[x IN labels(n) | ...]`'s own source-kind
+                    // check (`list_element`) doesn't wrongly reject a
+                    // perfectly good list comprehension source (TCK's
+                    // List12 [6]).
+                    "keys" | "labels" => Kind::List(Box::new(Kind::Scalar)),
+                    "id" | "size" | "exists" => Kind::Scalar,
                     "properties" => Kind::Map,
                     "head" | "last" => match arg_kinds.first() {
                         Some(Kind::List(inner)) => (**inner).clone(),
@@ -798,6 +806,11 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
         }
         ReturnExpr::IsNull(inner) => {
             infer_expr(inner, scope)?;
+            Kind::Scalar
+        }
+        ReturnExpr::In(needle, haystack) => {
+            infer_expr(needle, scope)?;
+            infer_expr(haystack, scope)?;
             Kind::Scalar
         }
         ReturnExpr::HasLabel(var, _) => {

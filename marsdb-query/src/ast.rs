@@ -210,6 +210,15 @@ pub enum ReturnExpr {
     /// (that's the whole point of the check). `IS NOT NULL` parses to
     /// `Not(IsNull(..))`, reusing the existing `Not` variant.
     IsNull(Box<ReturnExpr>),
+    /// `x IN list` — real Cypher's list membership test, three-valued
+    /// like `=` (`null IN [1]` and `1 IN [null]` are both "unknown", not
+    /// `false`): a definite element match wins outright even past a later
+    /// `null` element, no match with at least one `null` element compared
+    /// is "unknown", no match and no `null` anywhere is a definite
+    /// `false`. Binds *tighter* than a surrounding comparison, same
+    /// precedence tier as `IsNull` (`a = b IN list` is `a = (b IN
+    /// list)`) — see `compare_expr`'s grammar comment.
+    In(Box<ReturnExpr>, Box<ReturnExpr>),
     /// `(n:Foo)`/`(n:Foo:Bar)` used as a boolean expression — `true` iff
     /// the bound node has every listed label, `false` otherwise (a
     /// definite bool, not three-valued — same as `Expr::HasLabel`, the

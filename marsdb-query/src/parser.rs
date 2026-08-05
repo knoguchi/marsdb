@@ -484,11 +484,11 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
         Rule::with_is_null_expr => Ok(parse_with_is_null_expr(inner)?),
         Rule::with_comparison => parse_with_comparison(inner),
         Rule::with_expr => parse_with_expr(inner),
-        Rule::with_bare_expr => Ok(WithExpr::Bare(parse_add_expr(
+        Rule::with_bare_expr => Ok(WithExpr::Bare(parse_null_predicate_expr(
             inner
                 .into_inner()
                 .next()
-                .expect("with_bare_expr has an add_expr"),
+                .expect("with_bare_expr has a null_predicate_expr"),
         )?)),
         r => unreachable!("unexpected with_unary_expr child rule {r:?}"),
     }
@@ -855,7 +855,22 @@ fn parse_null_predicate_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError>
     let mut inner = pair.into_inner();
     let operand = parse_add_expr(inner.next().expect("null_predicate_expr has an add_expr"))?;
     match inner.next() {
-        Some(suffix) => Ok(parse_is_null_suffix(suffix, operand)),
+        Some(suffix) if suffix.as_rule() == Rule::is_null_suffix => {
+            Ok(parse_is_null_suffix(suffix, operand))
+        }
+        Some(suffix) if suffix.as_rule() == Rule::in_suffix => {
+            // `in_suffix = { kw_in ~ add_expr }` -- `kw_in` is atomic
+            // (`@{...}`), so it still produces its own `Pair`; skip past
+            // it to the real `add_expr`.
+            let haystack = parse_add_expr(
+                suffix
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::add_expr)
+                    .expect("in_suffix has an add_expr"),
+            )?;
+            Ok(ReturnExpr::In(Box::new(operand), Box::new(haystack)))
+        }
+        Some(other) => unreachable!("unexpected null_predicate_expr suffix rule {other:?}"),
         None => Ok(operand),
     }
 }
@@ -1464,11 +1479,11 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
         Rule::general_is_null_expr => parse_general_is_null_expr(inner),
         Rule::general_comparison => parse_general_comparison(inner),
         Rule::expr => parse_expr(inner),
-        Rule::general_bare_expr => Ok(Expr::GeneralBare(parse_add_expr(
+        Rule::general_bare_expr => Ok(Expr::GeneralBare(parse_null_predicate_expr(
             inner
                 .into_inner()
                 .next()
-                .expect("general_bare_expr has an add_expr"),
+                .expect("general_bare_expr has a null_predicate_expr"),
         )?)),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
     }

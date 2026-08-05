@@ -3827,6 +3827,95 @@ fn is_null_binds_tighter_than_comparison() {
     assert!(bool_val(&result.rows[0][0]));
 }
 
+/// `x IN list` -- real Cypher's list membership test, previously
+/// unsupported as a general expression (only existed inside a list
+/// comprehension/quantifier's own `filter_expr`). Three-valued like `=`,
+/// and binds *tighter* than a surrounding comparison, same precedence
+/// tier as `IS NULL` (TCK's Precedence3 [6]: `[1,2] = [3,4] IN
+/// [[3,4],false]` is `[1,2] = ([3,4] IN [[3,4],false])`).
+#[test]
+fn in_operator_list_membership_and_precedence() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(&store, "RETURN 3 IN [1, 2, 3] AS r");
+    assert!(bool_val(&result.rows[0][0]));
+
+    let result = run(&store, "RETURN 3 IN [1, 2, 3][0..2] AS r");
+    assert!(!bool_val(&result.rows[0][0]));
+
+    // Binds tighter than `=`: `[3,4] IN [...]` is `true`, so the whole
+    // thing is `[1,2] = true`, which is `false` (never `[1,2] = [3,4]`
+    // first, which would make the IN operand a bool, nonsensical).
+    let result = run(&store, "RETURN [1, 2] = [3, 4] IN [[3, 4], false] AS a");
+    assert!(!bool_val(&result.rows[0][0]));
+
+    // null propagation: an empty list is always definite false regardless
+    // of the needle's nullness; a null element only makes the result
+    // unknown when no earlier element definitely matched.
+    assert!(matches!(
+        run(&store, "RETURN null IN [1, 2] AS r").rows[0][0],
+        Value::Null
+    ));
+    assert!(!bool_val(&run(&store, "RETURN 1 IN [] AS r").rows[0][0]));
+    assert!(matches!(
+        run(&store, "RETURN null IN [] AS r").rows[0][0],
+        Value::Literal(marsdb_query::Literal::Bool(false))
+    ));
+    assert!(bool_val(
+        &run(&store, "RETURN 1 IN [null, 1] AS r").rows[0][0]
+    ));
+    assert!(matches!(
+        run(&store, "RETURN 1 IN [null, 2] AS r").rows[0][0],
+        Value::Null
+    ));
+}
+
+/// `MATCH ... WHERE n.name IN [x IN labels(b) | toLower(x)]` -- `IN` used
+/// directly as a bare WHERE predicate (no comparison operator), needing
+/// `general_bare_expr`'s widening from raw `add_expr` to
+/// `null_predicate_expr`. Also caught a separate, pre-existing bug this
+/// surfaced: `labels()`/`keys()` were both mis-typed as `Kind::Scalar` in
+/// semantic inference (they return a *list* of strings in real Cypher),
+/// wrongly rejecting `[x IN labels(n) | ...]`'s otherwise-valid list
+/// comprehension source.
+#[test]
+fn in_as_bare_where_predicate_with_labels_list_comprehension() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A {name: 'c'})-[:T]->(:B), (a)-[:T]->(:C)",
+    );
+
+    let result = run(
+        &store,
+        "MATCH (n)-->(b) WHERE n.name IN [x IN labels(b) | toLower(x)] RETURN n.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "c"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// `CREATE (n {prop: null})` never actually stores `prop` at all in real
+/// Cypher -- the same "setting to null removes/never-creates the
+/// property" rule `SET n.prop = null` already had, but `CREATE`'s own
+/// inline `{...}` map never applied it. Observable via `keys()` (TCK's
+/// Graph8 [8]): a stored `PropertyValue::Null` still shows up as a key,
+/// where a real missing property wouldn't.
+#[test]
+fn create_inline_null_property_is_never_stored() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({exists: 42, missing: null})");
+
+    let result = run(
+        &store,
+        "MATCH (n) RETURN 'exists' IN keys(n) AS a, 'missing' IN keys(n) AS b",
+    );
+    assert!(bool_val(&result.rows[0][0]));
+    assert!(!bool_val(&result.rows[0][1]));
+}
+
 /// Real Cypher's float literal grammar has three shapes beyond plain
 /// `digits.digits`: a leading-dot form with no integer part (`.1`), and
 /// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).
