@@ -394,6 +394,13 @@ pub enum WithExpr {
 #[derive(Debug, Clone)]
 pub struct WithClause {
     pub items: Vec<ReturnItem>,
+    /// `WITH DISTINCT ...` -- dedups the projected rows, same as `RETURN
+    /// DISTINCT` (`Tail::Return`'s own `distinct` flag), applied right
+    /// after projection/aggregation, before `where_clause` (matching
+    /// `WHERE`'s own "only sees the projected/aggregated names" rule for
+    /// an aggregating `WITH` -- `DISTINCT` puts `WITH` in that same
+    /// post-projection-only regime).
+    pub distinct: bool,
     pub where_clause: Option<WithExpr>,
     pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
     /// Always applied *after* `order_by` (real Cypher's own rule — skip N,

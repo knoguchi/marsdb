@@ -341,9 +341,9 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         // Real Cypher lets `WITH x AS y WHERE ...` see both the pre-WITH
         // binding (`x`) and the new alias (`y`) -- matches the merged-row
         // evaluation `executor::materialize_with` does at runtime for the
-        // same reason (see its docs). Aggregation collapses rows, so
-        // there's no single pre-WITH scope to fall back to there.
-        if crate::executor::has_aggregate(&with.items) {
+        // same reason (see its docs). Aggregation/DISTINCT both collapse
+        // rows, so there's no single pre-WITH scope to fall back to there.
+        if crate::executor::has_aggregate(&with.items) || with.distinct {
             validate_with_expr(expr, &projected)?;
         } else {
             let mut merged = input.clone();
