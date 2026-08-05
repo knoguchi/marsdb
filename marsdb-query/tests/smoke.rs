@@ -3706,6 +3706,63 @@ fn is_null_binds_tighter_than_comparison() {
     assert!(bool_val(&result.rows[0][0]));
 }
 
+/// Real Cypher's float literal grammar has three shapes beyond plain
+/// `digits.digits`: a leading-dot form with no integer part (`.1`), and
+/// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).
+/// `float_literal`'s old grammar only accepted `digits.digits`.
+#[test]
+fn float_literal_accepts_leading_dot_and_exponent_forms() {
+    let store = GraphStore::open_memory().unwrap();
+    let cases: &[(&str, f64)] = &[
+        (".1", 0.1),
+        (".0", 0.0),
+        ("1e9", 1e9),
+        ("1E9", 1e9),
+        (".1e9", 0.1e9),
+        ("1e-5", 1e-5),
+        (".1e-5", 0.1e-5),
+    ];
+    for (text, expected) in cases {
+        let result = run(&store, &format!("RETURN {text} AS x"));
+        match &result.rows[0][0] {
+            Value::Literal(marsdb_query::Literal::Float(f)) => {
+                assert!(
+                    (*f - expected).abs() < 1e-15,
+                    "{text}: got {f}, expected {expected}"
+                );
+            }
+            other => panic!("{text}: expected a float literal, got {other:?}"),
+        }
+    }
+    // A plain integer must stay an Int, not get swept into the widened
+    // float grammar.
+    let result = run(&store, "RETURN 42 AS x");
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::Int(n)) => assert_eq!(*n, 42),
+        other => panic!("expected an int literal, got {other:?}"),
+    }
+}
+
+/// `str::parse::<f64>()` silently returns `f64::INFINITY` for a magnitude
+/// beyond f64's representable range instead of erroring -- real Cypher
+/// requires this to be a compile-time error, not a silently-produced
+/// `inf` literal.
+#[test]
+fn float_literal_overflow_is_a_syntax_error_not_infinity() {
+    let err = marsdb_query::parse("RETURN 1.34E999")
+        .expect_err("a float literal beyond f64's range must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("too large"), "unexpected error: {msg}");
+
+    // Within range -- must still parse fine.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN 1.23456789e308 AS x");
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::Float(f)) => assert!(f.is_finite()),
+        other => panic!("expected a finite float literal, got {other:?}"),
+    }
+}
+
 #[test]
 fn list_comprehension_bare_where_now_parses() {
     // Regression: previously `filter_expr`'s WHERE reused WithExpr, which

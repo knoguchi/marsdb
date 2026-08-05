@@ -1372,12 +1372,25 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
                 .parse()
                 .map_err(|_| QueryError::Syntax("invalid integer literal".into()))?,
         ),
-        Rule::float_literal => Literal::Float(
-            inner
+        Rule::float_literal => {
+            let f: f64 = inner
                 .as_str()
                 .parse()
-                .map_err(|_| QueryError::Syntax("invalid float literal".into()))?,
-        ),
+                .map_err(|_| QueryError::Syntax("invalid float literal".into()))?;
+            // `str::parse::<f64>()` silently returns `f64::INFINITY` for a
+            // magnitude beyond f64's representable range instead of
+            // erroring (`"1e999".parse::<f64>()` is `Ok(inf)`) -- real
+            // Cypher requires this to be a compile-time error, not a
+            // silently-produced `inf` literal (TCK's Literals5 [27],
+            // `FloatingPointOverflow`).
+            if f.is_infinite() {
+                return Err(QueryError::Syntax(format!(
+                    "float literal '{}' is too large to represent",
+                    inner.as_str()
+                )));
+            }
+            Literal::Float(f)
+        }
         Rule::string_literal => {
             let s = inner.as_str();
             Literal::String(unescape_string(&s[1..s.len() - 1])?)

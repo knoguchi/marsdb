@@ -454,7 +454,20 @@ prop_access = { identifier ~ "." ~ identifier }
 
 literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal | param }
 int_literal    = @{ "-"? ~ ASCII_DIGIT+ }
-float_literal  = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+// Real Cypher's float literal has three shapes, tried in this order so
+// pest's ordered choice backtracks correctly when an earlier one doesn't
+// fully apply: `digits.digits`, a leading-dot form with no integer part
+// (`.1`, `.0`), and integer-plus-exponent with no decimal point at all
+// (`1e9`) -- any of the first two can also carry a trailing exponent
+// (`1.5e-10`, `.1e9`). Tried before `int_literal` in the `literal` rule,
+// so a plain `42` (no `.`/exponent, fails every alternative here) falls
+// through to `int_literal` untouched.
+float_literal  = @{ "-"? ~ (
+    (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ exponent_part?)
+    | ("." ~ ASCII_DIGIT+ ~ exponent_part?)
+    | (ASCII_DIGIT+ ~ exponent_part)
+) }
+exponent_part  = { ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+ }
 // `\` escapes the next character (so `\'` doesn't terminate the string
 // early -- without this, `(!"'" ~ ANY)*` has no concept of escaping and
 // `'it\'s'` silently mis-terminates at the escaped quote instead of
