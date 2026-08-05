@@ -110,6 +110,11 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
                             validate_remove_item(item, &scope)?;
                         }
                     }
+                    QueryClause::Create(patterns) => {
+                        for pattern in patterns {
+                            bind_create_pattern(pattern, &mut scope)?;
+                        }
+                    }
                 }
             }
 

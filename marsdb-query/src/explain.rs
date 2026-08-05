@@ -129,6 +129,14 @@ fn explain_clause(
             ));
             Ok(())
         }
+        QueryClause::Create(patterns) => {
+            out.push(format!(
+                "CREATE ({} pattern{})",
+                patterns.len(),
+                if patterns.len() == 1 { "" } else { "s" }
+            ));
+            Ok(())
+        }
     }
 }
 

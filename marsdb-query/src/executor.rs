@@ -1128,6 +1128,21 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+                // `CREATE ... WITH ...` -- unlike Set/Delete/Remove above,
+                // this DOES change every row's bindings (each pattern's
+                // own fresh/reused vars), so `current_rows` is replaced,
+                // not passed through, and `carried_vars` is extended
+                // directly (no bundled `.with` field on this variant to
+                // route through `apply_with_or_carry` the way `Merge`
+                // does above -- the following `WITH` is its own separate
+                // `QueryClause::With` entry, picked up by this same loop's
+                // next iteration, which needs `carried_vars` to already
+                // reflect these new names by then).
+                QueryClause::Create(patterns) => {
+                    let write_txn = require_write_txn(txn);
+                    current_rows = self.materialize_create(write_txn, patterns, &current_rows)?;
+                    carried_vars.extend(patterns.iter().flat_map(pattern_all_vars));
+                }
             }
             guard.check_intermediate_rows(current_rows.len())?;
         }
@@ -3492,6 +3507,7 @@ pub fn is_read_only(stmt: &Statement) -> bool {
                 | QueryClause::Set(_)
                 | QueryClause::Delete { .. }
                 | QueryClause::Remove(_)
+                | QueryClause::Create(_)
         )
     })
 }

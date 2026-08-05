@@ -80,6 +80,12 @@ fn substitute_query_clause(
         // No `$param`-able position -- `RemoveItem` is a bare prop/label
         // path, not a value expression.
         QueryClause::Remove(_) => Ok(()),
+        QueryClause::Create(patterns) => {
+            for pattern in patterns {
+                substitute_pattern(pattern, params)?;
+            }
+            Ok(())
+        }
     }
 }
 
