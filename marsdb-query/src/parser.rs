@@ -45,7 +45,7 @@ fn parse_statement(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     match inner.as_rule() {
         Rule::explain_stmt => parse_explain_stmt(inner),
         Rule::create_index_stmt => parse_create_index_stmt(inner),
-        Rule::create_stmt => parse_create_stmt(inner),
+        Rule::create_stmt_only => parse_create_stmt_only(inner),
         Rule::union_stmt => parse_union_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected statement child rule {r:?}"),
@@ -84,7 +84,7 @@ fn parse_union_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     })
 }
 
-/// `explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt |
+/// `explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt_only |
 /// union_stmt | match_stmt) }` -- one child, the wrapped statement,
 /// dispatched through the same per-rule parsers `parse_statement` itself
 /// uses (not a second copy of `parse_statement`, since `explain_stmt`
@@ -96,7 +96,7 @@ fn parse_explain_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         .expect("explain_stmt wraps exactly one statement");
     let wrapped = match inner.as_rule() {
         Rule::create_index_stmt => parse_create_index_stmt(inner),
-        Rule::create_stmt => parse_create_stmt(inner),
+        Rule::create_stmt_only => parse_create_stmt_only(inner),
         Rule::union_stmt => parse_union_stmt(inner),
         Rule::match_stmt => parse_match_stmt(inner),
         r => unreachable!("unexpected explain_stmt child rule {r:?}"),
@@ -106,6 +106,17 @@ fn parse_explain_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
 
 fn parse_create_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     Ok(Statement::Create(parse_create_patterns(pair)?))
+}
+
+/// `create_stmt_only = { create_stmt ~ !(return_clause | with_clause) }`
+/// -- the lookahead is zero-width (produces no `Pair`), so this rule's
+/// only real child is the wrapped `create_stmt` itself.
+fn parse_create_stmt_only(pair: Pair<Rule>) -> Result<Statement, QueryError> {
+    parse_create_stmt(
+        pair.into_inner()
+            .next()
+            .expect("create_stmt_only wraps a create_stmt"),
+    )
 }
 
 /// `create_index_stmt = { ^"CREATE" ~ ^"INDEX" ~ ^"ON" ~ ":" ~ identifier

@@ -34,7 +34,7 @@ query = { SOI ~ statement ~ ";"? ~ EOI }
 // in Rust, before parsing -- unambiguous there, unlike in this grammar.
 queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 
-// `create_index_stmt` tried before `create_stmt` -- both start with
+// `create_index_stmt` tried before `create_stmt_only` -- both start with
 // `^"CREATE"`, but `pattern` always starts with `(`, never `INDEX`, so
 // ordered choice backtracks cleanly on a plain `CREATE (...)`. `explain_stmt`
 // tried first of all -- it's the only rule starting with `EXPLAIN`, so there's
@@ -43,16 +43,35 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 // `union_stmt` additionally requires at least one trailing `UNION [ALL]
 // match_stmt`; if that's absent, pest backtracks cleanly onto plain
 // `match_stmt` (same ordered-choice-with-backtracking reasoning as
-// `create_index_stmt`/`create_stmt` above), at the cost of reparsing the
+// `create_index_stmt`/`create_stmt_only` above), at the cost of reparsing the
 // first part once on a non-UNION statement -- a normal, cheap PEG tradeoff.
-statement = { explain_stmt | create_index_stmt | create_stmt | union_stmt | match_stmt }
+//
+// A bare top-level `CREATE ...` with nothing meaningful after it --
+// `Statement::Create`'s own dedicated (if functionally equivalent, see
+// below) path. The `!(return_clause | with_clause)` negative lookahead is
+// what keeps this from ever firing for `CREATE (n) RETURN n`/`CREATE (n)
+// WITH n ...` (real, common Cypher -- TCK's Graph3 "Node labels", e.g.
+// `CREATE (node) RETURN labels(node)`, plus many similarly-shaped Create1
+// scenarios): without it, `create_stmt_only` would greedily match just
+// the `CREATE (n)` half and stop -- once one `statement` alternative
+// succeeds, `|` never backtracks into trying a different one just
+// because something *later* fails to parse, so the leftover `RETURN ...`
+// text would fail the whole statement instead of falling through to
+// `match_stmt` below, which already fully handles this shape via its own
+// `mutating_tail`'s `create_stmt ~ return_clause?` (reusing the exact
+// same `parse_create_patterns`/`materialize_create` either way -- see
+// `Executor::execute_create`'s own docs -- so which of the two paths a
+// given query ends up on changes nothing observable about its result,
+// only which `Statement`/`Tail` variant represents it internally).
+statement = { explain_stmt | create_index_stmt | create_stmt_only | union_stmt | match_stmt }
+create_stmt_only = { create_stmt ~ !(return_clause | with_clause) }
 
 // `EXPLAIN <statement>` -- never wraps another `explain_stmt` (real Cypher's
 // own `EXPLAIN EXPLAIN ...` isn't valid either), so the inner alternative
 // list deliberately excludes it rather than reusing `statement` itself.
 // `union_stmt` before `match_stmt` here for the same backtracking reason
 // `statement`'s own alternation needs it.
-explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt | union_stmt | match_stmt) }
+explain_stmt = { ^"EXPLAIN" ~ (create_index_stmt | create_stmt_only | union_stmt | match_stmt) }
 
 // `RETURN 1 AS x UNION RETURN 2 AS x` / `... UNION ALL ...` -- each part is
 // an independent `match_stmt` (own scope, no bindings shared across parts,

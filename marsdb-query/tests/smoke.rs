@@ -3392,6 +3392,44 @@ fn bare_label_predicate_as_return_expr() {
     );
 }
 
+/// A standalone (no preceding `MATCH`) `CREATE ... RETURN ...`/`EXPLAIN
+/// CREATE ... RETURN ...` -- TCK's Graph3 "Node labels" (e.g. `CREATE
+/// (node) RETURN labels(node)`) and many similarly-shaped Create1
+/// scenarios. `create_stmt`'s own top-level `statement` alternative used
+/// to greedily match just the `CREATE (...)` half and leave `RETURN ...`
+/// unconsumed (a real parse failure) since a successful `|` alternative
+/// is never revisited just because something later fails to parse --
+/// `create_stmt_only`'s `!(return_clause | with_clause)` lookahead is
+/// what now lets this correctly fall through to `match_stmt`'s own
+/// `mutating_tail` instead, which already fully supports it.
+#[test]
+fn standalone_create_followed_by_return() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "CREATE (node) RETURN labels(node)");
+    assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
+
+    let result = run(
+        &store,
+        "CREATE (node:Foo:Bar {name: 'Mattias'}) RETURN labels(node)",
+    );
+    let mut labels = list_str_values(&result.rows[0][0]);
+    labels.sort();
+    assert_eq!(labels, vec!["Bar".to_string(), "Foo".to_string()]);
+
+    // The plain, nothing-after shape (Statement::Create) must still work
+    // unaffected.
+    run(&store, "CREATE (:X), (:Y)");
+    let result = run(&store, "MATCH (n) RETURN count(n) AS c");
+    assert_eq!(int(&result.rows[0][0]), 4);
+
+    // EXPLAIN has the identical trap (its own `create_stmt`-in-ordered-
+    // choice list) -- must not error for either shape.
+    let stmt = parse("EXPLAIN CREATE (:Q)").unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_ok());
+    let stmt = parse("EXPLAIN CREATE (n:Q) RETURN n").unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_ok());
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already
