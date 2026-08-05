@@ -198,14 +198,7 @@ pub fn build_match_plan(
             for (key, expr) in &rel.props {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: Expr::Compare(
-                        PropAccess {
-                            var: rel_var.clone(),
-                            prop: key.clone(),
-                        },
-                        CompareOp::Eq,
-                        require_literal_pattern_prop(key, expr)?,
-                    ),
+                    predicate: pattern_prop_predicate(rel_var, key, expr),
                 };
             }
             for prior in &prior_rel_vars {
@@ -273,12 +266,8 @@ fn scan_for(var: &str, node: &NodePattern) -> Result<LogicalPlan, QueryError> {
 /// Inline node-pattern properties (`(a:Person {name:'Alice'})`) and any
 /// labels not already handled by a preceding scan (`skip` labels from the
 /// front) compile to the same Filter machinery as a WHERE clause, just
-/// synthesized from the pattern. `MATCH`'s inline `{...}` (unlike
-/// `CREATE`'s, see `Executor::eval_props_to_values`) must resolve to a
-/// plain `Literal` at plan-build time, before any row exists to evaluate
-/// a real expression against — `require_literal_pattern_prop` below
-/// rejects anything else with a clear error rather than this silently
-/// matching nothing.
+/// synthesized from the pattern -- see `pattern_prop_predicate`'s own
+/// docs for the literal-vs-computed split.
 fn wrap_labels_and_props(
     plan: LogicalPlan,
     var: &str,
@@ -293,17 +282,9 @@ fn wrap_labels_and_props(
         };
     }
     for (key, expr) in &node.props {
-        let predicate = Expr::Compare(
-            PropAccess {
-                var: var.to_string(),
-                prop: key.clone(),
-            },
-            CompareOp::Eq,
-            require_literal_pattern_prop(key, expr)?,
-        );
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
-            predicate,
+            predicate: pattern_prop_predicate(var, key, expr),
         };
     }
     Ok(plan)
@@ -338,20 +319,25 @@ fn rebuild_and(mut exprs: Vec<Expr>) -> Option<Expr> {
     )
 }
 
-/// A `MATCH`/`MERGE` pattern's inline `{key: value}` must be a plain
-/// literal (real Cypher's own restriction too — `MATCH (n {x: f()})`
-/// isn't valid there either) since it compiles straight into a `Filter`
-/// predicate at plan-build time, before any row/graph access exists to
-/// evaluate a computed expression against. `CREATE`'s `{...}` doesn't go
-/// through this at all (see `Executor::eval_props_to_values`), which is
-/// what actually lets `CREATE (:Val {d: date({year: 1984, ...})})` work.
-fn require_literal_pattern_prop(key: &str, expr: &ReturnExpr) -> Result<Literal, QueryError> {
+/// A `MATCH`/`MERGE` pattern's inline `{key: value}` -- a plain literal
+/// compiles to the narrow `Expr::Compare(PropAccess, Eq, Literal)` shape
+/// (the only one `apply_index_seeks` recognizes, so this is what keeps a
+/// literal pattern property index-seek-eligible), anything else (a bound
+/// variable, a function call, ...) compiles to `Expr::GeneralCompare`
+/// instead -- a generic post-scan filter, never index-seek-eligible, but
+/// evaluated per-row against the row's own bindings via
+/// `Executor::eval_expr` (real Cypher fully supports this, e.g. `WITH 42
+/// AS var MERGE (c:N {var: var})`, TCK's Merge1 [8] -- an earlier version
+/// of this codebase rejected it outright at plan-build time, which was
+/// wrong, not a real Cypher restriction).
+fn pattern_prop_predicate(var: &str, key: &str, expr: &ReturnExpr) -> Expr {
+    let access = PropAccess {
+        var: var.to_string(),
+        prop: key.to_string(),
+    };
     match expr {
-        ReturnExpr::Lit(lit) => Ok(lit.clone()),
-        _ => Err(QueryError::Semantic(format!(
-            "MATCH/MERGE pattern property '{key}' must be a literal value, not a computed expression — \
-             only CREATE's inline {{...}} supports that"
-        ))),
+        ReturnExpr::Lit(lit) => Expr::Compare(access, CompareOp::Eq, lit.clone()),
+        other => Expr::GeneralCompare(ReturnExpr::Prop(access), CompareOp::Eq, other.clone()),
     }
 }
 
