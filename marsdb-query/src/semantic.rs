@@ -615,15 +615,30 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                         }
                         Kind::List(Box::new(Kind::Edge))
                     }
-                    // `keys`/`labels`/`type`/`properties`/`id`/`size`/
-                    // `exists` accept a node, relationship, or (for keys/
+                    // Unlike `keys`/`labels`/`id`/`size`/`exists` (each
+                    // polymorphic over several kinds, so left to the
+                    // runtime's own `QueryError::Type` below), `type()`
+                    // only ever accepts a relationship -- checked here so
+                    // `MATCH (r) RETURN type(r)` (`r` a *node*, from the
+                    // pattern itself) is a compile-time error even when
+                    // the `MATCH` matches zero rows, not only a runtime
+                    // one a zero-row match would silently skip (TCK's
+                    // Graph4 [7]).
+                    "type" => {
+                        if let Some(kind) = arg_kinds.first() {
+                            require_compatible_kind(kind, &Kind::Edge, "type() argument")?;
+                        }
+                        Kind::Scalar
+                    }
+                    // `keys`/`labels`/`properties`/`id`/`size`/`exists`
+                    // accept a node, relationship, or (for keys/
                     // properties/size) a map/list/string too, depending on
                     // the specific function -- narrower than what the
                     // runtime (`executor::call_builtin`'s own arms) already
                     // enforces with a clear `QueryError::Type`, so no
                     // additional structural check is added here beyond
                     // "the call itself is a recognized function."
-                    "keys" | "labels" | "type" | "id" | "size" | "exists" => Kind::Scalar,
+                    "keys" | "labels" | "id" | "size" | "exists" => Kind::Scalar,
                     "properties" => Kind::Map,
                     "head" | "last" => match arg_kinds.first() {
                         Some(Kind::List(inner)) => (**inner).clone(),

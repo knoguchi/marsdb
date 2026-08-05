@@ -2445,6 +2445,16 @@ impl<'a> Executor<'a> {
     /// reason -- `d.year`/`d.months`/etc are real component accessors
     /// (Temporal5's whole scenario shape, `WITH v.date AS d ... RETURN
     /// d.year`), not a stored property `lookup_prop` could ever find.
+    ///
+    /// Only a node, relationship, map, or temporal value has any `.prop`
+    /// to access at all -- a plain scalar (`Bool`/`Int`/`Float`/`String`)
+    /// or a `List` is a real type error here (real Cypher's own
+    /// `InvalidArgumentType` is raised at *compile* time; this codebase's
+    /// `Kind` system can't see through a WITH-projected value's real
+    /// runtime shape to catch it any earlier -- see `infer_expr`'s own
+    /// `Kind::Scalar` docs -- so it surfaces here instead), not a silent
+    /// `null` (TCK's Graph6 [9] / Map1 [6]). `null` itself is exempt --
+    /// real Cypher's null propagation rule, not a type error.
     fn lookup_prop_value(
         &self,
         txn: Txn,
@@ -2453,10 +2463,21 @@ impl<'a> Executor<'a> {
     ) -> Result<Value, QueryError> {
         match row.get(&pa.var) {
             Some(Binding::Map(m)) => Ok(m.get(&pa.prop).cloned().unwrap_or(Value::Null)),
-            Some(Binding::Value(pv)) => Ok(match temporal_component(pv, &pa.prop) {
-                Some(component) => Value::Property(component),
-                None => Value::Null,
-            }),
+            Some(Binding::Value(PropertyValue::Null)) => Ok(Value::Null),
+            Some(Binding::Value(pv)) => match temporal_component(pv, &pa.prop) {
+                Some(component) => Ok(Value::Property(component)),
+                None if is_temporal_property_value(pv) => Ok(Value::Null),
+                None => Err(QueryError::Type(format!(
+                    "'{}' can't have properties accessed on it -- property access requires a \
+                     node, relationship, map, or temporal value",
+                    pa.var
+                ))),
+            },
+            Some(Binding::List(_)) => Err(QueryError::Type(format!(
+                "'{}' can't have properties accessed on it -- property access requires a node, \
+                 relationship, map, or temporal value, not a list",
+                pa.var
+            ))),
             Some(_) => Ok(match self.lookup_prop(txn, pa, row)? {
                 Some(PropertyValue::Null) | None => Value::Null,
                 Some(pv) => Value::Property(pv),
@@ -4958,12 +4979,16 @@ fn to_float(v: &Value) -> Result<Value, QueryError> {
                 Err(_) => Value::Null,
             }
         }
-        Value::Property(PropertyValue::Bool(_) | PropertyValue::Null)
-        | Value::Literal(Literal::Bool(_) | Literal::Null)
-        | Value::Null => Value::Null,
+        Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
+            Value::Null
+        }
         Value::Literal(Literal::Param(name)) => {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
+        // `Bool` is a real, deliberate type error, not `null` -- unlike
+        // an unparseable *string*, which real Cypher does treat as
+        // `null` (a string always at least plausibly *could* be numeric
+        // text), a boolean never could be (TCK's TypeConversion3 [6]).
         other => {
             return Err(QueryError::Type(format!(
                 "toFloat() cannot convert {other:?} to a float"
@@ -6638,6 +6663,25 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 /// recognized component (or a non-temporal `PropertyValue`), the same
 /// "treat as absent, not an error" convention every other `.prop` access
 /// already follows for an unknown property.
+/// True for the 6 `PropertyValue` variants that have a real `.prop`
+/// component-access interface (`temporal_component`) -- distinguishes
+/// "a temporal value with an *unrecognized* property name" (still `null`,
+/// same as a node/edge's own missing-property rule) from "a plain scalar
+/// with *no* `.prop` interface at all" (a real type error, see
+/// `lookup_prop_value`'s docs) -- `temporal_component` alone can't tell
+/// these apart, since it returns `None` for both.
+fn is_temporal_property_value(pv: &PropertyValue) -> bool {
+    matches!(
+        pv,
+        PropertyValue::Date(_)
+            | PropertyValue::Duration { .. }
+            | PropertyValue::LocalTime(_)
+            | PropertyValue::Time { .. }
+            | PropertyValue::LocalDateTime { .. }
+            | PropertyValue::DateTime { .. }
+    )
+}
+
 fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
     match pv {
         PropertyValue::Date(d) => temporal::date_component(*d, prop).map(PropertyValue::Int),
