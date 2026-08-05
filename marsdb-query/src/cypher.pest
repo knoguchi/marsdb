@@ -48,23 +48,26 @@ queries = { SOI ~ statement ~ (";" ~ statement)* ~ EOI }
 //
 // A bare top-level `CREATE ...` with nothing meaningful after it --
 // `Statement::Create`'s own dedicated (if functionally equivalent, see
-// below) path. The `!(return_clause | with_clause)` negative lookahead is
-// what keeps this from ever firing for `CREATE (n) RETURN n`/`CREATE (n)
-// WITH n ...` (real, common Cypher -- TCK's Graph3 "Node labels", e.g.
-// `CREATE (node) RETURN labels(node)`, plus many similarly-shaped Create1
-// scenarios): without it, `create_stmt_only` would greedily match just
-// the `CREATE (n)` half and stop -- once one `statement` alternative
-// succeeds, `|` never backtracks into trying a different one just
-// because something *later* fails to parse, so the leftover `RETURN ...`
-// text would fail the whole statement instead of falling through to
-// `match_stmt` below, which already fully handles this shape via its own
-// `mutating_tail`'s `create_stmt ~ return_clause?` (reusing the exact
-// same `parse_create_patterns`/`materialize_create` either way -- see
-// `Executor::execute_create`'s own docs -- so which of the two paths a
-// given query ends up on changes nothing observable about its result,
-// only which `Statement`/`Tail` variant represents it internally).
+// below) path. The `!(return_clause | chainable_after_create)` negative
+// lookahead is what keeps this from ever firing for `CREATE (n) RETURN
+// n`/`CREATE (n) WITH n ...`/`CREATE (n) SET n.x = 1` (real, common
+// Cypher -- TCK's Graph3 "Node labels", e.g. `CREATE (node) RETURN
+// labels(node)`, plus many similarly-shaped Create1 scenarios, and
+// Set1 [6]/[7]'s `CREATE (a {...}) SET a.prop = ...`): without it,
+// `create_stmt_only` would greedily match just the `CREATE (n)` half and
+// stop -- once one `statement` alternative succeeds, `|` never
+// backtracks into trying a different one just because something *later*
+// fails to parse, so the leftover text would fail the whole statement
+// instead of falling through to `match_stmt` below, which already fully
+// handles every one of those shapes via `clause*`'s own `create_as_clause`
+// (chained) or `mutating_tail`'s `create_stmt ~ return_clause?`
+// (terminal) -- reusing the exact same `parse_create_patterns`/
+// `materialize_create` either way (see `Executor::execute_create`'s own
+// docs), so which path a given query ends up on changes nothing
+// observable about its result, only which `Statement`/`Tail`/
+// `QueryClause` variant represents it internally.
 statement = { explain_stmt | create_index_stmt | create_stmt_only | union_stmt | match_stmt }
-create_stmt_only = { create_stmt ~ !(return_clause | with_clause) }
+create_stmt_only = { create_stmt ~ !(return_clause | chainable_after_create) }
 
 // `EXPLAIN <statement>` -- never wraps another `explain_stmt` (real Cypher's
 // own `EXPLAIN EXPLAIN ...` isn't valid either), so the inner alternative
@@ -144,13 +147,20 @@ remove_as_clause  = { remove_clause ~ &with_clause }
 // Same positive-lookahead technique again, applied to CREATE -- TCK's
 // Create3/Match4/Match5/Match6 fixtures routinely chain a leading
 // `CREATE (...) WITH ... UNWIND ... CREATE (...) WITH ...` sequence,
-// which the pre-existing `mutating_tail`/top-level `create_stmt_only`
-// paths only ever let be the very last (optionally RETURN-followed)
-// thing in a statement. Same non-regression argument: only fires when a
-// real `WITH` is definitely next, so a terminal `CREATE`/`CREATE ...
-// RETURN` (via `mutating_tail`) and a truly bare top-level `CREATE` (via
-// `create_stmt_only`) are both unaffected.
-create_as_clause  = { create_stmt ~ &with_clause }
+// and Set1 [6]/[7] chain `CREATE (a {...}) SET a.prop = ...` with no
+// `WITH` at all between the two -- both need CREATE to be a real
+// mid-statement clause, not only ever the very last (optionally
+// RETURN-followed) thing in a statement. The lookahead is `&
+// chainable_after_create` (any clause CREATE could sensibly run into:
+// `WITH`, or another mutating clause), not just `&with_clause` --
+// widened for the SET-with-no-WITH case, not narrowed. Same non-
+// regression argument as before: only fires when one of those is
+// definitely next, so a terminal `CREATE`/`CREATE ... RETURN` (via
+// `mutating_tail`) and a truly bare top-level `CREATE` (via
+// `create_stmt_only`, which uses the same lookahead, negated) are both
+// unaffected.
+create_as_clause  = { create_stmt ~ &chainable_after_create }
+chainable_after_create = { with_clause | set_clause | detach_delete_clause | delete_clause | remove_clause | create_stmt }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 
@@ -487,7 +497,14 @@ set_clause     = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
 // correctness requirement (a bare `identifier` alternative failing to
 // find `+=`/`=` right after it is a clean failure, not a partial-match
 // trap, so the ordering among these four is safe either way).
-set_item        = { (prop_access ~ "=" ~ return_expr) | set_label_item | set_map_merge | set_map_replace }
+set_item        = { (prop_access ~ "=" ~ return_expr) | (paren_prop_access ~ "=" ~ return_expr) | set_label_item | set_map_merge | set_map_replace }
+// `SET (n).name = 'x'` -- a parenthesized-variable target, same meaning
+// as the bare `n.name` form -- TCK's Set1 [3]/[4] ("selecting the node/
+// relationship using a simple expression"). Scoped to a parenthesized
+// bare identifier, not a general parenthesized expression (real Cypher
+// allows the latter too, but no TCK scenario needs it, so it's not
+// invented here).
+paren_prop_access = { "(" ~ identifier ~ ")" ~ "." ~ identifier }
 set_label_item  = { identifier ~ (":" ~ identifier)+ }
 // `SET n += {...}` -- merges the map's own keys into n's existing
 // properties (a `null` value removes that one key, anything else sets

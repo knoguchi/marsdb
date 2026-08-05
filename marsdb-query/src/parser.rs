@@ -792,6 +792,26 @@ fn parse_set_item(pair: Pair<Rule>) -> Result<SetItem, QueryError> {
                 parse_return_expr(value_pair)?,
             ))
         }
+        Rule::paren_prop_access => {
+            let mut parts = first.into_inner();
+            let var = parts
+                .next()
+                .expect("paren_prop_access has a var identifier")
+                .as_str()
+                .to_string();
+            let prop = parts
+                .next()
+                .expect("paren_prop_access has a prop identifier")
+                .as_str()
+                .to_string();
+            let value_pair = inner
+                .next()
+                .expect("set_item's paren_prop_access form has a return_expr");
+            Ok(SetItem::Prop(
+                PropAccess { var, prop },
+                parse_return_expr(value_pair)?,
+            ))
+        }
         Rule::set_label_item => {
             let (var, labels) = parse_set_label_item(first);
             Ok(SetItem::Labels(var, labels))

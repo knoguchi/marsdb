@@ -5991,6 +5991,61 @@ fn set_map_assign_replace_and_merge() {
     assert_eq!(str_value(&result.rows[0][0]), "A");
 }
 
+/// `SET (n).name = 'x'` -- a parenthesized-variable target, same meaning
+/// as bare `n.name` (TCK's Set1 [3]/[4]).
+#[test]
+fn set_parenthesized_target() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)");
+    let result = run(&store, "MATCH (n:A) SET (n).name = 'neo4j' RETURN n.name");
+    assert_eq!(str_value(&result.rows[0][0]), "neo4j");
+}
+
+/// `CREATE (a {...}) SET a.prop = ...` -- CREATE followed directly by
+/// another mutating clause, no `WITH` in between at all (TCK's Set1
+/// [6]/[7]) -- a real gap `create_as_clause`'s own WITH-only lookahead
+/// didn't cover. Also confirms a property-sourced list survives a list
+/// concat (`a.numbers + [4, 5]`) and a list comprehension over a
+/// property access (`[i IN n.numbers | ...]`, TCK's Set1 [5] -- needs
+/// `list_element` to not reject a property access's `Kind::Scalar`
+/// outright, the same widening `bind_unwind` already has).
+#[test]
+fn create_followed_directly_by_set_no_with() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "CREATE (a {numbers: [1, 2, 3]}) SET a.numbers = a.numbers + [4, 5] RETURN a.numbers",
+    );
+    let ints: Vec<i64> = match &result.rows[0][0] {
+        Value::List(items) => items.iter().map(int).collect(),
+        other => panic!("expected a list, got {other:?}"),
+    };
+    assert_eq!(ints, vec![1, 2, 3, 4, 5]);
+
+    run(&store, "CREATE (:N)");
+    let result = run(
+        &store,
+        "MATCH (n:N) SET n.numbers = [1, 2, 3] RETURN [i IN n.numbers | i / 2.0] AS x",
+    );
+    let floats: Vec<f64> = match &result.rows[0][0] {
+        Value::List(items) => items.iter().map(as_float).collect(),
+        other => panic!("expected a list, got {other:?}"),
+    };
+    assert_eq!(floats, vec![0.5, 1.0, 1.5]);
+
+    // The pre-existing `CREATE ... WITH ...` (#110) and plain standalone
+    // `CREATE ... RETURN ...`/bare-`CREATE` (#106) shapes must still work
+    // unaffected -- create_as_clause's lookahead grew wider, not
+    // narrower.
+    let result = run(
+        &store,
+        "CREATE (a) WITH a WITH * CREATE (b) CREATE (a)<-[:T]-(b)",
+    );
+    assert!(result.rows.is_empty());
+    let result = run(&store, "CREATE (node) RETURN labels(node)");
+    assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
+}
+
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
 // MATCH...CREATE followed directly by a RETURN in the same statement) ---
 
