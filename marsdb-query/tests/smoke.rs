@@ -1734,6 +1734,76 @@ fn path_equality_compares_nodes_and_relationships_not_always_false() {
     assert!(!bool_val(&result.rows[0][0]));
 }
 
+/// `MATCH (a:A), (b:B)` -- a genuine disjoint cross join, not a
+/// continuation (`b` doesn't continue from `a`'s pattern). Real Cypher's
+/// own implicit-join shape (TCK's Merge6/Merge7), previously rejected
+/// outright since `group_into_linear_patterns` used to require every
+/// comma-separated pattern to continue the previous one.
+#[test]
+fn comma_separated_match_patterns_cross_join() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A), (:A), (:B)");
+
+    let result = run(&store, "MATCH (a:A), (b:B) RETURN count(*) AS c");
+    assert_eq!(int(&result.rows[0][0]), 2);
+}
+
+/// A later comma-separated group can reference a variable from an
+/// even-earlier group, not just the immediately-preceding one -- the
+/// executor's existing already-bound-variable handling resolves it once
+/// both clauses run in order, no special grouping logic needed.
+#[test]
+fn comma_separated_match_pattern_references_an_earlier_group() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:KNOWS]->(:B)");
+    run(&store, "CREATE (:A)");
+    run(&store, "CREATE (:B)");
+
+    let result = run(
+        &store,
+        "MATCH (a:A), (b:B), (a)-[r:KNOWS]->(b) RETURN type(r)",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "KNOWS"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// A comma-separated cross join followed directly by `MERGE` -- the
+/// disjoint groups become separate `QueryClause::Match` entries, and
+/// `MERGE` still sees both `a`/`b` bound by the time it runs (TCK's
+/// Merge6 [1]).
+#[test]
+fn comma_separated_match_cross_join_feeds_a_following_merge() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A), (:B)");
+
+    run(
+        &store,
+        "MATCH (a:A), (b:B) MERGE (a)-[:KNOWS]->(b) ON CREATE SET b.created = 1",
+    );
+    let result = run(&store, "MATCH (b:B) RETURN b.created");
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// MERGE might need to *create* its relationship on no-match, and a
+/// brand new edge with no type is meaningless -- same requirement CREATE
+/// already had, but `bind_merge` never checked it (TCK's Merge5 [24]).
+#[test]
+fn merge_requires_an_explicit_relationship_type() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH (a), (b) MERGE (a)-[NO_COLON]->(b)").unwrap();
+    let err = Executor::new(&store)
+        .execute(&stmt)
+        .expect_err("an untyped MERGE relationship pattern must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("explicit relationship type"),
+        "unexpected error: {msg}"
+    );
+}
+
 #[test]
 fn chaining_past_multiple_with_boundaries_works() {
     let store = GraphStore::open_memory().unwrap();

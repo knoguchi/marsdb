@@ -213,6 +213,15 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
                 )));
             }
         }
+        // Same reasoning as CREATE's own check -- MERGE might need to
+        // *create* this relationship on no-match, and a brand new edge
+        // with no type is meaningless (TCK's Merge5 [24]).
+        if rel.rel_type.is_none() {
+            return Err(semantic(
+                "MERGE requires an explicit relationship type (e.g. -[:KNOWS]->) -- an untyped \
+                 relationship pattern can't be created if the MERGE doesn't find a match",
+            ));
+        }
     }
     bind_match_pattern(pattern, scope)?;
     for item in clause.on_create.iter().chain(&clause.on_match) {
