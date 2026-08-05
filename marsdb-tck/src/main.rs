@@ -93,6 +93,44 @@ fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Runs a `having executed:` setup block -- tries it as one `;`-separated
+/// batch first (the common case, and what a real Cypher submission would
+/// require). The openCypher TCK's own fixture convention often instead
+/// writes each statement on its own line with *no* `;` at all
+/// (`CREATE (:N)\nCREATE (:N)\n...`, e.g. Remove3's bulk-fixture
+/// scenarios) -- MarsDB's own `queries` grammar rule can't safely accept
+/// bare adjacency as a statement separator (`match_stmt`, one of
+/// `statement`'s alternatives, can itself match zero-width, so any
+/// repetition shaped like `(... | statement)*` is provably unbounded --
+/// confirmed by pest's own static "cannot fail and will repeat
+/// infinitely" check when this was tried at the grammar level), so this
+/// is handled here instead: on failure, split into lines and only fall
+/// back to running each one as its own statement if *every* line
+/// independently parses as one complete, self-contained statement --
+/// otherwise a real multi-line single statement (e.g. a pattern list
+/// spanning lines) would be silently, wrongly split, so this bails out
+/// and reports the original batch error instead of guessing.
+fn execute_setup_block(db: &Database, cypher: &str) -> Result<(), marsdb::Error> {
+    if db.execute_batch(cypher).is_ok() {
+        return Ok(());
+    }
+    let lines: Vec<&str> = cypher
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > 1 && lines.iter().all(|l| marsdb_query::parse(l).is_ok()) {
+        for line in lines {
+            db.execute(line)?;
+        }
+        return Ok(());
+    }
+    // Fall through to the original batch error for an honest failure
+    // reason, not the fallback's own (misleading, since the fallback
+    // never ran) success/failure.
+    db.execute_batch(cypher).map(|_| ())
+}
+
 fn run_scenario(scenario: &Scenario) -> (Outcome, Option<String>) {
     let db = Database::in_memory().expect("in-memory database always opens");
 
@@ -109,7 +147,7 @@ fn run_scenario(scenario: &Scenario) -> (Outcome, Option<String>) {
             }
         }
         for stmt in &scenario.setup_cypher {
-            db.execute_batch(stmt)?;
+            execute_setup_block(&db, stmt)?;
         }
         Ok(())
     })();

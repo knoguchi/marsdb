@@ -155,21 +155,11 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     }
 
     // Mirrors real Cypher's rule that multiple reading clauses need a WITH
-    // between them, and additionally caps chaining at one WITH boundary
-    // total — nothing IS1-7 needs requires more, and a hand-rolled parser
-    // is safer erroring on untested shapes than silently mishandling them.
-    // OPTIONAL MATCH and UNWIND are both exempt from the WITH-separation
-    // requirement (matching real Cypher: `MATCH (a) OPTIONAL MATCH (b) ...`
-    // and `MATCH (a) UNWIND [1,2] AS x ...` are both valid without a WITH
-    // between them — they continue in the same scope rather than starting
-    // a fresh reading context). The one-WITH-total cap still counts every
-    // clause kind's `with` uniformly.
-    let with_count = clauses.iter().filter(|c| clause_with(c).is_some()).count();
-    if with_count > 1 {
-        return Err(QueryError::Syntax(
-            "chaining past one WITH boundary in a single MATCH isn't supported yet".into(),
-        ));
-    }
+    // between them. OPTIONAL MATCH and UNWIND are both exempt from the
+    // WITH-separation requirement (matching real Cypher: `MATCH (a)
+    // OPTIONAL MATCH (b) ...` and `MATCH (a) UNWIND [1,2] AS x ...` are
+    // both valid without a WITH between them — they continue in the same
+    // scope rather than starting a fresh reading context).
     for i in 0..clauses.len() {
         let (QueryClause::Match(part), Some(QueryClause::Match(next))) =
             (&clauses[i], clauses.get(i + 1))
@@ -201,18 +191,6 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
         skip,
         limit,
     })
-}
-
-fn clause_with(clause: &QueryClause) -> Option<&WithClause> {
-    match clause {
-        QueryClause::Match(part) => part.with.as_ref(),
-        QueryClause::Unwind(u) => u.with.as_ref(),
-        QueryClause::Merge(m) => m.with.as_ref(),
-        // A standalone leading WITH *is* a WITH boundary itself, not a
-        // trailing suffix of one -- still counts toward the "at most one
-        // WITH boundary per statement" cap the same way.
-        QueryClause::With(with) => Some(with),
-    }
 }
 
 fn parse_clause(pair: Pair<Rule>) -> Result<QueryClause, QueryError> {
