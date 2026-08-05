@@ -386,6 +386,7 @@ fn format_expr(expr: &Expr) -> String {
             format!("{l:?} {} {r:?}", format_compare_op(*op))
         }
         Expr::GeneralIsNull(e) => format!("{e:?} IS NULL"),
+        Expr::GeneralBare(e) => format!("{e:?}"),
     }
 }
 

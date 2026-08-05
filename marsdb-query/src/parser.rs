@@ -463,6 +463,12 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
         Rule::with_is_null_expr => Ok(parse_with_is_null_expr(inner)?),
         Rule::with_comparison => parse_with_comparison(inner),
         Rule::with_expr => parse_with_expr(inner),
+        Rule::with_bare_expr => Ok(WithExpr::Bare(parse_add_expr(
+            inner
+                .into_inner()
+                .next()
+                .expect("with_bare_expr has an add_expr"),
+        )?)),
         r => unreachable!("unexpected with_unary_expr child rule {r:?}"),
     }
 }
@@ -1420,6 +1426,12 @@ fn parse_unary_expr(pair: Pair<Rule>) -> Result<Expr, QueryError> {
         Rule::general_is_null_expr => parse_general_is_null_expr(inner),
         Rule::general_comparison => parse_general_comparison(inner),
         Rule::expr => parse_expr(inner),
+        Rule::general_bare_expr => Ok(Expr::GeneralBare(parse_add_expr(
+            inner
+                .into_inner()
+                .next()
+                .expect("general_bare_expr has an add_expr"),
+        )?)),
         r => unreachable!("unexpected unary_expr child rule {r:?}"),
     }
 }

@@ -313,7 +313,7 @@ with_and_expr     = { with_unary_expr ~ (^"AND" ~ with_unary_expr)* }
 // `with_is_null_expr` tried before `with_comparison` -- both start with
 // `add_expr`, but `with_comparison` requires a `compare_op` to follow,
 // which `kw_is` never is, so ordered choice backtracks cleanly.
-with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_is_null_expr | with_comparison | ("(" ~ with_expr ~ ")") }
+with_unary_expr   = { (^"NOT" ~ with_unary_expr) | with_is_null_expr | with_comparison | ("(" ~ with_expr ~ ")") | with_bare_expr }
 // `x IS NULL` / `x IS NOT NULL` where `x` is any `add_expr`, not just a
 // property access -- real Cypher's WITH...WHERE needs this for a whole
 // bound var (`WHERE r IS NULL`, checking an OPTIONAL MATCH miss), not
@@ -332,6 +332,13 @@ with_is_null_expr = { add_expr ~ is_null_suffix }
 // so it's `add_expr` too now, same as pattern-level `Expr::Compare` needed
 // widening for chained comparisons.
 with_comparison   = { add_expr ~ compare_op ~ add_expr }
+// Final fallback, tried after `with_comparison`/`with_is_null_expr`/the
+// parenthesized-`with_expr` alt all fail -- a boolean-valued expression
+// used directly as a predicate, no comparison operator at all (`WHERE
+// single(x IN list WHERE x = 2) OR all(...)`, `WHERE n.flag`). Just
+// `add_expr` (evaluated via `value_to_bool3` at runtime, not coerced by
+// the grammar), same operand type every other `with_*` predicate uses.
+with_bare_expr    = { add_expr }
 
 // Any expression, not just a bare identifier -- real Cypher's DELETE
 // target can be `list[0]`, `map.key`, a whole named path (deletes every
@@ -417,9 +424,13 @@ and_expr   = { unary_expr ~ (^"AND" ~ unary_expr)* }
 // Never index-seek-eligible (see `planner::apply_index_seeks`, which
 // only recognizes the narrower `Expr::Compare`) -- always a generic
 // post-scan `Filter`, same as `PropCompare` already is.
-unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | general_is_null_expr | general_comparison | ("(" ~ expr ~ ")") }
+unary_expr    = { (^"NOT" ~ unary_expr) | is_null_expr | comparison | label_predicate | var_compare | general_is_null_expr | general_comparison | ("(" ~ expr ~ ")") | general_bare_expr }
 general_comparison    = { add_expr ~ compare_op ~ add_expr }
 general_is_null_expr  = { add_expr ~ is_null_suffix }
+// Final fallback -- same reasoning/shape as `with_bare_expr`, reused here
+// for a bare MATCH's WHERE (`WHERE single(x IN list WHERE x = 2) OR
+// all(...)`, `WHERE n.flag`).
+general_bare_expr     = { add_expr }
 // RHS is `prop_access` too, not just `literal` -- real Cypher's WHERE
 // routinely compares two properties (`a.id = b.id`), not just a property
 // against a constant. Only the `literal` shape is eligible for the
