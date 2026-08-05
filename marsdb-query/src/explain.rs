@@ -103,6 +103,32 @@ fn explain_clause(
             ));
             Ok(())
         }
+        QueryClause::Delete { items, detach } => {
+            out.push(format!(
+                "{}DELETE {}",
+                if *detach { "DETACH " } else { "" },
+                items
+                    .iter()
+                    .map(|e| format!("{e:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            Ok(())
+        }
+        QueryClause::Remove(items) => {
+            out.push(format!(
+                "REMOVE {}",
+                items
+                    .iter()
+                    .map(|item| match item {
+                        RemoveItem::Prop(pa) => format!("{}.{}", pa.var, pa.prop),
+                        RemoveItem::Labels(var, labels) => format!("{var}:{}", labels.join(":")),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            Ok(())
+        }
     }
 }
 

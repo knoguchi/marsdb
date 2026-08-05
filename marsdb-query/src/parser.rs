@@ -206,6 +206,31 @@ fn parse_clause(pair: Pair<Rule>) -> Result<Vec<QueryClause>, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(vec![QueryClause::Set(items)])
         }
+        Rule::delete_as_clause => {
+            let delete_pair = inner
+                .into_inner()
+                .next()
+                .expect("delete_as_clause has a detach_delete_clause or delete_clause");
+            let detach = delete_pair.as_rule() == Rule::detach_delete_clause;
+            let items = delete_pair
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::return_expr)
+                .map(parse_return_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(vec![QueryClause::Delete { items, detach }])
+        }
+        Rule::remove_as_clause => {
+            let remove_clause_pair = inner
+                .into_inner()
+                .next()
+                .expect("remove_as_clause has a remove_clause");
+            let items = remove_clause_pair
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::remove_item)
+                .map(parse_remove_item)
+                .collect();
+            Ok(vec![QueryClause::Remove(items)])
+        }
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
 }

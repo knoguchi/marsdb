@@ -112,8 +112,16 @@ match_stmt    = { clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~ lim
 // only ever prefers this alternative when a real `WITH` is definitely
 // next, never when the same `set_clause` text is followed by anything
 // else) -- no change to, or regression risk for, the pre-existing path.
-clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | match_part }
+clause        = { unwind_clause | merge_clause | with_clause | set_as_clause | delete_as_clause | remove_as_clause | match_part }
 set_as_clause = { set_clause ~ &with_clause }
+// Same positive-lookahead technique as `set_as_clause` above, applied to
+// DELETE/DETACH DELETE/REMOVE -- TCK's Delete6/Remove3 "Persistence of
+// .../REMOVE ... WITH ..." scenarios need these to continue the query too,
+// not just SET. Same non-regression argument: only fires when a real
+// `WITH` is definitely next, so the pre-existing `mutating_tail` paths
+// (DELETE/REMOVE followed by RETURN or nothing) are unaffected.
+delete_as_clause  = { (detach_delete_clause | delete_clause) ~ &with_clause }
+remove_as_clause  = { remove_clause ~ &with_clause }
 match_part    = { match_keyword ~ path_pattern ~ ("," ~ pattern)* ~ where_clause? ~ with_clause? }
 match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 

@@ -3226,6 +3226,67 @@ fn set_followed_by_with_continues_the_query() {
     assert_eq!(int(&result.rows[0][0]), 1);
 }
 
+/// `DELETE ... WITH ...` -- same continuation as `SET ... WITH ...` above
+/// (TCK's Delete6 [5]/[6]/[7]), applied to `QueryClause::Delete`. The
+/// deleted node's own `num` was already carried into a `WITH`-projected
+/// scalar before the DELETE, so the later WHERE filter/aggregation never
+/// touches the now-gone node itself.
+#[test]
+fn delete_followed_by_with_continues_the_query() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 1..=5 {
+        run(&store, &format!("CREATE (:N {{num: {i}}})"));
+    }
+
+    let result = run(
+        &store,
+        "MATCH (n:N) WITH n, n.num AS num DELETE n WITH num WHERE num % 2 = 0 RETURN num",
+    );
+    let mut vals: Vec<i64> = result.rows.iter().map(|row| int(&row[0])).collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 4]);
+
+    // Every matched node was actually deleted, not just filtered out of
+    // the result set.
+    let left = run(&store, "MATCH (n:N) RETURN count(n) AS c");
+    assert_eq!(int(&left.rows[0][0]), 0);
+
+    // The pre-existing `DELETE ... RETURN` (no WITH) shape must still work.
+    run(&store, "CREATE (:M {num: 1})");
+    let result = run(&store, "MATCH (n:M) DELETE n RETURN count(*) AS c");
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// `REMOVE ... WITH ...` -- same continuation, applied to
+/// `QueryClause::Remove` (TCK's Remove3).
+#[test]
+fn remove_followed_by_with_continues_the_query() {
+    let store = GraphStore::open_memory().unwrap();
+    for i in 1..=5 {
+        run(&store, &format!("CREATE (:N {{num: {i}, tag: 'x'}})"));
+    }
+
+    let result = run(
+        &store,
+        "MATCH (n:N) REMOVE n.tag WITH n WHERE n.num % 2 = 0 RETURN n.num AS num",
+    );
+    let mut vals: Vec<i64> = result.rows.iter().map(|row| int(&row[0])).collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 4]);
+
+    // The REMOVE's own side effect applies to every matched row, not just
+    // the ones that survive the later WHERE filter.
+    let tagged = run(
+        &store,
+        "MATCH (n:N) WHERE n.tag IS NOT NULL RETURN count(n) AS c",
+    );
+    assert_eq!(int(&tagged.rows[0][0]), 0);
+
+    // The pre-existing `REMOVE ... RETURN` (no WITH) shape must still work.
+    let result = run(&store, "MATCH (n:N {num: 2}) REMOVE n:N RETURN labels(n)");
+    assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already
