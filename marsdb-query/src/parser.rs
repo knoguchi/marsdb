@@ -464,6 +464,7 @@ fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
 
 fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     let mut distinct = false;
+    let mut star = false;
     let mut items = Vec::new();
     let mut where_clause = None;
     let mut order_by = None;
@@ -473,6 +474,12 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
         match p.as_rule() {
             Rule::distinct_kw => distinct = true,
             Rule::return_item => items.push(parse_return_item(p)?),
+            Rule::with_star => {
+                star = true;
+                for item_pair in p.into_inner() {
+                    items.push(parse_return_item(item_pair)?);
+                }
+            }
             Rule::with_where_clause => {
                 let expr_pair = p.into_inner().next().expect("WITH...WHERE has a with_expr");
                 where_clause = Some(parse_with_expr(expr_pair)?);
@@ -485,6 +492,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     }
     Ok(WithClause {
         items,
+        star,
         distinct,
         where_clause,
         order_by,

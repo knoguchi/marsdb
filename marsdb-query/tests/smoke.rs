@@ -3468,6 +3468,50 @@ fn exponentiation_and_unary_minus_precedence() {
     assert_eq!(int(&result.rows[0][1]), 3);
 }
 
+/// `WITH *` -- every currently-bound variable carries forward unchanged
+/// (TCK's Match8/Match4/Create3/TypeConversion2-4), mirroring `RETURN
+/// *`'s own already-supported star expansion. Covers both a plain `WITH
+/// *` and one combined with an extra item, plus the "includes this same
+/// clause's own new bindings, not just what was carried in before it"
+/// case (`MERGE`'s own target must be visible after `WITH *`, matching
+/// TCK's Match8 [2]).
+#[test]
+fn with_star_carries_every_bound_variable() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X)");
+
+    let result = run(
+        &store,
+        "MATCH (a) MERGE (b:Y) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*) AS c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    // Chained `WITH x WITH *` -- the star sees the prior WITH's own
+    // output, not the original pre-WITH scope. Two nodes exist by now
+    // (:X from setup, :Y from the MERGE above), so this matches both.
+    let result = run(&store, "MATCH (a) WITH a WITH * RETURN a");
+    assert_eq!(result.rows.len(), 2);
+
+    // `WITH *, expr AS extra` -- star-expanded names plus a real
+    // additional item in the same clause.
+    let result = run(
+        &store,
+        "WITH 1 AS a, 2 AS b WITH *, a + b AS c RETURN a, b, c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+    assert_eq!(int(&result.rows[0][1]), 2);
+    assert_eq!(int(&result.rows[0][2]), 3);
+
+    // Nothing bound yet -- must error, mirroring RETURN *'s own
+    // NoVariablesInScope rule.
+    let stmt = parse("WITH * RETURN 1").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("at least one variable"),
+        "expected a no-variables-in-scope error, got: {err}"
+    );
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already

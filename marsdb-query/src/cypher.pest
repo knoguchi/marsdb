@@ -151,7 +151,12 @@ match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 // sense for the whole matched shape, not a fragment of it.
 path_pattern          = { (identifier ~ "=")? ~ (shortest_path_wrapper | pattern) }
 shortest_path_wrapper = { ^"shortestPath" ~ "(" ~ pattern ~ ")" }
-with_clause   = { ^"WITH" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
+// `with_star` -- `WITH *` (optionally `WITH *, x AS y`), mirroring
+// `return_clause`'s own `star_return | (return_item ~ (...)*)` shape
+// (TCK's Match8/Match4/Create3/TypeConversion2-4, e.g. `MATCH (a) MERGE
+// (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*)`).
+with_clause   = { ^"WITH" ~ distinct_kw? ~ (with_star | (return_item ~ ("," ~ return_item)*)) ~ with_where_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
+with_star     = { "*" ~ ("," ~ return_item)* }
 
 // Not a general `Literal::List` usable anywhere a `literal` is (a prop
 // value, a comparison RHS, ...) — deliberately scoped to only appear right

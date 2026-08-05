@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use marsdb_graph::{PropertyValue, Txn};
 
 use crate::ast::{
-    CompareOp, Expr, Literal, MergeClause, QueryClause, QueryPart, RemoveItem, SetItem, Statement,
-    Tail, UnwindClause, WithClause,
+    CompareOp, Expr, Literal, MergeClause, QueryClause, QueryPart, RemoveItem, ReturnExpr,
+    ReturnItem, SetItem, Statement, Tail, UnwindClause, WithClause,
 };
 use crate::error::QueryError;
 use crate::executor::with_item_output_name;
@@ -86,7 +86,7 @@ fn explain_clause(
             Ok(())
         }
         QueryClause::With(with) => {
-            explain_with_projection(with, carried_vars, out);
+            explain_with_projection(with, HashSet::new(), carried_vars, out);
             Ok(())
         }
         QueryClause::Set(items) => {
@@ -180,9 +180,33 @@ fn explain_merge(m: &MergeClause, carried_vars: &mut HashSet<String>, out: &mut 
 
 fn explain_with_projection(
     with: &WithClause,
+    new_vars: HashSet<String>,
     carried_vars: &mut HashSet<String>,
     out: &mut Vec<String>,
 ) {
+    // `WITH *` -- same `carried_vars ∪ new_vars` reasoning as
+    // `executor::apply_with_or_carry`'s own star handling (this
+    // function's `carried_vars` hasn't absorbed `new_vars` yet either).
+    let with_owned;
+    let with: &WithClause = if with.star {
+        let mut owned = with.clone();
+        let mut items: Vec<_> = carried_vars
+            .union(&new_vars)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|name| ReturnItem {
+                expr: ReturnExpr::Var(name),
+                alias: None,
+            })
+            .collect();
+        items.extend(owned.items);
+        owned.items = items;
+        with_owned = owned;
+        &with_owned
+    } else {
+        with
+    };
     out.push(format!("WITH {}", with_columns(with)));
     *carried_vars = with
         .items
@@ -207,7 +231,7 @@ fn apply_with_to_carried_vars(
 ) {
     match with {
         None => carried_vars.extend(new_vars),
-        Some(with) => explain_with_projection(with, carried_vars, out),
+        Some(with) => explain_with_projection(with, new_vars, carried_vars, out),
     }
 }
 

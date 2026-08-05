@@ -454,6 +454,20 @@ pub enum WithExpr {
 #[derive(Debug, Clone)]
 pub struct WithClause {
     pub items: Vec<ReturnItem>,
+    /// `WITH *` (optionally followed by more items, `WITH *, x AS y`) --
+    /// every currently-bound variable, alphabetically, same convention
+    /// `Tail::ReturnStar`'s own `return_star_items` already established
+    /// for `RETURN *`. Can't be resolved into concrete `items` at parse
+    /// time (no scope exists yet) -- resolved independently wherever the
+    /// real bound-variable-name set entering this WITH is already on
+    /// hand (`executor::apply_with_or_carry`'s own `carried_vars`,
+    /// `semantic::project_with`'s `input: &Scope`, `explain.rs`'s own
+    /// `carried_vars`), mirroring `ReturnStar`'s "resolve at each call
+    /// site" approach rather than a separate whole-AST-mutation pass.
+    /// When both `star` and `items` are present, star-expanded names
+    /// come first (real Cypher has no TCK-tested requirement either way
+    /// for this combination, but this ordering is the common convention).
+    pub star: bool,
     /// `WITH DISTINCT ...` -- dedups the projected rows, same as `RETURN
     /// DISTINCT` (`Tail::Return`'s own `distinct` flag), applied right
     /// after projection/aggregation, before `where_clause` (matching
