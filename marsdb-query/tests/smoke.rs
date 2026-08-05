@@ -5991,6 +5991,109 @@ fn set_map_assign_replace_and_merge() {
     assert_eq!(str_value(&result.rows[0][0]), "A");
 }
 
+/// `SET (n).name = 'x'` -- a parenthesized-variable target, same meaning
+/// as bare `n.name` (TCK's Set1 [3]/[4]).
+#[test]
+fn set_parenthesized_target() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)");
+    let result = run(&store, "MATCH (n:A) SET (n).name = 'neo4j' RETURN n.name");
+    assert_eq!(str_value(&result.rows[0][0]), "neo4j");
+}
+
+/// `CREATE (a {...}) SET a.prop = ...` -- CREATE followed directly by
+/// another mutating clause, no `WITH` in between at all (TCK's Set1
+/// [6]/[7]) -- a real gap `create_as_clause`'s own WITH-only lookahead
+/// didn't cover. Also confirms a property-sourced list survives a list
+/// concat (`a.numbers + [4, 5]`) and a list comprehension over a
+/// property access (`[i IN n.numbers | ...]`, TCK's Set1 [5] -- needs
+/// `list_element` to not reject a property access's `Kind::Scalar`
+/// outright, the same widening `bind_unwind` already has).
+#[test]
+fn create_followed_directly_by_set_no_with() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "CREATE (a {numbers: [1, 2, 3]}) SET a.numbers = a.numbers + [4, 5] RETURN a.numbers",
+    );
+    let ints: Vec<i64> = match &result.rows[0][0] {
+        Value::List(items) => items.iter().map(int).collect(),
+        other => panic!("expected a list, got {other:?}"),
+    };
+    assert_eq!(ints, vec![1, 2, 3, 4, 5]);
+
+    run(&store, "CREATE (:N)");
+    let result = run(
+        &store,
+        "MATCH (n:N) SET n.numbers = [1, 2, 3] RETURN [i IN n.numbers | i / 2.0] AS x",
+    );
+    let floats: Vec<f64> = match &result.rows[0][0] {
+        Value::List(items) => items.iter().map(as_float).collect(),
+        other => panic!("expected a list, got {other:?}"),
+    };
+    assert_eq!(floats, vec![0.5, 1.0, 1.5]);
+
+    // The pre-existing `CREATE ... WITH ...` (#110) and plain standalone
+    // `CREATE ... RETURN ...`/bare-`CREATE` (#106) shapes must still work
+    // unaffected -- create_as_clause's lookahead grew wider, not
+    // narrower.
+    let result = run(
+        &store,
+        "CREATE (a) WITH a WITH * CREATE (b) CREATE (a)<-[:T]-(b)",
+    );
+    assert!(result.rows.is_empty());
+    let result = run(&store, "CREATE (node) RETURN labels(node)");
+    assert_eq!(list_str_values(&result.rows[0][0]), Vec::<String>::new());
+}
+
+/// Any of `SET`/`DELETE`/`CREATE`/`MERGE` can chain directly into any
+/// other one of them, `WITH` or not (TCK's Merge1/Merge5/Merge9, e.g.
+/// `CREATE (a), (b) MERGE (a)-[:X]->(b) RETURN count(a)`) -- previously
+/// only `WITH` was a valid thing to chain a mutating clause into.
+#[test]
+fn mutating_clauses_chain_directly_into_each_other_no_with_needed() {
+    let store = GraphStore::open_memory().unwrap();
+
+    // CREATE directly into MERGE.
+    let result = run(
+        &store,
+        "CREATE (a), (b) MERGE (a)-[:X]->(b) RETURN count(a)",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    // DELETE directly into MERGE.
+    run(&store, "CREATE (:A {num: 1}), (:A {num: 2})");
+    let result = run(&store, "MATCH (a:A) DELETE a MERGE (a2:A) RETURN a2.num");
+    assert!(result.rows.iter().all(|row| matches!(row[0], Value::Null)));
+
+    // CREATE, MERGE, and CREATE again, all directly chained.
+    let result = run(
+        &store,
+        "CREATE (a:P), (b:Q) MERGE (a)-[:KNOWS]->(b) CREATE (b)-[:KNOWS]->(c:R) RETURN count(*)",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// Real Cypher allows `ON MATCH`/`ON CREATE` in either order, not just
+/// `ON CREATE` before `ON MATCH` -- a repeated one of the same kind is
+/// still a real error (TCK's Merge4).
+#[test]
+fn merge_on_match_on_create_either_order() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+    run(
+        &store,
+        "MATCH () MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2",
+    );
+    let result = run(&store, "MATCH (a:L) RETURN labels(a)");
+    let mut labels = list_str_values(&result.rows[0][0]);
+    labels.sort();
+    assert_eq!(labels, vec!["L".to_string(), "M2".to_string()]);
+
+    // A repeated ON CREATE is rejected at parse time, not execution.
+    assert!(parse("MERGE (a:L) ON CREATE SET a:M1 ON CREATE SET a:M2").is_err());
+}
+
 // --- `<mutating-clause> RETURN ...` (SET/DELETE/DETACH DELETE/REMOVE/
 // MATCH...CREATE followed directly by a RETURN in the same statement) ---
 

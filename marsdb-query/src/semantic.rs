@@ -956,7 +956,16 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
 fn list_element(kind: Kind, context: &str) -> Result<Kind, QueryError> {
     match kind {
         Kind::List(element) => Ok(*element),
-        Kind::Unknown => Ok(Kind::Unknown),
+        // `Scalar` is deliberately not rejected here, same reasoning as
+        // `bind_unwind`'s own matching widening: a property access
+        // (`n.numbers`) always types as `Kind::Scalar` in this codebase's
+        // `Kind` system, even when it legitimately holds a `List` at
+        // runtime now that list-valued properties are supported (TCK's
+        // Set1 [5], `[i IN n.numbers | i / 2.0]`) -- only a confidently-
+        // wrong kind (a real node/edge/map/path) is rejected here,
+        // everything else defers to the real runtime `Value::List` check
+        // in `eval_return_expr`'s own `ListComp`/`Quantifier` arms.
+        Kind::Unknown | Kind::Scalar => Ok(Kind::Unknown),
         other => Err(semantic(format!(
             "{context} is {}, not a list",
             kind_name(&other)
