@@ -84,6 +84,13 @@ pub enum Expr {
     /// `IsNull`, the operand isn't restricted to a bare `prop_access`.
     /// Mirrors `WithExpr::IsNull` exactly, just evaluated pre-projection.
     GeneralIsNull(ReturnExpr),
+    /// A boolean-valued expression used directly as a predicate with no
+    /// comparison operator at all -- `WHERE single(x IN list WHERE x = 2)
+    /// OR all(x IN list WHERE x = 2)`, `WHERE n.flag`, `WHERE NOT
+    /// exists(n.prop)`. Three-valued (`Null` is "unknown", same as every
+    /// other `Expr` leaf), evaluated via `value_to_bool3`. Mirrors
+    /// `WithExpr::Bare` exactly, just evaluated pre-projection.
+    GeneralBare(ReturnExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,11 +108,11 @@ pub enum ReturnExpr {
     /// ordinary function call (no args to evaluate, no DISTINCT target —
     /// it counts rows, not values).
     CountStar,
-    /// Simple/value `CASE`: `CASE <test> WHEN <value> THEN <result> ... [ELSE
-    /// <else>] END`. `test` is `Some` for every form the parser currently
-    /// produces; kept `Option` so a future searched-`CASE` (`CASE WHEN
-    /// <bool_expr> THEN ...`) can reuse this variant without another type
-    /// change.
+    /// `CASE <test> WHEN <value> THEN <result> ... [ELSE <else>] END`
+    /// (simple form, `test: Some`) or `CASE WHEN <bool_expr> THEN <result>
+    /// ... [ELSE <else>] END` (searched form, `test: None` -- each `WHEN`
+    /// carries its own full condition instead of a value compared against
+    /// `test`).
     Case {
         test: Option<Box<ReturnExpr>>,
         whens: Vec<(ReturnExpr, ReturnExpr)>,
@@ -386,6 +393,13 @@ pub enum WithExpr {
     /// bound var). `IS NOT NULL` parses to `Not(IsNull(..))`, same
     /// convention as pattern-level `Expr::IsNull`.
     IsNull(ReturnExpr),
+    /// A boolean-valued expression used directly as a predicate with no
+    /// comparison operator at all -- `WHERE single(x IN list WHERE x = 2)
+    /// OR all(x IN list WHERE x = 2)`, `WHERE n.flag`, `WHERE
+    /// exists(n.prop)`. Three-valued (`Null` is "unknown"), evaluated via
+    /// `value_to_bool3` (real Cypher: a non-boolean value here is a type
+    /// error, not silently coerced).
+    Bare(ReturnExpr),
 }
 
 /// A `WITH` clause: projects/renames the current bindings, optionally

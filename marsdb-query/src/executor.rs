@@ -1840,6 +1840,7 @@ impl<'a> Executor<'a> {
             }
             // Always definite -- same reasoning as `Expr::IsNull`.
             WithExpr::IsNull(e) => Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null)),
+            WithExpr::Bare(e) => self.eval_return_expr_bool3(txn, e, row)?,
         })
     }
 
@@ -2403,6 +2404,7 @@ impl<'a> Executor<'a> {
             Expr::GeneralIsNull(e) => {
                 Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null))
             }
+            Expr::GeneralBare(e) => self.eval_return_expr_bool3(txn, e, row)?,
         })
     }
 
@@ -7527,6 +7529,22 @@ fn value_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             }
         }
         return Some(xs.len().cmp(&ys.len()));
+    }
+    // Real Cypher's `<`/`<=`/`>`/`>=` (unlike ORDER BY/`min`/`max`, which
+    // need a *total* order across every type for presentation purposes --
+    // see `comparable_ordering`'s own docs) is only ever defined within a
+    // single comparable type. A genuine cross-type pair (a list against a
+    // string, a node against a number, ...) must be `null`, not
+    // `comparable_ordering`'s type-rank fallback -- that fallback exists
+    // purely for `list_cmp_asc`/`min`/`max`'s total-order needs and must
+    // not leak into a real WHERE-predicate comparison. Verified against
+    // Comparison2's own "Comparing across types yields null, except
+    // numbers" scenario (`[] < 1`/`[] < ''`/`[] < true` were all wrongly
+    // `true` before this check, since `[]` alone -- not both sides --
+    // isn't `Value`-to-`PropertyValue` representable, falling through to
+    // the type-rank fallback).
+    if value_to_comparable(a).is_none() || value_to_comparable(b).is_none() {
+        return None;
     }
     comparable_ordering(a, b)
 }

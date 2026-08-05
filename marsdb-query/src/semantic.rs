@@ -541,6 +541,10 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             infer_expr(e, scope)?;
             Ok(())
         }
+        Expr::GeneralBare(e) => {
+            let kind = infer_expr(e, scope)?;
+            require_boolean_predicate_kind(&kind, "WHERE predicate")
+        }
     }
 }
 
@@ -559,6 +563,10 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
         WithExpr::IsNull(e) => {
             infer_expr(e, scope)?;
             Ok(())
+        }
+        WithExpr::Bare(e) => {
+            let kind = infer_expr(e, scope)?;
+            require_boolean_predicate_kind(&kind, "WHERE predicate")
         }
     }
 }
@@ -921,4 +929,27 @@ fn kind_name(kind: &Kind) -> &'static str {
 
 fn semantic(message: impl Into<String>) -> QueryError {
     QueryError::Semantic(message.into())
+}
+
+/// `WHERE (n)` / `WHERE (n)-->()`-shaped bare-expression predicates
+/// (`Expr::GeneralBare`/`WithExpr::Bare`) -- a node/relationship/list/map/
+/// path can *never* be a valid boolean predicate regardless of what data
+/// the query runs against (`MATCH (n) WHERE (n) RETURN n`'s `(n)` is a
+/// bare node reference, not a pattern predicate), so this is checked here
+/// rather than left to `value_to_bool3`'s runtime error -- a zero-row
+/// `MATCH` would otherwise never evaluate the predicate at all and the
+/// query would wrongly "succeed" (TCK's Pattern1 `[11]`, `InvalidArgumentType`
+/// expected "at compile time"). `Scalar`/`Unknown` both pass -- a `Scalar`
+/// could still turn out to be a non-boolean scalar (a string/int
+/// variable), which stays a real runtime `value_to_bool3` error, same
+/// tolerance every other `Kind::Scalar` check in this module already
+/// gives.
+fn require_boolean_predicate_kind(kind: &Kind, context: &str) -> Result<(), QueryError> {
+    match kind {
+        Kind::Scalar | Kind::Unknown => Ok(()),
+        other => Err(semantic(format!(
+            "{context} requires a boolean, but found {}",
+            kind_name(other)
+        ))),
+    }
 }

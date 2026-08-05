@@ -363,6 +363,56 @@ fn where_general_is_null_checks_an_arithmetic_expression() {
     }
 }
 
+/// MATCH's own bare `WHERE` accepts a boolean-valued expression directly
+/// as the predicate, no comparison operator at all (`Expr::GeneralBare`)
+/// -- `WHERE n.flag`, `WHERE NOT n.flag`, distinct from `WHERE n.flag =
+/// true`.
+#[test]
+fn where_general_bare_accepts_a_boolean_property_directly() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N {name: 'a', flag: true})");
+    run(&store, "CREATE (:N {name: 'b', flag: false})");
+
+    let result = run(&store, "MATCH (n) WHERE n.flag RETURN n.name");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "a"),
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    let result = run(&store, "MATCH (n) WHERE NOT n.flag RETURN n.name");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "b"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// Same widening for `WITH ... WHERE` (`WithExpr::Bare`) -- a bare
+/// quantifier expression combined via `OR`, no comparison operator
+/// wrapping either side. Exact shape the TCK's `Quantifier11 [3]`
+/// scenario needs (`WHERE single(...) OR all(...)`).
+#[test]
+fn with_where_bare_accepts_quantifier_expressions_combined_with_or() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(
+        &store,
+        "WITH [1, 2, 2] AS list \
+         WHERE single(x IN list WHERE x = 1) OR all(x IN list WHERE x = 2) \
+         RETURN list",
+    );
+    assert_eq!(result.rows.len(), 1);
+
+    let result = run(
+        &store,
+        "WITH [2, 2, 2] AS list \
+         WHERE single(x IN list WHERE x = 1) OR all(x IN list WHERE x = 1) \
+         RETURN list",
+    );
+    assert_eq!(result.rows.len(), 0);
+}
+
 #[test]
 fn skip_alone_drops_the_first_n_rows_after_order_by() {
     let store = GraphStore::open_memory().unwrap();
