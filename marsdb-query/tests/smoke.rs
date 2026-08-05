@@ -5904,14 +5904,38 @@ fn stored_time_and_date_time_survive_the_storage_round_trip() {
 }
 
 #[test]
-fn create_with_unsupported_list_property_errors_clearly_not_silently_nulls() {
-    // Regression guard: adding general expression support to CREATE's
-    // `{...}` prop map (needed for `date(...)`/`duration(...)` values)
-    // must not let a list/map-valued property silently collapse to null
-    // -- PropertyValue has no list/map variant at all (see its doc
-    // comment), so this must be a clear error, not a wrong answer.
+fn create_with_list_property_round_trips_as_a_real_list() {
+    // A list-valued property (`PropertyValue::List`, real Cypher/Neo4j's
+    // own "homogeneous array property" shape) is storable -- and reads
+    // back as a genuine `Value::List`, not an opaque
+    // `Value::Property(PropertyValue::List(_))`, so every existing list
+    // operation (indexing, `size()`, `IN`, `UNWIND`, ...) works
+    // transparently on it, the same as a list literal/`collect()` result.
     let store = GraphStore::open_memory().unwrap();
-    let stmt = parse("CREATE (n {tags: [1, 2, 3]})").unwrap();
+    run(&store, "CREATE (n {tags: [1, 2, 3]})");
+    let result = run(&store, "MATCH (n) RETURN n.tags");
+    let Value::List(items) = &result.rows[0][0] else {
+        panic!("expected a list, got {:?}", result.rows[0][0]);
+    };
+    let ints: Vec<i64> = items.iter().map(int).collect();
+    assert_eq!(ints, vec![1, 2, 3]);
+
+    let indexed = run(&store, "MATCH (n) RETURN n.tags[1], size(n.tags)");
+    assert_eq!(int(&indexed.rows[0][0]), 2);
+    assert_eq!(int(&indexed.rows[0][1]), 3);
+
+    let contains = run(&store, "MATCH (n) WHERE 2 IN n.tags RETURN n");
+    assert_eq!(contains.rows.len(), 1);
+}
+
+/// Regression guard: a genuinely unstorable property shape (a map, a
+/// node, an edge, a path) must still be a clear error, not a wrong
+/// answer -- widening `value_to_storable_property` to accept `Value::
+/// List` must not have widened it to accept everything.
+#[test]
+fn create_with_unsupported_map_property_errors_clearly_not_silently_nulls() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (n {tags: {a: 1}})").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(
         err.to_string().contains("property"),

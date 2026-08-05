@@ -132,6 +132,24 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
             out.extend_from_slice(&nanos.to_be_bytes());
             out
         }
+        // No real ordering across two lists is defined/needed (same
+        // "consistent for equality, not real ordering" carve-out
+        // `Duration` above already has) -- MVP indexing only does exact-
+        // match lookups. Each element's own encoding is length-prefixed
+        // so two different lists can never collide onto the same byte
+        // string (e.g. `["ab", "c"]` vs `["a", "bc"]`, which otherwise
+        // concatenate to visually-different but genuinely ambiguous byte
+        // runs once strings' own raw-UTF-8, non-length-prefixed encoding
+        // is stacked back to back).
+        PropertyValue::List(items) => {
+            let mut out = vec![0x0B];
+            for item in items {
+                let encoded = encode_index_value(item);
+                out.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                out.extend_from_slice(&encoded);
+            }
+            out
+        }
     }
 }
 

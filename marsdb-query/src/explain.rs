@@ -506,6 +506,7 @@ fn format_property_value(v: &PropertyValue) -> String {
         | PropertyValue::LocalTime(_)
         | PropertyValue::Time { .. }
         | PropertyValue::LocalDateTime { .. }
-        | PropertyValue::DateTime { .. } => format!("{v:?}"),
+        | PropertyValue::DateTime { .. }
+        | PropertyValue::List(_) => format!("{v:?}"),
     }
 }
