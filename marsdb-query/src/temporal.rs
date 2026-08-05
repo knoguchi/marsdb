@@ -16,7 +16,19 @@
 //! README's "Cypher coverage" section for the exact list of what that
 //! leaves out of TCK's `expressions/temporal` suite.
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{
+    Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike,
+};
+
+/// A `DateTime`'s zone -- a plain, `marsdb_graph`-independent mirror of
+/// `PropertyValue::DateTime`'s own `zone: marsdb_graph::model::TzId`
+/// field (same reasoning as `DurationParts` below: this module doesn't
+/// depend on `marsdb_graph`), translated at the `executor.rs` boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TzId {
+    Offset(i32),
+    Named(String),
+}
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -493,21 +505,42 @@ pub fn format_duration(months: i64, days: i64, seconds: i64, nanos: i32) -> Stri
     if days != 0 {
         out.push_str(&format!("{days}D"));
     }
-    if seconds != 0 || nanos != 0 {
+    let total_time_ns = seconds as i128 * NANOS_PER_SEC + nanos as i128;
+    if total_time_ns != 0 {
         out.push('T');
-        let hours = seconds / 3600;
-        let rem = seconds % 3600;
-        let minutes = rem / 60;
-        let secs = rem % 60;
-        if hours != 0 {
-            out.push_str(&format!("{hours}H"));
-        }
-        if minutes != 0 {
-            out.push_str(&format!("{minutes}M"));
-        }
-        if secs != 0 || nanos != 0 {
-            out.push_str(&format_seconds_fraction(secs, nanos));
-            out.push('S');
+        if total_time_ns >= 0 {
+            let hours = seconds / 3600;
+            let rem = seconds % 3600;
+            let minutes = rem / 60;
+            let secs = rem % 60;
+            if hours != 0 {
+                out.push_str(&format!("{hours}H"));
+            }
+            if minutes != 0 {
+                out.push_str(&format!("{minutes}M"));
+            }
+            if secs != 0 || nanos != 0 {
+                out.push_str(&format_seconds_fraction(secs, nanos));
+                out.push('S');
+            }
+        } else {
+            let total_ns = total_time_ns;
+            let hours = (total_ns / 3_600_000_000_000) as i64;
+            let rem_h = total_ns % 3_600_000_000_000;
+            let minutes = (rem_h / 60_000_000_000) as i64;
+            let rem_m = rem_h % 60_000_000_000;
+            let secs = (rem_m / 1_000_000_000) as i64;
+            let sub_nanos = (rem_m % 1_000_000_000) as i32;
+            if hours != 0 {
+                out.push_str(&format!("{hours}H"));
+            }
+            if minutes != 0 {
+                out.push_str(&format!("{minutes}M"));
+            }
+            if secs != 0 || sub_nanos != 0 {
+                out.push_str(&format_seconds_fraction(secs, sub_nanos));
+                out.push('S');
+            }
         }
     }
     out
@@ -891,7 +924,7 @@ pub fn split_epoch_seconds(epoch_seconds: i64) -> (i32, i64) {
     (epoch_day, secs_of_day * 1_000_000_000)
 }
 
-fn combine_epoch_day_and_nanos_of_day(epoch_day: i32, nanos_of_day: i64) -> i64 {
+pub fn combine_epoch_day_and_nanos_of_day(epoch_day: i32, nanos_of_day: i64) -> i64 {
     epoch_day as i64 * SECONDS_PER_DAY + nanos_of_day / 1_000_000_000
 }
 
@@ -933,11 +966,27 @@ pub fn local_date_time_from_fields(f: CalendarDateTime) -> Option<(i64, i32)> {
 }
 
 /// Same as `local_date_time_from_fields`, but the wall-clock reading is
-/// in `offset_seconds` east of UTC -- subtracts the offset to get the
-/// UTC instant `DateTime` actually stores (see its doc comment).
-pub fn date_time_from_fields(f: CalendarDateTime, offset_seconds: i32) -> Option<(i64, i32)> {
-    let (local_epoch_seconds, nanos) = local_date_time_from_fields(f)?;
-    Some((local_epoch_seconds - offset_seconds as i64, nanos))
+/// in the given zone -- for a fixed `Offset`, subtracts it to get the
+/// UTC instant `DateTime` actually stores (see its doc comment); for a
+/// `Named` zone, resolves the real, DST-aware offset for *this specific*
+/// local date-time via `chrono-tz` (the same zone can mean a different
+/// offset on a different date, which is why this needs the full
+/// calendar context `resolve_offset` alone doesn't have).
+pub fn date_time_from_fields(f: CalendarDateTime, zone: &TzId) -> Option<(i64, i32)> {
+    match zone {
+        TzId::Offset(offset_seconds) => {
+            let (local_epoch_seconds, nanos) = local_date_time_from_fields(f)?;
+            Some((local_epoch_seconds - *offset_seconds as i64, nanos))
+        }
+        TzId::Named(name) => {
+            let tz = parse_timezone_name(name)?;
+            let epoch_day = epoch_day_from_ymd(f.year, f.month, f.day)?;
+            let nanos_of_day = local_time_nanos_from_fields(f.hour, f.minute, f.second, f.nanos)?;
+            let naive = naive_datetime_from(epoch_day, nanos_of_day);
+            let (epoch_seconds, _offset) = utc_from_local_and_named_zone(naive, tz)?;
+            Some((epoch_seconds, (nanos_of_day % 1_000_000_000) as i32))
+        }
+    }
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS.fff` (and the compact/date-only-precision
@@ -955,24 +1004,51 @@ pub fn parse_local_date_time(s: &str) -> Option<(i64, i32)> {
 }
 
 /// Same date+time parse as `parse_local_date_time`, plus a required
-/// offset on the time half -- `None` for a bracketed named-zone suffix,
-/// same "caller gives the specific error" split as `parse_time`.
-pub fn parse_date_time(s: &str) -> Option<(i64, i32, i32)> {
+/// zone on the time half -- either a fixed offset (`+01:00`), a
+/// bracketed named zone with no explicit offset (`[Europe/London]`, the
+/// true offset derived from the zone for *this* local date-time, TCK's
+/// Temporal2 [6]), or both together (`+02:00[Europe/Stockholm]`, the
+/// explicit offset is trusted for the instant and the bracket is kept
+/// only for `TzId::Named`'s round-trip display).
+pub fn parse_date_time(s: &str) -> Option<(i64, i32, TzId)> {
     let s = s.trim();
-    if s.contains('[') {
-        return None;
-    }
     let (date_part, time_part) = s.split_once('T')?;
     let epoch_day = parse_date(date_part)?;
+    let (time_part, zone_name) = match time_part.split_once('[') {
+        Some((t, rest)) => (t, Some(rest.strip_suffix(']')?)),
+        None => (time_part, None),
+    };
     let (time_only, offset_part) = split_time_offset(time_part);
-    let offset_seconds = parse_offset_seconds(offset_part?)?;
     let nanos_of_day = parse_time_of_day(time_only)?;
-    let local_epoch_seconds = combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day);
-    Some((
-        local_epoch_seconds - offset_seconds as i64,
-        (nanos_of_day % 1_000_000_000) as i32,
-        offset_seconds,
-    ))
+    match (offset_part, zone_name) {
+        (Some(offset_str), zone_name) => {
+            let offset_seconds = parse_offset_seconds(offset_str)?;
+            let local_epoch_seconds = combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day);
+            let zone = match zone_name {
+                Some(zone_str) => {
+                    parse_timezone_name(zone_str)?;
+                    TzId::Named(zone_str.to_string())
+                }
+                None => TzId::Offset(offset_seconds),
+            };
+            Some((
+                local_epoch_seconds - offset_seconds as i64,
+                (nanos_of_day % 1_000_000_000) as i32,
+                zone,
+            ))
+        }
+        (None, Some(zone_str)) => {
+            let tz = parse_timezone_name(zone_str)?;
+            let naive = naive_datetime_from(epoch_day, nanos_of_day);
+            let (epoch_seconds, _offset) = utc_from_local_and_named_zone(naive, tz)?;
+            Some((
+                epoch_seconds,
+                (nanos_of_day % 1_000_000_000) as i32,
+                TzId::Named(zone_str.to_string()),
+            ))
+        }
+        (None, None) => None,
+    }
 }
 
 /// `d.<prop>` component access for `LocalDateTime`/`DateTime`'s
@@ -1092,18 +1168,74 @@ pub fn add_duration_to_local_date_time(
     ))
 }
 
-pub fn format_date_time(epoch_seconds: i64, nanos: i32, offset_seconds: i32) -> String {
+pub fn format_date_time(epoch_seconds: i64, nanos: i32, zone: &TzId) -> String {
     // The *displayed* wall-clock reading is the local (offset-adjusted)
     // one, not the stored UTC instant -- `DateTime` round-trips through
     // `toString`/reparse showing the original offset's time-of-day, per
     // the TCK's own examples (e.g. `datetime({..., timezone: '+01:00'})`
     // prints that same `+01:00` wall-clock hour back, not the UTC one).
+    let offset_seconds = resolve_offset(zone, epoch_seconds);
     let local_epoch_seconds = epoch_seconds + offset_seconds as i64;
+    let zone_suffix = match zone {
+        TzId::Offset(_) => String::new(),
+        // Real Cypher's `toString()` round-trips the zone name alongside
+        // its resolved offset (`+02:00[Europe/Stockholm]`), not just the
+        // offset alone -- TCK's Temporal1 [10].
+        TzId::Named(name) => format!("[{name}]"),
+    };
     format!(
-        "{}{}",
+        "{}{}{}",
         format_local_date_time(local_epoch_seconds, nanos),
-        format_offset(offset_seconds)
+        format_offset(offset_seconds),
+        zone_suffix
     )
+}
+
+/// Resolves a `TzId`'s real UTC offset (seconds east of UTC) at a given
+/// UTC instant -- `Offset`'s value directly, or a `Named` zone's real,
+/// DST-aware offset via `chrono-tz`'s embedded IANA database (the same
+/// zone name resolves to a *different* offset depending on which instant
+/// this is called with -- there's no single fixed "the" offset for a
+/// named zone, e.g. TCK's Temporal1 [10] resolves `Europe/Stockholm` to
+/// `+01:00` in October and `+02:00` in July). Falls back to UTC (`0`)
+/// for a zone name that fails to parse -- should never happen for a
+/// value MarsDB itself constructed (every `Named` zone is validated via
+/// `parse_timezone_name` before being stored), but this function can't
+/// return an error, so degrade gracefully rather than panic on a
+/// hypothetical corrupt/foreign-written value.
+pub fn resolve_offset(zone: &TzId, epoch_seconds: i64) -> i32 {
+    match zone {
+        TzId::Offset(o) => *o,
+        TzId::Named(name) => {
+            let tz = parse_timezone_name(name).unwrap_or(chrono_tz::Tz::UTC);
+            let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_seconds, 0)
+                .unwrap_or_default();
+            utc.with_timezone(&tz).offset().fix().local_minus_utc()
+        }
+    }
+}
+
+/// Parses an IANA timezone name (`'Europe/Stockholm'`) -- `None` if `s`
+/// isn't a zone `chrono-tz`'s embedded database recognizes.
+pub fn parse_timezone_name(s: &str) -> Option<chrono_tz::Tz> {
+    s.parse().ok()
+}
+
+/// Given a *local* (wall-clock) naive date-time and a named zone,
+/// resolves the true UTC `(epoch_seconds, offset_seconds)` -- the
+/// overwhelming common case is `LocalResult::Single`; a DST fall-back
+/// repeated hour (`Ambiguous`) takes the earlier instant, a DST
+/// spring-forward gap (`None`, the local time never occurred) has no
+/// valid mapping and fails -- real Cypher doesn't define a specific
+/// tie-break for either, and no TCK scenario lands in one.
+fn utc_from_local_and_named_zone(naive: NaiveDateTime, tz: chrono_tz::Tz) -> Option<(i64, i32)> {
+    let dt = match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earlier, _later) => earlier,
+        LocalResult::None => return None,
+    };
+    let offset = dt.offset().fix().local_minus_utc();
+    Some((dt.timestamp(), offset))
 }
 
 // ---------------------------------------------------------------------
@@ -1177,56 +1309,58 @@ fn shift_months(dt: NaiveDateTime, months: i64) -> NaiveDateTime {
 /// date+time target still reports a bare whole-day count with the
 /// sub-day remainder silently truncated away, not carried as a
 /// remaining `T...` component).
-/// Converts a local `NaiveDateTime` + its offset (east of UTC, seconds)
-/// to the UTC instant it represents.
-fn to_utc_instant(dt: NaiveDateTime, offset_seconds: i32) -> NaiveDateTime {
-    dt - chrono::Duration::seconds(offset_seconds as i64)
+fn to_utc_instant_tz(dt: NaiveDateTime, zone: &TzId) -> NaiveDateTime {
+    match zone {
+        TzId::Offset(o) => dt - chrono::Duration::seconds(*o as i64),
+        TzId::Named(name) => {
+            if let Some(tz) = parse_timezone_name(name) {
+                if let Some((epoch_seconds, _)) = utc_from_local_and_named_zone(dt, tz) {
+                    return chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_seconds, 0)
+                        .map(|utc| utc.naive_utc())
+                        .unwrap_or(dt);
+                }
+            }
+            dt
+        }
+    }
 }
 
-/// The elapsed time between two local readings -- UTC-instant-aware
-/// (accounts for the offset difference) *only* when **both** operands
-/// carry a real offset (`Time`/`DateTime`); if either lacks one
-/// (`Date`/`LocalTime`/`LocalDateTime`), any offset the *other* operand
-/// happens to carry is disregarded entirely and this is plain local-to-
-/// local subtraction -- confirmed against the TCK: mixing a `Date`
-/// with a `DateTime` produces the same result as mixing it with the
-/// equivalent `LocalDateTime`, offset ignored, but two `DateTime`s at
-/// *different* offsets need the real instant gap (see this module's
-/// own between_components docs and the `duration.between` TCK example
-/// that specifically tests two different offsets one year apart --
-/// naive local subtraction there is off by exactly the offset delta).
 fn elapsed_ns(
     from: NaiveDateTime,
-    from_offset: Option<i32>,
+    from_zone: Option<&TzId>,
     to: NaiveDateTime,
-    to_offset: Option<i32>,
+    to_zone: Option<&TzId>,
 ) -> i64 {
-    let delta = match (from_offset, to_offset) {
-        (Some(fo), Some(to_o)) => to_utc_instant(to, to_o) - to_utc_instant(from, fo),
-        _ => to - from,
+    let delta = match (from_zone, to_zone) {
+        (Some(fz), Some(tz)) => to_utc_instant_tz(to, tz) - to_utc_instant_tz(from, fz),
+        (Some(fz), None) => to_utc_instant_tz(to, fz) - to_utc_instant_tz(from, fz),
+        (None, Some(tz)) => to_utc_instant_tz(to, tz) - to_utc_instant_tz(from, tz),
+        (None, None) => to - from,
     };
     delta
         .num_nanoseconds()
         .expect("TCK-scale gaps stay well within i64 nanoseconds")
 }
 
-/// `months_between_datetimes`'s refinement step, made offset-aware the
-/// same way `elapsed_ns` is (see its docs).
 fn months_between_datetimes_offset_aware(
     from: NaiveDateTime,
-    from_offset: Option<i32>,
+    from_zone: Option<&TzId>,
     to: NaiveDateTime,
-    to_offset: Option<i32>,
+    to_zone: Option<&TzId>,
 ) -> i64 {
     let mut months = months_between_dates(from.date(), to.date());
     let shifted = shift_months(from, months);
-    let overshot = match (from_offset, to_offset) {
-        (Some(fo), Some(to_o)) => to_utc_instant(shifted, fo) > to_utc_instant(to, to_o),
-        _ => shifted > to,
+    let overshot = match (from_zone, to_zone) {
+        (Some(fz), Some(tz)) => to_utc_instant_tz(shifted, fz) > to_utc_instant_tz(to, tz),
+        (Some(fz), None) => to_utc_instant_tz(shifted, fz) > to_utc_instant_tz(to, fz),
+        (None, Some(tz)) => to_utc_instant_tz(shifted, tz) > to_utc_instant_tz(to, tz),
+        (None, None) => shifted > to,
     };
-    let undershot = match (from_offset, to_offset) {
-        (Some(fo), Some(to_o)) => to_utc_instant(shifted, fo) < to_utc_instant(to, to_o),
-        _ => shifted < to,
+    let undershot = match (from_zone, to_zone) {
+        (Some(fz), Some(tz)) => to_utc_instant_tz(shifted, fz) < to_utc_instant_tz(to, tz),
+        (Some(fz), None) => to_utc_instant_tz(shifted, fz) < to_utc_instant_tz(to, fz),
+        (None, Some(tz)) => to_utc_instant_tz(shifted, tz) < to_utc_instant_tz(to, tz),
+        (None, None) => shifted < to,
     };
     if months > 0 && overshot {
         months -= 1;
@@ -1236,38 +1370,63 @@ fn months_between_datetimes_offset_aware(
     months
 }
 
+fn time_to_utc_nanos(nanos_of_day: i64, zone: &TzId, ref_date: Option<i32>) -> i64 {
+    let epoch_day = ref_date.unwrap_or(0);
+    let dt = naive_datetime_from(epoch_day, nanos_of_day);
+    let utc = to_utc_instant_tz(dt, zone);
+    (utc.signed_duration_since(epoch().and_hms_opt(0, 0, 0).unwrap()))
+        .num_nanoseconds()
+        .unwrap_or(0)
+}
+
 fn between_components(
     a_date: Option<i32>,
     a_time: Option<i64>,
-    a_offset: Option<i32>,
+    a_zone: Option<&TzId>,
     b_date: Option<i32>,
     b_time: Option<i64>,
-    b_offset: Option<i32>,
+    b_zone: Option<&TzId>,
 ) -> (i64, i64, i64) {
     match (a_date, b_date) {
         (Some(ad), Some(bd)) => {
             let from = naive_datetime_from(ad, a_time.unwrap_or(0));
             let to = naive_datetime_from(bd, b_time.unwrap_or(0));
-            let months = months_between_datetimes_offset_aware(from, a_offset, to, b_offset);
+            let months = months_between_datetimes_offset_aware(from, a_zone, to, b_zone);
             let shifted = shift_months(from, months);
-            let shifted_remaining_ns = elapsed_ns(shifted, a_offset, to, b_offset);
-            let raw_total_ns = elapsed_ns(from, a_offset, to, b_offset);
+            let shifted_remaining_ns = elapsed_ns(shifted, a_zone, to, b_zone);
+            let raw_total_ns = elapsed_ns(from, a_zone, to, b_zone);
             (months, shifted_remaining_ns, raw_total_ns)
         }
-        // Time-only degrade mode still reconciles the offset difference
-        // when *both* operands carry a real one (`Time`/`DateTime`) --
-        // confirmed by the TCK's own `datetime(...+02:00)` vs
-        // `time(...+01:00)` example, off by exactly the 1h offset delta
-        // if compared as raw local time-of-day. Same "only when both
-        // sides have one" condition `elapsed_ns` uses.
         _ => {
-            let diff = match (a_offset, b_offset) {
-                (Some(ao), Some(bo)) => {
-                    let at = a_time.unwrap_or(0) - ao as i64 * 1_000_000_000;
-                    let bt = b_time.unwrap_or(0) - bo as i64 * 1_000_000_000;
+            let diff = match (a_zone, b_zone) {
+                (Some(az), Some(bz)) => {
+                    // Both sides resolved against the *same* reference
+                    // date -- "time-only mode" means the date each
+                    // operand happens to carry is disregarded (see this
+                    // function's module docs), so `a`/`b` must not each
+                    // pull in their own, potentially wildly different,
+                    // real date (that only cancels out in `bt - at` when
+                    // it's identical on both sides; a real, previously-
+                    // caught regression when this used `a_date`/`b_date`
+                    // independently). Only matters for resolving a
+                    // `Named` zone's DST-dependent offset -- a fixed
+                    // `Offset` doesn't care what date it's given at all.
+                    let ref_date = a_date.or(b_date);
+                    let at = time_to_utc_nanos(a_time.unwrap_or(0), az, ref_date);
+                    let bt = time_to_utc_nanos(b_time.unwrap_or(0), bz, ref_date);
                     bt - at
                 }
-                _ => b_time.unwrap_or(0) - a_time.unwrap_or(0),
+                (Some(az), None) => {
+                    let at = time_to_utc_nanos(a_time.unwrap_or(0), az, a_date);
+                    let bt = time_to_utc_nanos(b_time.unwrap_or(0), az, a_date);
+                    bt - at
+                }
+                (None, Some(bz)) => {
+                    let at = time_to_utc_nanos(a_time.unwrap_or(0), bz, b_date);
+                    let bt = time_to_utc_nanos(b_time.unwrap_or(0), bz, b_date);
+                    bt - at
+                }
+                (None, None) => b_time.unwrap_or(0) - a_time.unwrap_or(0),
             };
             (0, diff, diff)
         }
@@ -1277,58 +1436,58 @@ fn between_components(
 pub fn duration_between(
     a_date: Option<i32>,
     a_time: Option<i64>,
-    a_offset: Option<i32>,
+    a_zone: Option<&TzId>,
     b_date: Option<i32>,
     b_time: Option<i64>,
-    b_offset: Option<i32>,
+    b_zone: Option<&TzId>,
 ) -> DurationParts {
     let (months, shifted_ns, _) =
-        between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+        between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
     let days = shifted_ns / NANOS_PER_DAY_I64;
     let rem = shifted_ns % NANOS_PER_DAY_I64;
-    let seconds = rem / NANOS_PER_SEC as i64;
-    let nanos = (rem % NANOS_PER_SEC as i64) as i32;
+    let seconds = rem.div_euclid(NANOS_PER_SEC as i64);
+    let nanos = rem.rem_euclid(NANOS_PER_SEC as i64) as i32;
     (months, days, seconds, nanos)
 }
 
 pub fn duration_in_months(
     a_date: Option<i32>,
     a_time: Option<i64>,
-    a_offset: Option<i32>,
+    a_zone: Option<&TzId>,
     b_date: Option<i32>,
     b_time: Option<i64>,
-    b_offset: Option<i32>,
+    b_zone: Option<&TzId>,
 ) -> DurationParts {
-    let (months, _, _) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    let (months, _, _) = between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
     (months, 0, 0, 0)
 }
 
 pub fn duration_in_days(
     a_date: Option<i32>,
     a_time: Option<i64>,
-    a_offset: Option<i32>,
+    a_zone: Option<&TzId>,
     b_date: Option<i32>,
     b_time: Option<i64>,
-    b_offset: Option<i32>,
+    b_zone: Option<&TzId>,
 ) -> DurationParts {
-    let (_, _, raw) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    let (_, _, raw) = between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
     (0, raw / NANOS_PER_DAY_I64, 0, 0)
 }
 
 pub fn duration_in_seconds(
     a_date: Option<i32>,
     a_time: Option<i64>,
-    a_offset: Option<i32>,
+    a_zone: Option<&TzId>,
     b_date: Option<i32>,
     b_time: Option<i64>,
-    b_offset: Option<i32>,
+    b_zone: Option<&TzId>,
 ) -> DurationParts {
-    let (_, _, raw) = between_components(a_date, a_time, a_offset, b_date, b_time, b_offset);
+    let (_, _, raw) = between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
     (
         0,
         0,
-        raw / NANOS_PER_SEC as i64,
-        (raw % NANOS_PER_SEC as i64) as i32,
+        raw.div_euclid(NANOS_PER_SEC as i64),
+        raw.rem_euclid(NANOS_PER_SEC as i64) as i32,
     )
 }
 

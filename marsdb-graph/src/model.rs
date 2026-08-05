@@ -23,10 +23,10 @@ pub struct EdgeId(pub u64);
 /// query layer's own `Value` the way `Value::List` does -- see that
 /// type's own doc comment for the contrasting case). `LocalTime`/`Time`/
 /// `LocalDateTime`/`DateTime` (Cypher's other four temporal types) follow
-/// the same reasoning below. Only *fixed* UTC offsets are supported for
-/// `Time`/`DateTime` -- named timezones (`Europe/Stockholm`) aren't; see
-/// the README's "Cypher coverage" section for exactly what that leaves
-/// unsupported.
+/// the same reasoning below. `Time` only accepts a *fixed* UTC offset --
+/// it carries no calendar date, so a named zone's DST-dependent offset
+/// has nothing to resolve against; `DateTime` accepts either a fixed
+/// offset or a named zone (`TzId`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     Null,
@@ -90,18 +90,34 @@ pub enum PropertyValue {
         epoch_seconds: i64,
         nanos: i32,
     },
-    /// A calendar date + time-of-day with a *fixed* UTC offset (Cypher's
-    /// `DATETIME`). `epoch_seconds`/`nanos` are the *UTC instant* (same
-    /// convention as `LocalDateTime`); `offset_seconds` is kept only for
-    /// display/round-tripping the original wall-clock reading --
-    /// comparison/equality use the instant alone, matching real Cypher
-    /// (two `DateTime`s at the same instant but different offsets are
-    /// equal, even though they print differently).
+    /// A calendar date + time-of-day with a timezone (Cypher's
+    /// `DATETIME`) -- either a *fixed* UTC offset or a named IANA zone
+    /// (`Europe/Stockholm`). `epoch_seconds`/`nanos` are the *UTC
+    /// instant* (same convention as `LocalDateTime`); `zone` is kept
+    /// only for display/round-tripping the original wall-clock reading
+    /// -- comparison/equality use the instant alone, matching real
+    /// Cypher (two `DateTime`s at the same instant but different zones
+    /// are equal, even though they print differently). A `Named` zone's
+    /// real offset at this instant is *not* cached here (the same zone
+    /// has different offsets across a DST transition) -- it's re-derived
+    /// on demand via `chrono-tz` (`marsdb-query::temporal::resolve_
+    /// offset`), this crate only stores the value, it doesn't know
+    /// Cypher's timezone-resolution semantics.
     DateTime {
         epoch_seconds: i64,
         nanos: i32,
-        offset_seconds: i32,
+        zone: TzId,
     },
+}
+
+/// A `DateTime`'s zone: a fixed UTC offset, or a named IANA timezone
+/// (`Europe/Stockholm`) whose real offset varies by instant (DST) and is
+/// resolved on demand, not stored -- see `PropertyValue::DateTime`'s doc
+/// comment.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TzId {
+    Offset(i32),
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

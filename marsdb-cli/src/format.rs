@@ -83,8 +83,18 @@ fn format_property(p: &PropertyValue) -> String {
         PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
-        } => marsdb::temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
+            zone,
+        } => marsdb::temporal::format_date_time(*epoch_seconds, *nanos, &to_temporal_tz(zone)),
+    }
+}
+
+/// `marsdb_graph::TzId` <-> `marsdb::temporal::TzId` -- two independent,
+/// same-shaped types (`temporal.rs` deliberately doesn't depend on
+/// `marsdb_graph`), converted at this formatting boundary.
+fn to_temporal_tz(zone: &marsdb_graph::TzId) -> marsdb::temporal::TzId {
+    match zone {
+        marsdb_graph::TzId::Offset(o) => marsdb::temporal::TzId::Offset(*o),
+        marsdb_graph::TzId::Named(name) => marsdb::temporal::TzId::Named(name.clone()),
     }
 }
 

@@ -14,6 +14,7 @@ use std::time::Instant;
 
 pub use marsdb_graph::IntegrityReport;
 pub use marsdb_graph::PropertyValue;
+pub use marsdb_graph::TzId;
 pub use marsdb_query::{
     temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Literal, PathElem, QueryResult, Value,

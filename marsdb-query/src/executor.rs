@@ -7,7 +7,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use marsdb_graph::{
-    AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, WriteTransaction,
+    AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, TzId as GraphTzId,
+    WriteTransaction,
 };
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
@@ -4193,14 +4194,32 @@ fn as_local_date_time(v: &Value) -> Option<(i64, i32)> {
     }
 }
 
-fn as_date_time(v: &Value) -> Option<(i64, i32, i32)> {
+fn as_date_time(v: &Value) -> Option<(i64, i32, temporal::TzId)> {
     match v {
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
-        }) => Some((*epoch_seconds, *nanos, *offset_seconds)),
+            zone,
+        }) => Some((*epoch_seconds, *nanos, tz_from_graph(zone))),
         _ => None,
+    }
+}
+
+/// `marsdb_graph::TzId` <-> `temporal::TzId` -- two independent, same-
+/// shaped types (`temporal.rs` deliberately doesn't depend on
+/// `marsdb_graph`, see its own module doc comment), converted at this
+/// storage/query-layer boundary.
+fn tz_from_graph(zone: &GraphTzId) -> temporal::TzId {
+    match zone {
+        GraphTzId::Offset(o) => temporal::TzId::Offset(*o),
+        GraphTzId::Named(name) => temporal::TzId::Named(name.clone()),
+    }
+}
+
+fn tz_to_graph(zone: temporal::TzId) -> GraphTzId {
+    match zone {
+        temporal::TzId::Offset(o) => GraphTzId::Offset(o),
+        temporal::TzId::Named(name) => GraphTzId::Named(name),
     }
 }
 
@@ -4265,12 +4284,20 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
             QueryError::Type("local date-time +/- duration produced an out-of-range value".into())
         })
     };
+    // `Named` zone arithmetic is only ever a single fixed-offset op, not
+    // a full DST-crossing re-resolution -- the offset is resolved once
+    // (at the *pre*-arithmetic instant) via `resolve_offset` and carried
+    // through unchanged, same as `Offset`'s own behavior; no TCK scenario
+    // exercises arithmetic on a `Named`-zone `DateTime` at all, so this
+    // is a real, deliberately narrow scope, not silently wrong for a
+    // tested case.
     let date_time_plus_duration =
-        |(epoch_seconds, existing_nanos, offset_seconds): (i64, i32, i32),
+        |(epoch_seconds, existing_nanos, zone): (i64, i32, temporal::TzId),
          dur: temporal::DurationParts,
          negate: bool|
          -> Result<Value, QueryError> {
             let (months, days, seconds, nanos) = dur;
+            let offset_seconds = temporal::resolve_offset(&zone, epoch_seconds);
             temporal::add_duration_to_local_date_time(
                 epoch_seconds + offset_seconds as i64,
                 existing_nanos,
@@ -4284,7 +4311,7 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
                 Value::Property(PropertyValue::DateTime {
                     epoch_seconds: local_epoch_seconds - offset_seconds as i64,
                     nanos,
-                    offset_seconds,
+                    zone: tz_to_graph(zone),
                 })
             })
             .ok_or_else(|| {
@@ -5177,8 +5204,8 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
-        }) => temporal::format_date_time(*epoch_seconds, *nanos, *offset_seconds),
+            zone,
+        }) => temporal::format_date_time(*epoch_seconds, *nanos, &tz_from_graph(zone)),
         Value::Property(PropertyValue::Null) | Value::Literal(Literal::Null) | Value::Null => {
             return Ok(Value::Null);
         }
@@ -5269,27 +5296,34 @@ fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i32, QueryError> 
         }
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
-            offset_seconds,
+            zone,
             ..
-        }) => Ok(temporal::split_epoch_seconds(epoch_seconds + *offset_seconds as i64).0),
+        }) => {
+            let offset_seconds = temporal::resolve_offset(&tz_from_graph(zone), *epoch_seconds);
+            Ok(temporal::split_epoch_seconds(epoch_seconds + offset_seconds as i64).0)
+        }
         other => Err(QueryError::Type(format!(
             "'{key}' must be a Date, LocalDateTime, or DateTime, got {other:?}"
         ))),
     }
 }
 
-/// Pulls `(hour, minute, second, nanos, offset_seconds)` out of a
-/// `LocalTime`/`Time`/`LocalDateTime`/`DateTime` value -- the "base" a
-/// `time`/`datetime` map key projects its clock fields from. `nanos`
-/// here is just the nanosecond-of-second remainder (not the whole
-/// nanos-of-day), matching the map constructors' own `nanosecond` field.
-/// `offset_seconds` is `Some` only for `Time`/`DateTime` -- callers use
-/// it as the *default* offset when building a `Time`/`DateTime`, unless
-/// overridden by an explicit `timezone` key.
-fn extract_time_base(
-    key: &str,
-    v: &Value,
-) -> Result<(i64, i64, i64, i64, Option<i32>), QueryError> {
+/// `(hour, minute, second, nanos, zone)` pulled out of a `LocalTime`/
+/// `Time`/`LocalDateTime`/`DateTime` value -- the "base" a `time`/
+/// `datetime` map key projects its clock fields from. `nanos` here is
+/// just the nanosecond-of-second remainder (not the whole nanos-of-day),
+/// matching the map constructors' own `nanosecond` field. `zone` is
+/// `Some((original_zone, resolved_offset_seconds))` only for `Time`/
+/// `DateTime` sources -- both are kept, not just the resolved number, so
+/// a caller that projects this base *without* an explicit `timezone`
+/// override (`{time: t}`, `{datetime: dt}`) can preserve the source's
+/// own zone *identity* (a `Named` zone stays `Named`, TCK's Temporal3
+/// [9]/[11] `{datetime: other}` rows), while a caller that only ever
+/// needs a plain number (`time_builtin`'s cross-type conversion, `TIME`
+/// structurally can't hold a name) uses the resolved half directly.
+type ClockBase = (i64, i64, i64, i64, Option<(temporal::TzId, i32)>);
+
+fn extract_time_base(key: &str, v: &Value) -> Result<ClockBase, QueryError> {
     let hms_nanos = |nanos_of_day: i64| {
         (
             temporal::local_time_component(nanos_of_day, "hour").unwrap(),
@@ -5308,7 +5342,13 @@ fn extract_time_base(
             offset_seconds,
         }) => {
             let (h, m, s, ns) = hms_nanos(*nanos_of_day);
-            Ok((h, m, s, ns, Some(*offset_seconds)))
+            Ok((
+                h,
+                m,
+                s,
+                ns,
+                Some((temporal::TzId::Offset(*offset_seconds), *offset_seconds)),
+            ))
         }
         Value::Property(PropertyValue::LocalDateTime {
             epoch_seconds,
@@ -5321,12 +5361,14 @@ fn extract_time_base(
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
+            zone,
         }) => {
-            let local = epoch_seconds + *offset_seconds as i64;
+            let tz = tz_from_graph(zone);
+            let offset_seconds = temporal::resolve_offset(&tz, *epoch_seconds);
+            let local = epoch_seconds + offset_seconds as i64;
             let (_, nanos_of_day) = temporal::split_epoch_seconds(local);
             let (h, m, s, _) = hms_nanos(nanos_of_day);
-            Ok((h, m, s, *nanos as i64, Some(*offset_seconds)))
+            Ok((h, m, s, *nanos as i64, Some((tz, offset_seconds))))
         }
         other => Err(QueryError::Type(format!(
             "'{key}' must be a LocalTime, Time, LocalDateTime, or DateTime, got {other:?}"
@@ -5658,43 +5700,114 @@ fn int_field(m: &BTreeMap<String, Value>, key: &str, default: i64) -> Result<i64
 /// Cypher's rule, confirmed against Temporal3's own examples -- and
 /// only *then* do explicit hour/minute/second overrides apply, on top
 /// of the shifted result, not the original.
+/// `epoch_day` is the calendar date the resulting clock fields will be
+/// combined with -- only needed to resolve a *shift into a named zone*
+/// (its real, DST-aware offset depends on the date, TCK's Temporal3 [9]
+/// row: `{time: t+01:00, second: 42, timezone: 'Pacific/Honolulu'}`),
+/// `None` for callers with no date at all (`time()`'s own map form,
+/// which can't shift into a named zone regardless -- its caller rejects
+/// that case itself) or that don't care about the resolved zone
+/// (`localdatetime()`'s map form, which discards it).
+/// The 5th element is `Some((effective_zone, effective_offset))` --
+/// `effective_zone` preserves a `Named` base's identity when no
+/// explicit `timezone` override is given (needed by `DATETIME`, which
+/// can hold one); `effective_offset` is always a plain resolved number,
+/// usable directly by a caller that structurally can't hold a zone name
+/// (`TIME`) regardless of which case produced it.
 fn clock_fields_from_map(
     m: &BTreeMap<String, Value>,
-) -> Result<(i64, i64, i64, i64, Option<i32>), QueryError> {
-    let (base_h, base_m, base_s, base_ns, base_offset) = if let Some(v) = m.get("time") {
+    epoch_day: Option<i32>,
+) -> Result<ClockBase, QueryError> {
+    let (base_h, base_m, base_s, base_ns, base_zone) = if let Some(v) = m.get("time") {
         extract_time_base("time", v)?
     } else if let Some(v) = m.get("datetime") {
         extract_time_base("datetime", v)?
     } else {
         (0, 0, 0, 0, None)
     };
-    let effective_offset = match m.get("timezone") {
-        Some(v) => Some(offset_from_timezone_value(v)?),
-        None => base_offset,
+    let has_explicit_timezone = m.contains_key("timezone");
+    let effective_zone = match m.get("timezone") {
+        Some(v) => Some(timezone_value_to_tzid(v)?),
+        // No explicit override -- preserve the base's own zone
+        // *identity* (a `Named` zone stays `Named`), not just its
+        // resolved offset (TCK's Temporal3 [9]/[11] `{datetime: other}`
+        // rows, where `other` is itself a named-zone value).
+        None => base_zone.as_ref().map(|(tz, _)| tz.clone()),
     };
-    let (base_h, base_m, base_s, base_ns) = match (base_offset, effective_offset) {
-        (Some(from), Some(to)) if from != to => {
-            let nanos_of_day = base_h * 3_600_000_000_000
-                + base_m * 60_000_000_000
-                + base_s * 1_000_000_000
-                + base_ns;
-            let shifted =
-                (nanos_of_day + (to - from) as i64 * 1_000_000_000).rem_euclid(86_400_000_000_000);
-            (
-                shifted / 3_600_000_000_000,
-                (shifted / 60_000_000_000) % 60,
-                (shifted / 1_000_000_000) % 60,
-                shifted % 1_000_000_000,
-            )
+    // The wall-clock is only ever *shifted* by an *explicit* `timezone`
+    // override that actually changes the zone -- with no override, the
+    // literal local time passes straight through unchanged even if the
+    // base's own zone's real offset differs for the (possibly
+    // day-overridden) new date, e.g. a DST boundary crossed by a `day`
+    // override (TCK's Temporal3 [10]: a `Named` base carried through
+    // with no `timezone` key keeps its `12:00` wall-clock as `12:00`,
+    // just re-displayed with whatever offset that zone now resolves to
+    // -- it does *not* shift to a different wall-clock hour).
+    let base_nanos_of_day =
+        base_h * 3_600_000_000_000 + base_m * 60_000_000_000 + base_s * 1_000_000_000 + base_ns;
+    let (base_h, base_m, base_s, base_ns, effective_offset) = if has_explicit_timezone {
+        // The base's own offset, re-resolved against the *new* date --
+        // not its own original instant's offset (`extract_time_base`'s
+        // `Named` resolution, which used the *source* value's own
+        // epoch_seconds/date, not necessarily this one -- a `day`
+        // override can move the result to a different date than the
+        // base's, potentially across a DST boundary for the *same*
+        // zone, TCK's Temporal3 [10] row 337).
+        let from_offset = match base_zone.as_ref() {
+            Some((temporal::TzId::Offset(o), _)) => Some(*o),
+            Some((zone @ temporal::TzId::Named(_), resolved)) => Some(match epoch_day {
+                Some(ed) => temporal::resolve_offset(
+                    zone,
+                    temporal::combine_epoch_day_and_nanos_of_day(ed, base_nanos_of_day),
+                ),
+                None => *resolved,
+            }),
+            None => None,
+        };
+        let to_offset = match (from_offset, effective_zone.as_ref(), epoch_day) {
+            (Some(_), Some(temporal::TzId::Offset(to)), _) => Some(*to),
+            (Some(from), Some(zone @ temporal::TzId::Named(_)), Some(ed)) => {
+                let approx_epoch_seconds =
+                    temporal::combine_epoch_day_and_nanos_of_day(ed, base_nanos_of_day)
+                        - from as i64;
+                Some(temporal::resolve_offset(zone, approx_epoch_seconds))
+            }
+            _ => None,
+        };
+        match (from_offset, to_offset) {
+            (Some(from), Some(to)) if from != to => {
+                let shifted = (base_nanos_of_day + (to - from) as i64 * 1_000_000_000)
+                    .rem_euclid(86_400_000_000_000);
+                (
+                    shifted / 3_600_000_000_000,
+                    (shifted / 60_000_000_000) % 60,
+                    (shifted / 1_000_000_000) % 60,
+                    shifted % 1_000_000_000,
+                    to_offset.unwrap_or(0),
+                )
+            }
+            _ => (base_h, base_m, base_s, base_ns, to_offset.unwrap_or(0)),
         }
-        _ => (base_h, base_m, base_s, base_ns),
+    } else {
+        // No override -- the resolved offset is just the base's own
+        // (unchanged, no re-resolution -- a caller that can't hold a
+        // zone name, `TIME`, degrades a `Named` base to this number
+        // silently, TCK's Temporal3 [3] row 125: `{time: t}` where `t`
+        // is a named-zone `DateTime` -> the plain offset, no error).
+        (
+            base_h,
+            base_m,
+            base_s,
+            base_ns,
+            base_zone.as_ref().map_or(0, |(_, o)| *o),
+        )
     };
     Ok((
         int_field(m, "hour", base_h)?,
         int_field(m, "minute", base_m)?,
         int_field(m, "second", base_s)?,
         sub_second_nanos_from_map(base_ns, m)?,
-        effective_offset,
+        effective_zone.map(|z| (z, effective_offset)),
     ))
 }
 
@@ -5757,7 +5870,7 @@ fn local_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Valu
                 "localtime({{...}}) key '{bad}' isn't a recognized field"
             )));
         }
-        let (hour, minute, second, nanos, _) = clock_fields_from_map(m)?;
+        let (hour, minute, second, nanos, _) = clock_fields_from_map(m, None)?;
         let t = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
             .ok_or_else(|| QueryError::Type("localtime({...}) has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::LocalTime(t)));
@@ -5812,13 +5925,17 @@ fn time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
                 | PropertyValue::DateTime { .. }
         )
     ) {
-        let (hour, minute, second, nanos, offset_seconds) =
-            extract_time_base("time() argument", arg)?;
+        let (hour, minute, second, nanos, zone) = extract_time_base("time() argument", arg)?;
         let nanos_of_day = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
             .ok_or_else(|| QueryError::Type("time() argument has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::Time {
             nanos_of_day,
-            offset_seconds: offset_seconds.unwrap_or(0),
+            // `TIME` structurally can't carry a zone name -- degrades a
+            // `Named` source to its resolved numeric offset (TCK's
+            // Temporal3 [3] `datetime({..., timezone: 'Europe/
+            // Stockholm'})` -> `time(other)` = `'12:00+01:00'`, the
+            // offset alone, no bracket).
+            offset_seconds: zone.map_or(0, |(_, o)| o),
         }));
     }
     if let Some(s) = as_arith_str(arg) {
@@ -5853,8 +5970,27 @@ fn time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
                 "time({{...}}) key '{bad}' isn't a recognized field"
             )));
         }
-        let (hour, minute, second, nanos, offset_seconds) = clock_fields_from_map(m)?;
-        let offset_seconds = offset_seconds.unwrap_or(0);
+        let (hour, minute, second, nanos, zone) = clock_fields_from_map(m, None)?;
+        let offset_seconds = match zone {
+            None => 0,
+            // A `Named` zone reaching here with no *explicit* `timezone`
+            // key was just carried through from a projected `time`/
+            // `datetime` base (`{time: namedZoneDateTime}`) -- `TIME`
+            // can't hold a name, so it silently degrades to the base's
+            // own resolved offset, same as the cross-type positional
+            // form already does (TCK's Temporal3 [3] row 125). An
+            // *explicit* named-zone request, though, is a real error --
+            // there's no calendar date here to resolve it against.
+            Some((_, o)) if !m.contains_key("timezone") => o,
+            Some((temporal::TzId::Offset(o), _)) => o,
+            Some((temporal::TzId::Named(name), _)) => {
+                return Err(QueryError::Type(format!(
+                    "'timezone': '{name}' looks like a named timezone (e.g. 'Europe/Stockholm') -- TIME has \
+                     no calendar date to resolve a named zone's DST-dependent offset against, only a fixed \
+                     UTC offset like '+01:00' is supported"
+                )));
+            }
+        };
         let nanos_of_day = temporal::local_time_nanos_from_fields(hour, minute, second, nanos)
             .ok_or_else(|| QueryError::Type("time({...}) has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::Time {
@@ -5867,20 +6003,30 @@ fn time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, Que
     )))
 }
 
-/// `{timezone: '+01:00'}`'s value -- a string offset only, matching this
-/// module's offset-only scope (see `temporal.rs`'s top-of-file docs).
-fn offset_from_timezone_value(v: &Value) -> Result<i32, QueryError> {
+/// `{timezone: '+01:00'}`'s value -- a fixed UTC offset, or an IANA zone
+/// name (`'Europe/Stockholm'`). Both forms are always syntactically
+/// disjoint (an offset always starts with `+`/`-`/`Z`, a zone name never
+/// does), so there's no ambiguity to resolve between them. A caller that
+/// can't accept a `Named` zone (`time_builtin`'s map form -- `TIME` has
+/// no calendar date to resolve a named zone's DST-dependent offset
+/// against) rejects it itself, after this succeeds.
+fn timezone_value_to_tzid(v: &Value) -> Result<temporal::TzId, QueryError> {
     let s = as_arith_str(v).ok_or_else(|| {
-        QueryError::Type("'timezone' must be a string offset, e.g. '+01:00'".into())
+        QueryError::Type(
+            "'timezone' must be a string offset or IANA zone name, e.g. '+01:00' or \
+             'Europe/Stockholm'"
+                .into(),
+        )
     })?;
-    if s.contains('/') {
-        return Err(QueryError::Type(format!(
-            "'timezone': '{s}' looks like a named timezone (e.g. 'Europe/Stockholm') -- MarsDB only supports a \
-             fixed UTC offset like '+01:00'"
-        )));
+    if let Some(offset) = temporal::parse_offset_seconds(s) {
+        return Ok(temporal::TzId::Offset(offset));
     }
-    temporal::parse_offset_seconds(s)
-        .ok_or_else(|| QueryError::Type(format!("'timezone': '{s}' isn't a valid UTC offset")))
+    if temporal::parse_timezone_name(s).is_some() {
+        return Ok(temporal::TzId::Named(s.to_string()));
+    }
+    Err(QueryError::Type(format!(
+        "'timezone': '{s}' isn't a valid UTC offset or a recognized IANA zone name"
+    )))
 }
 
 /// `localdatetime(...)` -- zero args (now, UTC), a string, a map
@@ -5956,7 +6102,7 @@ fn local_date_time_builtin(
     if let Value::Map(m) = arg {
         let (year, month, day) =
             calendar_fields_from_map("localdatetime", m, DATE_TIME_ALLOWED_KEYS)?;
-        let (hour, minute, second, nanos, _) = clock_fields_from_map(m)?;
+        let (hour, minute, second, nanos, _) = clock_fields_from_map(m, None)?;
         let (epoch_seconds, nanos) =
             temporal::local_date_time_from_fields(temporal::CalendarDateTime {
                 year,
@@ -6002,10 +6148,11 @@ const DATE_TIME_ALLOWED_KEYS: &[&str] = &[
 ];
 
 /// `datetime(...)` -- zero args (now, UTC), a string, a map
-/// (`datetime({year, ..., timezone: '+01:00'})`), or another `DateTime`
-/// (identity). Requires a `timezone` for every constructed form except
-/// identity (defaults to UTC, `offset_seconds: 0`, if the map omits it
-/// -- matches `date()`'s own "no timezone info -> UTC" convention).
+/// (`datetime({year, ..., timezone: '+01:00'})` or `{..., timezone:
+/// 'Europe/Stockholm'}`), or another `DateTime` (identity). Requires a
+/// `timezone` for every constructed form except identity (defaults to
+/// UTC, `TzId::Offset(0)`, if the map omits it -- matches `date()`'s own
+/// "no timezone info -> UTC" convention).
 fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
@@ -6017,7 +6164,7 @@ fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value
         return Ok(Value::Property(PropertyValue::DateTime {
             epoch_seconds: now.epoch_seconds,
             nanos: now.nanos,
-            offset_seconds: 0,
+            zone: GraphTzId::Offset(0),
         }));
     };
     if matches!(arg, Value::Null) {
@@ -6026,37 +6173,44 @@ fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value
     if let Value::Property(PropertyValue::DateTime {
         epoch_seconds,
         nanos,
-        offset_seconds,
+        zone,
     }) = arg
     {
         return Ok(Value::Property(PropertyValue::DateTime {
             epoch_seconds: *epoch_seconds,
             nanos: *nanos,
-            offset_seconds: *offset_seconds,
+            zone: zone.clone(),
+        }));
+    }
+    // `datetime(otherLocalDateTime)` -- a bare `LocalDateTime` argument
+    // has no zone of its own, defaults to UTC, same as `{datetime:
+    // otherLocalDateTime}` (TCK's Temporal3 [11]).
+    if let Value::Property(PropertyValue::LocalDateTime {
+        epoch_seconds,
+        nanos,
+    }) = arg
+    {
+        return Ok(Value::Property(PropertyValue::DateTime {
+            epoch_seconds: *epoch_seconds,
+            nanos: *nanos,
+            zone: GraphTzId::Offset(0),
         }));
     }
     if let Some(s) = as_arith_str(arg) {
-        if s.contains('[') {
-            return Err(QueryError::Type(
-                "datetime('...'): named timezones (e.g. '[Europe/Stockholm]') aren't supported, only a fixed \
-                 UTC offset like '+01:00'"
-                    .into(),
-            ));
-        }
-        let (epoch_seconds, nanos, offset_seconds) =
-            temporal::parse_date_time(s).ok_or_else(|| {
-                QueryError::Type(format!("'{s}' isn't a date-time string MarsDB can parse"))
-            })?;
+        let (epoch_seconds, nanos, zone) = temporal::parse_date_time(s).ok_or_else(|| {
+            QueryError::Type(format!("'{s}' isn't a date-time string MarsDB can parse"))
+        })?;
         return Ok(Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
+            zone: tz_to_graph(zone),
         }));
     }
     if let Value::Map(m) = arg {
         let (year, month, day) = calendar_fields_from_map("datetime", m, DATE_TIME_ALLOWED_KEYS)?;
-        let (hour, minute, second, nanos, offset_seconds) = clock_fields_from_map(m)?;
-        let offset_seconds = offset_seconds.unwrap_or(0);
+        let epoch_day = temporal::epoch_day_from_ymd(year, month, day);
+        let (hour, minute, second, nanos, zone) = clock_fields_from_map(m, epoch_day)?;
+        let zone = zone.map_or(temporal::TzId::Offset(0), |(z, _)| z);
         let (epoch_seconds, nanos) = temporal::date_time_from_fields(
             temporal::CalendarDateTime {
                 year,
@@ -6067,13 +6221,13 @@ fn date_time_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value
                 second,
                 nanos,
             },
-            offset_seconds,
+            &zone,
         )
         .ok_or_else(|| QueryError::Type("datetime({...}) has an out-of-range field".into()))?;
         return Ok(Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
+            zone: tz_to_graph(zone),
         }));
     }
     Err(QueryError::Type(format!(
@@ -6098,7 +6252,11 @@ fn between_operand(name: &str, v: &Value) -> Result<BetweenOperand, QueryError> 
         Value::Property(PropertyValue::Time {
             nanos_of_day,
             offset_seconds,
-        }) => Ok((None, Some(*nanos_of_day), Some(*offset_seconds))),
+        }) => Ok((
+            None,
+            Some(*nanos_of_day),
+            Some(temporal::TzId::Offset(*offset_seconds)),
+        )),
         Value::Property(PropertyValue::LocalDateTime {
             epoch_seconds,
             nanos,
@@ -6109,11 +6267,13 @@ fn between_operand(name: &str, v: &Value) -> Result<BetweenOperand, QueryError> 
         Value::Property(PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
+            zone,
         }) => {
-            let local = epoch_seconds + *offset_seconds as i64;
+            let tz = tz_from_graph(zone);
+            let offset_seconds = temporal::resolve_offset(&tz, *epoch_seconds);
+            let local = epoch_seconds + offset_seconds as i64;
             let (d, n) = temporal::split_epoch_seconds(local);
-            Ok((Some(d), Some(n + *nanos as i64), Some(*offset_seconds)))
+            Ok((Some(d), Some(n + *nanos as i64), Some(tz)))
         }
         other => Err(QueryError::Type(format!(
             "{name}() needs a Date, LocalTime, Time, LocalDateTime, or DateTime, got {other:?}"
@@ -6121,21 +6281,20 @@ fn between_operand(name: &str, v: &Value) -> Result<BetweenOperand, QueryError> 
     }
 }
 
-/// `(epoch_day, nanos_of_day, offset_seconds)`, see `between_operand`'s
-/// docs.
-type BetweenOperand = (Option<i32>, Option<i64>, Option<i32>);
+/// `(epoch_day, nanos_of_day, zone)`, see `between_operand`'s docs.
+type BetweenOperand = (Option<i32>, Option<i64>, Option<temporal::TzId>);
 
-/// `(a_epoch_day, a_nanos_of_day, a_offset_seconds, b_epoch_day,
-/// b_nanos_of_day, b_offset_seconds) -> DurationParts` -- the shape
+/// `(a_epoch_day, a_nanos_of_day, a_zone, b_epoch_day,
+/// b_nanos_of_day, b_zone) -> DurationParts` -- the shape
 /// every `temporal::duration_between`/`duration_in_months`/
 /// `duration_in_days`/`duration_in_seconds` function shares.
 type BetweenFn = fn(
     Option<i32>,
     Option<i64>,
-    Option<i32>,
+    Option<&temporal::TzId>,
     Option<i32>,
     Option<i64>,
-    Option<i32>,
+    Option<&temporal::TzId>,
 ) -> temporal::DurationParts;
 
 /// Shared dispatch for `duration.between`/`.inMonths`/`.inDays`/
@@ -6152,10 +6311,15 @@ fn duration_between_builtin(name: &str, args: &[Value], f: BetweenFn) -> Result<
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
         return Ok(Value::Null);
     }
-    let (a_date, a_time, a_offset) = between_operand(name, &args[0])?;
-    let (b_date, b_time, b_offset) = between_operand(name, &args[1])?;
+    let (a_date, a_time, a_zone) = between_operand(name, &args[0])?;
+    let (b_date, b_time, b_zone) = between_operand(name, &args[1])?;
     Ok(duration_value(f(
-        a_date, a_time, a_offset, b_date, b_time, b_offset,
+        a_date,
+        a_time,
+        a_zone.as_ref(),
+        b_date,
+        b_time,
+        b_zone.as_ref(),
     )))
 }
 
@@ -6365,8 +6529,20 @@ fn time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
     })?;
     let nanos_of_day = apply_time_overrides(truncated, map)?;
     let offset_seconds = match map.and_then(|m| m.get("timezone")) {
-        Some(v) => offset_from_timezone_value(v)?,
-        None => base_offset.unwrap_or(0),
+        Some(v) => match timezone_value_to_tzid(v)? {
+            temporal::TzId::Offset(o) => o,
+            temporal::TzId::Named(name) => {
+                return Err(QueryError::Type(format!(
+                    "'timezone': '{name}' looks like a named timezone (e.g. 'Europe/Stockholm') -- TIME has \
+                     no calendar date to resolve a named zone's DST-dependent offset against, only a fixed \
+                     UTC offset like '+01:00' is supported"
+                )));
+            }
+        },
+        None => match base_offset {
+            Some(temporal::TzId::Offset(o)) => o,
+            _ => 0,
+        },
     };
     Ok(Value::Property(PropertyValue::Time {
         nanos_of_day,
@@ -6471,15 +6647,27 @@ fn date_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError> {
         })?;
     let final_date = apply_date_overrides(trunc_date, map)?;
     let final_time = apply_time_overrides(trunc_time, map)?;
-    let offset_seconds = match map.and_then(|m| m.get("timezone")) {
-        Some(v) => offset_from_timezone_value(v)?,
-        None => base_offset.unwrap_or(0),
+    let zone = match map.and_then(|m| m.get("timezone")) {
+        Some(v) => timezone_value_to_tzid(v)?,
+        None => base_offset.unwrap_or(temporal::TzId::Offset(0)),
     };
-    let (local_epoch_seconds, nanos) = temporal::combine_date_and_time(final_date, final_time);
+    let calendar = temporal::CalendarDateTime {
+        year: temporal::date_component(final_date, "year").unwrap() as i32,
+        month: temporal::date_component(final_date, "month").unwrap() as u32,
+        day: temporal::date_component(final_date, "day").unwrap() as u32,
+        hour: temporal::local_time_component(final_time, "hour").unwrap(),
+        minute: temporal::local_time_component(final_time, "minute").unwrap(),
+        second: temporal::local_time_component(final_time, "second").unwrap(),
+        nanos: temporal::local_time_component(final_time, "nanosecond").unwrap(),
+    };
+    let (epoch_seconds, nanos) =
+        temporal::date_time_from_fields(calendar, &zone).ok_or_else(|| {
+            QueryError::Type("datetime.truncate() produced an out-of-range value".into())
+        })?;
     Ok(Value::Property(PropertyValue::DateTime {
-        epoch_seconds: local_epoch_seconds - offset_seconds as i64,
+        epoch_seconds,
         nanos,
-        offset_seconds,
+        zone: tz_to_graph(zone),
     }))
 }
 
@@ -6528,8 +6716,8 @@ fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
         PropertyValue::DateTime {
             epoch_seconds,
             nanos,
-            offset_seconds,
-        } => date_time_component(*epoch_seconds, *nanos, Some(*offset_seconds), prop),
+            zone,
+        } => date_time_component(*epoch_seconds, *nanos, Some(&tz_from_graph(zone)), prop),
         _ => None,
     }
 }
@@ -6565,12 +6753,26 @@ fn time_component(nanos_of_day: i64, offset_seconds: i32, prop: &str) -> Option<
 fn date_time_component(
     epoch_seconds: i64,
     nanos: i32,
-    offset_seconds: Option<i32>,
+    zone: Option<&temporal::TzId>,
     prop: &str,
 ) -> Option<PropertyValue> {
-    if let Some(offset_seconds) = offset_seconds {
+    if let Some(zone) = zone {
+        let offset_seconds = temporal::resolve_offset(zone, epoch_seconds);
         match prop {
-            "timezone" | "offset" => {
+            // `.timezone` is the zone *identifier* as written -- the
+            // zone name for a `Named` zone, or the offset text itself
+            // for a fixed `Offset` (there's no separate name); `.offset`
+            // is always the *resolved* offset text, so the two only
+            // diverge for a `Named` zone (TCK's Temporal5's `d.timezone`
+            // = `'Europe/Stockholm'` vs `d.offset` = `'+01:00'`).
+            "timezone" => {
+                let text = match zone {
+                    temporal::TzId::Named(name) => name.clone(),
+                    temporal::TzId::Offset(_) => temporal::format_offset(offset_seconds),
+                };
+                return Some(PropertyValue::String(text));
+            }
+            "offset" => {
                 return Some(PropertyValue::String(temporal::format_offset(
                     offset_seconds,
                 )))
@@ -6586,7 +6788,8 @@ fn date_time_component(
             _ => {}
         }
     }
-    let local_epoch_seconds = epoch_seconds + offset_seconds.unwrap_or(0) as i64;
+    let offset_seconds = zone.map_or(0, |z| temporal::resolve_offset(z, epoch_seconds));
+    let local_epoch_seconds = epoch_seconds + offset_seconds as i64;
     temporal::date_time_calendar_component(local_epoch_seconds, prop)
         .or_else(|| temporal::date_time_clock_component(local_epoch_seconds, nanos, prop))
         .map(PropertyValue::Int)
