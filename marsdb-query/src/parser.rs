@@ -1238,14 +1238,18 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
 /// more).
 fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
     let rest = &text[1..]; // strip leading '*'
+                           // Real Cypher's default minimum is 1, not 0 -- a variable-length
+                           // pattern always requires at least one real relationship unless a
+                           // zero-length lower bound is written explicitly (`*0..`); `x` in
+                           // `(a)-[*]->(x)` is never `a` itself.
     if rest.is_empty() {
-        return Ok((0, None));
+        return Ok((1, None));
     }
     if let Some(idx) = rest.find("..") {
         let min_str = &rest[..idx];
         let max_str = &rest[idx + 2..];
         let min = if min_str.is_empty() {
-            0
+            1
         } else {
             min_str
                 .parse()
