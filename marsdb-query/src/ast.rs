@@ -91,6 +91,17 @@ pub enum Expr {
     /// other `Expr` leaf), evaluated via `value_to_bool3`. Mirrors
     /// `WithExpr::Bare` exactly, just evaluated pre-projection.
     GeneralBare(ReturnExpr),
+    /// `WHERE (n)-[:REL]->(m)` etc (TCK's Pattern1 "Pattern predicate") --
+    /// existential: true iff at least one real match of `Pattern` exists
+    /// against the graph, with every named endpoint already bound in the
+    /// current row held fixed to that binding rather than searched freely
+    /// (a pattern predicate never introduces a new variable -- real
+    /// Cypher's `UndefinedVariable`, checked at compile time by
+    /// `semantic::validate_pattern_predicate`). Evaluated by
+    /// `Executor::eval_expr` via the same `build_match_plan` "already-
+    /// bound var -> Seed" mechanism `eval_merge`'s own "try as an
+    /// ordinary MATCH first" half already uses.
+    Pattern(Pattern),
 }
 
 #[derive(Debug, Clone, PartialEq)]
