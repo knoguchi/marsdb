@@ -154,6 +154,17 @@ fn property_to_py<'py>(
         } => ::marsdb::temporal::format_date_time(*epoch_seconds, *nanos, &to_temporal_tz(zone))
             .into_pyobject(py)?
             .into_any(),
+        // A list-valued node/edge property (real Cypher/Neo4j's own
+        // "homogeneous array property" shape) -- converts to a Python
+        // list, recursing per-element the same as `value_to_py`'s own
+        // list handling above.
+        marsdb_graph::PropertyValue::List(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(property_to_py(py, item)?)?;
+            }
+            list.into_any()
+        }
     })
 }
 

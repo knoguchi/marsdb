@@ -34,6 +34,16 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0]["p"]["labels"], ["Person"])
         self.assertEqual(rows[0]["p"]["props"], {"name": "Ada"})
 
+    def test_list_valued_node_property_round_trips(self):
+        # A stored PropertyValue::List (real Cypher/Neo4j's own
+        # "homogeneous array property" shape), not the query-layer-only
+        # list literal the other test above already covers.
+        db = marsdb.Database.in_memory()
+        db.execute("CREATE (:Person {name: 'Ada', tags: [1, 2, 3]})")
+        rows = db.execute("MATCH (p:Person) RETURN p.tags")
+
+        self.assertEqual(rows, [{"p.tags": [1, 2, 3]}])
+
 
 if __name__ == "__main__":
     unittest.main()
