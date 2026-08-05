@@ -102,7 +102,7 @@ match_keyword = { (^"OPTIONAL" ~ ^"MATCH") | ^"MATCH" }
 // sense for the whole matched shape, not a fragment of it.
 path_pattern          = { (identifier ~ "=")? ~ (shortest_path_wrapper | pattern) }
 shortest_path_wrapper = { ^"shortestPath" ~ "(" ~ pattern ~ ")" }
-with_clause   = { ^"WITH" ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
+with_clause   = { ^"WITH" ~ distinct_kw? ~ return_item ~ ("," ~ return_item)* ~ with_where_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
 
 // Not a general `Literal::List` usable anywhere a `literal` is (a prop
 // value, a comparison RHS, ...) — deliberately scoped to only appear right
@@ -343,7 +343,7 @@ limit_clause    = { ^"LIMIT" ~ int_literal }
 skip_clause     = { ^"SKIP" ~ int_literal }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ sort_item ~ ("," ~ sort_item)* }
 sort_item       = { return_expr ~ sort_dir? }
-sort_dir        = { ^"ASC" | ^"DESC" }
+sort_dir        = { ^"ASCENDING" | ^"ASC" | ^"DESCENDING" | ^"DESC" }
 
 pattern = { node_pattern ~ (rel_pattern ~ node_pattern)* }
 

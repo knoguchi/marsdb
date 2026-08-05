@@ -1444,13 +1444,18 @@ impl<'a> Executor<'a> {
                 })
                 .collect()
         };
+        if with.distinct {
+            out = dedup_binding_rows(&with.items, out)?;
+        }
         if let Some(where_clause) = &with.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
-            if is_aggregating {
-                // Aggregation collapses many input rows into one group --
+            if is_aggregating || with.distinct {
+                // Aggregation collapses many input rows into one group, and
+                // DISTINCT collapses rows into deduped ones -- either way
                 // there's no single pre-WITH row left to fall back to, so
                 // (matching real Cypher) WHERE only sees the grouped/
-                // aggregated names, same as `RETURN`'s own aggregate WHERE.
+                // aggregated/deduped names, same as `RETURN`'s own
+                // aggregate WHERE.
                 for row in out {
                     if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
                         filtered.push(row);
@@ -7092,6 +7097,39 @@ fn dedup_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, QueryError> {
         let key = row
             .iter()
             .map(value_hash_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        if seen.insert(key) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// `WITH DISTINCT`'s result-set-level dedup -- same first-occurrence-wins
+/// structural equality as `dedup_rows` (`RETURN DISTINCT`), but keyed at
+/// the `Binding` level via `binding_hash_key` (node/edge identity, not
+/// re-fetched contents) since a `WITH`-projected row can still carry a
+/// real `Binding::Node`/`Edge` a later clause keeps traversing from,
+/// unlike `RETURN`'s already-fully-evaluated `Value` rows.
+fn dedup_binding_rows(
+    items: &[ReturnItem],
+    rows: Vec<BindingRow>,
+) -> Result<Vec<BindingRow>, QueryError> {
+    let names: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(with_item_output_name)
+        .collect();
+    let mut seen: HashSet<Vec<HashKey>> = HashSet::with_capacity(rows.len());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = names
+            .iter()
+            .map(|name| {
+                binding_hash_key(row.get(name).unwrap_or_else(|| {
+                    panic!("DISTINCT row missing its own projected column '{name}'")
+                }))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if seen.insert(key) {
             out.push(row);

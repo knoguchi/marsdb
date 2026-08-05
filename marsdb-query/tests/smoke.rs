@@ -3445,6 +3445,52 @@ fn with_where_comparison_followed_by_order_by_still_parses() {
     assert_eq!(int(&result.rows[0][0]), 20);
 }
 
+/// Real Cypher accepts `ASCENDING`/`DESCENDING` as full-word spellings of
+/// `ASC`/`DESC` -- the grammar's `sort_dir` rule tried `^"ASC"` before
+/// `^"ASCENDING"`, so it matched just the `ASC` prefix and left `ENDING`
+/// dangling as a syntax error (longest alternative must come first in a
+/// pest `|` alternation).
+#[test]
+fn order_by_accepts_ascending_and_descending_spellings() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "UNWIND [3, 1, 2] AS x CREATE (:Item {idx: x})");
+
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx ORDER BY n.idx ASCENDING",
+    );
+    let vals: Vec<i64> = result.rows.iter().map(|r| int(&r[0])).collect();
+    assert_eq!(vals, vec![1, 2, 3]);
+
+    let result = run(
+        &store,
+        "MATCH (n:Item) RETURN n.idx ORDER BY n.idx DESCENDING",
+    );
+    let vals: Vec<i64> = result.rows.iter().map(|r| int(&r[0])).collect();
+    assert_eq!(vals, vec![3, 2, 1]);
+}
+
+/// `WITH DISTINCT x` -- dedups the projected rows, same as `RETURN
+/// DISTINCT`, applied before `ORDER BY`/`LIMIT` see the (now-deduped) rows.
+#[test]
+fn with_distinct_dedups_projected_rows_before_order_by_and_limit() {
+    let store = GraphStore::open_memory().unwrap();
+
+    let result = run(
+        &store,
+        "UNWIND [0, 2, 1, 2, 0, 1] AS x WITH DISTINCT x ORDER BY x ASC LIMIT 1 RETURN x",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 0);
+
+    let result = run(
+        &store,
+        "UNWIND [0, 2, 1, 2, 0, 1] AS x WITH DISTINCT x ORDER BY x DESC LIMIT 1 RETURN x",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 2);
+}
+
 #[test]
 fn return_expr_or_immediately_before_order_by_does_not_swallow_order() {
     // Regression: a bare `^"OR"` keyword has no word-boundary check, so

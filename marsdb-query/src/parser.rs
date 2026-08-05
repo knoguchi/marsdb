@@ -388,6 +388,7 @@ fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
 }
 
 fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
+    let mut distinct = false;
     let mut items = Vec::new();
     let mut where_clause = None;
     let mut order_by = None;
@@ -395,6 +396,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
+            Rule::distinct_kw => distinct = true,
             Rule::return_item => items.push(parse_return_item(p)?),
             Rule::with_where_clause => {
                 let expr_pair = p.into_inner().next().expect("WITH...WHERE has a with_expr");
@@ -408,6 +410,7 @@ fn parse_with_clause(pair: Pair<Rule>) -> Result<WithClause, QueryError> {
     }
     Ok(WithClause {
         items,
+        distinct,
         where_clause,
         order_by,
         skip,
@@ -569,7 +572,7 @@ fn parse_sort_item(pair: Pair<Rule>) -> Result<(ReturnExpr, SortDir), QueryError
     let mut inner = pair.into_inner();
     let expr = parse_return_expr(inner.next().expect("sort_item has a return_expr"))?;
     let dir = match inner.next() {
-        Some(d) if d.as_str().eq_ignore_ascii_case("desc") => SortDir::Desc,
+        Some(d) if d.as_str().to_ascii_lowercase().starts_with("desc") => SortDir::Desc,
         _ => SortDir::Asc,
     };
     Ok((expr, dir))
