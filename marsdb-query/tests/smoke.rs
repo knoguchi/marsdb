@@ -3430,6 +3430,44 @@ fn standalone_create_followed_by_return() {
     assert!(Executor::new(&store).execute(&stmt).is_ok());
 }
 
+/// `^` (exponentiation) and general unary minus -- TCK's Precedence2
+/// "On numeric values" plus Return2 [1]. `^` always produces a `Float`
+/// (even for two `Int`s), binds tighter than `*`/`/`/`%`/`+`/`-` but
+/// looser than unary minus, and is LEFT-associative (`4^(3*2)^3` is
+/// `(4^6)^3`, confirmed against the real TCK fixture -- general math
+/// convention's right-associativity would have been wrong here).
+#[test]
+fn exponentiation_and_unary_minus_precedence() {
+    let store = GraphStore::open_memory().unwrap();
+
+    // `^` binds tighter than `*`.
+    let result = run(&store, "RETURN 4 ^ 3 * 2 ^ 3 AS a, 4 ^ (3 * 2) ^ 3 AS c");
+    assert!((as_float(&result.rows[0][0]) - 512.0).abs() < 1e-9);
+    assert!((as_float(&result.rows[0][1]) - 68719476736.0).abs() < 1e-3);
+
+    // `^` binds tighter than `+`.
+    let result = run(&store, "RETURN 4 ^ 3 + 2 ^ 3 AS a, 4 ^ (3 + 2) ^ 3 AS c");
+    assert!((as_float(&result.rows[0][0]) - 72.0).abs() < 1e-9);
+    assert!((as_float(&result.rows[0][1]) - 1073741824.0).abs() < 1e-3);
+
+    // Unary minus binds tighter than `^`: `-3^2` is `(-3)^2`, not `-(3^2)`.
+    let result = run(&store, "RETURN -3 ^ 2 AS a, -(3 ^ 2) AS c");
+    assert!((as_float(&result.rows[0][0]) - 9.0).abs() < 1e-9);
+    assert!((as_float(&result.rows[0][1]) - (-9.0)).abs() < 1e-9);
+
+    // A negative numeric literal is unaffected -- still a plain `Literal`,
+    // not a `Neg`-wrapped computed value (preserves the planner's
+    // index-seek fusion for `MATCH (n {x: -5})`-shaped patterns).
+    let result = run(&store, "RETURN -3 AS x");
+    assert_eq!(int(&result.rows[0][0]), -3);
+
+    // General unary minus on a non-literal (a bound variable) -- this is
+    // the actually-new grammar shape (`-3` alone always worked).
+    let result = run(&store, "WITH 3 AS n RETURN -n AS x, --n AS y");
+    assert_eq!(int(&result.rows[0][0]), -3);
+    assert_eq!(int(&result.rows[0][1]), 3);
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already

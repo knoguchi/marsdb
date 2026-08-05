@@ -256,8 +256,35 @@ is_null_suffix       = { kw_is ~ kw_not? ~ kw_null }
 in_suffix            = { kw_in ~ add_expr }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
-mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }
+mul_expr    = { pow_expr ~ (mul_op ~ pow_expr)* }
 mul_op      = { "*" | "/" | "%" }
+// `^` binds tighter than `*`/`/`/`%` but looser than unary minus (`-3 ^
+// 2` is `(-3) ^ 2`, not `-(3 ^ 2)` -- TCK's Precedence2 [4]) and is
+// LEFT-associative (`4 ^ (3 * 2) ^ 3` is `(4 ^ 6) ^ 3` = 68719476736.0,
+// not `4 ^ (6 ^ 3)` -- TCK's Precedence2 [2]/[3]'s own "wrong" column,
+// confirmed directly against the vendored TCK fixture rather than
+// assumed from general math convention, which is right-associative and
+// would have been wrong here) -- same repeat-then-left-fold shape every
+// other binary operator in this file already uses, not a special case.
+pow_expr    = { unary_minus_expr ~ ("^" ~ unary_minus_expr)* }
+// General unary negation (`-n.prop`, `-(1+2)`, `-f()`) -- `postfix_expr`
+// is tried FIRST, not the `"-" ~ ...` branch, so a negative numeric
+// *literal* (`-3`) keeps parsing exactly as it always has, via
+// `int_literal`/`float_literal`'s own optional leading `-` (baked into
+// the literal itself, tried inside `postfix_expr` -> `atom_expr` ->
+// `literal`) -- this rule's own `"-"` branch only ever gets reached when
+// `postfix_expr` alone can't consume a leading `-` at all (a bare `-` in
+// front of an identifier/paren-group/function call/property access,
+// none of which `int_literal`/`float_literal` can absorb). This ordering
+// is what keeps `MATCH (n {x: -5})`'s existing planner index-seek
+// fusion untouched -- `pattern_prop_predicate` only recognizes a literal
+// `ReturnExpr::Lit`, not a `Neg`-wrapped one, so preserving the direct
+// literal path for plain negative numbers (rather than routing every
+// `-3` through a new `Neg(Lit(3))` wrapper) avoids a real seek-vs-scan
+// regression for that shape. Right-recursive (not `"-"*`) so `--x`
+// parses as nested `Neg(Neg(x))`, same reasoning as `bool_not_expr`'s
+// own `NOT NOT x` handling.
+unary_minus_expr = { postfix_expr | ("-" ~ unary_minus_expr) }
 // `[...]` binds tighter than `*`/`/`/`%` -- `list[0] * 2` indexes first,
 // then multiplies -- and chains (`[[1]][0][0]`), via the `*` repeat.
 // `index_or_slice`'s two forms (`slice_range` vs a single index

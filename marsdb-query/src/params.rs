@@ -298,6 +298,7 @@ fn substitute_return_expr(
             substitute_return_expr(l, params)?;
             substitute_return_expr(r, params)?;
         }
+        ReturnExpr::Neg(e) => substitute_return_expr(e, params)?,
         ReturnExpr::ListLit(items) => {
             for item in items {
                 substitute_return_expr(item, params)?;
