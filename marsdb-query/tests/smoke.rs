@@ -5417,6 +5417,63 @@ fn builtin_to_float_and_to_boolean() {
     ));
 }
 
+/// `toFloat()` on a `Bool` is a real type error, not `null` -- unlike an
+/// unparseable *string*, which real Cypher does treat as `null` (a
+/// string always at least plausibly could be numeric text, a boolean
+/// never could be). TCK's TypeConversion3 [6].
+#[test]
+fn to_float_on_a_bool_is_a_type_error_not_null() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN toFloat(true)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("tofloat"));
+    // sanity: an unparseable string still degrades to null, not an error
+    assert!(matches!(
+        run(&store, "RETURN toFloat('nope')").rows[0][0],
+        Value::Null
+    ));
+}
+
+/// Only a node, relationship, map, or temporal value has any `.prop` to
+/// access at all -- a plain scalar or list is a real type error, not a
+/// silent `null`. TCK's Graph6 [9] / Map1 [6].
+#[test]
+fn property_access_on_a_non_graph_scalar_or_list_is_a_type_error() {
+    let store = GraphStore::open_memory().unwrap();
+    for exp in ["123", "42.45", "true", "false", "'string'", "[123, true]"] {
+        let stmt = parse(&format!(
+            "WITH {exp} AS nonGraphElement RETURN nonGraphElement.num"
+        ))
+        .unwrap();
+        let err = Executor::new(&store).execute(&stmt).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("propert"),
+            "expected a property-access type error for {exp:?}, got: {err}"
+        );
+    }
+    // sanity: null, maps, nodes, and temporal values still work normally
+    assert!(matches!(
+        run(&store, "WITH null AS x RETURN x.num").rows[0][0],
+        Value::Null
+    ));
+    match &run(&store, "WITH {name: 'foo'} AS m RETURN m.name").rows[0][0] {
+        Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "foo"),
+        other => panic!("expected a string, got {other:?}"),
+    }
+}
+
+/// `type()` only ever accepts a relationship -- `MATCH (r) RETURN
+/// type(r)` (`r` a *node*, from the pattern itself) is a compile-time
+/// error even when the `MATCH` matches zero rows, not only a runtime one
+/// a zero-row match would silently skip. TCK's Graph4 [7].
+#[test]
+fn type_on_a_node_is_a_compile_time_error_even_on_zero_rows() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH (r) RETURN type(r)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("relationship"));
+}
+
 #[test]
 fn builtin_exists_checks_property_presence() {
     let store = GraphStore::open_memory().unwrap();
