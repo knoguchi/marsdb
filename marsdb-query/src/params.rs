@@ -71,6 +71,15 @@ fn substitute_query_clause(
             }
             Ok(())
         }
+        QueryClause::Delete { items, detach: _ } => {
+            for expr in items {
+                substitute_return_expr(expr, params)?;
+            }
+            Ok(())
+        }
+        // No `$param`-able position -- `RemoveItem` is a bare prop/label
+        // path, not a value expression.
+        QueryClause::Remove(_) => Ok(()),
     }
 }
 

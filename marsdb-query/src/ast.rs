@@ -554,6 +554,18 @@ pub enum QueryClause {
     /// and passes `current_rows` through unchanged, same as `Merge`
     /// already does for its own non-binding side effects.
     Set(Vec<SetItem>),
+    /// `DELETE`/`DETACH DELETE ...` immediately followed by `WITH` -- same
+    /// reasoning as `Set` above (TCK's Delete6 "Persistence of delete
+    /// clause side effects"). `detach`: whether `DETACH` was present
+    /// (mirrors `Tail::Delete` vs `Tail::DetachDelete`'s own split).
+    Delete {
+        items: Vec<ReturnExpr>,
+        detach: bool,
+    },
+    /// `REMOVE ...` immediately followed by `WITH` -- same reasoning as
+    /// `Set` above (TCK's Remove3 "Persistence of remove clause side
+    /// effects").
+    Remove(Vec<RemoveItem>),
 }
 
 #[derive(Debug, Clone)]

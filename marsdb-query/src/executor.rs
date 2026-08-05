@@ -1077,6 +1077,52 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+                // `DELETE/DETACH DELETE ... WITH ...` -- same passthrough
+                // reasoning as `QueryClause::Set` above (see
+                // `delete_as_clause`'s grammar docs). Reuses the same
+                // `delete_binding`/`delete_value` helpers `materialize_delete`
+                // itself calls.
+                QueryClause::Delete { items, detach } => {
+                    let write_txn = require_write_txn(txn);
+                    let mut deleted_nodes = HashSet::new();
+                    let mut deleted_edges = HashSet::new();
+                    for row in &current_rows {
+                        for target in items {
+                            if let ReturnExpr::Var(name) = target {
+                                let binding = row
+                                    .get(name)
+                                    .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                                delete_binding(
+                                    write_txn,
+                                    binding,
+                                    *detach,
+                                    &mut deleted_nodes,
+                                    &mut deleted_edges,
+                                )?;
+                            } else {
+                                let value = self.eval_return_expr(txn, target, row)?;
+                                delete_value(
+                                    write_txn,
+                                    &value,
+                                    *detach,
+                                    &mut deleted_nodes,
+                                    &mut deleted_edges,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                // `REMOVE ... WITH ...` -- same passthrough reasoning as
+                // `QueryClause::Set` above (see `remove_as_clause`'s
+                // grammar docs).
+                QueryClause::Remove(items) => {
+                    let write_txn = require_write_txn(txn);
+                    for row in &current_rows {
+                        for item in items {
+                            apply_remove_item(write_txn, row, item)?;
+                        }
+                    }
+                }
             }
             guard.check_intermediate_rows(current_rows.len())?;
         }
@@ -3355,9 +3401,15 @@ pub fn is_read_only(stmt: &Statement) -> bool {
     else {
         return false;
     };
-    !clauses
-        .iter()
-        .any(|c| matches!(c, QueryClause::Merge(_) | QueryClause::Set(_)))
+    !clauses.iter().any(|c| {
+        matches!(
+            c,
+            QueryClause::Merge(_)
+                | QueryClause::Set(_)
+                | QueryClause::Delete { .. }
+                | QueryClause::Remove(_)
+        )
+    })
 }
 
 /// Recovers the real `&WriteTransaction` from a `Txn` for `execute_match`
