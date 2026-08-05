@@ -3122,6 +3122,69 @@ fn with_order_by_sees_pre_with_scope() {
     assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
 }
 
+/// `RETURN *` -- every currently-bound variable, alphabetically. Can't
+/// resolve to a concrete `Tail::Return` at parse time (no scope exists
+/// yet); resolved independently in both `semantic.rs` (compile-time
+/// validation) and `executor.rs` (`carried_vars`, at actual execution).
+#[test]
+fn return_star_returns_every_bound_variable_alphabetically() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A)-[:REL]->(:X)");
+    run(&store, "CREATE (:B)");
+
+    let result = run(
+        &store,
+        "MATCH (n:A) WITH n LIMIT 1 MATCH (m:B), (n)-->(x:X) RETURN *",
+    );
+    assert_eq!(result.columns, vec!["m", "n", "x"]);
+    assert_eq!(result.rows.len(), 1);
+
+    // Nothing bound at all -- a real compile-time error, not an empty
+    // projection.
+    let stmt = parse("MATCH () RETURN *").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().contains("at least one variable"));
+}
+
+/// `$1` -- real Cypher's legacy positional-parameter form (a plain
+/// non-negative-integer name), not just a `$name` identifier.
+#[test]
+fn numeric_named_parameters() {
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+    let mut stmt = parse("RETURN $1 AS x").unwrap();
+    let mut params = HashMap::new();
+    params.insert("1".to_string(), marsdb_graph::PropertyValue::Int(42));
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int(&result.rows[0][0]), 42);
+}
+
+/// A bare (unparenthesized) `var:Label` used directly as a `WITH ...
+/// WHERE` predicate (`WHERE i.var > 'te' AND i:TextNode`) -- distinct
+/// from `label_check_expr`'s own `(n:Foo)` parenthesized general-
+/// expression form. Pattern-level `WHERE` already had this; `WITH`'s own
+/// `WHERE` didn't.
+#[test]
+fn with_where_bare_label_predicate() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:TextNode {var: 'text'})");
+    run(&store, "CREATE (:IntNode {var: 0})");
+
+    let result = run(&store, "MATCH (i) WITH i WHERE i:TextNode RETURN i.var");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "text"),
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    let result = run(
+        &store,
+        "MATCH (i) WITH i WHERE i.var > 'te' AND i:TextNode RETURN i.var",
+    );
+    assert_eq!(result.rows.len(), 1);
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already
