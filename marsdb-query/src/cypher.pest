@@ -460,7 +460,11 @@ compare_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" | (^"STARTS" ~ ^"WITH") | (^
 prop_access = { identifier ~ "." ~ identifier }
 
 literal        = { float_literal | int_literal | string_literal | bool_literal | null_literal | param }
-int_literal    = @{ "-"? ~ ASCII_DIGIT+ }
+// `0x`/`0o` tried before plain decimal digits -- a bare "0" alone (no
+// `x`/`o` suffix) falls through to the decimal alternative untouched,
+// same ordered-choice-backtracking reasoning `float_literal` already
+// uses elsewhere in this rule.
+int_literal    = @{ "-"? ~ (("0x" ~ ASCII_HEX_DIGIT+) | ("0o" ~ ASCII_OCT_DIGIT+) | ASCII_DIGIT+) }
 // Real Cypher's float literal has three shapes, tried in this order so
 // pest's ordered choice backtracks correctly when an earlier one doesn't
 // fully apply: `digits.digits`, a leading-dot form with no integer part
@@ -480,11 +484,17 @@ exponent_part  = { ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+ }
 // `'it\'s'` silently mis-terminates at the escaped quote instead of
 // erroring, leaving a dangling `s'` that breaks whatever follows with a
 // confusing, seemingly-unrelated parse error). Which escapes are
-// recognized (`\\ \' \" \n \r \t \b \f`) is checked in parser.rs, not
-// here -- this rule accepts any `\`-prefixed char permissively, same
+// recognized (`\\ \' \" \n \r \t \b \f \uXXXX`) is checked in parser.rs,
+// not here -- this rule accepts any `\`-prefixed char permissively, same
 // precedent as this grammar's other permissive/semantic-check-in-Rust
-// rules (see call_args's DISTINCT-validity comment).
-string_literal = @{ "'" ~ (escaped_char | (!("'" | "\\") ~ ANY))* ~ "'" }
+// rules (see call_args's DISTINCT-validity comment). Real Cypher accepts
+// either quote style for a string literal, not just `'...'` -- both
+// alternatives share the exact same escaping structure, just against the
+// other quote char.
+string_literal = @{
+    ("'" ~ (escaped_char | (!("'" | "\\") ~ ANY))* ~ "'")
+    | ("\"" ~ (escaped_char | (!("\"" | "\\") ~ ANY))* ~ "\"")
+}
 escaped_char   =  { "\\" ~ ANY }
 bool_literal   = @{ ^"true" | ^"false" }
 null_literal   = @{ ^"null" }

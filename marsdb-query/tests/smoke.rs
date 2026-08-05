@@ -3994,6 +3994,60 @@ fn plus_concatenates_and_appends_lists() {
     assert!(format!("{err}").contains("cannot use a list"));
 }
 
+/// Real Cypher's integer literal grammar has hex (`0x...`) and octal
+/// (`0o...`) forms beyond plain decimal, on both a positive and negative
+/// literal. Also exercises `i64::MIN`'s magnitude (`2^63`), which doesn't
+/// fit in a *positive* `i64` at all -- only `-0x8000000000000000` (the
+/// negated form) is representable, needing the two's-complement special
+/// case `parse_int_literal` has.
+#[test]
+fn int_literal_accepts_hex_and_octal_forms() {
+    let store = GraphStore::open_memory().unwrap();
+    let cases: &[(&str, i64)] = &[
+        ("0x1", 1),
+        ("0x7FFFFFFFFFFFFFFF", i64::MAX),
+        ("-0x1", -1),
+        ("-0x8000000000000000", i64::MIN),
+        ("0x1a2b3", 0x1a2b3),
+        ("0x1A2B3", 0x1a2b3),
+        ("0o1", 1),
+        ("0o777777777777777777777", i64::MAX),
+        ("-0o1", -1),
+        ("-0o1000000000000000000000", i64::MIN),
+    ];
+    for (text, expected) in cases {
+        let result = run(&store, &format!("RETURN {text} AS x"));
+        assert_eq!(int(&result.rows[0][0]), *expected, "for {text}");
+    }
+    // A plain decimal literal must stay unaffected.
+    assert_eq!(int(&run(&store, "RETURN 42 AS x").rows[0][0]), 42);
+}
+
+/// Real Cypher accepts either quote style for a string literal, not just
+/// `'...'` -- and `\uXXXX` (exactly 4 hex digits, a BMP code point) as a
+/// string escape, previously unrecognized.
+#[test]
+fn double_quoted_strings_and_unicode_escapes() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN \"\" AS a, \"hello\" AS b");
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (
+            Value::Literal(marsdb_query::Literal::String(a)),
+            Value::Literal(marsdb_query::Literal::String(b)),
+        ) => {
+            assert_eq!(a, "");
+            assert_eq!(b, "hello");
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    let result = run(&store, "RETURN '\\u01FF' AS a");
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "\u{1FF}"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
 /// Real Cypher's float literal grammar has three shapes beyond plain
 /// `digits.digits`: a leading-dot form with no integer part (`.1`), and
 /// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).
