@@ -20,9 +20,13 @@ pub enum Value {
     Edge(Edge),
     Property(PropertyValue),
     Literal(Literal),
-    /// A `collect()` result — a query-layer-only concept, not persisted as
-    /// a `PropertyValue` (nothing in the grammar can construct a list
-    /// literal to store as a node/edge property).
+    /// A list literal, `collect()` result, or a list-valued node/edge
+    /// property read back from storage (`PropertyValue::List` converts to
+    /// this, never a raw `Value::Property(PropertyValue::List(_))` — see
+    /// `executor::property_value_to_value`) — every existing list
+    /// operation (indexing, `size()`, `IN`, `UNWIND`, ...) pattern-matches
+    /// on this variant specifically, not on a property-sourced list
+    /// separately.
     List(Vec<Value>),
     /// A named path (`MATCH p = (a)-->(b) RETURN p`) or a `shortestPath()`
     /// result — see `Binding::Path`'s docs (executor.rs) for how this

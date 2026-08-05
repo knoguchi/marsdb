@@ -219,17 +219,19 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 2901/3880 TCK scenarios pass (74.8%), 1 wrong-result
+Short version: 3601/3880 TCK scenarios pass (92.8%), 1 wrong-result
 scenario (a `Duration` internal-representation edge case, not a wrong
 answer — see [CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact
 explanation).
 
 ## Roadmap
 
-- List-valued `$parameters`, to unblock `UNWIND $items AS x`
-- List/map-valued node/edge properties (`CREATE (n {tags: [1,2,3]})` now
-  parses but errors at execution — `PropertyValue` has no list/map
-  variant to store one in yet)
+- List-valued `$parameters`, to unblock `UNWIND $items AS x` with a
+  parameter-bound list directly (a list-valued *property* or an inline
+  list literal both already work)
+- `CALL <procedure>`/`YIELD` and `EXISTS { ... }` subqueries
+- Named-path capture over a variable-length relationship pattern
+  (`MATCH p = (a)-[:T*1..3]->(b) RETURN p`)
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR

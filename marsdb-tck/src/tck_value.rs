@@ -20,11 +20,14 @@ pub enum TckScalar {
 pub enum TckValue {
     Node {
         labels: BTreeSet<String>,
-        props: BTreeMap<String, TckScalar>,
+        /// `TckValue`, not `TckScalar` -- a node/rel property can now be a
+        /// list (`PropertyValue::List`, TCK's WithOrderBy1 `(:B {list: [1,
+        /// 2]})`-shaped expected cells), not just a scalar.
+        props: BTreeMap<String, TckValue>,
     },
     Rel {
         rel_type: String,
-        props: BTreeMap<String, TckScalar>,
+        props: BTreeMap<String, TckValue>,
     },
     List(Vec<TckValue>),
     Scalar(TckScalar),
@@ -72,7 +75,7 @@ pub fn value_to_tck(v: &Value) -> TckValue {
             props: n
                 .props
                 .iter()
-                .map(|(k, v)| (k.clone(), property_to_scalar(v)))
+                .map(|(k, v)| (k.clone(), property_to_tck(v)))
                 .collect(),
         },
         Value::Edge(e) => TckValue::Rel {
@@ -80,25 +83,22 @@ pub fn value_to_tck(v: &Value) -> TckValue {
             props: e
                 .props
                 .iter()
-                .map(|(k, v)| (k.clone(), property_to_scalar(v)))
+                .map(|(k, v)| (k.clone(), property_to_tck(v)))
                 .collect(),
         },
-        Value::Property(p) => match p {
-            PropertyValue::Null => TckValue::Null,
-            other => TckValue::Scalar(property_to_scalar(other)),
-        },
+        Value::Property(p) => property_to_tck(p),
         Value::List(items) => TckValue::List(items.iter().map(value_to_tck).collect()),
         // A bare map literal used as a returned value compares the same
         // way node props already do -- see `parse_map_value`'s matching
-        // choice on the expected-cell-parsing side. `TckValue::Node`'s
-        // `props` is scalar-only, so a nested non-scalar value (a map
-        // containing a list/map/node) is dropped rather than compared --
-        // real, pre-existing limitation of this comparator, not new here.
+        // choice on the expected-cell-parsing side. Each value recurses
+        // through `value_to_tck` directly (not the narrower
+        // `property_to_tck`) since a map's own values are already full
+        // `Value`s, not raw stored `PropertyValue`s.
         Value::Map(m) => TckValue::Node {
             labels: BTreeSet::new(),
             props: m
                 .iter()
-                .filter_map(|(k, v)| value_to_scalar(v).map(|s| (k.clone(), s)))
+                .map(|(k, v)| (k.clone(), value_to_tck(v)))
                 .collect(),
         },
         Value::Literal(lit) => literal_to_tck(lit),
@@ -108,28 +108,29 @@ pub fn value_to_tck(v: &Value) -> TckValue {
     }
 }
 
-/// Mirrors `parse_props`'s own convention exactly (the expected-cell
-/// side): a null map value is a `TckScalar::Str("null")` sentinel, not
-/// dropped -- found via a real TCK scenario (`Literals8 :: [7] Return a
-/// map containing a null`) where dropping it made `{k: null}` compare
-/// as an empty map instead of a one-entry map with a null value.
-fn value_to_scalar(v: &Value) -> Option<TckScalar> {
-    match v {
-        Value::Null => Some(TckScalar::Str("null".to_string())),
-        Value::Property(PropertyValue::Null) => Some(TckScalar::Str("null".to_string())),
-        Value::Property(p) => Some(property_to_scalar(p)),
-        Value::Literal(lit) => match literal_to_tck(lit) {
-            TckValue::Scalar(s) => Some(s),
-            TckValue::Null => Some(TckScalar::Str("null".to_string())),
-            _ => None,
-        },
-        _ => None,
+/// A raw stored `PropertyValue` (a node/edge property, or a top-level
+/// `Value::Property` RETURN result) converted to the same `TckValue`
+/// shape everything else compares through. `Null` maps to `TckValue::
+/// Null` (mirrors `parse_props`'s own convention on the expected-cell
+/// side); `List` recurses per-element -- a node/edge property really can
+/// hold one now (`PropertyValue::List`), not just a scalar.
+fn property_to_tck(p: &PropertyValue) -> TckValue {
+    match p {
+        PropertyValue::Null => TckValue::Null,
+        PropertyValue::List(items) => TckValue::List(items.iter().map(property_to_tck).collect()),
+        other => TckValue::Scalar(property_to_scalar(other)),
     }
 }
 
+/// The genuinely-scalar cases of `property_to_tck` -- split out so
+/// `property_to_tck` can wrap the result in `TckValue::Scalar` once,
+/// rather than every arm repeating it. Never called directly with
+/// `Null`/`List` (see `property_to_tck`'s own dispatch).
 fn property_to_scalar(p: &PropertyValue) -> TckScalar {
     match p {
-        PropertyValue::Null => TckScalar::Str("null".to_string()), // unreachable in practice, see callers
+        PropertyValue::Null | PropertyValue::List(_) => {
+            unreachable!("property_to_tck dispatches Null/List before reaching here")
+        }
         PropertyValue::Bool(b) => TckScalar::Bool(*b),
         PropertyValue::Int(i) => TckScalar::Int(*i),
         PropertyValue::Float(f) => TckScalar::Float(*f),
@@ -438,7 +439,13 @@ impl CellParser {
         })
     }
 
-    fn parse_props(&mut self) -> Result<BTreeMap<String, TckScalar>, String> {
+    /// `TckValue`, not `TckScalar` -- a node/rel prop (or a bare map
+    /// entry, `parse_map_value` reuses this too) can be any value now,
+    /// including a `[...]` list (TCK's WithOrderBy1 `(:B {list: [1,
+    /// 2]})`) or `null` (compares directly as `TckValue::Null`, no
+    /// sentinel-string workaround needed anymore now that `props` isn't
+    /// forced scalar-only).
+    fn parse_props(&mut self) -> Result<BTreeMap<String, TckValue>, String> {
         self.expect('{')?;
         let mut props = BTreeMap::new();
         self.skip_ws();
@@ -448,12 +455,7 @@ impl CellParser {
                 let key = self.parse_identifier();
                 self.expect(':')?;
                 let value = self.parse_value()?;
-                let scalar = match value {
-                    TckValue::Scalar(s) => s,
-                    TckValue::Null => TckScalar::Str("null".to_string()),
-                    other => return Err(format!("unsupported non-scalar prop value: {other:?}")),
-                };
-                props.insert(key, scalar);
+                props.insert(key, value);
                 self.skip_ws();
                 match self.peek() {
                     Some(',') => {
@@ -491,8 +493,14 @@ mod tests {
             panic!("expected a node")
         };
         assert_eq!(labels, BTreeSet::from(["A".to_string(), "B".to_string()]));
-        assert_eq!(props.get("name"), Some(&TckScalar::Str("b".to_string())));
-        assert_eq!(props.get("age"), Some(&TckScalar::Int(30)));
+        assert_eq!(
+            props.get("name"),
+            Some(&TckValue::Scalar(TckScalar::Str("b".to_string())))
+        );
+        assert_eq!(
+            props.get("age"),
+            Some(&TckValue::Scalar(TckScalar::Int(30)))
+        );
     }
 
     #[test]
@@ -502,7 +510,10 @@ mod tests {
             panic!("expected a rel")
         };
         assert_eq!(rel_type, "KNOWS");
-        assert_eq!(props.get("since"), Some(&TckScalar::Int(2020)));
+        assert_eq!(
+            props.get("since"),
+            Some(&TckValue::Scalar(TckScalar::Int(2020)))
+        );
     }
 
     #[test]
