@@ -138,6 +138,15 @@ pub enum ReturnExpr {
     /// widening that is a separate, larger change to the planner's
     /// pre-projection `Filter` pushdown.
     Arith(Box<ReturnExpr>, ArithOp, Box<ReturnExpr>),
+    /// `-x` — general unary negation (`-n.prop`, `-(1 + 2)`, `-f()`, ...),
+    /// distinct from a negative numeric *literal* (`-3` is still just
+    /// `Lit(Int(-3))`, parsed directly by `int_literal`/`float_literal`'s
+    /// own optional leading `-` — see `cypher.pest`'s `unary_minus_expr`
+    /// docs for why that path is deliberately left untouched, rather than
+    /// this variant subsuming it, to avoid losing the planner's index-seek
+    /// fusion for `MATCH (n {x: -5})`-shaped literal patterns). Binds
+    /// tighter than every other arithmetic operator, including `^`.
+    Neg(Box<ReturnExpr>),
     /// `[a, b, c]` — a general expression list, not `UnwindSource::List`'s
     /// literal-only cousin (that one's deliberately scoped to right after
     /// `UNWIND`; this one is a real `ReturnExpr`, usable anywhere one is).
@@ -254,6 +263,12 @@ pub enum ArithOp {
     Mul,
     Div,
     Mod,
+    /// `a ^ b` -- always produces a `Float`, even for two `Int` operands
+    /// (real Cypher's own rule; unlike every other `ArithOp`, there's no
+    /// Int/Int-stays-Int case). Right-associative and binds tighter than
+    /// `*`/`/`/`%` but looser than unary minus (`-3 ^ 2` is `(-3) ^ 2`,
+    /// not `-(3 ^ 2)`) -- see `cypher.pest`'s `pow_expr`/`unary_minus_expr`.
+    Pow,
 }
 
 /// Case-insensitive aggregate-function recognition, shared by `parser.rs`

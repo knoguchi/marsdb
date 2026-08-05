@@ -985,11 +985,7 @@ fn parse_add_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 
 fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     let mut inner = pair.into_inner();
-    let mut lhs = parse_postfix_expr(
-        inner
-            .next()
-            .expect("mul_expr has at least one postfix_expr"),
-    )?;
+    let mut lhs = parse_pow_expr(inner.next().expect("mul_expr has at least one pow_expr"))?;
     while let Some(op_pair) = inner.next() {
         let op = match op_pair.as_str() {
             "*" => ArithOp::Mul,
@@ -997,10 +993,45 @@ fn parse_mul_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
             "%" => ArithOp::Mod,
             other => unreachable!("unexpected mul_op {other:?}"),
         };
-        let rhs = parse_postfix_expr(inner.next().expect("mul_op has a following postfix_expr"))?;
+        let rhs = parse_pow_expr(inner.next().expect("mul_op has a following pow_expr"))?;
         lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
     }
     Ok(lhs)
+}
+
+/// `pow_expr = { unary_minus_expr ~ ("^" ~ unary_minus_expr)* }` -- left-
+/// associative (`4 ^ 3 ^ 2` is `(4 ^ 3) ^ 2`, confirmed against the real
+/// TCK fixture -- see the grammar's own docs), same repeat-then-fold
+/// shape `parse_add_expr`/`parse_mul_expr` already use.
+fn parse_pow_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let mut inner = pair.into_inner();
+    let mut lhs = parse_unary_minus_expr(
+        inner
+            .next()
+            .expect("pow_expr has at least one unary_minus_expr"),
+    )?;
+    for rhs_pair in inner {
+        let rhs = parse_unary_minus_expr(rhs_pair)?;
+        lhs = ReturnExpr::Arith(Box::new(lhs), ArithOp::Pow, Box::new(rhs));
+    }
+    Ok(lhs)
+}
+
+/// `unary_minus_expr = { postfix_expr | ("-" ~ unary_minus_expr) }` --
+/// see the grammar's own docs for why `postfix_expr` (which already
+/// covers a negative numeric *literal* via `int_literal`/`float_literal`'s
+/// own leading `-`) is tried first, and the general `Neg` wrapper below
+/// is only reached for `-` in front of something else entirely.
+fn parse_unary_minus_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("unary_minus_expr has one child");
+    match inner.as_rule() {
+        Rule::postfix_expr => parse_postfix_expr(inner),
+        Rule::unary_minus_expr => Ok(ReturnExpr::Neg(Box::new(parse_unary_minus_expr(inner)?))),
+        r => unreachable!("unexpected unary_minus_expr child rule {r:?}"),
+    }
 }
 
 fn parse_postfix_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {

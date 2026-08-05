@@ -508,6 +508,7 @@ fn validate_delete_target(expr: &ReturnExpr, scope: &Scope) -> Result<(), QueryE
             ReturnExpr::Lit(_)
                 | ReturnExpr::CountStar
                 | ReturnExpr::Arith(..)
+                | ReturnExpr::Neg(..)
                 | ReturnExpr::And(..)
                 | ReturnExpr::Or(..)
                 | ReturnExpr::Xor(..)
@@ -790,6 +791,11 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                 require_scalarish(&rk, "arithmetic operand")?;
                 Kind::Scalar
             }
+        }
+        ReturnExpr::Neg(e) => {
+            let k = infer_expr(e, scope)?;
+            require_scalarish(&k, "unary minus operand")?;
+            Kind::Scalar
         }
         ReturnExpr::ListLit(items) => {
             let kinds = items

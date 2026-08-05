@@ -2785,6 +2785,10 @@ impl<'a> Executor<'a> {
                 let rv = self.eval_return_expr(txn, r, row)?;
                 apply_arith(*op, &lv, &rv)
             }
+            ReturnExpr::Neg(e) => {
+                let v = self.eval_return_expr(txn, e, row)?;
+                apply_neg(&v)
+            }
             ReturnExpr::ListLit(items) => Ok(Value::List(
                 items
                     .iter()
@@ -3488,7 +3492,7 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Call { name, .. } => format!("{name}(...)"),
         ReturnExpr::CountStar => "count(*)".to_string(),
         ReturnExpr::Case { .. } => format!("case{idx}"),
-        ReturnExpr::Arith(..) => format!("col{idx}"),
+        ReturnExpr::Arith(..) | ReturnExpr::Neg(..) => format!("col{idx}"),
         ReturnExpr::ListLit(..)
         | ReturnExpr::Index(..)
         | ReturnExpr::Slice(..)
@@ -3546,6 +3550,7 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
                 || else_.as_deref().is_some_and(contains_aggregate)
         }
         ReturnExpr::Arith(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
+        ReturnExpr::Neg(e) => contains_aggregate(e),
         ReturnExpr::ListLit(items) => items.iter().any(contains_aggregate),
         ReturnExpr::Index(base, index) => contains_aggregate(base) || contains_aggregate(index),
         ReturnExpr::Slice(base, start, end) => {
@@ -3614,6 +3619,7 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
                 || else_.as_deref().is_some_and(contains_rand_call)
         }
         ReturnExpr::Arith(l, _, r) => contains_rand_call(l) || contains_rand_call(r),
+        ReturnExpr::Neg(e) => contains_rand_call(e),
         ReturnExpr::ListLit(items) => items.iter().any(contains_rand_call),
         ReturnExpr::Index(base, index) => contains_rand_call(base) || contains_rand_call(index),
         ReturnExpr::Slice(base, start, end) => {
@@ -4344,6 +4350,30 @@ fn as_arith_str(v: &Value) -> Option<&str> {
     }
 }
 
+/// `-x` for `ReturnExpr::Neg` -- a negative numeric *literal* (`-3`)
+/// never reaches this (see `cypher.pest`'s `unary_minus_expr` docs), so
+/// this only ever handles negating a genuinely computed/bound value
+/// (`-n.prop`, `-(1+2)`, ...). Same null-propagation/numeric-only
+/// convention as `apply_arith`.
+fn apply_neg(v: &Value) -> Result<Value, QueryError> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    Ok(match as_arith_num(v) {
+        Some(ArithNum::Int(i)) => {
+            Value::Property(PropertyValue::Int(i.checked_neg().ok_or_else(|| {
+                QueryError::Type("integer arithmetic overflow".into())
+            })?))
+        }
+        Some(ArithNum::Float(f)) => Value::Property(PropertyValue::Float(-f)),
+        None => {
+            return Err(QueryError::Type(format!(
+                "unary minus needs a number -- got {v:?}"
+            )))
+        }
+    })
+}
+
 /// `lhs op rhs` for `ReturnExpr::Arith`. Null propagates (matches every
 /// other operator's null-handling convention in this file). `+` also
 /// concatenates two strings, real Cypher's other overload for that
@@ -4392,6 +4422,19 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
             "arithmetic needs two numbers (or, for +, two strings) -- got {a:?} and {b:?}"
         )));
     };
+    // `^` always produces a Float, even for two Ints (real Cypher's own
+    // rule) -- handled up front, separately from the Int/Int-stays-Int
+    // branch below, rather than folding it into that match's own `op`
+    // dispatch.
+    if op == ArithOp::Pow {
+        let to_f64 = |n: ArithNum| match n {
+            ArithNum::Int(i) => i as f64,
+            ArithNum::Float(f) => f,
+        };
+        return Ok(Value::Property(PropertyValue::Float(
+            to_f64(na).powf(to_f64(nb)),
+        )));
+    }
     // Int/Int stays Int (truncating division/modulo, matching Rust's `/`/
     // `%` on integers) -- any Float operand promotes the whole expression
     // to Float, same numeric-promotion rule `compare()` already follows.
@@ -4406,6 +4449,7 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
                 ArithOp::Mul => x.checked_mul(y),
                 ArithOp::Div => x.checked_div(y),
                 ArithOp::Mod => x.checked_rem(y),
+                ArithOp::Pow => unreachable!("handled above"),
             }
             .ok_or_else(|| QueryError::Type("integer arithmetic overflow".into()))?;
             Value::Property(PropertyValue::Int(value))
@@ -4425,6 +4469,7 @@ fn apply_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, QueryError> {
                 ArithOp::Mul => x * y,
                 ArithOp::Div => x / y,
                 ArithOp::Mod => x % y,
+                ArithOp::Pow => unreachable!("handled above"),
             }))
         }
     })
@@ -4678,6 +4723,10 @@ fn apply_temporal_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Option<Valu
             }
         }
         ArithOp::Mod => None,
+        // `^` is never meaningful for a date/duration/etc operand --
+        // real Cypher has no temporal exponentiation, so this always
+        // falls through to `apply_arith`'s own numeric-only rejection.
+        ArithOp::Pow => None,
     })
 }
 
@@ -7278,6 +7327,10 @@ fn eval_projected_expr(
             let lv = eval_projected_expr(l, row)?;
             let rv = eval_projected_expr(r, row)?;
             apply_arith(*op, &lv, &rv)
+        }
+        ReturnExpr::Neg(e) => {
+            let v = eval_projected_expr(e, row)?;
+            apply_neg(&v)
         }
         ReturnExpr::ListLit(items) => Ok(Value::List(
             items
