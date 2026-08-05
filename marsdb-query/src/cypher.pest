@@ -186,14 +186,19 @@ kw_not = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
 // (`island`, `nullable`, ...).
 kw_is   = @{ ^"IS" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_null = @{ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_") }
+// Same word-boundary reasoning -- `IN` is short enough to realistically
+// prefix a real identifier (`index`, `Inc`, ...).
+kw_in   = @{ ^"IN" ~ !(ASCII_ALPHANUMERIC | "_") }
 // A chain of 0+ comparisons (`1 < x < 10`), each operand its own
-// `null_predicate_expr` -- real Cypher's `IS [NOT] NULL` binds *tighter*
-// than a comparison (`false = true IS NULL` is `false = (true IS NULL)`,
-// not `(false = true) IS NULL`), so it lives on the operand, not as a
+// `null_predicate_expr` -- real Cypher's `IS [NOT] NULL`/`IN` both bind
+// *tighter* than a comparison (`false = true IS NULL` is `false = (true
+// IS NULL)`, `[1,2] = [3,4] IN [[3,4]]` is `[1,2] = ([3,4] IN [[3,4]])`,
+// not `(... = ...) IS NULL`/`IN`), so they live on the operand, not as a
 // suffix on the whole chain like an earlier version of this rule had it.
 compare_expr        = { null_predicate_expr ~ (compare_op ~ null_predicate_expr)* }
-null_predicate_expr = { add_expr ~ is_null_suffix? }
+null_predicate_expr = { add_expr ~ (is_null_suffix | in_suffix)? }
 is_null_suffix       = { kw_is ~ kw_not? ~ kw_null }
+in_suffix            = { kw_in ~ add_expr }
 add_expr    = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op      = { "+" | "-" }
 mul_expr    = { postfix_expr ~ (mul_op ~ postfix_expr)* }
@@ -336,10 +341,12 @@ with_comparison   = { add_expr ~ compare_op ~ add_expr }
 // Final fallback, tried after `with_comparison`/`with_is_null_expr`/the
 // parenthesized-`with_expr` alt all fail -- a boolean-valued expression
 // used directly as a predicate, no comparison operator at all (`WHERE
-// single(x IN list WHERE x = 2) OR all(...)`, `WHERE n.flag`). Just
-// `add_expr` (evaluated via `value_to_bool3` at runtime, not coerced by
-// the grammar), same operand type every other `with_*` predicate uses.
-with_bare_expr    = { add_expr }
+// single(x IN list WHERE x = 2) OR all(...)`, `WHERE n.flag`, `WHERE
+// n.name IN [...]`). `null_predicate_expr`, not bare `add_expr` -- `x IN
+// list` used as the whole predicate needs the same `in_suffix` handling
+// `compare_expr`'s own operands get (evaluated via `value_to_bool3` at
+// runtime, not coerced by the grammar).
+with_bare_expr    = { null_predicate_expr }
 
 // Any expression, not just a bare identifier -- real Cypher's DELETE
 // target can be `list[0]`, `map.key`, a whole named path (deletes every
@@ -430,8 +437,8 @@ general_comparison    = { add_expr ~ compare_op ~ add_expr }
 general_is_null_expr  = { add_expr ~ is_null_suffix }
 // Final fallback -- same reasoning/shape as `with_bare_expr`, reused here
 // for a bare MATCH's WHERE (`WHERE single(x IN list WHERE x = 2) OR
-// all(...)`, `WHERE n.flag`).
-general_bare_expr     = { add_expr }
+// all(...)`, `WHERE n.flag`, `WHERE n.name IN [...]`).
+general_bare_expr     = { null_predicate_expr }
 // RHS is `prop_access` too, not just `literal` -- real Cypher's WHERE
 // routinely compares two properties (`a.id = b.id`), not just a property
 // against a constant. Only the `literal` shape is eligible for the

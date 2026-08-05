@@ -702,17 +702,35 @@ impl<'a> Executor<'a> {
     ) -> Result<BTreeMap<String, PropertyValue>, QueryError> {
         props
             .iter()
-            .map(|(k, expr)| {
-                let value = self.eval_return_expr(txn, expr, row)?;
-                let pv = value_to_storable_property(&value).ok_or_else(|| {
+            .filter_map(|(k, expr)| {
+                let value = match self.eval_return_expr(txn, expr, row) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                // `CREATE (n {prop: null})` never actually stores `prop`
+                // at all in real Cypher -- the same "setting to null
+                // removes/never-creates the property" rule
+                // `apply_set_item`'s own `SET n.prop = null` handling
+                // already has (see its docs), just never applied here
+                // too. Observable via `keys(n)`/property enumeration
+                // (TCK's Graph8 [8]) -- a stored `PropertyValue::Null`
+                // still shows up as a key, where a real missing property
+                // wouldn't.
+                if matches!(value, Value::Null) {
+                    return None;
+                }
+                let pv = match value_to_storable_property(&value).ok_or_else(|| {
                     QueryError::Type(format!(
                         "property '{k}' can't be stored -- MarsDB's node/edge properties are limited to null/\
                          bool/int/float/string/date/duration; a list/map/node/edge/path value (got {value:?}) \
                          isn't storable, matching PropertyValue's real, deliberately fixed set of variants (see \
                          its doc comment)"
                     ))
-                })?;
-                Ok((k.clone(), pv))
+                }) {
+                    Ok(pv) => pv,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Ok((k.clone(), pv)))
             })
             .collect()
     }
@@ -2740,6 +2758,11 @@ impl<'a> Executor<'a> {
                 let v = self.eval_return_expr(txn, e, row)?;
                 Ok(Value::Literal(Literal::Bool(matches!(v, Value::Null))))
             }
+            ReturnExpr::In(needle, haystack) => {
+                let nv = self.eval_return_expr(txn, needle, row)?;
+                let hv = self.eval_return_expr(txn, haystack, row)?;
+                Ok(bool3_to_value(list_membership_ternary(&nv, &hv)?))
+            }
             ReturnExpr::HasLabel(var, labels) => {
                 let binding = row
                     .get(var)
@@ -3307,6 +3330,7 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Not(..)
         | ReturnExpr::Compare(..)
         | ReturnExpr::IsNull(..)
+        | ReturnExpr::In(..)
         | ReturnExpr::HasLabel(..) => format!("col{idx}"),
     }
 }
@@ -3373,6 +3397,9 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::Not(e) => contains_aggregate(e),
         ReturnExpr::Compare(l, _, r) => contains_aggregate(l) || contains_aggregate(r),
         ReturnExpr::IsNull(e) => contains_aggregate(e),
+        ReturnExpr::In(needle, haystack) => {
+            contains_aggregate(needle) || contains_aggregate(haystack)
+        }
         ReturnExpr::Var(_)
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
@@ -7084,6 +7111,11 @@ fn eval_projected_expr(
             eval_projected_expr(e, row)?,
             Value::Null
         )))),
+        ReturnExpr::In(needle, haystack) => {
+            let nv = eval_projected_expr(needle, row)?;
+            let hv = eval_projected_expr(haystack, row)?;
+            Ok(bool3_to_value(list_membership_ternary(&nv, &hv)?))
+        }
         ReturnExpr::HasLabel(var, labels) => {
             let binding = row
                 .get(var)
@@ -7598,6 +7630,38 @@ fn value_equal_ternary(a: &Value, b: &Value) -> Option<bool> {
             fold_ternary_eq(x.iter().map(|(k, xv)| value_equal_ternary(xv, &y[k])))
         }
         _ => Some(values_equal_numeric_aware(a, b)),
+    }
+}
+
+/// `needle IN haystack` -- three-valued like `=`, since it's built from
+/// `=` per element: a definite match wins outright even past a later
+/// `null` element (short-circuits, matching `and3`/`or3`'s "false/true
+/// outranks unknown" convention), no match with at least one `null`
+/// element compared along the way is "unknown" (not `false` -- that
+/// element *might* have matched), no match and no `null` anywhere is a
+/// definite `false`. An empty list is always a definite `false`
+/// regardless of `needle`'s own nullness (nothing to compare against, no
+/// unknown comparisons ever happened) -- verified against Comparison5's
+/// exact empty-list scenarios. `haystack` being `Null` itself (not an
+/// empty list) is "unknown", matching `=`'s own null-operand rule;
+/// anything else on the right isn't a list at all, a real type error.
+fn list_membership_ternary(needle: &Value, haystack: &Value) -> Result<Option<bool>, QueryError> {
+    match haystack {
+        Value::Null => Ok(None),
+        Value::List(items) => {
+            let mut saw_unknown = false;
+            for item in items {
+                match value_equal_ternary(needle, item) {
+                    Some(true) => return Ok(Some(true)),
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+            Ok(if saw_unknown { None } else { Some(false) })
+        }
+        other => Err(QueryError::Type(format!(
+            "IN requires a list on the right-hand side, got {other:?}"
+        ))),
     }
 }
 
