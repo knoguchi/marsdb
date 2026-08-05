@@ -123,6 +123,33 @@ func TestExecutePreservesIntegersAndFormatsTemporals(t *testing.T) {
 	}
 }
 
+func TestListValuedNodePropertyRoundTrips(t *testing.T) {
+	// A stored PropertyValue::List (real Cypher/Neo4j's own "homogeneous
+	// array property" shape) -- confirms the C-ABI's JSON array for a
+	// list property decodes through encoding/json with no Go-side
+	// special-casing needed.
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Execute("CREATE (:Person {name: 'Ada', tags: [1, 2, 3]})"); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+	rows, err := db.Execute("MATCH (p:Person) RETURN p.tags AS tags")
+	if err != nil {
+		t.Fatalf("MATCH: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	tags := rows[0]["tags"].([]any)
+	if len(tags) != 3 || tags[0].(int64) != 1 || tags[1].(int64) != 2 || tags[2].(int64) != 3 {
+		t.Fatalf("unexpected tags: %+v", tags)
+	}
+}
+
 func TestExecuteErrorSurfacesAsGoError(t *testing.T) {
 	db, err := InMemory()
 	if err != nil {
