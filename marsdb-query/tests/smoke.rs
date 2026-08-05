@@ -3351,6 +3351,47 @@ fn pattern_predicate_introducing_new_variable_is_rejected() {
     );
 }
 
+/// `a:Label` as a general boolean expression, usable anywhere a
+/// `return_expr` is (RETURN/WITH items, not just pattern-level WHERE) --
+/// TCK's Graph5 "Node and edge label expressions". Reuses the existing
+/// `ReturnExpr::HasLabel` (previously only reachable via the
+/// parenthesized `(n:Foo)` general-expression form) through a new bare
+/// grammar alternative.
+#[test]
+fn bare_label_predicate_as_return_expr() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:A:B:C), (:A:B), (:A:C), (:B:C), (:A), (:B), (:C), ()",
+    );
+
+    let result = run(&store, "MATCH (a) RETURN a:B AS result");
+    let mut vals: Vec<bool> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Literal(marsdb_query::Literal::Bool(b)) => *b,
+            other => panic!("expected a bool, got {other:?}"),
+        })
+        .collect();
+    vals.sort();
+    assert_eq!(
+        vals,
+        vec![false, false, false, false, true, true, true, true]
+    );
+
+    // A DELETE target must never be a label predicate (TCK's Delete1
+    // [8]) -- a boolean can never be a node/relationship/path, and this
+    // must be rejected at compile time regardless of whether any row
+    // actually matches (an empty MATCH would otherwise let it through).
+    let stmt = parse("MATCH (n) DELETE n:Person").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("delete target"),
+        "expected a DELETE-target error, got: {err}"
+    );
+}
+
 /// `MATCH (a) MERGE (a)` -- a bare already-bound node with no
 /// relationship at all doesn't search for or create anything, so real
 /// Cypher rejects it, the same rule `materialize_create` already
