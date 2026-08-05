@@ -1295,6 +1295,31 @@ impl<'a> Executor<'a> {
             carried_vars.extend(new_vars);
             return Ok(rows);
         };
+        // `WITH *` -- expand to every name already carried into this
+        // clause *plus* whatever this same clause's own pattern just
+        // bound (`new_vars`, e.g. MERGE's own target -- `carried_vars`
+        // alone wouldn't have that yet, since it's only ever updated at
+        // this function's very end). `with_owned` only exists to give
+        // the rest of this function a `&WithClause` with `items` already
+        // containing the expanded names, without touching any of its
+        // other fields (`order_by`/`skip`/`limit`/`distinct`/
+        // `where_clause` all stay exactly as parsed).
+        let with_owned;
+        let with: &WithClause = if with.star {
+            // A `HashSet` union, not a plain chain -- `new_vars` can
+            // legitimately overlap with `carried_vars` (e.g. `MATCH (a)
+            // MERGE (a)-[:R]->(b)` reuses the already-bound `a`), and a
+            // raw chain would double it up into two identical columns.
+            let star_items = return_star_items(carried_vars.union(&new_vars).cloned())?;
+            let mut owned = with.clone();
+            let mut items = star_items;
+            items.extend(owned.items);
+            owned.items = items;
+            with_owned = owned;
+            &with_owned
+        } else {
+            with
+        };
         // Only cloned when actually needed below (ORDER BY on a
         // non-aggregating, non-`DISTINCT` WITH) -- avoids the copy on
         // every other WITH shape.

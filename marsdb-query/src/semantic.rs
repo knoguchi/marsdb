@@ -339,6 +339,23 @@ fn apply_with(with: &Option<WithClause>, scope: &mut Scope) -> Result<(), QueryE
 }
 
 fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
+    // `WITH *` -- `input` already reflects this same clause's own new
+    // bindings (`bind_match_pattern`/`bind_unwind`/`bind_merge` all
+    // mutate `scope` before calling `apply_with`), so no union with
+    // anything else is needed here, unlike `executor::
+    // apply_with_or_carry`'s own `carried_vars`/`new_vars` split.
+    let with_owned;
+    let with: &WithClause = if with.star {
+        let star_items = crate::executor::return_star_items(input.keys().cloned())?;
+        let mut owned = with.clone();
+        let mut items = star_items;
+        items.extend(owned.items);
+        owned.items = items;
+        with_owned = owned;
+        &with_owned
+    } else {
+        with
+    };
     crate::executor::validate_return_items(&with.items)?;
     let mut projected = Scope::new();
     for (index, item) in with.items.iter().enumerate() {
