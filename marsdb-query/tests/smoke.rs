@@ -2268,6 +2268,40 @@ fn match_create_rejects_bare_already_bound_node_with_no_relationship() {
     );
 }
 
+/// `VariableAlreadyBound` is a compile-time/structural error, not a
+/// data-dependent one -- it must fire even when the preceding `MATCH`
+/// produces *zero* rows, since the check is about variable scope, not
+/// runtime data. A real bug found and fixed: the check used to live only
+/// in the per-row runtime path (`materialize_create`/`merge_one_row`),
+/// which a zero-row MATCH skips entirely, silently no-op'ing instead of
+/// erroring. Now duplicated at compile time in `semantic.rs`. TCK's
+/// Create1 [13]/[14], Merge1 [15], Merge5 [26] ("any graph" -- MarsDB's
+/// own harness exercises the empty-graph case).
+#[test]
+fn already_bound_rejection_fires_even_on_a_zero_row_match() {
+    let store = GraphStore::open_memory().unwrap();
+    for q in [
+        "MATCH (a) CREATE (a)",
+        "MATCH (a) CREATE (a {name: 'foo'}) RETURN a",
+        "MATCH (a) MERGE (a)",
+        "MATCH (a)-[r]->(b) MERGE (a)-[r]->(b)",
+    ] {
+        let stmt = parse(q).unwrap();
+        let result = Executor::new(&store).execute(&stmt);
+        let err = match result {
+            Ok(r) => panic!(
+                "expected an already-bound error for {q:?}, got Ok: {:?}",
+                r.rows
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("already bound"),
+            "expected an already-bound error for {q:?}, got: {err}"
+        );
+    }
+}
+
 #[test]
 fn match_create_rejects_variable_length_pattern() {
     let store = GraphStore::open_memory().unwrap();

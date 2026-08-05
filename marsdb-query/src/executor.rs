@@ -614,28 +614,6 @@ impl<'a> Executor<'a> {
             // instead of just consulting the original incoming `row`.
             let mut row = row.clone();
             for pattern in patterns {
-                // A bare already-bound node token with no relationship at
-                // all (`MATCH (a) CREATE (a)`) does nothing real -- it's
-                // not creating a node (that var already exists) and it's
-                // not connecting anything either, so real Cypher rejects
-                // it outright rather than silently no-op'ing. A token
-                // that *is* a relationship endpoint (`MATCH (a) CREATE
-                // (a)-[:T]->(b)`) is the legitimate reuse case and stays
-                // allowed -- only the zero-hops, whole-pattern-is-just-
-                // this-one-bare-token shape is rejected.
-                if pattern.hops.is_empty() {
-                    if let Some(var) = &pattern.start.var {
-                        if pattern.start.labels.is_empty()
-                            && pattern.start.props.is_empty()
-                            && row.contains_key(var)
-                        {
-                            return Err(QueryError::Semantic(format!(
-                                "'{var}' is already bound — CREATE ({var}) with no relationship \
-                                 and no new labels/properties doesn't create or connect anything"
-                            )));
-                        }
-                    }
-                }
                 let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, &row)?;
                 if let Some(var) = &pattern.start.var {
                     row.insert(var.clone(), Binding::Node(prev_id));
@@ -678,12 +656,12 @@ impl<'a> Executor<'a> {
 
     /// A node pattern token reuses an existing binding iff it names a
     /// variable already bound in `row` (from a preceding MATCH/WITH) --
-    /// restating labels/props on that token is rejected with a clear
-    /// error rather than silently ignored, since silently dropping
-    /// user-written labels/props would be a correctness trap. Anything
-    /// else (no variable, or a variable not yet bound in this row)
-    /// creates a brand-new node, exactly like standalone CREATE always
-    /// has for every node token.
+    /// restating labels/props on that token is rejected at compile time
+    /// (`semantic::check_create_node_not_already_bound`), since silently
+    /// dropping user-written labels/props would be a correctness trap.
+    /// Anything else (no variable, or a variable not yet bound in this
+    /// row) creates a brand-new node, exactly like standalone CREATE
+    /// always has for every node token.
     fn resolve_or_create_node(
         &self,
         write_txn: &WriteTransaction,
@@ -697,11 +675,9 @@ impl<'a> Executor<'a> {
                         "'{var}' is not a node — can't use it as a CREATE pattern endpoint"
                     )));
                 };
-                if !node.labels.is_empty() || !node.props.is_empty() {
-                    return Err(QueryError::Semantic(format!(
-                        "'{var}' is already bound — CREATE can't add labels/properties to an existing node"
-                    )));
-                }
+                // Reusing an already-bound var with new labels/props is
+                // rejected at compile time (`semantic::check_create_node_
+                // not_already_bound`) -- unreachable here in practice.
                 return Ok(*id);
             }
         }
@@ -805,46 +781,16 @@ impl<'a> Executor<'a> {
         // node in the graph (AllNodesScan, no Filter), which is a
         // wrong-answer footgun, not a helpful default.
         require_mergeable(&clause.pattern.start, row)?;
-        // A bare already-bound node with no relationship at all
-        // (`MATCH (a) MERGE (a)`) does nothing real -- it's not
-        // searching for or creating anything, just re-stating a var
-        // that already exists. Real Cypher rejects it outright, the
-        // same reasoning `materialize_create`'s own already-bound check
-        // applies to standalone `CREATE (a)`. A bound start node used as
-        // a relationship endpoint (`MATCH (a) MERGE (a)-[:T]->(b)`)
-        // stays legitimate -- only checked when there are no hops at all.
-        if clause.pattern.hops.is_empty() {
-            if let Some(var) = &clause.pattern.start.var {
-                if clause.pattern.start.labels.is_empty()
-                    && clause.pattern.start.props.is_empty()
-                    && row.contains_key(var)
-                {
-                    return Err(QueryError::Semantic(format!(
-                        "'{var}' is already bound — MERGE ({var}) with no relationship and no \
-                         labels/properties doesn't search for or create anything"
-                    )));
-                }
-            }
-        }
+        // The bare-already-bound-start and reused-relationship-variable
+        // cases are rejected at compile time (`semantic::bind_merge`),
+        // not only here -- a zero-row MATCH would otherwise skip both
+        // entirely even though real Cypher's `VariableAlreadyBound` is a
+        // structural/scope error, not a data-dependent one.
         for (rel, node) in &clause.pattern.hops {
             if rel.hop_range.is_some() {
                 return Err(QueryError::Semantic(
                     "MERGE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                 ));
-            }
-            // Unlike a node endpoint (which can legitimately reference an
-            // already-bound node to search/create from), MERGE never
-            // reuses an already-bound relationship as its own pattern
-            // token -- there's no "search using this specific existing
-            // edge" mode, MERGE always searches *for* a relationship
-            // matching the pattern shape, or creates one.
-            if let Some(var) = &rel.var {
-                if row.contains_key(var) {
-                    return Err(QueryError::Semantic(format!(
-                        "'{var}' is already bound — MERGE can't reuse an existing relationship \
-                         variable as its own pattern token"
-                    )));
-                }
             }
             require_mergeable(node, row)?;
         }

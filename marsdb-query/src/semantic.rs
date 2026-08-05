@@ -8,8 +8,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    is_aggregate_name, Expr, Literal, MergeClause, Pattern, QueryClause, RemoveItem, ReturnExpr,
-    ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
+    is_aggregate_name, Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, RemoveItem,
+    ReturnExpr, ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause,
+    WithExpr,
 };
 use crate::QueryError;
 
@@ -175,7 +176,45 @@ fn bind_unwind(clause: &UnwindClause, scope: &mut Scope) -> Result<(), QueryErro
 }
 
 fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError> {
-    bind_match_pattern(&clause.pattern, scope)?;
+    let pattern = &clause.pattern;
+    // A bare already-bound node with no relationship at all (`MATCH (a)
+    // MERGE (a)`) does nothing real -- not searching for or creating
+    // anything, just re-stating a var that already exists. A bound start
+    // node used as a relationship endpoint (`MATCH (a) MERGE (a)-[:T]->
+    // (b)`) stays legitimate -- only checked when there are no hops at
+    // all. Checked here (compile time, TCK's Merge1 [15]), not only at
+    // runtime -- a zero-row MATCH would otherwise skip this entirely
+    // even though real Cypher's `VariableAlreadyBound` is a
+    // structural/scope error, not a data-dependent one.
+    if pattern.hops.is_empty() {
+        if let Some(var) = &pattern.start.var {
+            if pattern.start.labels.is_empty()
+                && pattern.start.props.is_empty()
+                && scope.contains_key(var)
+            {
+                return Err(semantic(format!(
+                    "'{var}' is already bound — MERGE ({var}) with no relationship and no \
+                     labels/properties doesn't search for or create anything"
+                )));
+            }
+        }
+    }
+    // Unlike a node endpoint (which can legitimately reference an
+    // already-bound node to search/create from), MERGE never reuses an
+    // already-bound relationship as its own pattern token -- there's no
+    // "search using this specific existing edge" mode (TCK's Merge5
+    // [26]).
+    for (rel, _) in &pattern.hops {
+        if let Some(var) = &rel.var {
+            if scope.contains_key(var) {
+                return Err(semantic(format!(
+                    "'{var}' is already bound — MERGE can't reuse an existing relationship \
+                     variable as its own pattern token"
+                )));
+            }
+        }
+    }
+    bind_match_pattern(pattern, scope)?;
     for item in clause.on_create.iter().chain(&clause.on_match) {
         validate_set_item(item, scope)?;
     }
@@ -199,11 +238,13 @@ fn bind_match_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), QueryE
 
 fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), QueryError> {
     validate_props(&pattern.start.props, scope)?;
+    check_create_node_not_already_bound(&pattern.start, scope, pattern.hops.is_empty())?;
     if let Some(var) = &pattern.start.var {
         bind_kind(scope, var, Kind::Node, "CREATE node")?;
     }
     for (rel, node) in &pattern.hops {
         validate_props(&node.props, scope)?;
+        check_create_node_not_already_bound(node, scope, false)?;
         if let Some(var) = &node.var {
             bind_kind(scope, var, Kind::Node, "CREATE node")?;
         }
@@ -221,6 +262,40 @@ fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), Query
         if let Some(var) = &rel.var {
             bind_kind(scope, var, Kind::Edge, "CREATE relationship")?;
         }
+    }
+    Ok(())
+}
+
+/// Mirrors `Executor::resolve_or_create_node`'s already-bound rejection
+/// at compile time -- a node token naming a variable already in `scope`
+/// either does nothing real (`is_bare`: no relationship, no new
+/// labels/props -- `MATCH (a) CREATE (a)`) or would silently drop
+/// user-written labels/props onto an existing node (any hop count --
+/// `MATCH (a) CREATE (a {x: 1})`). Checked here, not only at runtime --
+/// a zero-row MATCH would otherwise skip this entirely even though real
+/// Cypher's `VariableAlreadyBound` is a structural/scope error, not a
+/// data-dependent one (TCK's Create1 [13]/[14]).
+fn check_create_node_not_already_bound(
+    node: &NodePattern,
+    scope: &Scope,
+    is_bare: bool,
+) -> Result<(), QueryError> {
+    let Some(var) = &node.var else {
+        return Ok(());
+    };
+    if !scope.contains_key(var) {
+        return Ok(());
+    }
+    if is_bare && node.labels.is_empty() && node.props.is_empty() {
+        return Err(semantic(format!(
+            "'{var}' is already bound — CREATE ({var}) with no relationship and no new \
+             labels/properties doesn't create or connect anything"
+        )));
+    }
+    if !node.labels.is_empty() || !node.props.is_empty() {
+        return Err(semantic(format!(
+            "'{var}' is already bound — CREATE can't add labels/properties to an existing node"
+        )));
     }
     Ok(())
 }
