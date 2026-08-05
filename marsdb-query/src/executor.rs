@@ -5059,11 +5059,38 @@ fn call_builtin(
             None => Ok(Value::Null),
         },
         "date" => date_builtin(args, now),
+        "date.transaction" | "date.statement" | "date.realtime" => {
+            Ok(Value::Property(PropertyValue::Date(now.epoch_day)))
+        }
         "duration" => duration_builtin(args),
         "localtime" => local_time_builtin(args, now),
+        "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            Ok(Value::Property(PropertyValue::LocalTime(now.nanos_of_day)))
+        }
         "time" => time_builtin(args, now),
+        "time.transaction" | "time.statement" | "time.realtime" => {
+            // No-arg time() defaults to UTC offset (real Cypher's statement default timezone)
+            Ok(Value::Property(PropertyValue::Time {
+                nanos_of_day: now.nanos_of_day,
+                offset_seconds: 0,
+            }))
+        }
         "localdatetime" => local_date_time_builtin(args, now),
+        "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            Ok(Value::Property(PropertyValue::LocalDateTime {
+                epoch_seconds: now.epoch_seconds,
+                nanos: now.nanos,
+            }))
+        }
         "datetime" => date_time_builtin(args, now),
+        "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
+            // No-arg datetime() defaults to UTC offset (real Cypher's statement default timezone)
+            Ok(Value::Property(PropertyValue::DateTime {
+                epoch_seconds: now.epoch_seconds,
+                nanos: now.nanos,
+                zone: GraphTzId::Offset(0),
+            }))
+        }
         "duration.between" => {
             duration_between_builtin("duration.between", args, temporal::duration_between)
         }

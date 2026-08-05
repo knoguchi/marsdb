@@ -404,4 +404,32 @@ fn report(reports: &[ScenarioReport]) {
             }
         }
     }
+
+    if std::env::var("TCK_DUMP_REJECTS").is_ok() {
+        let rejected: Vec<&ScenarioReport> = reports
+            .iter()
+            .filter(|r| r.outcome == Outcome::ParseRejected)
+            .collect();
+        println!("\n--- ParseRejected scenarios ({}) ---", rejected.len());
+        for r in &rejected {
+            println!("[{}] {} :: {}", r.category, r.feature_name, r.name);
+            if let Some(d) = &r.detail {
+                println!("    {d}");
+            }
+        }
+    }
+
+    if std::env::var("TCK_DUMP_UNSUP").is_ok() {
+        let unsup: Vec<&ScenarioReport> = reports
+            .iter()
+            .filter(|r| r.outcome == Outcome::RunnerUnsupported)
+            .collect();
+        println!("\n--- RunnerUnsupported scenarios ({}) ---", unsup.len());
+        for r in &unsup {
+            println!("[{}] {} :: {}", r.category, r.feature_name, r.name);
+            if let Some(d) = &r.detail {
+                println!("    {d}");
+            }
+        }
+    }
 }
