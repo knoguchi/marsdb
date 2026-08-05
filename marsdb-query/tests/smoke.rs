@@ -1276,6 +1276,63 @@ fn variable_length_bounded_range_respects_max_hops() {
     assert_eq!(reached, vec![1, 2]);
 }
 
+/// A bare `[*]` (no explicit bounds) defaults to `min_hops = 1`, not 0 --
+/// the destination is never the start node itself, same as `[*1..]`
+/// already correctly behaved. A real bug found via the TCK: `parse_
+/// rel_range` defaulted the *omitted* min (both the fully bare `*` case
+/// and the `*..M` case with an empty min before `..`) to 0, incorrectly
+/// including the zero-hop "reached myself" row. TCK's Match4 [2].
+#[test]
+fn variable_length_bare_star_defaults_to_min_hops_one() {
+    use std::collections::BTreeMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let mut props = BTreeMap::new();
+        props.insert("idx".to_string(), marsdb_graph::PropertyValue::Int(i));
+        ids.push(store.create_node(&["Item"], props).unwrap());
+    }
+    for i in 0..3 {
+        store
+            .create_edge("NEXT", ids[i], ids[i + 1], BTreeMap::new())
+            .unwrap();
+    }
+    for query in [
+        "MATCH (n:Item {idx: 0})-[:NEXT*]->(m:Item) RETURN m.idx",
+        "MATCH (n:Item {idx: 0})-[:NEXT*..3]->(m:Item) RETURN m.idx",
+    ] {
+        let result = run(&store, query);
+        let mut reached: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+                other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        reached.sort();
+        assert_eq!(reached, vec![1, 2, 3], "query: {query}");
+    }
+
+    // `*0..` (explicit zero lower bound) still legitimately includes the
+    // start node itself -- only the *omitted*-min cases default to 1.
+    let result = run(
+        &store,
+        "MATCH (n:Item {idx: 0})-[:NEXT*0..2]->(m:Item) RETURN m.idx",
+    );
+    let mut reached: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    reached.sort();
+    assert_eq!(reached, vec![0, 1, 2]);
+}
+
 #[test]
 fn variable_length_preserves_distinct_paths_to_same_node() {
     use std::collections::BTreeMap;
