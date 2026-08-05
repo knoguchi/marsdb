@@ -1138,6 +1138,27 @@ impl<'a> Executor<'a> {
                     projected
                 }
             }
+            Some(Tail::ReturnStar(distinct)) => {
+                let items = return_star_items(carried_vars.iter().cloned())?;
+                let projected = self.materialize_return(txn, &items, &current_rows, *distinct)?;
+                if let Some(ob) = order_by {
+                    if !distinct {
+                        order_by_pre_applied = true;
+                        self.apply_order_by_with_scope(
+                            txn,
+                            &current_rows,
+                            projected,
+                            ob,
+                            skip,
+                            limit,
+                        )?
+                    } else {
+                        projected
+                    }
+                } else {
+                    projected
+                }
+            }
             Some(Tail::Delete(vars, ret)) => {
                 self.materialize_delete(txn, vars, &current_rows, false, ret)?
             }
@@ -3278,7 +3299,7 @@ fn apply_remove_item(
 /// even when more exist.
 fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
     match tail {
-        Some(Tail::Return(_, distinct)) => *distinct,
+        Some(Tail::Return(_, distinct)) | Some(Tail::ReturnStar(distinct)) => *distinct,
         Some(Tail::Delete(_, ret))
         | Some(Tail::DetachDelete(_, ret))
         | Some(Tail::Set(_, ret))
@@ -3498,6 +3519,37 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         | ReturnExpr::Lit(_)
         | ReturnExpr::HasLabel(..) => false,
     }
+}
+
+/// `RETURN *`/`RETURN DISTINCT *` resolved into the equivalent concrete
+/// item list -- one bare-`Var` item per currently-bound name, sorted
+/// alphabetically (real Cypher's own `RETURN *` column order, confirmed
+/// against the TCK's own multi-variable scenarios, not introduction
+/// order). Shared by `semantic.rs` (`scope.keys()`) and this file's own
+/// `execute_match` (`carried_vars`) -- each already has its own accurate
+/// bound-name set on hand at the point `Tail::ReturnStar` is reached, so
+/// resolving it there (rather than via a separate whole-AST-mutation
+/// pass before execution) needs no `&mut Statement` ripple through
+/// `Executor::execute`'s public signature. Real Cypher's own
+/// `NoVariablesInScope` compile-time error when nothing is bound at all
+/// (TCK's Return7 `[2]`, `MATCH () RETURN *`).
+pub(crate) fn return_star_items(
+    names: impl Iterator<Item = String>,
+) -> Result<Vec<ReturnItem>, QueryError> {
+    let mut names: Vec<String> = names.collect();
+    if names.is_empty() {
+        return Err(QueryError::Semantic(
+            "RETURN * needs at least one variable in scope".into(),
+        ));
+    }
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| ReturnItem {
+            expr: ReturnExpr::Var(name),
+            alias: None,
+        })
+        .collect())
 }
 
 /// Validates a RETURN/WITH item list before any row is processed: every

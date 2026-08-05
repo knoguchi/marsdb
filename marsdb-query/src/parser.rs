@@ -496,6 +496,16 @@ fn parse_with_unary_expr(pair: Pair<Rule>) -> Result<WithExpr, QueryError> {
                 .next()
                 .expect("with_bare_expr has a null_predicate_expr"),
         )?)),
+        Rule::with_label_predicate => {
+            let mut parts = inner.into_inner();
+            let var = parts
+                .next()
+                .expect("with_label_predicate has a var identifier")
+                .as_str()
+                .to_string();
+            let labels = parts.map(|p| p.as_str().to_string()).collect();
+            Ok(WithExpr::Bare(ReturnExpr::HasLabel(var, labels)))
+        }
         r => unreachable!("unexpected with_unary_expr child rule {r:?}"),
     }
 }
@@ -611,7 +621,10 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
     match inner.as_rule() {
         Rule::return_clause => {
             let (items, distinct) = parse_return_clause(inner)?;
-            Ok(Tail::Return(items, distinct))
+            Ok(match items {
+                Some(items) => Tail::Return(items, distinct),
+                None => Tail::ReturnStar(distinct),
+            })
         }
         Rule::mutating_tail => parse_mutating_tail(inner),
         r => unreachable!("unexpected tail_clause child rule {r:?}"),
@@ -622,15 +635,21 @@ fn parse_tail_clause(pair: Pair<Rule>) -> Result<Tail, QueryError> {
 /// `Tail::Return` itself (`parse_tail_clause`) and a trailing `ReturnTail`
 /// after a mutating clause (`parse_mutating_tail`), same grammar rule
 /// either way.
-fn parse_return_clause(pair: Pair<Rule>) -> Result<(Vec<ReturnItem>, bool), QueryError> {
+/// `None` (instead of `Some(items)`) means `RETURN *` -- see
+/// `Tail::ReturnStar`'s own docs for why this can't resolve to a concrete
+/// item list here (no scope exists yet at parse time).
+fn parse_return_clause(pair: Pair<Rule>) -> Result<(Option<Vec<ReturnItem>>, bool), QueryError> {
     let children: Vec<_> = pair.into_inner().collect();
     let distinct = children.iter().any(|p| p.as_rule() == Rule::distinct_kw);
+    if children.iter().any(|p| p.as_rule() == Rule::star_return) {
+        return Ok((None, distinct));
+    }
     let items = children
         .into_iter()
         .filter(|p| p.as_rule() == Rule::return_item)
         .map(parse_return_item)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((items, distinct))
+    Ok((Some(items), distinct))
 }
 
 /// A mutating clause (`DETACH DELETE`/`DELETE`/`REMOVE`/`SET`/`CREATE`)
@@ -643,6 +662,17 @@ fn parse_mutating_tail(pair: Pair<Rule>) -> Result<Tail, QueryError> {
         .next()
         .map(|p| -> Result<ReturnTail, QueryError> {
             let (items, distinct) = parse_return_clause(p)?;
+            // `RETURN *` isn't supported as a mutating clause's own
+            // trailing RETURN yet -- `ReturnTail` (unlike `Tail::Return`)
+            // has no star-resolution site, only `Tail::ReturnStar`'s
+            // own call sites do. No real TCK scenario needs this
+            // specific combination; a clear error here beats silently
+            // treating `*` as an empty projection.
+            let items = items.ok_or_else(|| {
+                QueryError::Syntax(
+                    "RETURN * isn't supported as a mutating clause's own trailing RETURN".into(),
+                )
+            })?;
             Ok(ReturnTail { items, distinct })
         })
         .transpose()?;
@@ -1484,12 +1514,13 @@ fn parse_literal(pair: Pair<Rule>) -> Result<Literal, QueryError> {
         Rule::bool_literal => Literal::Bool(inner.as_str().eq_ignore_ascii_case("true")),
         Rule::null_literal => Literal::Null,
         Rule::param => {
-            let name = inner
-                .into_inner()
-                .next()
-                .expect("param has an identifier")
-                .as_str()
-                .to_string();
+            // `param = { "$" ~ (ASCII_DIGIT+ | identifier) }` -- the
+            // digit form isn't a named sub-rule (bare `ASCII_DIGIT+`
+            // produces no child `Pair` of its own), so this reads the
+            // name straight from `param`'s own span (stripping the "$")
+            // rather than drilling into a specific inner rule, which
+            // works for both forms uniformly.
+            let name = inner.as_str()[1..].trim_end().to_string();
             Literal::Param(name)
         }
         r => unreachable!("unexpected literal child rule {r:?}"),

@@ -207,6 +207,8 @@ fn substitute_tail(
                 substitute_return_expr(&mut item.expr, params)?;
             }
         }
+        // No `$param`-able position -- a bare `*`, nothing to substitute.
+        Tail::ReturnStar(_) => {}
         Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
             for expr in exprs {
                 substitute_return_expr(expr, params)?;

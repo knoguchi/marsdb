@@ -192,6 +192,9 @@ fn explain_tail(tail: &Tail) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Tail::ReturnStar(distinct) => {
+            format!("RETURN{} *", if *distinct { " DISTINCT" } else { "" })
+        }
         // Targets are a general `ReturnExpr` now (DELETE's target can be
         // any expression, not just a bare variable) -- same `Debug`
         // fallback SET's RHS formatting already uses, for the same reason

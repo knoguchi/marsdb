@@ -409,6 +409,10 @@ fn validate_tail(tail: &Option<Tail>, scope: &mut Scope) -> Result<Scope, QueryE
     };
     match tail {
         Tail::Return(items, _) => project_return(items, scope),
+        Tail::ReturnStar(_) => {
+            let items = crate::executor::return_star_items(scope.keys().cloned())?;
+            project_return(&items, scope)
+        }
         Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
             for expr in exprs {
                 // Some shapes can *never* evaluate to a node/relationship/

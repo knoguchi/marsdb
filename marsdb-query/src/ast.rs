@@ -317,6 +317,17 @@ pub enum Tail {
     /// an aggregate call (`count(DISTINCT x)`), which only affects that one
     /// aggregate's own accumulation.
     Return(Vec<ReturnItem>, bool),
+    /// `RETURN *` (`distinct`: `RETURN DISTINCT *`) -- every currently-
+    /// bound variable, alphabetically. Can't be resolved into a concrete
+    /// `Return(Vec<ReturnItem>, _)` at parse time (no scope exists yet);
+    /// resolved independently wherever the real bound-variable-name set
+    /// is already on hand (`execute_match`'s own `carried_vars` in
+    /// `executor.rs`, `Scope`'s keys in `semantic.rs`) rather than via a
+    /// separate AST-mutation pass, avoiding a `&mut Statement` ripple
+    /// through `Executor::execute`'s public signature. `MATCH ()
+    /// RETURN *` (nothing bound at all) is a compile-time
+    /// `NoVariablesInScope` error, not an empty projection.
+    ReturnStar(bool),
     /// Every mutating tail variant's trailing `Option<ReturnTail>` is real
     /// Cypher: `MATCH (n) SET n.x = 1 RETURN n`, `MATCH (n) DELETE n RETURN
     /// count(n)`, etc — see `ReturnTail`'s docs for why it's `None` (the
