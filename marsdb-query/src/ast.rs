@@ -426,9 +426,13 @@ pub struct WithClause {
 }
 
 /// One `MATCH <pattern>[, <pattern>...] [WHERE ...] [WITH ...]` segment.
-/// Comma-separated patterns within one part are spliced into a single
-/// linear `Pattern` at parse time (see `parser::splice_patterns`) — this
-/// only ever holds one already-combined `Pattern`, not several.
+/// Comma-separated patterns that continue each other (a later pattern's
+/// start is the previous one's last-introduced variable) are spliced into
+/// a single linear `Pattern` at parse time (see
+/// `parser::group_into_linear_patterns`) — this only ever holds one
+/// already-combined `Pattern`, not several. A genuine disjoint cross join
+/// (`MATCH (a:A), (b:B)`) instead becomes *multiple* `QueryPart`s, one per
+/// disjoint group (see `parser::parse_match_part`'s docs).
 ///
 /// `path_var` is `Some` for `p = (a)-->(b)` / `p = shortestPath(...)` —
 /// capturing the whole matched path, not just its endpoints. General

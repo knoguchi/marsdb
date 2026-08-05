@@ -145,7 +145,7 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     let mut limit = None;
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::clause => clauses.push(parse_clause(p)?),
+            Rule::clause => clauses.extend(parse_clause(p)?),
             Rule::tail_clause => tail = Some(parse_tail_clause(p)?),
             Rule::order_by_clause => order_by = Some(parse_order_by_clause(p)?),
             Rule::skip_clause => skip = Some(parse_skip_clause(p)?),
@@ -174,13 +174,20 @@ fn parse_match_stmt(pair: Pair<Rule>) -> Result<Statement, QueryError> {
     })
 }
 
-fn parse_clause(pair: Pair<Rule>) -> Result<QueryClause, QueryError> {
+/// Usually one `QueryClause`, except a `match_part` whose comma-separated
+/// patterns turned out to be a genuine disjoint cross join -- see
+/// `parse_match_part`'s docs -- which becomes several `QueryClause::Match`
+/// entries.
+fn parse_clause(pair: Pair<Rule>) -> Result<Vec<QueryClause>, QueryError> {
     let inner = pair.into_inner().next().expect("clause has one child");
     match inner.as_rule() {
-        Rule::match_part => Ok(QueryClause::Match(parse_match_part(inner)?)),
-        Rule::unwind_clause => Ok(QueryClause::Unwind(parse_unwind_clause(inner)?)),
-        Rule::merge_clause => Ok(QueryClause::Merge(parse_merge_clause(inner)?)),
-        Rule::with_clause => Ok(QueryClause::With(parse_with_clause(inner)?)),
+        Rule::match_part => Ok(parse_match_part(inner)?
+            .into_iter()
+            .map(QueryClause::Match)
+            .collect()),
+        Rule::unwind_clause => Ok(vec![QueryClause::Unwind(parse_unwind_clause(inner)?)]),
+        Rule::merge_clause => Ok(vec![QueryClause::Merge(parse_merge_clause(inner)?)]),
+        Rule::with_clause => Ok(vec![QueryClause::With(parse_with_clause(inner)?)]),
         r => unreachable!("unexpected clause child rule {r:?}"),
     }
 }
@@ -270,7 +277,26 @@ fn parse_unwind_source(pair: Pair<Rule>) -> Result<UnwindSource, QueryError> {
     Ok(UnwindSource(parse_return_expr(inner)?))
 }
 
-fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
+/// A comma-separated `MATCH` pattern list can be a genuine disjoint cross
+/// join (`MATCH (a:A), (b:B)`, real Cypher's own implicit-join shape,
+/// e.g. TCK's Merge6/Merge7), not just a continuation chain
+/// (`MATCH (message)-->(post:Post), (post)-->(person)`, where a later
+/// pattern's start is exactly the previous one's last-introduced
+/// variable). Splits `patterns` into one `QueryPart` per disjoint group
+/// -- each becomes its own `QueryClause::Match` (the same chained-MATCH
+/// machinery `execute_match`'s `carried_vars` threading already handles
+/// correctly for any already-bound variable, regardless of which earlier
+/// clause introduced it), so a later group referencing an even-earlier
+/// group's variable (not just the immediately-preceding one) still works
+/// without any special-casing here. `where_clause`/`with` (which apply to
+/// the whole comma-separated list, not just its last fragment) are
+/// attached to the *last* group only, so they see every group's bindings
+/// by the time they run -- same reasoning `WHERE`'s "sees the merged
+/// scope" rule already relies on elsewhere. `path_var`/`shortest_path`
+/// only ever apply to the first pattern (see `match_part`'s grammar) and
+/// are only valid when the whole list turned out to be one single group
+/// (naming a cross join as one path makes no sense).
+fn parse_match_part(pair: Pair<Rule>) -> Result<Vec<QueryPart>, QueryError> {
     let mut optional = false;
     let mut path_var = None;
     let mut shortest_path = false;
@@ -297,20 +323,34 @@ fn parse_match_part(pair: Pair<Rule>) -> Result<QueryPart, QueryError> {
             r => unreachable!("unexpected match_part child rule {r:?}"),
         }
     }
-    let pattern = splice_patterns(patterns)?;
-    if shortest_path {
-        validate_shortest_path_pattern(&pattern)?;
-    } else if path_var.is_some() {
-        validate_named_path_pattern(&pattern)?;
+    let groups = group_into_linear_patterns(patterns)?;
+    if groups.len() > 1 && (shortest_path || path_var.is_some()) {
+        return Err(QueryError::Syntax(
+            "a named path can't span a comma-separated cross join".into(),
+        ));
     }
-    Ok(QueryPart {
-        optional,
-        path_var,
-        shortest_path,
-        pattern,
-        where_clause,
-        with,
-    })
+    if shortest_path {
+        validate_shortest_path_pattern(&groups[0])?;
+    } else if path_var.is_some() {
+        validate_named_path_pattern(&groups[0])?;
+    }
+    let last = groups.len() - 1;
+    Ok(groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, pattern)| QueryPart {
+            optional,
+            path_var: if i == 0 { path_var.clone() } else { None },
+            shortest_path: i == 0 && shortest_path,
+            pattern,
+            where_clause: if i == last {
+                where_clause.clone()
+            } else {
+                None
+            },
+            with: if i == last { with.clone() } else { None },
+        })
+        .collect())
 }
 
 fn parse_path_pattern(pair: Pair<Rule>) -> Result<(Option<String>, bool, Pattern), QueryError> {
@@ -512,47 +552,46 @@ fn parse_skip_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
     Ok(n)
 }
 
-/// Merges comma-separated patterns within one `MATCH` into a single linear
-/// `Pattern`. Not a general cross-join — each subsequent pattern's start
-/// variable must be exactly the previous pattern's last-introduced
-/// variable (e.g. IS2's `MATCH (message)-[...]->(post:Post), (post)-[...]->
-/// (person)`, where `post` is both the first pattern's end and the second's
-/// start). Any labels/props the continuing pattern restates on that shared
-/// variable are merged in as additional filters. Non-linear/branching
-/// comma patterns (sharing a variable that isn't this exact splice point)
-/// are rejected rather than silently mishandled.
-fn splice_patterns(mut patterns: Vec<Pattern>) -> Result<Pattern, QueryError> {
+/// Groups comma-separated patterns within one `MATCH` into linear
+/// `Pattern` chains -- when a later pattern's start variable is exactly
+/// the previous one's last-introduced variable (e.g. IS2's `MATCH
+/// (message)-[...]->(post:Post), (post)-[...]->(person)`, where `post` is
+/// both the first pattern's end and the second's start), it's spliced
+/// into the same chain (any labels/props it restates on that shared
+/// variable merge in as additional filters); otherwise it starts a new
+/// group -- a genuine disjoint cross join (`MATCH (a:A), (b:B)`), which
+/// `parse_match_part` turns into its own separate `QueryPart`/
+/// `QueryClause::Match`. A later group referencing an even-earlier
+/// group's variable (not the immediately-preceding one) doesn't need
+/// special-casing here either -- it just starts its own new group, and
+/// the executor's existing already-bound-variable handling (used for
+/// chained MATCH clauses generally) resolves the reference correctly
+/// once both clauses run in order.
+fn group_into_linear_patterns(mut patterns: Vec<Pattern>) -> Result<Vec<Pattern>, QueryError> {
     if patterns.is_empty() {
         return Err(QueryError::Syntax("MATCH requires a pattern".into()));
     }
-    let mut combined = patterns.remove(0);
+    let mut groups = vec![patterns.remove(0)];
     for next in patterns {
-        let Some(start_var) = next.start.var.clone() else {
-            return Err(QueryError::Syntax(
-                "a comma-separated MATCH pattern must start from a named variable".into(),
-            ));
-        };
-        let last_var = combined
+        let current = groups.last_mut().expect("groups is never empty");
+        let last_var = current
             .hops
             .last()
             .map(|(_, n)| n.var.clone())
-            .unwrap_or_else(|| combined.start.var.clone());
-        if last_var.as_deref() != Some(start_var.as_str()) {
-            return Err(QueryError::Syntax(format!(
-                "comma-separated MATCH pattern must continue from the previous pattern's last \
-                 variable ('{}'), not '{start_var}' — general cross-joins aren't supported",
-                last_var.unwrap_or_default()
-            )));
+            .unwrap_or_else(|| current.start.var.clone());
+        if next.start.var.is_some() && last_var == next.start.var {
+            let target = match current.hops.last_mut() {
+                Some((_, node)) => node,
+                None => &mut current.start,
+            };
+            target.labels.extend(next.start.labels);
+            target.props.extend(next.start.props);
+            current.hops.extend(next.hops);
+        } else {
+            groups.push(next);
         }
-        let target = match combined.hops.last_mut() {
-            Some((_, node)) => node,
-            None => &mut combined.start,
-        };
-        target.labels.extend(next.start.labels);
-        target.props.extend(next.start.props);
-        combined.hops.extend(next.hops);
     }
-    Ok(combined)
+    Ok(groups)
 }
 
 fn parse_sort_item(pair: Pair<Rule>) -> Result<(ReturnExpr, SortDir), QueryError> {
