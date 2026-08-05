@@ -30,6 +30,31 @@ fn create_match_return() {
     assert_eq!(names, vec!["Alice", "Bob"]);
 }
 
+/// Real Cypher's two comment forms (`//` line, `/* */` block) -- a real
+/// grammar gap found via the openCypher TCK's own fixture text, which
+/// pervasively annotates `CREATE` blocks this way.
+#[test]
+fn line_and_block_comments_are_ignored() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:A {num: 1}), //first node\n(:A {num: 2}) // second node",
+    );
+    let result = run(
+        &store,
+        "/* leading */ MATCH (a:A) // trailing\nRETURN a.num /* mid-expr */ + 0 ORDER BY a.num",
+    );
+    let nums: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(nums, vec![1, 2]);
+}
+
 #[test]
 fn traversal_with_label_filter() {
     let store = GraphStore::open_memory().unwrap();
@@ -1441,11 +1466,49 @@ fn multiple_match_without_with_is_rejected() {
 }
 
 #[test]
-fn two_with_boundaries_is_rejected() {
-    // Grammar-valid (two match_parts, each with its own WITH) but rejected
-    // at the AST level -- v1 only supports chaining past one WITH boundary.
-    let err = parse("MATCH (a:Item) WITH a MATCH (b:Item) WITH b RETURN a").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("with"));
+fn chaining_past_multiple_with_boundaries_works() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:A {num: 1, num2: 4}), (:A {num: 5, num2: 2}), (:A {num: 9, num2: 0})",
+    );
+    // Two chained WITH boundaries (a real, previously-rejected shape --
+    // TCK's WithOrderBy4, chained `WITH x AS y WITH y % 3 AS y ...`).
+    let result = run(
+        &store,
+        "MATCH (a:A) WITH a.num AS x WITH x % 3 AS x ORDER BY x * -1 LIMIT 3 RETURN x",
+    );
+    let values: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(v)) => *v,
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![2, 1, 0]);
+
+    // Three chained WITH boundaries, mixing an aggregating one in the
+    // middle -- grouping and non-grouping WITH clauses both carry
+    // through correctly across a chain, not just a single boundary.
+    let result = run(
+        &store,
+        "MATCH (a:A) WITH a AS a, a.num + a.num2 AS sum \
+         WITH a.num2 % 3 AS mod, min(sum) AS min \
+         WITH mod AS mod, min AS min ORDER BY min LIMIT 2 RETURN mod, min",
+    );
+    let rows: Vec<(i64, i64)> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let get = |v: &Value| match v {
+                Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+                other => panic!("unexpected value {other:?}"),
+            };
+            (get(&row[0]), get(&row[1]))
+        })
+        .collect();
+    assert_eq!(rows, vec![(1, 5), (2, 7)]);
 }
 
 #[test]

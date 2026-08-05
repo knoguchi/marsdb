@@ -1,4 +1,9 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+// Real Cypher's own comment forms -- pest's special `COMMENT` rule is
+// implicitly skippable anywhere `WHITESPACE` is, same as real Cypher
+// treats a comment as insignificant whitespace, not a token any
+// individual grammar rule needs to know about.
+COMMENT = _{ ("//" ~ (!"\n" ~ ANY)*) | ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
 
 query = { SOI ~ statement ~ ";"? ~ EOI }
 
@@ -7,6 +12,16 @@ query = { SOI ~ statement ~ ";"? ~ EOI }
 // separates `statement`s here; a `;` inside a `string_literal` is
 // consumed as part of that atomic rule and never reaches this level, so
 // no special-casing is needed to avoid splitting inside a string.
+// Deliberately requires an explicit `;` between statements, not just
+// adjacency -- `match_stmt` (a `statement` alternative) can itself match
+// zero-width (`clause*` plus every trailing modifier is optional), so
+// any `(... | statement)*`-shaped repetition is genuinely unbounded at
+// the grammar level (confirmed by pest's own "cannot fail and will
+// repeat infinitely" static check, not just an overly-conservative
+// warning) -- real fixture text that separates statements by newline
+// alone (the openCypher TCK's own `having executed:` convention) is
+// handled by splitting on statement boundaries before parsing, not by
+// loosening this rule -- see `marsdb-tck`'s own setup-execution code.
 queries = { SOI ~ statement ~ (";" ~ statement)* ~ ";"? ~ EOI }
 
 // `create_index_stmt` tried before `create_stmt` -- both start with
