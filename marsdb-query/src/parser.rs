@@ -1044,9 +1044,19 @@ fn parse_quantifier_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
     })
 }
 
+/// The subject expression is optional (see `case_expr`'s grammar comment)
+/// -- its presence can't be assumed positionally anymore, only
+/// distinguished by rule: a leading child that isn't itself a `case_when`
+/// is the "simple CASE" subject, otherwise this is the "searched CASE"
+/// form and every `WHEN` carries its own full condition.
 fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
-    let mut inner = pair.into_inner();
-    let test = parse_return_expr(inner.next().expect("case_expr has a test expr"))?;
+    let mut inner = pair.into_inner().peekable();
+    let test = match inner.peek() {
+        Some(p) if p.as_rule() != Rule::case_when => {
+            Some(Box::new(parse_return_expr(inner.next().unwrap())?))
+        }
+        _ => None,
+    };
     let mut whens = Vec::new();
     let mut else_ = None;
     for p in inner {
@@ -1063,11 +1073,7 @@ fn parse_case_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
             _ => else_ = Some(Box::new(parse_return_expr(p)?)),
         }
     }
-    Ok(ReturnExpr::Case {
-        test: Some(Box::new(test)),
-        whens,
-        else_,
-    })
+    Ok(ReturnExpr::Case { test, whens, else_ })
 }
 
 fn parse_function_call(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {

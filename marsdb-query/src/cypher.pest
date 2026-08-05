@@ -274,7 +274,20 @@ filter_expr         = { identifier ~ ^"IN" ~ return_expr ~ (^"WHERE" ~ return_ex
 quantifier_expr      = { quantifier_kw ~ "(" ~ filter_expr ~ ")" }
 quantifier_kw        = { ^"ALL" | ^"ANY" | ^"NONE" | ^"SINGLE" }
 
-case_expr     = { ^"CASE" ~ return_expr ~ case_when+ ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
+// The subject expression is optional -- real Cypher's "searched CASE" form
+// (`CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ELSE r3 END`, condition
+// directly in each `WHEN`, no value being matched) omits it entirely,
+// unlike the "simple CASE" form (`CASE x WHEN v1 THEN r1 ... END`, each
+// `WHEN` compares against `x`). Deliberately `(case_when+ | (return_expr ~
+// case_when+))`, not `return_expr? ~ case_when+` -- pest's `?` greedily
+// commits to matching once it locally succeeds (`return_expr` can start
+// with a bare identifier, so it would swallow `WHEN` itself as the
+// subject) and does NOT backtrack just because a later required element
+// then fails to find a real `WHEN` token. Ordered choice (`|`) does
+// backtrack on overall-alternative failure, so trying the anchor-first
+// (searched) shape before falling back to the subject-first (simple)
+// shape resolves the ambiguity correctly either way.
+case_expr     = { ^"CASE" ~ (case_when+ | (return_expr ~ case_when+)) ~ (^"ELSE" ~ return_expr)? ~ ^"END" }
 case_when     = { ^"WHEN" ~ return_expr ~ ^"THEN" ~ return_expr }
 function_call = { identifier ~ "(" ~ call_args ~ ")" }
 // `"*"` (bare, only meaningful for `count(*)`) is tried first — no

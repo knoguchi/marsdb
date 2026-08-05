@@ -702,6 +702,34 @@ fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
     }
 }
 
+/// Real Cypher's "searched CASE" form -- no subject expression, each
+/// `WHEN` carries its own full boolean condition (`CASE WHEN cond THEN
+/// ... END`), distinct from the "simple CASE" form both other `case_*`
+/// tests exercise (`CASE x WHEN v THEN ... END`). A bare `WHEN` right
+/// after `CASE` used to get swallowed as a bare-identifier subject
+/// expression (pest's `?` doesn't backtrack across a later parse
+/// failure), rejecting every searched-CASE query.
+#[test]
+fn case_searched_form_has_no_subject_expression() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Person {age: 30})");
+    run(&store, "CREATE (b:Person {age: 17})");
+    let result = run(
+        &store,
+        "MATCH (n:Person) RETURN CASE WHEN n.age >= 18 THEN 'adult' ELSE 'minor' END AS x",
+    );
+    let mut values: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Literal(marsdb_query::Literal::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    values.sort();
+    assert_eq!(values, vec!["adult".to_string(), "minor".to_string()]);
+}
+
 #[test]
 fn order_by_multi_key_against_aliases_not_raw_bindings() {
     let store = GraphStore::open_memory().unwrap();
