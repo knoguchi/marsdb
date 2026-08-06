@@ -1571,7 +1571,7 @@ fn parse_map_expr(pair: Pair<Rule>) -> Result<ReturnExpr, QueryError> {
 /// guess). `\uXXXX` is exactly 4 hex digits (a BMP code point, real
 /// Cypher's own escape width -- not the 8-digit `\UXXXXXXXX` some other
 /// languages have).
-fn unescape_string(s: &str) -> Result<String, QueryError> {
+pub(crate) fn unescape_string(s: &str) -> Result<String, QueryError> {
     if !s.contains('\\') {
         return Ok(s.to_string());
     }
@@ -1631,7 +1631,7 @@ fn unescape_string(s: &str) -> Result<String, QueryError> {
 /// `u64`, and `i64::MIN`'s own negation would itself overflow (`i64`'s
 /// range is asymmetric) -- special-cased via the two's-complement
 /// identity instead of negating.
-fn parse_int_literal(s: &str) -> Result<i64, QueryError> {
+pub(crate) fn parse_int_literal(s: &str) -> Result<i64, QueryError> {
     let (neg, rest) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s),
