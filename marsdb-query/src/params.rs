@@ -256,6 +256,7 @@ fn substitute_expr(
                 substitute_expr(w, params)?;
             }
         }
+        Expr::ExistsSubquery(stmt) => substitute_params(stmt, params)?,
     }
     Ok(())
 }
@@ -446,6 +447,7 @@ fn substitute_return_expr(
                 substitute_expr(w, params)?;
             }
         }
+        ReturnExpr::ExistsSubquery(stmt) => substitute_params(stmt, params)?,
     }
     Ok(())
 }

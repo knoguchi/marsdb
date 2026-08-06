@@ -482,6 +482,7 @@ fn format_expr(expr: &Expr) -> String {
             pattern,
             where_clause,
         } => format!("exists {{{pattern:?} {where_clause:?}}}"),
+        Expr::ExistsSubquery(stmt) => format!("exists {{{stmt:?}}}"),
         Expr::EdgeNotInSet {
             edge_var,
             edge_set_var,

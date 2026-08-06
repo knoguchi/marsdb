@@ -57,141 +57,162 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
             tail,
             order_by,
             ..
-        } => {
-            let mut scope = Scope::new();
-            for clause in clauses {
-                match clause {
-                    QueryClause::Match(part) => {
-                        let prior_scope = scope.clone();
-                        bind_match_pattern(&part.pattern, &mut scope)?;
-                        if part.shortest_path {
-                            let start = part.pattern.start.var.as_deref().ok_or_else(|| {
-                                semantic("shortestPath() start node must have a variable")
-                            })?;
-                            let end = part
-                                .pattern
-                                .hops
-                                .first()
-                                .and_then(|(_, node)| node.var.as_deref())
-                                .ok_or_else(|| {
-                                    semantic("shortestPath() end node must have a variable")
-                                })?;
-                            require_kind(
-                                &prior_scope,
-                                start,
-                                &Kind::Node,
-                                "shortestPath endpoint",
-                            )?;
-                            require_kind(&prior_scope, end, &Kind::Node, "shortestPath endpoint")?;
-                        }
-                        if let Some(path_var) = &part.path_var {
-                            bind_kind(&mut scope, path_var, Kind::Path, "path variable")?;
-                        }
-                        if let Some(expr) = &part.where_clause {
-                            validate_pattern_expr(expr, &scope)?;
-                        }
-                        apply_with(&part.with, &mut scope)?;
-                    }
-                    QueryClause::Unwind(clause) => bind_unwind(clause, &mut scope)?,
-                    QueryClause::Merge(clause) => bind_merge(clause, &mut scope)?,
-                    QueryClause::With(with) => scope = project_with(with, &scope)?,
-                    QueryClause::Set(items) => {
-                        for item in items {
-                            validate_set_item(item, &scope)?;
-                        }
-                    }
-                    QueryClause::Delete { items, detach: _ } => {
-                        for expr in items {
-                            validate_delete_target(expr, &scope)?;
-                        }
-                    }
-                    QueryClause::Remove(items) => {
-                        for item in items {
-                            validate_remove_item(item, &scope)?;
-                        }
-                    }
-                    QueryClause::Create(patterns) => {
-                        for pattern in patterns {
-                            bind_create_pattern(pattern, &mut scope)?;
-                        }
-                    }
-                }
-            }
+        } => validate_match_clauses(clauses, tail, order_by, Scope::new(), true),
+    }
+}
 
-            let input_scope = scope.clone();
-            let output_scope = validate_tail(tail, &mut scope)?;
-            if let Some(order_by) = order_by {
-                let mut order_scope = input_scope;
-                order_scope.extend(output_scope);
-                // Real Cypher: an aggregate in RETURN's ORDER BY is only
-                // legal when RETURN itself is aggregating (the ORDER BY
-                // then runs against the already-collapsed grouped rows,
-                // same as its own WITH/RETURN items would) -- otherwise
-                // it's a compile-time `InvalidAggregation` error (TCK's
-                // ReturnOrderBy2 [14]), not a runtime one.
-                let tail_items: Option<&[ReturnItem]> = match tail {
-                    Some(Tail::Return(items, _)) => Some(items),
-                    _ => None,
-                };
-                let tail_aggregates = tail_items.is_some_and(crate::executor::has_aggregate);
-                for (expr, _) in order_by {
-                    if tail_aggregates {
-                        // An ORDER BY item that repeats a RETURN item's
-                        // expression *or own alias* (`RETURN sum(x) AS s
-                        // ORDER BY sum(x)` / `ORDER BY s`, TCK's
-                        // WithOrderBy4 [11]/`ReturnOrderBy3`/
-                        // `WithSkipLimit1 [2]`) refers to that
-                        // already-aggregated item, not a fresh expression
-                        // -- its kind is already known from
-                        // `output_scope`, and re-running `infer_expr` on
-                        // it would need pre-aggregation bindings (like
-                        // `x`'s row) that no longer exist post-grouping.
-                        // Unlike `validate_composed_expr`'s own *nested*-
-                        // leaf check just below, this whole-expression
-                        // match doesn't exclude aggregating items -- an
-                        // aggregate's own alias referenced *directly* (not
-                        // buried inside a larger expression) is exactly
-                        // "reuse this item's already-finished value",
-                        // which `materialize_aggregating_return_with_
-                        // order`'s matching top-level lookup (executor.rs)
-                        // handles the same way.
-                        if tail_items
-                            .unwrap()
-                            .iter()
-                            .enumerate()
-                            .any(|(i, item)| crate::executor::item_matches_leaf(expr, i, item))
-                        {
-                            continue;
-                        }
-                        // Not a verbatim match -- may still be a *composed*
-                        // expression (an aggregate combined with other
-                        // values, or a plain non-aggregate expression
-                        // referencing a pre-aggregation variable, TCK's
-                        // ReturnOrderBy6) that `resolve_grouped_rows`/
-                        // `rewrite_composed_item` (executor.rs) can
-                        // evaluate the same way a composed RETURN item
-                        // would -- validated the same way, by the same
-                        // function, rather than `infer_expr` against a
-                        // scope that structurally can't have pre-
-                        // aggregation bindings in it anymore.
-                        crate::executor::validate_order_by_composed_expr(
-                            expr,
-                            tail_items.unwrap(),
-                        )?;
-                        continue;
-                    }
-                    if crate::executor::contains_aggregate(expr) {
-                        return Err(semantic(
-                            "ORDER BY cannot use an aggregate function unless RETURN itself \
-                             is aggregating",
-                        ));
-                    }
-                    infer_expr(expr, &order_scope)?;
+/// The body of `Statement::Match`'s own validation, factored out so
+/// `Expr::ExistsSubquery` (a nested `exists { MATCH ... RETURN ... }`, TCK's
+/// ExistentialSubquery2/3) can reuse it correlated against the enclosing
+/// scope instead of a fresh one, with `allow_mutation: false` -- real
+/// Cypher only allows *reading* clauses inside `exists {}` (an updating
+/// clause there is a compile-time `InvalidClauseComposition`, TCK's
+/// ExistentialSubquery2 `[3]`).
+fn validate_match_clauses(
+    clauses: &[QueryClause],
+    tail: &Option<Tail>,
+    order_by: &Option<Vec<(ReturnExpr, crate::ast::SortDir)>>,
+    mut scope: Scope,
+    allow_mutation: bool,
+) -> Result<(), QueryError> {
+    let reject_mutation = |clause_name: &str| -> Result<(), QueryError> {
+        if allow_mutation {
+            Ok(())
+        } else {
+            Err(semantic(format!(
+                "exists {{}} can't contain an updating clause ({clause_name}) -- only reading \
+                 clauses (MATCH/UNWIND/WITH) are allowed inside it"
+            )))
+        }
+    };
+    for clause in clauses {
+        match clause {
+            QueryClause::Match(part) => {
+                let prior_scope = scope.clone();
+                bind_match_pattern(&part.pattern, &mut scope)?;
+                if part.shortest_path {
+                    let start = part.pattern.start.var.as_deref().ok_or_else(|| {
+                        semantic("shortestPath() start node must have a variable")
+                    })?;
+                    let end = part
+                        .pattern
+                        .hops
+                        .first()
+                        .and_then(|(_, node)| node.var.as_deref())
+                        .ok_or_else(|| semantic("shortestPath() end node must have a variable"))?;
+                    require_kind(&prior_scope, start, &Kind::Node, "shortestPath endpoint")?;
+                    require_kind(&prior_scope, end, &Kind::Node, "shortestPath endpoint")?;
+                }
+                if let Some(path_var) = &part.path_var {
+                    bind_kind(&mut scope, path_var, Kind::Path, "path variable")?;
+                }
+                if let Some(expr) = &part.where_clause {
+                    validate_pattern_expr(expr, &scope)?;
+                }
+                apply_with(&part.with, &mut scope)?;
+            }
+            QueryClause::Unwind(clause) => bind_unwind(clause, &mut scope)?,
+            QueryClause::Merge(clause) => {
+                reject_mutation("MERGE")?;
+                bind_merge(clause, &mut scope)?
+            }
+            QueryClause::With(with) => scope = project_with(with, &scope)?,
+            QueryClause::Set(items) => {
+                reject_mutation("SET")?;
+                for item in items {
+                    validate_set_item(item, &scope)?;
                 }
             }
-            Ok(())
+            QueryClause::Delete { items, detach: _ } => {
+                reject_mutation("DELETE")?;
+                for expr in items {
+                    validate_delete_target(expr, &scope)?;
+                }
+            }
+            QueryClause::Remove(items) => {
+                reject_mutation("REMOVE")?;
+                for item in items {
+                    validate_remove_item(item, &scope)?;
+                }
+            }
+            QueryClause::Create(patterns) => {
+                reject_mutation("CREATE")?;
+                for pattern in patterns {
+                    bind_create_pattern(pattern, &mut scope)?;
+                }
+            }
         }
     }
+
+    let input_scope = scope.clone();
+    let output_scope = validate_tail(tail, &mut scope, allow_mutation)?;
+    if let Some(order_by) = order_by {
+        let mut order_scope = input_scope;
+        order_scope.extend(output_scope);
+        // Real Cypher: an aggregate in RETURN's ORDER BY is only
+        // legal when RETURN itself is aggregating (the ORDER BY
+        // then runs against the already-collapsed grouped rows,
+        // same as its own WITH/RETURN items would) -- otherwise
+        // it's a compile-time `InvalidAggregation` error (TCK's
+        // ReturnOrderBy2 [14]), not a runtime one.
+        let tail_items: Option<&[ReturnItem]> = match tail {
+            Some(Tail::Return(items, _)) => Some(items),
+            _ => None,
+        };
+        let tail_aggregates = tail_items.is_some_and(crate::executor::has_aggregate);
+        for (expr, _) in order_by {
+            if tail_aggregates {
+                // An ORDER BY item that repeats a RETURN item's
+                // expression *or own alias* (`RETURN sum(x) AS s
+                // ORDER BY sum(x)` / `ORDER BY s`, TCK's
+                // WithOrderBy4 [11]/`ReturnOrderBy3`/
+                // `WithSkipLimit1 [2]`) refers to that
+                // already-aggregated item, not a fresh expression
+                // -- its kind is already known from
+                // `output_scope`, and re-running `infer_expr` on
+                // it would need pre-aggregation bindings (like
+                // `x`'s row) that no longer exist post-grouping.
+                // Unlike `validate_composed_expr`'s own *nested*-
+                // leaf check just below, this whole-expression
+                // match doesn't exclude aggregating items -- an
+                // aggregate's own alias referenced *directly* (not
+                // buried inside a larger expression) is exactly
+                // "reuse this item's already-finished value",
+                // which `materialize_aggregating_return_with_
+                // order`'s matching top-level lookup (executor.rs)
+                // handles the same way.
+                if tail_items
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .any(|(i, item)| crate::executor::item_matches_leaf(expr, i, item))
+                {
+                    continue;
+                }
+                // Not a verbatim match -- may still be a *composed*
+                // expression (an aggregate combined with other
+                // values, or a plain non-aggregate expression
+                // referencing a pre-aggregation variable, TCK's
+                // ReturnOrderBy6) that `resolve_grouped_rows`/
+                // `rewrite_composed_item` (executor.rs) can
+                // evaluate the same way a composed RETURN item
+                // would -- validated the same way, by the same
+                // function, rather than `infer_expr` against a
+                // scope that structurally can't have pre-
+                // aggregation bindings in it anymore.
+                crate::executor::validate_order_by_composed_expr(expr, tail_items.unwrap())?;
+                continue;
+            }
+            if crate::executor::contains_aggregate(expr) {
+                return Err(semantic(
+                    "ORDER BY cannot use an aggregate function unless RETURN itself \
+                     is aggregating",
+                ));
+            }
+            infer_expr(expr, &order_scope)?;
+        }
+    }
+    Ok(())
 }
 
 fn bind_unwind(clause: &UnwindClause, scope: &mut Scope) -> Result<(), QueryError> {
@@ -543,9 +564,23 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
     Ok(projected)
 }
 
-fn validate_tail(tail: &Option<Tail>, scope: &mut Scope) -> Result<Scope, QueryError> {
+fn validate_tail(
+    tail: &Option<Tail>,
+    scope: &mut Scope,
+    allow_mutation: bool,
+) -> Result<Scope, QueryError> {
     let Some(tail) = tail else {
         return Ok(Scope::new());
+    };
+    let reject_mutation = |clause_name: &str| -> Result<(), QueryError> {
+        if allow_mutation {
+            Ok(())
+        } else {
+            Err(semantic(format!(
+                "exists {{}} can't contain an updating clause ({clause_name}) -- only reading \
+                 clauses (MATCH/UNWIND/WITH) are allowed inside it"
+            )))
+        }
     };
     match tail {
         Tail::Return(items, _) => project_return(items, scope),
@@ -554,24 +589,28 @@ fn validate_tail(tail: &Option<Tail>, scope: &mut Scope) -> Result<Scope, QueryE
             project_return(&items, scope)
         }
         Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
+            reject_mutation("DELETE")?;
             for expr in exprs {
                 validate_delete_target(expr, scope)?;
             }
             validate_return_tail(ret, scope)
         }
         Tail::Set(items, ret) => {
+            reject_mutation("SET")?;
             for item in items {
                 validate_set_item(item, scope)?;
             }
             validate_return_tail(ret, scope)
         }
         Tail::Remove(items, ret) => {
+            reject_mutation("REMOVE")?;
             for item in items {
                 validate_remove_item(item, scope)?;
             }
             validate_return_tail(ret, scope)
         }
         Tail::Create(patterns, ret) => {
+            reject_mutation("CREATE")?;
             for pattern in patterns {
                 bind_create_pattern(pattern, scope)?;
             }
@@ -766,6 +805,28 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
                 validate_pattern_expr(w, &inner_scope)?;
             }
             Ok(())
+        }
+        // `exists { MATCH ... RETURN ... }` (TCK's ExistentialSubquery2/3)
+        // -- correlated against the enclosing scope (`scope.clone()`, same
+        // reasoning as `Exists` above), reusing `validate_match_clauses`
+        // with `allow_mutation: false`. Only `Statement::Match` is a valid
+        // shape here (real Cypher's `exists {}` body is always
+        // MATCH/UNWIND/WITH-only, never a bare CREATE or UNION) -- anything
+        // else the grammar happened to parse inside it is rejected with a
+        // clear error rather than silently mishandled.
+        Expr::ExistsSubquery(stmt) => {
+            let Statement::Match {
+                clauses,
+                tail,
+                order_by,
+                ..
+            } = stmt.as_ref()
+            else {
+                return Err(semantic(
+                    "exists {} subquery must be a MATCH ... RETURN ... statement",
+                ));
+            };
+            validate_match_clauses(clauses, tail, order_by, scope.clone(), false)
         }
         // Never reaches here: synthesized by the planner (`build_match_
         // plan`), well after this pass already validated the original
@@ -1237,7 +1298,7 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             }
             Kind::List(Box::new(infer_expr(projection, &inner_scope)?))
         }
-        ReturnExpr::ExistsPattern { .. } => {
+        ReturnExpr::ExistsPattern { .. } | ReturnExpr::ExistsSubquery(_) => {
             return Err(QueryError::Semantic(
                 "an exists {} subquery can only be used inside WHERE".into(),
             ))

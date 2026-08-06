@@ -1056,6 +1056,28 @@ impl<'a> Executor<'a> {
         modifiers: ResultModifiers<'_>,
         guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
+        self.execute_match_seeded(txn, clauses, tail, modifiers, None, guard)
+    }
+
+    /// `execute_match`'s general form -- `seed` is `None` for an ordinary
+    /// top-level statement (nothing carried in, same as `execute_match`'s
+    /// old fixed behavior) or `Some(row)` for a correlated `exists { MATCH
+    /// ... RETURN ... }` subquery (`eval_exists_subquery`): the outer row's
+    /// own bindings become this statement's starting `current_rows`/
+    /// `carried_vars`, so a pattern referencing an outer-bound name (`(n)
+    /// -->(m)` where `n` is already bound) seeds from it (`LogicalPlan::
+    /// Seed`) instead of scanning fresh, exactly like a later clause in an
+    /// ordinary multi-clause statement already does with an earlier
+    /// clause's bindings.
+    fn execute_match_seeded(
+        &self,
+        txn: Txn,
+        clauses: &[QueryClause],
+        tail: &Option<Tail>,
+        modifiers: ResultModifiers<'_>,
+        seed: Option<&BindingRow>,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
         let ResultModifiers {
             order_by,
             skip,
@@ -1064,10 +1086,14 @@ impl<'a> Executor<'a> {
         // Threads bindings through each MATCH/UNWIND/WITH clause.
         // `carried_vars` tells the planner which of the next MATCH clause's
         // pattern variables are already bound (-> LogicalPlan::Seed) rather
-        // than fresh (-> a scan). Starts empty: the first clause never has
-        // anything carried into it.
-        let mut carried_vars: HashSet<String> = HashSet::new();
-        let mut current_rows: Vec<BindingRow> = vec![BindingRow::new()];
+        // than fresh (-> a scan). Starts empty (except for `seed`'s own
+        // vars, if any): the first clause never has anything else carried
+        // into it.
+        let mut carried_vars: HashSet<String> = match seed {
+            Some(row) => row.keys().cloned().collect(),
+            None => HashSet::new(),
+        };
+        let mut current_rows: Vec<BindingRow> = vec![seed.cloned().unwrap_or_default()];
         // A plain, non-blocking RETURN can stop the final MATCH pipeline as
         // soon as SKIP+LIMIT rows have arrived (SKIP rows still have to
         // physically flow through the pipeline to be counted and dropped
@@ -2574,6 +2600,7 @@ impl<'a> Executor<'a> {
             ReturnExpr::PatternPredicate(p) => ReturnExpr::PatternPredicate(p.clone()),
             ReturnExpr::PatternComprehension { .. } => expr.clone(),
             ReturnExpr::ExistsPattern { .. } => expr.clone(),
+            ReturnExpr::ExistsSubquery(_) => expr.clone(),
             ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {
                 unreachable!("handled above, before this match")
             }
@@ -2663,6 +2690,51 @@ impl<'a> Executor<'a> {
         let found =
             self.eval_plan_with_limit(txn, &plan, std::slice::from_ref(row), guard, Some(1))?;
         Ok(!found.is_empty())
+    }
+
+    /// `exists { MATCH ... RETURN ... }`'s "full" form (TCK's
+    /// ExistentialSubquery2/3) -- runs `stmt` (always a `Statement::Match`,
+    /// `semantic::validate_statement` rejects anything else reaching here
+    /// and rejects every mutating clause inside it, so this only ever sees
+    /// a real read-only pipeline) correlated against `row` via
+    /// `execute_match_seeded`, then checks whether it produced at least
+    /// one output row -- the inner RETURN's own projected *values* are
+    /// never inspected, only whether the row exists at all, same as
+    /// `eval_pattern_predicate_exists`/`Expr::Exists` above.
+    fn eval_exists_subquery(
+        &self,
+        txn: Txn,
+        stmt: &Statement,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<bool, QueryError> {
+        let Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        } = stmt
+        else {
+            unreachable!(
+                "semantic::validate_statement only allows Statement::Match inside exists {{}}"
+            )
+        };
+        let skip = self.resolve_skip_limit(txn, skip.as_deref(), "SKIP", guard)?;
+        let limit = self.resolve_skip_limit(txn, limit.as_deref(), "LIMIT", guard)?;
+        let result = self.execute_match_seeded(
+            txn,
+            clauses,
+            tail,
+            ResultModifiers {
+                order_by,
+                skip,
+                limit,
+            },
+            Some(row),
+            guard,
+        )?;
+        Ok(!result.rows.is_empty())
     }
 
     /// Evaluates an `OPTIONAL MATCH` part with left-outer-join semantics:
@@ -3371,6 +3443,11 @@ impl<'a> Executor<'a> {
                 )?;
                 Some(!found.is_empty())
             }
+            // `exists { MATCH ... RETURN ... }` (TCK's
+            // ExistentialSubquery2/3, the "full" form) -- runs the nested
+            // statement correlated against `row` (`execute_match_seeded`)
+            // and checks whether it produced at least one output row.
+            Expr::ExistsSubquery(stmt) => Some(self.eval_exists_subquery(txn, stmt, row, guard)?),
             // See `Expr::EdgeNotInSet`'s own docs -- `edge_var` is always
             // a real `Binding::Edge` (a fixed hop's own filter var, the
             // only thing this gets generated for) and `edge_set_var` is
@@ -3951,9 +4028,9 @@ impl<'a> Executor<'a> {
                 row,
                 guard,
             ),
-            ReturnExpr::ExistsPattern { .. } => Err(QueryError::Semantic(
-                "an exists {} subquery can only be used inside WHERE".into(),
-            )),
+            ReturnExpr::ExistsPattern { .. } | ReturnExpr::ExistsSubquery(_) => Err(
+                QueryError::Semantic("an exists {} subquery can only be used inside WHERE".into()),
+            ),
         }
     }
 
@@ -4738,7 +4815,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
         | ReturnExpr::PatternComprehension { .. }
-        | ReturnExpr::ExistsPattern { .. } => format!("col{idx}"),
+        | ReturnExpr::ExistsPattern { .. }
+        | ReturnExpr::ExistsSubquery(_) => format!("col{idx}"),
     }
 }
 
@@ -4852,7 +4930,8 @@ fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
         | ReturnExpr::PatternComprehension { .. }
-        | ReturnExpr::ExistsPattern { .. } => {}
+        | ReturnExpr::ExistsPattern { .. }
+        | ReturnExpr::ExistsSubquery(_) => {}
     }
 }
 
@@ -4909,7 +4988,8 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         // doesn't have, so (like `PatternPredicate`) it's opaque here
         // rather than searched into.
         | ReturnExpr::PatternComprehension { .. }
-        | ReturnExpr::ExistsPattern { .. } => false,
+        | ReturnExpr::ExistsPattern { .. }
+        | ReturnExpr::ExistsSubquery(_) => false,
     }
 }
 
@@ -4983,7 +5063,8 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         // a pattern comprehension's projection is checked once it's
         // actually evaluated per match, not searched into ahead of time.
         | ReturnExpr::PatternComprehension { .. }
-        | ReturnExpr::ExistsPattern { .. } => false,
+        | ReturnExpr::ExistsPattern { .. }
+        | ReturnExpr::ExistsSubquery(_) => false,
     }
 }
 
@@ -5243,7 +5324,8 @@ pub(crate) fn validate_composed_expr(
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
         | ReturnExpr::PatternComprehension { .. }
-        | ReturnExpr::ExistsPattern { .. } => {}
+        | ReturnExpr::ExistsPattern { .. }
+        | ReturnExpr::ExistsSubquery(_) => {}
     }
     Ok(())
 }
@@ -9312,9 +9394,9 @@ fn eval_projected_expr(
              key that repeats one of their items verbatim"
                 .into(),
         )),
-        ReturnExpr::ExistsPattern { .. } => Err(QueryError::Semantic(
-            "an exists {} subquery can only be used inside WHERE".into(),
-        )),
+        ReturnExpr::ExistsPattern { .. } | ReturnExpr::ExistsSubquery(_) => Err(
+            QueryError::Semantic("an exists {} subquery can only be used inside WHERE".into()),
+        ),
     }
 }
 

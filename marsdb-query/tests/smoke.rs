@@ -147,14 +147,69 @@ fn exists_simple_subquery_with_and_without_inline_where() {
 }
 
 #[test]
-fn exists_full_subquery_form_is_not_supported_yet() {
-    // TCK ExistentialSubquery2 [1]: `exists { MATCH ... RETURN ... }` --
-    // a full nested query, not the simple pattern-with-where form.
-    // Deliberately out of scope (would need running an arbitrary
-    // correlated nested Statement) -- a clear compile-time rejection,
-    // not a panic or a silently wrong answer.
-    let stmt = parse("MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n");
-    assert!(stmt.is_err());
+fn exists_full_subquery_form_runs_an_arbitrary_correlated_statement() {
+    // TCK ExistentialSubquery2 [1]/[2], ExistentialSubquery3 [1]:
+    // `exists { MATCH ... RETURN ... }` -- unlike the simple pattern-only
+    // form, this can carry its own aggregation/WHERE, and nest another
+    // `exists {}` inside it. Only `a` has any outgoing edge at all in this
+    // graph, so every assertion below narrows down to exactly that one row.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A {prop: 1})-[:R]->(:B {prop: 1}), (a)-[:R]->(:C {prop: 2}), \
+         (a)-[:R]->(:D {prop: 3})",
+    );
+
+    let result = run(
+        &store,
+        "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n.prop",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+
+    // Nested exists {} inside a full-form exists {} -- for n = a, m = the
+    // {prop: 1} node satisfies both the outer edge and the prop equality.
+    let result = run(
+        &store,
+        "MATCH (n) WHERE exists { \
+             MATCH (m) WHERE exists { (n)-[]->(m) WHERE n.prop = m.prop } \
+             RETURN true \
+         } RETURN n.prop",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+
+    // Full form with its own aggregation -- separate graph so `a`'s
+    // {prop: 1} neighbor (`b`) also gets one further outgoing edge, giving
+    // `a` exactly 3 connections and `b` only 1.
+    let store2 = GraphStore::open_memory().unwrap();
+    run(
+        &store2,
+        "CREATE (a:A {prop: 1})-[:R]->(b:B {prop: 1}), (a)-[:R]->(:C {prop: 2}), \
+         (a)-[:R]->(d:D {prop: 3}), (b)-[:R]->(d)",
+    );
+    let result = run(
+        &store2,
+        "MATCH (n) WHERE exists { \
+             MATCH (n)-->(m) \
+             WITH n, count(*) AS numConnections \
+             WHERE numConnections = 3 \
+             RETURN true \
+         } RETURN n.prop",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+}
+
+#[test]
+fn exists_full_subquery_form_rejects_a_mutating_clause() {
+    // TCK ExistentialSubquery2 [3]: real Cypher's `InvalidClauseComposition`
+    // -- an updating clause inside `exists {}` is a compile-time error,
+    // checked regardless of whether any row would ever reach it.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt =
+        parse("MATCH (n) WHERE exists { MATCH (n)-->(m) SET m.prop = 'fail' } RETURN n").unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_err());
 }
 
 #[test]

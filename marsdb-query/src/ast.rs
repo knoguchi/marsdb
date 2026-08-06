@@ -111,14 +111,24 @@ pub enum Expr {
     /// own pattern -- `where_clause` is threaded into `build_match_plan`
     /// directly, same as an ordinary `MATCH ... WHERE ...`, rather than
     /// evaluated as a separate post-filter step). Existence check only
-    /// (`Some(1)`-limited, same as `Pattern`) -- the "full" `exists { MATCH
-    /// ... RETURN ... }` subquery form (TCK's ExistentialSubquery2) isn't
-    /// supported yet (needs running an arbitrary nested `Statement`
-    /// correlated against the current row, a bigger change).
+    /// (`Some(1)`-limited, same as `Pattern`) -- see `ExistsSubquery` below
+    /// for the "full" `exists { MATCH ... RETURN ... }` subquery form.
     Exists {
         pattern: Box<Pattern>,
         where_clause: Option<Box<Expr>>,
     },
+    /// `WHERE exists { MATCH ... RETURN ... }` (TCK's
+    /// ExistentialSubquery2/3) -- runs an arbitrary read-only
+    /// `Statement::Match` correlated against the current row (its already-
+    /// bound variables seed the nested statement's own scope, same
+    /// already-bound-var -> Seed mechanism `Exists`/`Pattern` above use),
+    /// true iff it produces at least one output row. Unlike `Exists`
+    /// above, the nested statement can carry its own aggregation/multiple
+    /// clauses/nested `exists {}` -- `semantic::validate_statement`
+    /// rejects any mutating clause inside it at compile time (real
+    /// Cypher's `InvalidClauseComposition`, TCK's ExistentialSubquery2
+    /// `[3]`).
+    ExistsSubquery(Box<Statement>),
     /// Real Cypher's edge-isomorphism rule (`VarEq`'s own docs), extended
     /// to a variable-length hop: `edge_var`'s bound edge must not be among
     /// the edges an *earlier* variable-length hop in the same pattern
@@ -326,6 +336,19 @@ pub enum ReturnExpr {
         pattern: Box<Pattern>,
         where_clause: Option<Box<Expr>>,
     },
+    /// `exists { MATCH ... RETURN ... }` reached from general expression
+    /// position -- the "full" nested-subquery form of `exists {}`
+    /// (`ExistsPattern`'s complement, TCK's ExistentialSubquery2/3), an
+    /// arbitrary read-only `Statement::Match` (any number of MATCH/UNWIND/
+    /// WITH clauses, its own aggregation/WHERE, ending in a RETURN) run
+    /// correlated against whatever's already bound in the enclosing row --
+    /// same "only meaningful inside WHERE" story as `ExistsPattern`
+    /// (`return_expr_to_expr` folds it into `Expr::ExistsSubquery` there
+    /// before it ever reaches the executor; reaching `eval_return_expr`
+    /// directly is a real error). The inner statement's own RETURN items
+    /// are never actually projected out -- only whether it produces at
+    /// least one row matters, same as `ExistsPattern`.
+    ExistsSubquery(Box<Statement>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,7 +395,7 @@ pub fn is_percentile_name(name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReturnItem {
     pub expr: ReturnExpr,
     pub alias: Option<String>,
@@ -449,7 +472,7 @@ pub struct Pattern {
     pub hops: Vec<(RelPattern, NodePattern)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Tail {
     /// `distinct`: `RETURN DISTINCT ...` -- a result-set-level dedup of the
     /// whole projected row, applied after projection (and after grouping,
@@ -505,13 +528,13 @@ pub enum Tail {
 /// exactly one mutating clause directly followed by exactly one `RETURN`,
 /// which is the shape the real TCK scenarios for SET/DELETE/REMOVE
 /// overwhelmingly use.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReturnTail {
     pub items: Vec<ReturnItem>,
     pub distinct: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SetItem {
     /// `SET n.prop = <expr>` — the value is any `ReturnExpr` (arithmetic,
     /// a property read, a function call, ...), not just a literal, same
@@ -534,7 +557,7 @@ pub enum SetItem {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RemoveItem {
     Prop(PropAccess),
     /// `REMOVE n:A:B` — removes each label from the node's label set (not
@@ -552,7 +575,7 @@ pub enum RemoveItem {
 /// of it, since `Expr::Compare` is what the planner pushes into
 /// pre-projection `Filter`/`Expand` nodes, and this filter fundamentally
 /// belongs *post*-projection instead (see `materialize_with`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WithExpr {
     And(Box<WithExpr>, Box<WithExpr>),
     Or(Box<WithExpr>, Box<WithExpr>),
@@ -575,7 +598,7 @@ pub enum WithExpr {
 /// A `WITH` clause: projects/renames the current bindings, optionally
 /// filtered/sorted/limited at that boundary, and becomes the binding scope
 /// for whatever follows (the next `QueryPart`, or the final `Tail`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WithClause {
     pub items: Vec<ReturnItem>,
     /// `WITH *` (optionally followed by more items, `WITH *, x AS y`) --
@@ -635,7 +658,7 @@ pub struct WithClause {
 /// hop (`shortestPath((a)-[:TYPE*..N]-(b))`), and both endpoints must
 /// already be bound by a preceding clause (see `executor::eval_shortest_
 /// path`'s docs for why unbound endpoints aren't supported in v1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueryPart {
     pub optional: bool,
     pub path_var: Option<String>,
@@ -658,7 +681,7 @@ pub struct QueryPart {
 /// (`x > 2`), which `Expr::Compare`'s always-`PropAccess` LHS structurally
 /// cannot express (only `x.prop > 2` is) — `WithExpr::Compare`'s
 /// `ReturnExpr` LHS covers both.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnwindClause {
     pub source: UnwindSource,
     pub var: String,
@@ -676,7 +699,7 @@ pub struct UnwindClause {
 /// `$param` is a single scalar); a `$param` used *inside* an inline list
 /// literal (`[1, 2, $p]`) still works, since each element substitutes
 /// independently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnwindSource(pub ReturnExpr);
 
 /// `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...] [WITH ...]` —
@@ -691,7 +714,7 @@ pub struct UnwindSource(pub ReturnExpr);
 /// is capped at one relationship by the parser — whole-pattern atomicity
 /// across multiple simultaneously-unbound hops isn't attempted in v1, see
 /// `executor::eval_merge`'s docs for why.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MergeClause {
     pub pattern: Pattern,
     /// `MERGE p = (a)-[:R]->(b)` -- captures the whole matched-or-created
@@ -716,7 +739,7 @@ pub struct MergeClause {
 /// end in a `WITH` — see `Statement::Match`'s docs for the WITH-
 /// separation/one-WITH-total rules this enum's variants are validated
 /// against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum QueryClause {
     Match(QueryPart),
     Unwind(UnwindClause),
@@ -758,7 +781,7 @@ pub enum QueryClause {
     Create(Vec<Pattern>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Create(Vec<Pattern>),
     /// `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE`.
