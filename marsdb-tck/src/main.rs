@@ -45,6 +45,16 @@ fn main() {
         antlr_spike_report(&features_dir);
         return;
     }
+    // Phase 2/3 pre-cutover gate (mars-nog): same shape as ANTLR_SPIKE
+    // above, but exercises the real visitor-based parse_antlr() instead of
+    // the Phase 1 grammar-only accept/reject probe -- catches both
+    // accept/reject disagreements against pest and any panic (an
+    // unreachable!()/`.expect()` hit on a real-world query shape this
+    // file's own unit tests didn't cover).
+    if std::env::var("ANTLR_PARSE_SPIKE").is_ok() {
+        antlr_parse_spike_report(&features_dir);
+        return;
+    }
 
     let filter = std::env::var("TCK_FILTER").ok();
     let mut reports = Vec::new();
@@ -224,6 +234,160 @@ fn antlr_spike_report(features_dir: &Path) {
     }
     std::fs::write("/tmp/antlr_wrongly_accepted.txt", out)
         .expect("write /tmp/antlr_wrongly_accepted.txt");
+}
+
+/// Phase 2/3 pre-cutover gate (mars-nog, see `main`'s `ANTLR_PARSE_SPIKE`
+/// check) -- same comparison shape as `antlr_spike_report`, but calls the
+/// real `parse_antlr()` (full visitor-based `Statement` construction, not
+/// just grammar accept/reject) and catches panics separately from clean
+/// rejects, since a panic (`unreachable!()`/`.expect()` on a shape this
+/// file's own unit tests never exercised) is a real bug to fix before
+/// Phase 3 cutover, not just a coverage gap.
+fn antlr_parse_spike_report(features_dir: &Path) {
+    let mut antlr_accept = 0usize;
+    let mut antlr_reject = 0usize;
+    let mut pest_accept = 0usize;
+    let mut disagreements: Vec<(String, String, bool, bool)> = Vec::new();
+    let mut panics: Vec<(String, String, String)> = Vec::new();
+    let mut wrongly_accepted: Vec<(String, String)> = Vec::new();
+    let mut wrongly_rejected: Vec<(String, String, String)> = Vec::new();
+    let filter = std::env::var("TCK_FILTER").ok();
+
+    // A panic inside parse_antlr shouldn't spam stderr for every one --
+    // the panic is captured and reported in the summary below instead.
+    std::panic::set_hook(Box::new(|_| {}));
+
+    for entry in walk_feature_files(features_dir) {
+        if let Some(filter) = &filter {
+            let rel_path = entry.strip_prefix(features_dir).unwrap();
+            if !rel_path.to_string_lossy().contains(filter.as_str()) {
+                continue;
+            }
+        }
+        let content =
+            std::fs::read_to_string(&entry).unwrap_or_else(|e| panic!("read {entry:?}: {e}"));
+        for scenario_result in gherkin::parse_feature(&content) {
+            let Ok(scenario) = scenario_result else {
+                continue;
+            };
+            let query = scenario.query.clone();
+            let antlr_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                marsdb_query::parse_antlr(&query)
+            }));
+            let pest_ok = marsdb_query::parse(&scenario.query).is_ok();
+            if pest_ok {
+                pest_accept += 1;
+            }
+            let expects_error = matches!(scenario.expected, Expected::AnyError);
+
+            let (antlr_ok, was_panic) = match antlr_result {
+                Ok(Ok(_)) => (true, false),
+                Ok(Err(_)) => (false, false),
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    panics.push((scenario.feature_name.clone(), scenario.query.clone(), msg));
+                    (false, true)
+                }
+            };
+
+            if antlr_ok {
+                antlr_accept += 1;
+                if expects_error {
+                    wrongly_accepted.push((scenario.feature_name.clone(), scenario.query.clone()));
+                }
+            } else {
+                antlr_reject += 1;
+                if !expects_error {
+                    let reason = if was_panic {
+                        "panic (see /tmp/antlr_parse_spike_panics.txt)".to_string()
+                    } else {
+                        "clean reject".to_string()
+                    };
+                    wrongly_rejected.push((
+                        scenario.feature_name.clone(),
+                        scenario.query.clone(),
+                        reason,
+                    ));
+                }
+            }
+            if antlr_ok != pest_ok {
+                disagreements.push((
+                    scenario.feature_name.clone(),
+                    scenario.query.clone(),
+                    antlr_ok,
+                    pest_ok,
+                ));
+            }
+        }
+    }
+    let _ = std::panic::take_hook();
+
+    let total = antlr_accept + antlr_reject;
+    println!("{total} total scenarios");
+    println!(
+        "pest:  {pest_accept:>5}/{total} accepted ({:.1}%)",
+        100.0 * pest_accept as f64 / total as f64
+    );
+    println!(
+        "antlr: {antlr_accept:>5}/{total} accepted ({:.1}%)",
+        100.0 * antlr_accept as f64 / total as f64
+    );
+    println!(
+        "{} panics -- written to /tmp/antlr_parse_spike_panics.txt",
+        panics.len()
+    );
+    let mut out = String::new();
+    for (feature, query, msg) in &panics {
+        out.push_str(&format!(
+            "[{feature}] panic={msg} :: {}\n",
+            query.replace('\n', " ")
+        ));
+    }
+    std::fs::write("/tmp/antlr_parse_spike_panics.txt", out)
+        .expect("write /tmp/antlr_parse_spike_panics.txt");
+
+    println!(
+        "{} disagreements (antlr accept != pest accept) -- written to /tmp/antlr_parse_spike_disagreements.txt",
+        disagreements.len()
+    );
+    let mut out = String::new();
+    for (feature, query, antlr_ok, pest_ok) in &disagreements {
+        out.push_str(&format!(
+            "[{feature}] antlr={antlr_ok} pest={pest_ok} :: {}\n",
+            query.replace('\n', " ")
+        ));
+    }
+    std::fs::write("/tmp/antlr_parse_spike_disagreements.txt", out)
+        .expect("write /tmp/antlr_parse_spike_disagreements.txt");
+
+    println!(
+        "{} wrongly accepted (antlr accepted, TCK expects AnyError) -- written to /tmp/antlr_parse_spike_wrongly_accepted.txt",
+        wrongly_accepted.len()
+    );
+    let mut out = String::new();
+    for (feature, query) in &wrongly_accepted {
+        out.push_str(&format!("[{feature}] :: {}\n", query.replace('\n', " ")));
+    }
+    std::fs::write("/tmp/antlr_parse_spike_wrongly_accepted.txt", out)
+        .expect("write /tmp/antlr_parse_spike_wrongly_accepted.txt");
+
+    println!(
+        "{} wrongly rejected (antlr rejected, TCK doesn't expect an error) -- written to /tmp/antlr_parse_spike_wrongly_rejected.txt",
+        wrongly_rejected.len()
+    );
+    let mut out = String::new();
+    for (feature, query, reason) in &wrongly_rejected {
+        out.push_str(&format!(
+            "[{feature}] [{reason}] :: {}\n",
+            query.replace('\n', " ")
+        ));
+    }
+    std::fs::write("/tmp/antlr_parse_spike_wrongly_rejected.txt", out)
+        .expect("write /tmp/antlr_parse_spike_wrongly_rejected.txt");
 }
 
 fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {

@@ -3,6 +3,7 @@ mod ast;
 // ANTLR-based AST builder (see antlr_visitor.rs's module doc) -- not wired
 // into `parse`/`parse_many` yet, built incrementally alongside `generated`.
 mod antlr_visitor;
+pub use antlr_visitor::parse_antlr;
 mod error;
 mod executor;
 mod explain;
