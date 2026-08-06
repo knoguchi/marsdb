@@ -415,17 +415,31 @@ impl<'a> Executor<'a> {
                     order_by,
                     skip,
                     limit,
-                } => self.execute_match(
-                    Txn::Read(&read_txn),
-                    clauses,
-                    tail,
-                    ResultModifiers {
-                        order_by,
-                        skip: *skip,
-                        limit: *limit,
-                    },
-                    guard,
-                ),
+                } => {
+                    let skip = self.resolve_skip_limit(
+                        Txn::Read(&read_txn),
+                        skip.as_deref(),
+                        "SKIP",
+                        guard,
+                    )?;
+                    let limit = self.resolve_skip_limit(
+                        Txn::Read(&read_txn),
+                        limit.as_deref(),
+                        "LIMIT",
+                        guard,
+                    )?;
+                    self.execute_match(
+                        Txn::Read(&read_txn),
+                        clauses,
+                        tail,
+                        ResultModifiers {
+                            order_by,
+                            skip,
+                            limit,
+                        },
+                        guard,
+                    )
+                }
                 _ => unreachable!("is_read_only only returns true for Statement::Match/Union"),
             };
         }
@@ -559,17 +573,27 @@ impl<'a> Executor<'a> {
                 order_by,
                 skip,
                 limit,
-            } => self.execute_match(
-                Txn::Write(write_txn),
-                clauses,
-                tail,
-                ResultModifiers {
-                    order_by,
-                    skip: *skip,
-                    limit: *limit,
-                },
-                guard,
-            ),
+            } => {
+                let skip =
+                    self.resolve_skip_limit(Txn::Write(write_txn), skip.as_deref(), "SKIP", guard)?;
+                let limit = self.resolve_skip_limit(
+                    Txn::Write(write_txn),
+                    limit.as_deref(),
+                    "LIMIT",
+                    guard,
+                )?;
+                self.execute_match(
+                    Txn::Write(write_txn),
+                    clauses,
+                    tail,
+                    ResultModifiers {
+                        order_by,
+                        skip,
+                        limit,
+                    },
+                    guard,
+                )
+            }
             Statement::Explain(inner) => {
                 // Only reachable if a future caller invokes this directly,
                 // bypassing `execute_in_write_transaction_with_guard`'s own
@@ -1365,6 +1389,8 @@ impl<'a> Executor<'a> {
         } else {
             with
         };
+        let with_skip = self.resolve_skip_limit(txn, with.skip.as_ref(), "SKIP", guard)?;
+        let with_limit = self.resolve_skip_limit(txn, with.limit.as_ref(), "LIMIT", guard)?;
         let rows = if let Some(with_order_by) = with
             .order_by
             .as_ref()
@@ -1383,7 +1409,7 @@ impl<'a> Executor<'a> {
                 &with.items,
                 &rows,
                 with_order_by,
-                (with.skip, with.limit),
+                (with_skip, with_limit),
                 guard,
             )?
         } else {
@@ -1403,14 +1429,14 @@ impl<'a> Executor<'a> {
                     pre_with_rows.as_deref(),
                     &with.items,
                     with_order_by,
-                    (with.skip, with.limit),
+                    (with_skip, with_limit),
                 )?;
             } else {
-                let skip_n = with.skip.unwrap_or(0).max(0) as usize;
+                let skip_n = with_skip.unwrap_or(0).max(0) as usize;
                 if skip_n > 0 {
                     rows.drain(0..skip_n.min(rows.len()));
                 }
-                if let Some(with_limit) = with.limit {
+                if let Some(with_limit) = with_limit {
                     rows.truncate(with_limit.max(0) as usize);
                 }
             }
@@ -3291,6 +3317,39 @@ impl<'a> Executor<'a> {
         Ok(QueryResult { columns, rows })
     }
 
+    /// `SKIP`/`LIMIT` accept any expression, not just a literal integer
+    /// (`SKIP $n`, `SKIP toInteger(rand()*9)` -- TCK's `ReturnSkipLimit1
+    /// [2]`/`[3]`) -- evaluated exactly once here, against an empty row,
+    /// since no pattern variable can be in scope at a statement's own
+    /// SKIP/LIMIT (an `UnboundVariable` error from `eval_return_expr`
+    /// below is exactly the right outcome if one is referenced). Params
+    /// are already resolved to concrete `Literal`s by this point (see
+    /// `params::substitute_params`).
+    fn resolve_skip_limit(
+        &self,
+        txn: Txn,
+        expr: Option<&ReturnExpr>,
+        clause: &str,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Option<i64>, QueryError> {
+        let Some(expr) = expr else {
+            return Ok(None);
+        };
+        let value = self.eval_return_expr(txn, expr, &BindingRow::new(), guard)?;
+        let n = match value {
+            Value::Literal(Literal::Int(n)) | Value::Property(PropertyValue::Int(n)) => n,
+            _ => {
+                return Err(QueryError::Semantic(format!(
+                    "{clause} must evaluate to an integer"
+                )));
+            }
+        };
+        if n < 0 {
+            return Err(QueryError::Semantic(format!("{clause} can't be negative")));
+        }
+        Ok(Some(n))
+    }
+
     fn eval_return_expr(
         &self,
         txn: Txn,
@@ -3794,14 +3853,16 @@ impl<'a> Executor<'a> {
                     "union_stmt parts are always Statement::Match -- see parser::parse_union_stmt"
                 )
             };
+            let skip = self.resolve_skip_limit(txn, skip.as_deref(), "SKIP", guard)?;
+            let limit = self.resolve_skip_limit(txn, limit.as_deref(), "LIMIT", guard)?;
             let result = self.execute_match(
                 txn,
                 clauses,
                 tail,
                 ResultModifiers {
                     order_by,
-                    skip: *skip,
-                    limit: *limit,
+                    skip,
+                    limit,
                 },
                 guard,
             )?;

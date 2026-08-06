@@ -542,14 +542,44 @@ fn skip_past_the_end_of_the_result_set_returns_empty_not_an_error() {
     assert_eq!(result.rows.len(), 0);
 }
 
-/// SKIP is negative -- must be a real (`Syntax`) error, not silently
-/// clamped to 0 or treated as unbounded.
+/// SKIP is negative -- must be a real error, not silently clamped to 0 or
+/// treated as unbounded. SKIP/LIMIT accept any expression (`SKIP $n`,
+/// `SKIP toInteger(rand()*9)` -- TCK's `ReturnSkipLimit1 [2]`/`[3]`), so
+/// this is only checkable once at execution time, not at parse time.
 #[test]
 fn skip_negative_is_a_syntax_error() {
-    let err =
-        marsdb_query::parse("RETURN 1 AS x SKIP -1").expect_err("negative SKIP must be rejected");
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("RETURN 1 AS x SKIP -1").unwrap();
+    let err = Executor::new(&store)
+        .execute(&stmt)
+        .expect_err("negative SKIP must be rejected");
     let msg = format!("{err}");
     assert!(msg.contains("SKIP"), "unexpected error: {msg}");
+}
+
+/// SKIP/LIMIT accept `$param` and arbitrary constant expressions (not
+/// just a literal integer) -- TCK's `ReturnSkipLimit1 [2]`/`[3]`,
+/// `ReturnSkipLimit2 [6]`.
+#[test]
+fn skip_limit_accept_params_and_constant_expressions() {
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+    for i in 0..5 {
+        run(&store, &format!("CREATE (n:Item {{idx: {i}}})"));
+    }
+    let mut stmt =
+        parse("MATCH (n:Item) RETURN n.idx AS idx ORDER BY idx SKIP $s LIMIT $l").unwrap();
+    let mut params = HashMap::new();
+    params.insert("s".to_string(), marsdb_graph::PropertyValue::Int(2));
+    params.insert("l".to_string(), marsdb_graph::PropertyValue::Int(2));
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(result.rows.len(), 2);
+
+    let stmt =
+        parse("MATCH (n:Item) RETURN n.idx AS idx ORDER BY idx LIMIT toInteger(2.9)").unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(result.rows.len(), 2);
 }
 
 /// SKIP on a WITH clause -- separate code path from RETURN's own SKIP

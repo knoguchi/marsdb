@@ -30,8 +30,8 @@ pub fn substitute_params(
             clauses,
             tail,
             order_by,
-            skip: _,
-            limit: _,
+            skip,
+            limit,
         } => {
             for clause in clauses {
                 substitute_query_clause(clause, params)?;
@@ -43,6 +43,12 @@ pub fn substitute_params(
                 for (expr, _) in items {
                     substitute_return_expr(expr, params)?;
                 }
+            }
+            if let Some(expr) = skip {
+                substitute_return_expr(expr, params)?;
+            }
+            if let Some(expr) = limit {
+                substitute_return_expr(expr, params)?;
             }
         }
         Statement::Union { parts, .. } => {
@@ -160,6 +166,12 @@ fn substitute_with_clause(
         for (expr, _) in items {
             substitute_return_expr(expr, params)?;
         }
+    }
+    if let Some(expr) = &mut with.skip {
+        substitute_return_expr(expr, params)?;
+    }
+    if let Some(expr) = &mut with.limit {
+        substitute_return_expr(expr, params)?;
     }
     Ok(())
 }

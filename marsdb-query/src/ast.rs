@@ -573,8 +573,14 @@ pub struct WithClause {
     /// then take the following `limit`, against the sorted sequence when
     /// one exists), regardless of which field a caller happens to read
     /// first.
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    ///
+    /// Any expression, not just a literal integer — `SKIP $n`, `SKIP
+    /// toInteger(rand()*9)` (TCK's `ReturnSkipLimit1 [2]`/`[3]`) are real
+    /// Cypher. Evaluated exactly once against an empty row (no pattern
+    /// variable can be in scope here) — see
+    /// `executor::resolve_skip_limit`.
+    pub skip: Option<ReturnExpr>,
+    pub limit: Option<ReturnExpr>,
 }
 
 /// One `MATCH <pattern>[, <pattern>...] [WHERE ...] [WITH ...]` segment.
@@ -749,9 +755,12 @@ pub enum Statement {
         /// pattern variable.
         order_by: Option<Vec<(ReturnExpr, SortDir)>>,
         /// Applied after `order_by`, before `limit` — same convention as
-        /// `WithClause::skip`.
-        skip: Option<i64>,
-        limit: Option<i64>,
+        /// `WithClause::skip`. Boxed (clippy's `large_enum_variant`) --
+        /// `Statement::Match` would otherwise be far larger than
+        /// `Statement`'s other variants just for this rarely-non-`None`
+        /// field.
+        skip: Option<Box<ReturnExpr>>,
+        limit: Option<Box<ReturnExpr>>,
     },
     /// `<match_stmt> UNION [ALL] <match_stmt> (UNION [ALL] <match_stmt>)*`
     /// — each `parts` entry is itself a `Statement::Match`, own scope, no

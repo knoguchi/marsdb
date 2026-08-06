@@ -126,8 +126,8 @@ pub(crate) struct ParsedDelete {
 pub(crate) struct ParsedReturnClause {
     pub tail: Tail,
     pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
-    pub skip: Option<i64>,
-    pub limit: Option<i64>,
+    pub skip: Option<ReturnExpr>,
+    pub limit: Option<ReturnExpr>,
 }
 
 macro_rules! ast_node_into {
@@ -1752,7 +1752,14 @@ impl AstBuilder {
     fn build_order_skip_limit(
         &mut self,
         ctx: &ProjectionBodyContext,
-    ) -> Result<(Option<Vec<(ReturnExpr, SortDir)>>, Option<i64>, Option<i64>), QueryError> {
+    ) -> Result<
+        (
+            Option<Vec<(ReturnExpr, SortDir)>>,
+            Option<ReturnExpr>,
+            Option<ReturnExpr>,
+        ),
+        QueryError,
+    > {
         let order_by = match ctx.orderSt() {
             Some(order_ctx) => Some(self.build_order_by(&order_ctx)?),
             None => None,
@@ -1762,8 +1769,7 @@ impl AstBuilder {
                 let expr_ctx = skip_ctx
                     .expression()
                     .expect("skipSt always has an expression");
-                let expr = self.visit(&*expr_ctx).into_return_expr()?;
-                Some(literal_non_negative_int(expr, "SKIP")?)
+                Some(self.visit(&*expr_ctx).into_return_expr()?)
             }
             None => None,
         };
@@ -1772,8 +1778,7 @@ impl AstBuilder {
                 let expr_ctx = limit_ctx
                     .expression()
                     .expect("limitSt always has an expression");
-                let expr = self.visit(&*expr_ctx).into_return_expr()?;
-                Some(literal_non_negative_int(expr, "LIMIT")?)
+                Some(self.visit(&*expr_ctx).into_return_expr()?)
             }
             None => None,
         };
@@ -2170,8 +2175,8 @@ impl AstBuilder {
         (
             Tail,
             Option<Vec<(ReturnExpr, SortDir)>>,
-            Option<i64>,
-            Option<i64>,
+            Option<ReturnExpr>,
+            Option<ReturnExpr>,
         ),
         QueryError,
     > {
@@ -2294,8 +2299,8 @@ impl AstBuilder {
             clauses,
             tail,
             order_by,
-            skip,
-            limit,
+            skip: skip.map(Box::new),
+            limit: limit.map(Box::new),
         })
     }
 
@@ -2709,23 +2714,6 @@ fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
         },
         other => Expr::GeneralBare(other),
     })
-}
-
-/// `skipSt`/`limitSt` grammar-allow any `expression` (`SKIP_W expression`),
-/// wider than pest's grammar, which structurally requires a bare
-/// `int_literal` there. Matching pest's existing behavior rather than
-/// silently accepting something it can't (`SKIP $n`, `LIMIT 1 + 1`) --
-/// restrict to a literal non-negative integer here too.
-fn literal_non_negative_int(expr: ReturnExpr, clause: &str) -> Result<i64, QueryError> {
-    let ReturnExpr::Lit(Literal::Int(n)) = expr else {
-        return Err(QueryError::Syntax(format!(
-            "{clause} must be a literal non-negative integer"
-        )));
-    };
-    if n < 0 {
-        return Err(QueryError::Syntax(format!("{clause} can't be negative")));
-    }
-    Ok(n)
 }
 
 #[cfg(test)]
@@ -3905,8 +3893,8 @@ mod tests {
         assert_eq!(order_by.len(), 1);
         assert_eq!(order_by[0].0, ReturnExpr::Var("a".to_string()));
         assert_eq!(order_by[0].1, SortDir::Desc);
-        assert_eq!(c.skip, Some(5));
-        assert_eq!(c.limit, Some(10));
+        assert_eq!(c.skip, Some(ReturnExpr::Lit(Literal::Int(5))));
+        assert_eq!(c.limit, Some(ReturnExpr::Lit(Literal::Int(10))));
     }
 
     #[test]
@@ -3916,15 +3904,15 @@ mod tests {
     }
 
     #[test]
-    fn limit_negative_errors() {
-        // skipSt/limitSt grammar-allow any expression; restricted to a
-        // literal non-negative integer to match pest's existing behavior.
-        assert!(parse_return("RETURN a LIMIT -1").is_err());
-    }
-
-    #[test]
-    fn limit_non_literal_errors() {
-        assert!(parse_return("RETURN a LIMIT 1 + 1").is_err());
+    fn limit_accepts_arbitrary_expression() {
+        // skipSt/limitSt grammar-allow any expression -- SKIP/LIMIT no
+        // longer restrict to a literal integer at parse time (real Cypher
+        // permits `SKIP $n`/`LIMIT toInteger(rand()*9)`, TCK's
+        // `ReturnSkipLimit1 [2]`/`[3]`); the non-negative-integer check
+        // happens once at execution time instead (see
+        // `executor::resolve_skip_limit`).
+        let c = parse_return("RETURN a LIMIT 1 + 1").unwrap();
+        assert!(c.limit.is_some());
     }
 
     #[test]
@@ -3967,8 +3955,8 @@ mod tests {
         let c = parse_with("WITH DISTINCT a ORDER BY a SKIP 1 LIMIT 2").unwrap();
         assert!(c.distinct);
         assert!(c.order_by.is_some());
-        assert_eq!(c.skip, Some(1));
-        assert_eq!(c.limit, Some(2));
+        assert_eq!(c.skip, Some(ReturnExpr::Lit(Literal::Int(1))));
+        assert_eq!(c.limit, Some(ReturnExpr::Lit(Literal::Int(2))));
     }
 
     #[test]
@@ -4211,8 +4199,8 @@ mod tests {
             panic!("expected Statement::Match");
         };
         assert!(order_by.is_some());
-        assert_eq!(skip, Some(1));
-        assert_eq!(limit, Some(2));
+        assert_eq!(skip, Some(Box::new(ReturnExpr::Lit(Literal::Int(1)))));
+        assert_eq!(limit, Some(Box::new(ReturnExpr::Lit(Literal::Int(2)))));
     }
 
     #[test]
@@ -4332,8 +4320,8 @@ mod tests {
         };
         assert!(matches!(tail, Some(Tail::Set(_, Some(_)))));
         assert!(order_by.is_some());
-        assert_eq!(skip, Some(1));
-        assert_eq!(limit, Some(2));
+        assert_eq!(skip, Some(Box::new(ReturnExpr::Lit(Literal::Int(1)))));
+        assert_eq!(limit, Some(Box::new(ReturnExpr::Lit(Literal::Int(2)))));
     }
 
     #[test]
