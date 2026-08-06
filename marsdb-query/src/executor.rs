@@ -7865,23 +7865,42 @@ fn top_k_by<T>(
     keyed
 }
 
-/// NULLs sort last regardless of ASC/DESC (matches Neo4j's documented
-/// behavior) — only non-null comparisons get reversed for DESC.
+/// `Null` is just the highest-ranked type in `type_rank`'s total order
+/// (see its docs), not a special case here -- confirmed via TCK's
+/// `ReturnOrderBy1 [12]`/`WithOrderBy1 [22]` ("sort distinct types...
+/// descending"), which expect `null` to sort *first* under `DESC`, not
+/// last. An earlier version of this function hardcoded nulls-last
+/// regardless of direction (citing Neo4j's docs); that's wrong per the
+/// TCK's own evidence -- `DESC` is a real reversal of the whole order,
+/// `null` included, not just of the non-null comparisons.
 fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let a_null = matches!(a, Value::Null);
-    let b_null = matches!(b, Value::Null);
-    match (a_null, b_null) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Greater,
-        (false, true) => return Ordering::Less,
-        (false, false) => {}
-    }
     let ord = compare_non_null(a, b);
     if dir == SortDir::Desc {
         ord.reverse()
     } else {
         ord
+    }
+}
+
+/// Real Cypher regards `NaN` as larger than every other number (confirmed
+/// via TCK's `ReturnOrderBy1 [11]`/`[12]`: `NaN` sorts directly below
+/// `null`, above every finite float, both ASC and DESC) -- plain
+/// `f64::partial_cmp` returns `None` for any comparison involving `NaN`,
+/// which `.unwrap_or(Ordering::Equal)` used to paper over by treating
+/// `NaN` as *equal* to every number. That's not just cosmetically wrong:
+/// a stable sort over a comparator that calls two genuinely-different
+/// values "equal" preserves their original relative order instead of
+/// actually ordering them, and `DESC`'s blanket `.reverse()` of an
+/// "equal" result is still "equal" -- so `1.5`/`NaN` kept the same
+/// relative order under both ASC and DESC, when DESC should have
+/// swapped them.
+fn cmp_f64_nan_greatest(x: f64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
     }
 }
 
@@ -7903,13 +7922,13 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (pa, pb) {
         (Some(PropertyValue::Int(x)), Some(PropertyValue::Int(y))) => x.cmp(&y),
         (Some(PropertyValue::Int(x)), Some(PropertyValue::Float(y))) => {
-            (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal)
+            cmp_f64_nan_greatest(x as f64, y)
         }
         (Some(PropertyValue::Float(x)), Some(PropertyValue::Int(y))) => {
-            x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal)
+            cmp_f64_nan_greatest(x, y as f64)
         }
         (Some(PropertyValue::Float(x)), Some(PropertyValue::Float(y))) => {
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            cmp_f64_nan_greatest(x, y)
         }
         (Some(PropertyValue::String(x)), Some(PropertyValue::String(y))) => x.cmp(&y),
         (Some(PropertyValue::Bool(x)), Some(PropertyValue::Bool(y))) => x.cmp(&y),
@@ -7965,30 +7984,51 @@ fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// `WHERE`'s three-valued comparison semantics) -- only covers the types
 /// that can actually reach here with no same-type match already handling
 /// them (see `compare_non_null`'s cross-type fallback and `list_cmp_asc`).
-/// `List` sorts *before* every scalar (confirmed against a real TCK
-/// scenario -- `max()`/`min()` over `[1, 'a', null, [1, 2], 0.2, 'b']`
-/// picks `1` for max and `[1, 2]` for min, only consistent with List
-/// ranking lowest, not highest as an earlier version of this function
-/// had it, unverified against any real cross-type-vs-list case at the
-/// time). `Map`/`Node`/`Edge`/`Path`/`Duration` have no defined
-/// orderability against other types either in real Cypher or in this
-/// codebase (matches `compare_non_null`'s pre-existing plain `Equal`
-/// fallback for them) -- `None` here, not a rank, so they keep
-/// comparing as ties rather than claiming a real position in this order.
+/// Order confirmed against a real TCK scenario (`ReturnOrderBy1`/
+/// `WithOrderBy1`'s "sort distinct types" scenarios, only reachable once
+/// `marsdb-tck`'s own harness could parse a path-shaped expected cell --
+/// previously these scenarios could never even run): `Map < Node <
+/// Relationship < List < Path < String < Boolean < Number`, `Null` always
+/// last regardless (`compare_with_dir`'s own separate check). This is
+/// also a fix, not just an addition -- `Bool`/`String` were previously
+/// ranked in the wrong relative order (`Bool` before `String`; real
+/// Cypher has `String` before `Bool`), and `List` sorting before every
+/// scalar (confirmed separately, `max()`/`min()` over `[1, 'a', null,
+/// [1, 2], 0.2, 'b']` picks `1` for max and `[1, 2]` for min) still
+/// holds with `Map`/`Node`/`Relationship` now ranking below it too.
+/// Temporal types (`Date`.../`Duration`) have no TCK evidence placing
+/// them anywhere in this cross-type order -- kept after `Number` in
+/// their pre-existing relative order among themselves, arbitrarily but
+/// harmlessly (nothing tests a temporal-vs-Map-shaped ORDER BY column).
+/// `Null` ranks highest of all -- also TCK-confirmed
+/// (`ReturnOrderBy1 [11]`'s own expected order ends with `null` last),
+/// and, critically, ranking it here rather than special-casing it in
+/// `compare_with_dir` is what makes `DESC` correctly put `null` *first*
+/// (`ReturnOrderBy1 [12]`/`WithOrderBy1 [22]`) -- a hardcoded
+/// "nulls always last" rule would get the ascending case right and the
+/// descending case wrong, since real Cypher's `DESC` is a genuine
+/// reversal of the total order, not just of the non-null comparisons.
 fn type_rank(v: &Value) -> Option<u8> {
     match v {
-        Value::List(_) => Some(0),
-        Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_)) => Some(1),
-        Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_)) => Some(2),
+        Value::Map(_) => Some(0),
+        Value::Node(_) => Some(1),
+        Value::Edge(_) => Some(2),
+        Value::List(_) => Some(3),
+        Value::Path(_) => Some(4),
+        Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_)) => Some(5),
+        Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_)) => Some(6),
         Value::Literal(Literal::Int(_))
         | Value::Property(PropertyValue::Int(_))
         | Value::Literal(Literal::Float(_))
-        | Value::Property(PropertyValue::Float(_)) => Some(3),
-        Value::Property(PropertyValue::Date(_)) => Some(4),
-        Value::Property(PropertyValue::LocalTime(_)) => Some(5),
-        Value::Property(PropertyValue::Time { .. }) => Some(6),
-        Value::Property(PropertyValue::LocalDateTime { .. }) => Some(7),
-        Value::Property(PropertyValue::DateTime { .. }) => Some(8),
+        | Value::Property(PropertyValue::Float(_)) => Some(7),
+        Value::Property(PropertyValue::Date(_)) => Some(8),
+        Value::Property(PropertyValue::LocalTime(_)) => Some(9),
+        Value::Property(PropertyValue::Time { .. }) => Some(10),
+        Value::Property(PropertyValue::LocalDateTime { .. }) => Some(11),
+        Value::Property(PropertyValue::DateTime { .. }) => Some(12),
+        Value::Null | Value::Literal(Literal::Null) | Value::Property(PropertyValue::Null) => {
+            Some(13)
+        }
         _ => None,
     }
 }
@@ -8050,7 +8090,6 @@ fn value_to_comparable(v: &Value) -> Option<PropertyValue> {
 /// (`max()` over `[1, 'a', [1, 2]]`-shaped input), via the same
 /// `type_rank` fallback `compare_non_null` uses.
 pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
     if let (Value::List(_), Value::List(_)) = (a, b) {
         return Some(list_cmp_asc(a, b));
     }
@@ -8058,23 +8097,30 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
         (Some(pa), Some(pb)) => (pa, pb),
         _ => {
             return match (type_rank(a), type_rank(b)) {
+                // Different rank -- a real cross-type comparison (e.g. a
+                // `List` vs a `String` inside a `max()` fold), safe to
+                // order by rank.
                 (Some(ra), Some(rb)) if ra != rb => Some(ra.cmp(&rb)),
-                (Some(_), Some(_)) => Some(Ordering::Equal),
+                // Same rank only ever means both are `Map`/`Node`/`Edge`/
+                // `Path` here (every type with a real per-value order
+                // already matched via `value_to_comparable`'s `Some` case
+                // above, `List` is handled separately at the top) --
+                // those have no defined per-value order at all. Real for
+                // ORDER BY's own use of `type_rank` (`compare_non_null`,
+                // which tolerates "equal" for presentation purposes), but
+                // silently treating two different `Map`s (or `Node`s,
+                // ...) as "equal" here would be a wrong-answer failure
+                // mode for an aggregate, not just an unhelpful sort
+                // order -- `None` instead (see this function's own docs).
                 _ => None,
-            }
+            };
         }
     };
     Some(match (pa, pb) {
         (PropertyValue::Int(x), PropertyValue::Int(y)) => x.cmp(&y),
-        (PropertyValue::Int(x), PropertyValue::Float(y)) => {
-            (x as f64).partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
-        (PropertyValue::Float(x), PropertyValue::Int(y)) => {
-            x.partial_cmp(&(y as f64)).unwrap_or(Ordering::Equal)
-        }
-        (PropertyValue::Float(x), PropertyValue::Float(y)) => {
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
+        (PropertyValue::Int(x), PropertyValue::Float(y)) => cmp_f64_nan_greatest(x as f64, y),
+        (PropertyValue::Float(x), PropertyValue::Int(y)) => cmp_f64_nan_greatest(x, y as f64),
+        (PropertyValue::Float(x), PropertyValue::Float(y)) => cmp_f64_nan_greatest(x, y),
         (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(&y),
         (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(&y),
         // `Duration` deliberately has no arm here (falls through to

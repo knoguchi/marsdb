@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use marsdb::{PropertyValue, Value};
+use marsdb::{PathElem, PropertyValue, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TckScalar {
@@ -32,6 +32,32 @@ pub enum TckValue {
     List(Vec<TckValue>),
     Scalar(TckScalar),
     Null,
+    /// `<(:A)-[:T]->(:B)>`-shaped expected cells (TCK's own path-literal
+    /// syntax) and real `Value::Path` results, both converted to this
+    /// same alternating-element shape. A dedicated `PathTckElem::Edge`
+    /// (not the bare `Rel` variant above) since a path's edges carry a
+    /// real traversal direction that matters for equality
+    /// (`<(:A)-[:T]->(:B)>` != `<(:A)<-[:T]-(:B)>`, same two nodes,
+    /// opposite direction) -- `Rel` on its own (used for a bare
+    /// `[:KNOWS {...}]`-shaped expected value, no path context) has no
+    /// such concept, correctly.
+    Path(Vec<PathTckElem>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathTckElem {
+    Node {
+        labels: BTreeSet<String>,
+        props: BTreeMap<String, TckValue>,
+    },
+    Edge {
+        rel_type: String,
+        props: BTreeMap<String, TckValue>,
+        /// `true` iff this edge's stored direction (`src` -> `dst`)
+        /// matches the order it's walked in the path (`-[...]->`);
+        /// `false` means the path walks it backward (`<-[...]-`).
+        forward: bool,
+    },
 }
 
 /// Equality respecting `list_order_matters` -- when `false` (the TCK's
@@ -41,6 +67,17 @@ pub enum TckValue {
 /// construction (`BTreeMap`/`BTreeSet`).
 pub fn tck_eq(a: &TckValue, b: &TckValue, list_order_matters: bool) -> bool {
     match (a, b) {
+        // `f64::NAN != f64::NAN` under IEEE 754 (and thus under the
+        // derived `PartialEq` every other arm's `a == b` fallback relies
+        // on) -- TCK's `WithOrderBy1`/`ReturnOrderBy1` "sort distinct
+        // types" scenarios just need "is this classified as NaN", not
+        // IEEE bit-identity, so special-cased here rather than trying to
+        // thread a NaN-aware `Eq` through the derive.
+        (TckValue::Scalar(TckScalar::Float(x)), TckValue::Scalar(TckScalar::Float(y)))
+            if x.is_nan() && y.is_nan() =>
+        {
+            true
+        }
         (TckValue::List(xs), TckValue::List(ys)) => {
             if xs.len() != ys.len() {
                 return false;
@@ -102,10 +139,46 @@ pub fn value_to_tck(v: &Value) -> TckValue {
                 .collect(),
         },
         Value::Literal(lit) => literal_to_tck(lit),
-        Value::Path(_) => TckValue::Scalar(TckScalar::Str(
-            "<path -- not TCK-comparable in v1>".to_string(),
-        )),
+        Value::Path(elems) => path_to_tck(elems),
     }
+}
+
+/// Walks a real `Value::Path`'s alternating `Node`/`Edge` elements into
+/// the same `PathTckElem` shape `parse_path` builds from a TCK expected
+/// cell's `<...>` syntax. `forward` is derived from comparing each edge's
+/// stored `src` against the *preceding* node's id in the walk -- the
+/// path itself carries no separate direction flag, direction is implicit
+/// in which node came first.
+fn path_to_tck(elems: &[PathElem]) -> TckValue {
+    let mut out = Vec::with_capacity(elems.len());
+    let mut prev_node_id = None;
+    for elem in elems {
+        match elem {
+            PathElem::Node(n) => {
+                prev_node_id = Some(n.id);
+                out.push(PathTckElem::Node {
+                    labels: n.labels.iter().cloned().collect(),
+                    props: n
+                        .props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), property_to_tck(v)))
+                        .collect(),
+                });
+            }
+            PathElem::Edge(e) => {
+                out.push(PathTckElem::Edge {
+                    rel_type: e.label.clone(),
+                    props: e
+                        .props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), property_to_tck(v)))
+                        .collect(),
+                    forward: prev_node_id == Some(e.src),
+                });
+            }
+        }
+    }
+    TckValue::Path(out)
 }
 
 /// A raw stored `PropertyValue` (a node/edge property, or a top-level
@@ -260,10 +333,82 @@ impl CellParser {
             Some('(') => self.parse_node(),
             Some('[') => self.parse_list_or_rel(),
             Some('{') => self.parse_map_value(),
+            Some('<') => self.parse_path(),
             Some('\'') => Ok(TckValue::Scalar(TckScalar::Str(self.parse_string()?))),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+            // `NaN`/`Infinity`/`-Infinity` are keywords in TCK's expected-
+            // cell syntax, not parseable as an ordinary signed number (no
+            // digits) -- tried before the general digit/`-` branch below
+            // since they also start with `-`.
+            Some(c) if c == '-' || c.is_ascii_digit() => {
+                if self.chars[self.pos..].starts_with(&['N', 'a', 'N'])
+                    || self.chars[self.pos..].starts_with(&['I', 'n', 'f', 'i', 'n', 'i', 't', 'y'])
+                    || self.chars[self.pos..]
+                        .starts_with(&['-', 'I', 'n', 'f', 'i', 'n', 'i', 't', 'y'])
+                {
+                    self.parse_keyword()
+                } else {
+                    self.parse_number()
+                }
+            }
             _ => self.parse_keyword(),
         }
+    }
+
+    /// `<node ((-[...]-> | <-[...]-) node)*>` -- TCK's own path-literal
+    /// syntax (`<(:A)-[:T]->(:B)>`), matching the same `PathTckElem` shape
+    /// `path_to_tck` builds from a real `Value::Path`.
+    fn parse_path(&mut self) -> Result<TckValue, String> {
+        self.expect('<')?;
+        self.skip_ws();
+        let mut elems = vec![self.parse_path_node()?];
+        self.skip_ws();
+        while self.peek() != Some('>') {
+            elems.push(self.parse_path_edge()?);
+            elems.push(self.parse_path_node()?);
+            self.skip_ws();
+        }
+        self.expect('>')?;
+        Ok(TckValue::Path(elems))
+    }
+
+    fn parse_path_node(&mut self) -> Result<PathTckElem, String> {
+        let TckValue::Node { labels, props } = self.parse_node()? else {
+            unreachable!("parse_node always returns TckValue::Node");
+        };
+        Ok(PathTckElem::Node { labels, props })
+    }
+
+    /// Either `-[:TYPE {props}]->` (forward) or `<-[:TYPE {props}]-`
+    /// (backward) -- the two arrowhead shapes a path's own edges can
+    /// appear in (an *undirected* `-[...]-`, no arrowhead either side,
+    /// never appears in a real matched path's own written form, since a
+    /// concrete walk always has a real traversed direction).
+    fn parse_path_edge(&mut self) -> Result<PathTckElem, String> {
+        self.skip_ws();
+        let backward = self.peek() == Some('<');
+        if backward {
+            self.pos += 1;
+        }
+        self.expect('-')?;
+        self.expect('[')?;
+        self.expect(':')?;
+        let rel_type = self.parse_identifier();
+        self.skip_ws();
+        let props = if self.peek() == Some('{') {
+            self.parse_props()?
+        } else {
+            BTreeMap::new()
+        };
+        self.expect(']')?;
+        self.expect('-')?;
+        if !backward {
+            self.expect('>')?;
+        }
+        Ok(PathTckElem::Edge {
+            rel_type,
+            props,
+            forward: !backward,
+        })
     }
 
     fn parse_keyword(&mut self) -> Result<TckValue, String> {
@@ -271,6 +416,15 @@ impl CellParser {
             ("null", TckValue::Null),
             ("true", TckValue::Scalar(TckScalar::Bool(true))),
             ("false", TckValue::Scalar(TckScalar::Bool(false))),
+            ("NaN", TckValue::Scalar(TckScalar::Float(f64::NAN))),
+            (
+                "-Infinity",
+                TckValue::Scalar(TckScalar::Float(f64::NEG_INFINITY)),
+            ),
+            (
+                "Infinity",
+                TckValue::Scalar(TckScalar::Float(f64::INFINITY)),
+            ),
         ] {
             if self.chars[self.pos..].starts_with(&kw.chars().collect::<Vec<_>>()[..]) {
                 self.pos += kw.len();
@@ -337,6 +491,29 @@ impl CellParser {
                 self.pos += 1;
             } else {
                 break;
+            }
+        }
+        // Scientific notation (`1e308`, `1.23456789e308`, `1e-305`) --
+        // always a float regardless of whether the mantissa itself had a
+        // `.` (`1e308` has none). `e`/`E` followed by an optional sign
+        // and at least one digit; back out to just the mantissa if that
+        // shape isn't actually present (an identifier starting with `e`
+        // right after a bare number isn't valid input here anyway, so no
+        // real ambiguity).
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let exp_start = self.pos;
+            self.pos += 1;
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.pos += 1;
+            }
+            let digits_start = self.pos;
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+            if self.pos == digits_start {
+                self.pos = exp_start;
+            } else {
+                is_float = true;
             }
         }
         let text: String = self.chars[start..self.pos].iter().collect();
@@ -545,6 +722,104 @@ mod tests {
             parse_cell("-3.125").unwrap(),
             TckValue::Scalar(TckScalar::Float(-3.125))
         );
+    }
+
+    #[test]
+    fn parses_scientific_notation_floats() {
+        assert_eq!(
+            parse_cell("1e308").unwrap(),
+            TckValue::Scalar(TckScalar::Float(1e308))
+        );
+        assert_eq!(
+            parse_cell("1.23456789e308").unwrap(),
+            TckValue::Scalar(TckScalar::Float(1.23456789e308))
+        );
+        assert_eq!(
+            parse_cell("1e-305").unwrap(),
+            TckValue::Scalar(TckScalar::Float(1e-305))
+        );
+        assert_eq!(
+            parse_cell("-1e-305").unwrap(),
+            TckValue::Scalar(TckScalar::Float(-1e-305))
+        );
+    }
+
+    #[test]
+    fn parses_nan_and_infinity_keywords() {
+        let TckValue::Scalar(TckScalar::Float(f)) = parse_cell("NaN").unwrap() else {
+            panic!("expected a float");
+        };
+        assert!(f.is_nan());
+        assert_eq!(
+            parse_cell("Infinity").unwrap(),
+            TckValue::Scalar(TckScalar::Float(f64::INFINITY))
+        );
+        assert_eq!(
+            parse_cell("-Infinity").unwrap(),
+            TckValue::Scalar(TckScalar::Float(f64::NEG_INFINITY))
+        );
+    }
+
+    #[test]
+    fn nan_compares_equal_to_nan_via_tck_eq() {
+        let a = TckValue::Scalar(TckScalar::Float(f64::NAN));
+        let b = TckValue::Scalar(TckScalar::Float(f64::NAN));
+        assert!(tck_eq(&a, &b, true));
+    }
+
+    #[test]
+    fn parses_zero_length_path() {
+        assert_eq!(
+            parse_cell("<()>").unwrap(),
+            TckValue::Path(vec![PathTckElem::Node {
+                labels: BTreeSet::new(),
+                props: BTreeMap::new(),
+            }])
+        );
+    }
+
+    #[test]
+    fn parses_forward_path() {
+        let v = parse_cell("<(:A)-[:T]->(:B)>").unwrap();
+        let TckValue::Path(elems) = v else {
+            panic!("expected a path")
+        };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(
+            &elems[1],
+            PathTckElem::Edge { rel_type, forward: true, .. } if rel_type == "T"
+        ));
+    }
+
+    #[test]
+    fn parses_backward_path() {
+        let v = parse_cell("<(:B)<-[:T]-(:A)>").unwrap();
+        let TckValue::Path(elems) = v else {
+            panic!("expected a path")
+        };
+        assert!(matches!(
+            &elems[1],
+            PathTckElem::Edge { rel_type, forward: false, .. } if rel_type == "T"
+        ));
+    }
+
+    #[test]
+    fn same_nodes_different_edge_direction_are_not_equal() {
+        let forward = parse_cell("<(:A)-[:T]->(:B)>").unwrap();
+        let backward = parse_cell("<(:A)<-[:T]-(:B)>").unwrap();
+        assert!(!tck_eq(&forward, &backward, true));
+    }
+
+    #[test]
+    fn parses_multi_hop_path_with_props() {
+        let v = parse_cell(
+            "<(:A {name: 'A'})-[:KNOWS {num: 1}]->(:B {name: 'B'})-[:KNOWS {num: 2}]->(:C {name: 'C'})>",
+        )
+        .unwrap();
+        let TckValue::Path(elems) = v else {
+            panic!("expected a path")
+        };
+        assert_eq!(elems.len(), 5);
     }
 
     #[test]

@@ -823,6 +823,94 @@ fn order_by_multi_key_against_aliases_not_raw_bindings() {
 }
 
 #[test]
+fn order_by_sorts_distinct_types_in_defined_cross_type_order() {
+    // TCK clauses/return-orderby ReturnOrderBy1 [11]: distinct types have a
+    // total order for ORDER BY, Map < Node < Relationship < List < Path <
+    // String < Boolean < Number < Null.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:N)-[:REL]->()");
+    let result = run(
+        &store,
+        "MATCH p = (n:N)-[r:REL]->() \
+         UNWIND [n, r, p, 1.5, ['list'], 'text', null, false, 0.0 / 0.0, {a: 'map'}] AS types \
+         RETURN types ORDER BY types",
+    );
+    let kinds: Vec<&str> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Map(_) => "map",
+            Value::Node(_) => "node",
+            Value::Edge(_) => "edge",
+            Value::List(_) => "list",
+            Value::Path(_) => "path",
+            Value::Literal(marsdb_query::Literal::String(_))
+            | Value::Property(marsdb_graph::PropertyValue::String(_)) => "string",
+            Value::Literal(marsdb_query::Literal::Bool(_))
+            | Value::Property(marsdb_graph::PropertyValue::Bool(_)) => "bool",
+            Value::Literal(marsdb_query::Literal::Float(f))
+            | Value::Property(marsdb_graph::PropertyValue::Float(f))
+                if f.is_nan() =>
+            {
+                "nan"
+            }
+            Value::Literal(marsdb_query::Literal::Float(_))
+            | Value::Literal(marsdb_query::Literal::Int(_))
+            | Value::Property(marsdb_graph::PropertyValue::Float(_))
+            | Value::Property(marsdb_graph::PropertyValue::Int(_)) => "number",
+            Value::Literal(marsdb_query::Literal::Null)
+            | Value::Property(marsdb_graph::PropertyValue::Null)
+            | Value::Null => "null",
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["map", "node", "edge", "list", "path", "string", "bool", "number", "nan", "null"]
+    );
+}
+
+#[test]
+fn order_by_desc_reverses_the_whole_cross_type_order_null_and_nan_included() {
+    // TCK clauses/return-orderby ReturnOrderBy1 [12]: DESC is a genuine
+    // reversal of the whole total order, not just of non-null/non-NaN
+    // comparisons -- `null` sorts *first* under DESC (not last
+    // regardless of direction), and `NaN` (the largest number) sorts
+    // right after it, ahead of every finite float.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "UNWIND [1.5, null, 0.0 / 0.0, false, 'text'] AS types \
+         RETURN types ORDER BY types DESC",
+    );
+    let kinds: Vec<&str> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Literal(marsdb_query::Literal::Null)
+            | Value::Property(marsdb_graph::PropertyValue::Null)
+            | Value::Null => "null",
+            Value::Literal(marsdb_query::Literal::Float(f))
+            | Value::Property(marsdb_graph::PropertyValue::Float(f))
+                if f.is_nan() =>
+            {
+                "nan"
+            }
+            Value::Literal(marsdb_query::Literal::Float(_))
+            | Value::Literal(marsdb_query::Literal::Int(_))
+            | Value::Property(marsdb_graph::PropertyValue::Float(_))
+            | Value::Property(marsdb_graph::PropertyValue::Int(_)) => "number",
+            Value::Literal(marsdb_query::Literal::Bool(_))
+            | Value::Property(marsdb_graph::PropertyValue::Bool(_)) => "bool",
+            Value::Literal(marsdb_query::Literal::String(_))
+            | Value::Property(marsdb_graph::PropertyValue::String(_)) => "string",
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, vec!["null", "nan", "number", "bool", "string"]);
+}
+
+#[test]
 fn order_by_then_limit_sorts_before_truncating() {
     let store = GraphStore::open_memory().unwrap();
     for i in 0..5 {
