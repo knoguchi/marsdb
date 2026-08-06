@@ -23,8 +23,9 @@
 //! type. Grows a variant per AST node kind as later increments need it.
 
 use crate::ast::{
-    is_aggregate_name, ArithOp, CompareOp, Literal, NodePattern, Pattern, PropAccess, QueryPart,
-    RelDirection, RelPattern, ReturnExpr, ReturnItem, SortDir, Tail, WithClause, WithExpr,
+    is_aggregate_name, ArithOp, CompareOp, Literal, MergeClause, NodePattern, Pattern, PropAccess,
+    QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir,
+    Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -32,27 +33,31 @@ use crate::generated::cypherparser::{
     AtomContextAttrs, AtomicExpressionContext, AtomicExpressionContextAll,
     AtomicExpressionContextAttrs, BoolLitContext, BoolLitContextAttrs, CharLitContext,
     CharLitContextAttrs, ComparisonExpressionContext, ComparisonExpressionContextAttrs,
-    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext,
-    ExpressionChainContextAttrs, ExpressionContext, ExpressionContextAttrs,
-    FunctionInvocationContext, FunctionInvocationContextAttrs, InvocationNameContextAll,
-    InvocationNameContextAttrs, LimitStContextAttrs, ListExpressionContextAll,
-    ListExpressionContextAttrs, LiteralContext, LiteralContextAttrs, MatchStContext,
-    MatchStContextAttrs, MultDivExpressionContext, NodeLabelsContextAttrs, NodePatternContext,
-    NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
-    NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
-    OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
-    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
-    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
-    PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
-    PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
-    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertyExpressionContext,
-    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
+    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext, CreateStContext,
+    CreateStContextAttrs, DeleteStContext, DeleteStContextAttrs, ExpressionChainContextAttrs,
+    ExpressionContext, ExpressionContextAttrs, FunctionInvocationContext,
+    FunctionInvocationContextAttrs, InvocationNameContextAll, InvocationNameContextAttrs,
+    LimitStContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs, ListLitContext,
+    ListLitContextAttrs, LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs,
+    MapPairContextAttrs, MatchStContext, MatchStContextAttrs, MergeActionContextAll,
+    MergeActionContextAttrs, MergeStContext, MergeStContextAttrs, MultDivExpressionContext,
+    NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs, NotExpressionContext,
+    NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext, NumLitContextAll,
+    NumLitContextAttrs, OrderItemContextAttrs, OrderStContext, OrderStContextAttrs,
+    ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
+    ParenthesizedExpressionContextAttrs, PatternContextAttrs, PatternElemChainContextAttrs,
+    PatternElemContext, PatternElemContextAttrs, PatternPartContextAttrs, PatternWhereContextAttrs,
+    PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
+    ProjectionBodyContextAttrs, ProjectionItemContextAttrs, ProjectionItemsContextAttrs,
+    PropertyExpressionContext, PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
     PropertyOrLabelExpressionContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
     RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
-    ReturnStContext, ReturnStContextAttrs, SkipStContextAttrs, StringExpPrefixContextAll,
-    StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
-    StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
-    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, WhereContextAttrs,
+    RemoveItemContextAll, RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs,
+    ReturnStContext, ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext,
+    SetStContextAttrs, SkipStContextAttrs, StringExpPrefixContextAll, StringExpPrefixContextAttrs,
+    StringExpressionContextAll, StringExpressionContextAttrs, StringLitContext,
+    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
+    UnaryAddSubExpressionContextAttrs, UnwindStContext, UnwindStContextAttrs, WhereContextAttrs,
     WithStContext, WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
@@ -74,7 +79,19 @@ pub(crate) enum AstNode {
     ReturnExpr(ReturnExpr),
     ReturnClause(ParsedReturnClause),
     WithClause(WithClause),
+    UnwindClause(UnwindClause),
+    SetItems(Vec<SetItem>),
+    DeleteItems(ParsedDelete),
+    RemoveItems(Vec<RemoveItem>),
+    CreatePatterns(Vec<Pattern>),
+    MergeClause(MergeClause),
     Err(QueryError),
+}
+
+#[derive(Debug)]
+pub(crate) struct ParsedDelete {
+    pub items: Vec<ReturnExpr>,
+    pub detach: bool,
 }
 
 /// `returnSt`'s/`withSt`'s shared `projectionBody` bundles the item list,
@@ -110,8 +127,32 @@ impl AstNode {
     ast_node_into!(into_pattern, Pattern, Pattern);
     ast_node_into!(into_query_parts, QueryParts, Vec<QueryPart>);
     ast_node_into!(into_return_expr, ReturnExpr, ReturnExpr);
+
+    /// `ast::Literal` has no List/Map variant -- `listLit`/`mapLit` build
+    /// `ReturnExpr::ListLit`/`MapLit` directly instead (see
+    /// `visit_listLit`/`visit_mapLit`), so a `literal` context (reached
+    /// via `atom`, which can't tell in advance which of its 7 alternatives
+    /// it'll get) may resolve to either an `AstNode::Literal` (bool/num/
+    /// string/char/null) or an `AstNode::ReturnExpr` (list/map). This
+    /// accepts either, wrapping a bare `Literal` in `ReturnExpr::Lit`.
+    fn into_return_expr_lenient(self) -> Result<ReturnExpr, QueryError> {
+        match self {
+            AstNode::Literal(l) => Ok(ReturnExpr::Lit(l)),
+            AstNode::ReturnExpr(e) => Ok(e),
+            AstNode::Err(e) => Err(e),
+            other => {
+                unreachable!("expected AstNode::Literal or AstNode::ReturnExpr, got {other:?}")
+            }
+        }
+    }
     ast_node_into!(into_return_clause, ReturnClause, ParsedReturnClause);
     ast_node_into!(into_with_clause, WithClause, WithClause);
+    ast_node_into!(into_unwind_clause, UnwindClause, UnwindClause);
+    ast_node_into!(into_set_items, SetItems, Vec<SetItem>);
+    ast_node_into!(into_delete_items, DeleteItems, ParsedDelete);
+    ast_node_into!(into_remove_items, RemoveItems, Vec<RemoveItem>);
+    ast_node_into!(into_create_patterns, CreatePatterns, Vec<Pattern>);
+    ast_node_into!(into_merge_clause, MergeClause, MergeClause);
 }
 
 pub(crate) struct AstBuilder {
@@ -455,6 +496,77 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             Ok(c) => AstNode::WithClause(c),
             Err(e) => AstNode::Err(e),
         }
+    }
+
+    fn visit_unwindSt(&mut self, ctx: &UnwindStContext<'input>) -> Self::Return {
+        match self.build_unwind_st(ctx) {
+            Ok(c) => AstNode::UnwindClause(c),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_setSt(&mut self, ctx: &SetStContext<'input>) -> Self::Return {
+        match self.build_set_st(ctx) {
+            Ok(items) => AstNode::SetItems(items),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_deleteSt(&mut self, ctx: &DeleteStContext<'input>) -> Self::Return {
+        match self.build_delete_st(ctx) {
+            Ok(d) => AstNode::DeleteItems(d),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_removeSt(&mut self, ctx: &RemoveStContext<'input>) -> Self::Return {
+        match self.build_remove_st(ctx) {
+            Ok(items) => AstNode::RemoveItems(items),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_createSt(&mut self, ctx: &CreateStContext<'input>) -> Self::Return {
+        match self.build_create_st(ctx) {
+            Ok(patterns) => AstNode::CreatePatterns(patterns),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_mergeSt(&mut self, ctx: &MergeStContext<'input>) -> Self::Return {
+        match self.build_merge_st(ctx) {
+            Ok(c) => AstNode::MergeClause(c),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_listLit(&mut self, ctx: &ListLitContext<'input>) -> Self::Return {
+        let mut items = Vec::new();
+        if let Some(chain_ctx) = ctx.expressionChain() {
+            for expr_ctx in chain_ctx.expression_all() {
+                match self.visit(&*expr_ctx).into_return_expr() {
+                    Ok(e) => items.push(e),
+                    Err(e) => return AstNode::Err(e),
+                }
+            }
+        }
+        AstNode::ReturnExpr(ReturnExpr::ListLit(items))
+    }
+
+    fn visit_mapLit(&mut self, ctx: &MapLitContext<'input>) -> Self::Return {
+        let mut items = Vec::new();
+        for pair_ctx in ctx.mapPair_all() {
+            let name_ctx = pair_ctx.name().expect("mapPair always has a name");
+            let expr_ctx = pair_ctx
+                .expression()
+                .expect("mapPair always has an expression");
+            let value = match self.visit(&*expr_ctx).into_return_expr() {
+                Ok(v) => v,
+                Err(e) => return AstNode::Err(e),
+            };
+            items.push((name_ctx.get_text(), value));
+        }
+        AstNode::ReturnExpr(ReturnExpr::MapLit(items))
     }
 }
 
@@ -1041,7 +1153,7 @@ impl AstBuilder {
 
     fn build_atom(&mut self, ctx: &AtomContext) -> Result<ReturnExpr, QueryError> {
         if let Some(lit_ctx) = ctx.literal() {
-            return self.visit(&*lit_ctx).into_literal().map(ReturnExpr::Lit);
+            return self.visit(&*lit_ctx).into_return_expr_lenient();
         }
         if let Some(param_ctx) = ctx.parameter() {
             return self.build_parameter(&param_ctx);
@@ -1244,6 +1356,230 @@ impl AstBuilder {
             limit,
         })
     }
+
+    /// `UnwindClause::where_clause`/`::with` are populated wherever mars's
+    /// own AST assembly attaches a following `WHERE`/`WITH` -- neither is
+    /// part of `unwindSt`'s own grammar (`UNWIND expression AS symbol`,
+    /// no trailing clauses at all), unlike pest's grammar, which does let
+    /// UNWIND carry an inline WHERE directly (a mars-specific extension
+    /// beyond real openCypher syntax, per `UnwindClause::where_clause`'s
+    /// own docs). Always `None` here; a real capability gap versus pest
+    /// for this specific extension, not a deferred-for-now stub.
+    fn build_unwind_st(&mut self, ctx: &UnwindStContext) -> Result<UnwindClause, QueryError> {
+        let expr_ctx = ctx.expression().expect("unwindSt always has an expression");
+        let source = UnwindSource(self.visit(&*expr_ctx).into_return_expr()?);
+        let var_ctx = ctx.symbol().expect("unwindSt always has a symbol");
+        Ok(UnwindClause {
+            source,
+            var: symbol_text(&var_ctx),
+            where_clause: None,
+            with: None,
+        })
+    }
+
+    fn build_set_st(&mut self, ctx: &SetStContext) -> Result<Vec<SetItem>, QueryError> {
+        ctx.setItem_all()
+            .into_iter()
+            .map(|item_ctx| self.build_set_item(&item_ctx))
+            .collect()
+    }
+
+    fn build_set_item(&mut self, ctx: &SetItemContextAll) -> Result<SetItem, QueryError> {
+        // `setItem`'s first alternative is `propertyExpression ASSIGN
+        // expression`, and `propertyExpression`'s own zero-`.name`-suffix
+        // form degenerates to a bare variable -- so `n = {...}` (no dots
+        // at all) parses through *this* alternative too, not the
+        // `symbol ASSIGN expression` one below (which ANTLR only reaches
+        // for `+=`, since alternative one has no ADD_ASSIGN option at
+        // all). `build_property_expression`'s result tells them apart:
+        // `Prop` is real `x.prop` access; `Var` is the degenerate case,
+        // meaning `SetItem::MapAssign` (never `merge: true` here --
+        // that's only reachable via `+=`, which can't take this branch).
+        if let Some(prop_ctx) = ctx.propertyExpression() {
+            let expr_ctx = ctx
+                .expression()
+                .expect("setItem's propertyExpression form always has an expression");
+            return match self.build_property_expression(&prop_ctx)? {
+                ReturnExpr::Prop(prop) => {
+                    let value = self.visit(&*expr_ctx).into_return_expr()?;
+                    Ok(SetItem::Prop(prop, value))
+                }
+                ReturnExpr::Var(var) => {
+                    let value = self.visit(&*expr_ctx).into_return_expr()?;
+                    Ok(SetItem::MapAssign {
+                        var,
+                        value,
+                        merge: false,
+                    })
+                }
+                _ => Err(QueryError::Syntax(
+                    "expected a property access (x.prop) or variable on the left of SET's `=`"
+                        .into(),
+                )),
+            };
+        }
+        let sym_ctx = ctx
+            .symbol()
+            .expect("setItem always has a propertyExpression or symbol");
+        let var = symbol_text(&sym_ctx);
+        if let Some(labels_ctx) = ctx.nodeLabels() {
+            let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+            return Ok(SetItem::Labels(var, labels));
+        }
+        let expr_ctx = ctx
+            .expression()
+            .expect("setItem's symbol-assign form always has an expression");
+        let value = self.visit(&*expr_ctx).into_return_expr()?;
+        Ok(SetItem::MapAssign {
+            var,
+            value,
+            merge: ctx.ADD_ASSIGN().is_some(),
+        })
+    }
+
+    fn build_delete_st(&mut self, ctx: &DeleteStContext) -> Result<ParsedDelete, QueryError> {
+        let chain_ctx = ctx
+            .expressionChain()
+            .expect("deleteSt always has an expressionChain");
+        let mut items = Vec::new();
+        for expr_ctx in chain_ctx.expression_all() {
+            items.push(self.visit(&*expr_ctx).into_return_expr()?);
+        }
+        Ok(ParsedDelete {
+            items,
+            detach: ctx.DETACH().is_some(),
+        })
+    }
+
+    fn build_remove_st(&mut self, ctx: &RemoveStContext) -> Result<Vec<RemoveItem>, QueryError> {
+        ctx.removeItem_all()
+            .into_iter()
+            .map(|item_ctx| self.build_remove_item(&item_ctx))
+            .collect()
+    }
+
+    fn build_remove_item(&mut self, ctx: &RemoveItemContextAll) -> Result<RemoveItem, QueryError> {
+        if let Some(prop_ctx) = ctx.propertyExpression() {
+            return Ok(RemoveItem::Prop(self.build_prop_access(&prop_ctx)?));
+        }
+        let sym_ctx = ctx
+            .symbol()
+            .expect("removeItem always has a symbol+nodeLabels or a propertyExpression");
+        let labels_ctx = ctx
+            .nodeLabels()
+            .expect("removeItem's symbol form always has nodeLabels");
+        let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+        Ok(RemoveItem::Labels(symbol_text(&sym_ctx), labels))
+    }
+
+    /// `propertyExpression`'s own grammar rule is reused by `setItem`/
+    /// `removeItem` for their `x.prop` alternative -- `build_property_
+    /// expression` already builds exactly `ReturnExpr::Prop` for that
+    /// shape (or errors for anything wider, chained access etc), so this
+    /// just unwraps the one variant these two callers can ever legally
+    /// see here (the grammar alternative they're on doesn't admit a bare
+    /// `symbol` or anything else propertyExpression could otherwise
+    /// produce).
+    fn build_prop_access(
+        &mut self,
+        ctx: &PropertyExpressionContext,
+    ) -> Result<PropAccess, QueryError> {
+        match self.build_property_expression(ctx)? {
+            ReturnExpr::Prop(p) => Ok(p),
+            _ => Err(QueryError::Syntax(
+                "expected a property access (x.prop)".into(),
+            )),
+        }
+    }
+
+    /// `Statement::Create`'s `Vec<Pattern>` has no named-path-capture slot
+    /// at all (unlike `QueryPart::path_var`), and unlike `MATCH`, CREATE's
+    /// comma-separated patterns are never spliced into linear chains --
+    /// each becomes its own independent `Pattern` directly (matches
+    /// `parser.rs`'s `parse_create_patterns`, which does the same, no
+    /// `group_into_linear_patterns` call).
+    fn build_create_st(&mut self, ctx: &CreateStContext) -> Result<Vec<Pattern>, QueryError> {
+        let pattern_ctx = ctx.pattern().expect("createSt always has a pattern");
+        pattern_ctx
+            .patternPart_all()
+            .into_iter()
+            .map(|part_ctx| {
+                if part_ctx.ASSIGN().is_some() {
+                    return Err(QueryError::Syntax(
+                        "named-path capture (`p = ...`) isn't supported on CREATE".into(),
+                    ));
+                }
+                let elem_ctx = part_ctx
+                    .patternElem()
+                    .expect("patternPart always has a patternElem");
+                self.visit(&*elem_ctx).into_pattern()
+            })
+            .collect()
+    }
+
+    /// Mirrors `parser.rs`'s `parse_merge_clause`: `MergeClause::pattern`
+    /// caps at one relationship hop (checked here, not the grammar, which
+    /// permissively allows any hop count via the same `patternElem` every
+    /// other pattern context uses), and real Cypher rejects more than one
+    /// `ON CREATE`/`ON MATCH` on the same MERGE (also grammar-permissive,
+    /// `mergeAction*` allows any order/count) -- same "grammar permissive,
+    /// builder enforces the exact constraint" split used there. No
+    /// named-path capture either, same reasoning as `build_create_st`.
+    fn build_merge_st(&mut self, ctx: &MergeStContext) -> Result<MergeClause, QueryError> {
+        let part_ctx = ctx.patternPart().expect("mergeSt always has a patternPart");
+        if part_ctx.ASSIGN().is_some() {
+            return Err(QueryError::Syntax(
+                "named-path capture (`p = ...`) isn't supported on MERGE".into(),
+            ));
+        }
+        let elem_ctx = part_ctx
+            .patternElem()
+            .expect("patternPart always has a patternElem");
+        let pattern = self.visit(&*elem_ctx).into_pattern()?;
+        if pattern.hops.len() > 1 {
+            return Err(QueryError::Syntax(
+                "MERGE with more than one relationship hop isn't supported yet — split it into a MATCH \
+                 for the already-known part and a MERGE for one new hop"
+                    .into(),
+            ));
+        }
+
+        let mut on_create = Vec::new();
+        let mut on_match = Vec::new();
+        for action_ctx in ctx.mergeAction_all() {
+            let set_items = self.build_merge_action(&action_ctx)?;
+            if action_ctx.MATCH().is_some() {
+                if !on_match.is_empty() {
+                    return Err(QueryError::Syntax(
+                        "MERGE can have at most one ON MATCH SET clause".into(),
+                    ));
+                }
+                on_match = set_items;
+            } else {
+                if !on_create.is_empty() {
+                    return Err(QueryError::Syntax(
+                        "MERGE can have at most one ON CREATE SET clause".into(),
+                    ));
+                }
+                on_create = set_items;
+            }
+        }
+
+        Ok(MergeClause {
+            pattern,
+            on_create,
+            on_match,
+            with: None,
+        })
+    }
+
+    fn build_merge_action(
+        &mut self,
+        ctx: &MergeActionContextAll,
+    ) -> Result<Vec<SetItem>, QueryError> {
+        let set_ctx = ctx.setSt().expect("mergeAction always has a setSt");
+        self.build_set_st(&set_ctx)
+    }
 }
 
 /// `where`'s grammar reuses the same `expression` rule as everywhere else
@@ -1361,6 +1697,72 @@ mod tests {
             .withSt()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `withSt`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_with_clause()
+    }
+
+    fn parse_unwind(input: &str) -> Result<UnwindClause, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .unwindSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `unwindSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_unwind_clause()
+    }
+
+    fn parse_set(input: &str) -> Result<Vec<SetItem>, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .setSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `setSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_set_items()
+    }
+
+    fn parse_delete(input: &str) -> Result<ParsedDelete, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .deleteSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `deleteSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_delete_items()
+    }
+
+    fn parse_remove(input: &str) -> Result<Vec<RemoveItem>, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .removeSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `removeSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_remove_items()
+    }
+
+    fn parse_create(input: &str) -> Result<Vec<Pattern>, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .createSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `createSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_create_patterns()
+    }
+
+    fn parse_merge(input: &str) -> Result<MergeClause, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .mergeSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `mergeSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_merge_clause()
     }
 
     #[test]
@@ -2096,5 +2498,153 @@ mod tests {
         // Bare rather than silently dropping the XOR semantics.
         let c = parse_with("WITH a WHERE a.x XOR a.y").unwrap();
         assert!(matches!(c.where_clause.unwrap(), WithExpr::Bare(_)));
+    }
+
+    #[test]
+    fn unwind_basic() {
+        let c = parse_unwind("UNWIND [1, 2, 3] AS x").unwrap();
+        assert_eq!(c.var, "x");
+        assert_eq!(
+            c.source.0,
+            ReturnExpr::ListLit(vec![
+                ReturnExpr::Lit(Literal::Int(1)),
+                ReturnExpr::Lit(Literal::Int(2)),
+                ReturnExpr::Lit(Literal::Int(3)),
+            ])
+        );
+        assert!(c.where_clause.is_none());
+        assert!(c.with.is_none());
+    }
+
+    #[test]
+    fn set_prop() {
+        let items = parse_set("SET n.name = 'x'").unwrap();
+        assert_eq!(items.len(), 1);
+        let SetItem::Prop(prop, value) = &items[0] else {
+            panic!("expected SetItem::Prop");
+        };
+        assert_eq!(prop.var, "n");
+        assert_eq!(prop.prop, "name");
+        assert_eq!(*value, ReturnExpr::Lit(Literal::String("x".to_string())));
+    }
+
+    #[test]
+    fn set_labels() {
+        let items = parse_set("SET n:A:B").unwrap();
+        let SetItem::Labels(var, labels) = &items[0] else {
+            panic!("expected SetItem::Labels");
+        };
+        assert_eq!(var, "n");
+        assert_eq!(labels, &vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn set_map_assign() {
+        let items = parse_set("SET n = {a: 1}").unwrap();
+        let SetItem::MapAssign { var, merge, .. } = &items[0] else {
+            panic!("expected SetItem::MapAssign");
+        };
+        assert_eq!(var, "n");
+        assert!(!merge);
+
+        let items = parse_set("SET n += {a: 1}").unwrap();
+        let SetItem::MapAssign { merge, .. } = &items[0] else {
+            panic!("expected SetItem::MapAssign");
+        };
+        assert!(merge);
+    }
+
+    #[test]
+    fn set_multiple_items() {
+        assert_eq!(parse_set("SET n.a = 1, n.b = 2").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_items() {
+        let d = parse_delete("DELETE n, r").unwrap();
+        assert!(!d.detach);
+        assert_eq!(d.items.len(), 2);
+    }
+
+    #[test]
+    fn detach_delete() {
+        let d = parse_delete("DETACH DELETE n").unwrap();
+        assert!(d.detach);
+    }
+
+    #[test]
+    fn remove_prop() {
+        let items = parse_remove("REMOVE n.name").unwrap();
+        let RemoveItem::Prop(prop) = &items[0] else {
+            panic!("expected RemoveItem::Prop");
+        };
+        assert_eq!(prop.var, "n");
+        assert_eq!(prop.prop, "name");
+    }
+
+    #[test]
+    fn remove_labels() {
+        let items = parse_remove("REMOVE n:A:B").unwrap();
+        let RemoveItem::Labels(var, labels) = &items[0] else {
+            panic!("expected RemoveItem::Labels");
+        };
+        assert_eq!(var, "n");
+        assert_eq!(labels, &vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn create_single_pattern() {
+        let patterns = parse_create("CREATE (a:Person)").unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].start.var.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn create_comma_patterns_stay_separate() {
+        // Unlike MATCH, CREATE never splices shared-node comma patterns
+        // into one linear chain -- each stays its own Pattern.
+        let patterns = parse_create("CREATE (a), (a)-->(b)").unwrap();
+        assert_eq!(patterns.len(), 2);
+    }
+
+    #[test]
+    fn create_named_path_errors() {
+        assert!(parse_create("CREATE p = (a)-->(b)").is_err());
+    }
+
+    #[test]
+    fn merge_single_hop() {
+        let m = parse_merge("MERGE (a)-[:KNOWS]->(b)").unwrap();
+        assert_eq!(m.pattern.hops.len(), 1);
+        assert!(m.on_create.is_empty());
+        assert!(m.on_match.is_empty());
+    }
+
+    #[test]
+    fn merge_multi_hop_errors() {
+        assert!(parse_merge("MERGE (a)-->(b)-->(c)").is_err());
+    }
+
+    #[test]
+    fn merge_named_path_errors() {
+        assert!(parse_merge("MERGE p = (a)-->(b)").is_err());
+    }
+
+    #[test]
+    fn merge_on_create_on_match() {
+        let m = parse_merge("MERGE (a) ON CREATE SET a.created = true ON MATCH SET a.seen = true")
+            .unwrap();
+        assert_eq!(m.on_create.len(), 1);
+        assert_eq!(m.on_match.len(), 1);
+    }
+
+    #[test]
+    fn merge_duplicate_on_create_errors() {
+        assert!(parse_merge("MERGE (a) ON CREATE SET a.x = 1 ON CREATE SET a.y = 2").is_err());
+    }
+
+    #[test]
+    fn merge_duplicate_on_match_errors() {
+        assert!(parse_merge("MERGE (a) ON MATCH SET a.x = 1 ON MATCH SET a.y = 2").is_err());
     }
 }
