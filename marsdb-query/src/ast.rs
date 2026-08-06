@@ -102,6 +102,23 @@ pub enum Expr {
     /// bound var -> Seed" mechanism `eval_merge`'s own "try as an
     /// ordinary MATCH first" half already uses.
     Pattern(Pattern),
+    /// `WHERE exists { (n)-->(m) WHERE n.prop = m.prop }` (TCK's
+    /// ExistentialSubquery1, the "simple" form) -- unlike `Pattern`
+    /// above, `pattern` here *can* introduce brand-new variables (`m`
+    /// above; real Cypher allows that inside an `exists {}` block, unlike
+    /// a bare pattern predicate), and carries its own inline `where?`
+    /// clause (the grammar's `patternWhere` rule, shared with `MATCH`'s
+    /// own pattern -- `where_clause` is threaded into `build_match_plan`
+    /// directly, same as an ordinary `MATCH ... WHERE ...`, rather than
+    /// evaluated as a separate post-filter step). Existence check only
+    /// (`Some(1)`-limited, same as `Pattern`) -- the "full" `exists { MATCH
+    /// ... RETURN ... }` subquery form (TCK's ExistentialSubquery2) isn't
+    /// supported yet (needs running an arbitrary nested `Statement`
+    /// correlated against the current row, a bigger change).
+    Exists {
+        pattern: Box<Pattern>,
+        where_clause: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +295,15 @@ pub enum ReturnExpr {
         pattern: Box<Pattern>,
         where_clause: Option<Box<Expr>>,
         projection: Box<ReturnExpr>,
+    },
+    /// `exists { (n)-->(m) WHERE ... }` reached from general expression
+    /// position -- same "only meaningful inside WHERE" story as
+    /// `PatternPredicate` (`return_expr_to_expr` folds it into
+    /// `Expr::Exists` there before it ever reaches the executor;
+    /// reaching `eval_return_expr` directly is a real error).
+    ExistsPattern {
+        pattern: Box<Pattern>,
+        where_clause: Option<Box<Expr>>,
     },
 }
 

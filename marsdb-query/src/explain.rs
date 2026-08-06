@@ -473,6 +473,10 @@ fn format_expr(expr: &Expr) -> String {
         Expr::GeneralIsNull(e) => format!("{e:?} IS NULL"),
         Expr::GeneralBare(e) => format!("{e:?}"),
         Expr::Pattern(pattern) => format!("{pattern:?}"),
+        Expr::Exists {
+            pattern,
+            where_clause,
+        } => format!("exists {{{pattern:?} {where_clause:?}}}"),
     }
 }
 

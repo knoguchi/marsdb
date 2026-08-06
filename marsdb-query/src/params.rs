@@ -230,6 +230,15 @@ fn substitute_expr(
         Expr::GeneralIsNull(e) => substitute_return_expr(e, params)?,
         Expr::GeneralBare(e) => substitute_return_expr(e, params)?,
         Expr::Pattern(pattern) => substitute_pattern(pattern, params)?,
+        Expr::Exists {
+            pattern,
+            where_clause,
+        } => {
+            substitute_pattern(pattern, params)?;
+            if let Some(w) = where_clause {
+                substitute_expr(w, params)?;
+            }
+        }
     }
     Ok(())
 }
@@ -409,6 +418,15 @@ fn substitute_return_expr(
                 substitute_expr(w, params)?;
             }
             substitute_return_expr(projection, params)?;
+        }
+        ReturnExpr::ExistsPattern {
+            pattern,
+            where_clause,
+        } => {
+            substitute_pattern(pattern, params)?;
+            if let Some(w) = where_clause {
+                substitute_expr(w, params)?;
+            }
         }
     }
     Ok(())

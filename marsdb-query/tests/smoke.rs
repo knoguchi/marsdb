@@ -118,6 +118,46 @@ fn pattern_predicate_outside_where_is_a_compile_time_error() {
 }
 
 #[test]
+fn exists_simple_subquery_with_and_without_inline_where() {
+    // TCK expressions/existentialSubqueries ExistentialSubquery1 [1]/[2]:
+    // `exists { <pattern> }` / `exists { <pattern> WHERE ... }` -- the
+    // "simple" form, same existential search as a bare pattern predicate
+    // (`WHERE (n)-->()`) but able to introduce a new variable (`m`) and
+    // carry its own inline `WHERE`.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A {prop: 1})-[:R]->(:B {prop: 1}), (a)-[:R]->(:C {prop: 2})",
+    );
+
+    let result = run(&store, "MATCH (n) WHERE exists { (n)-->() } RETURN n.prop");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+
+    let result = run(
+        &store,
+        "MATCH (n) WHERE exists { (n)-->(m) WHERE n.prop = m.prop } RETURN n.prop",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int_value(&result.rows[0][0]), 1);
+
+    // A relationship type/inline WHERE that never matches -- no rows.
+    let result = run(&store, "MATCH (n) WHERE exists { (n)-[:NA]->() } RETURN n");
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn exists_full_subquery_form_is_not_supported_yet() {
+    // TCK ExistentialSubquery2 [1]: `exists { MATCH ... RETURN ... }` --
+    // a full nested query, not the simple pattern-with-where form.
+    // Deliberately out of scope (would need running an arbitrary
+    // correlated nested Statement) -- a clear compile-time rejection,
+    // not a panic or a silently wrong answer.
+    let stmt = parse("MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n");
+    assert!(stmt.is_err());
+}
+
+#[test]
 fn where_clause_filters() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice', age: 30})");

@@ -2249,6 +2249,7 @@ impl<'a> Executor<'a> {
             ReturnExpr::HasLabel(v, l) => ReturnExpr::HasLabel(v.clone(), l.clone()),
             ReturnExpr::PatternPredicate(p) => ReturnExpr::PatternPredicate(p.clone()),
             ReturnExpr::PatternComprehension { .. } => expr.clone(),
+            ReturnExpr::ExistsPattern { .. } => expr.clone(),
             ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {
                 unreachable!("handled above, before this match")
             }
@@ -2909,6 +2910,27 @@ impl<'a> Executor<'a> {
                 )?;
                 Some(!found.is_empty())
             }
+            // `exists { (n)-->(m) WHERE ... }` (TCK's ExistentialSubquery1,
+            // the "simple" form) -- same existential search as `Pattern`
+            // above, just with its own inline `where?` threaded straight
+            // into `build_match_plan`, same as an ordinary `MATCH ...
+            // WHERE ...` (not evaluated as a separate post-filter step).
+            Expr::Exists {
+                pattern,
+                where_clause,
+            } => {
+                let carried_vars: HashSet<String> = row.keys().cloned().collect();
+                let wc: Option<Expr> = where_clause.as_deref().cloned();
+                let plan = apply_index_seeks(build_match_plan(pattern, &wc, &carried_vars)?, txn)?;
+                let found = self.eval_plan_with_limit(
+                    txn,
+                    &plan,
+                    std::slice::from_ref(row),
+                    guard,
+                    Some(1),
+                )?;
+                Some(!found.is_empty())
+            }
         })
     }
 
@@ -3307,6 +3329,9 @@ impl<'a> Executor<'a> {
                 row,
                 guard,
             ),
+            ReturnExpr::ExistsPattern { .. } => Err(QueryError::Semantic(
+                "an exists {} subquery can only be used inside WHERE".into(),
+            )),
         }
     }
 
@@ -4049,7 +4074,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::In(..)
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
-        | ReturnExpr::PatternComprehension { .. } => format!("col{idx}"),
+        | ReturnExpr::PatternComprehension { .. }
+        | ReturnExpr::ExistsPattern { .. } => format!("col{idx}"),
     }
 }
 
@@ -4161,7 +4187,8 @@ fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
         | ReturnExpr::Lit(_)
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
-        | ReturnExpr::PatternComprehension { .. } => {}
+        | ReturnExpr::PatternComprehension { .. }
+        | ReturnExpr::ExistsPattern { .. } => {}
     }
 }
 
@@ -4216,7 +4243,8 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         // it'd need its own separate grouping concept this codebase
         // doesn't have, so (like `PatternPredicate`) it's opaque here
         // rather than searched into.
-        | ReturnExpr::PatternComprehension { .. } => false,
+        | ReturnExpr::PatternComprehension { .. }
+        | ReturnExpr::ExistsPattern { .. } => false,
     }
 }
 
@@ -4288,7 +4316,8 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         // Same opaque treatment as `contains_aggregate`'s own arm above --
         // a pattern comprehension's projection is checked once it's
         // actually evaluated per match, not searched into ahead of time.
-        | ReturnExpr::PatternComprehension { .. } => false,
+        | ReturnExpr::PatternComprehension { .. }
+        | ReturnExpr::ExistsPattern { .. } => false,
     }
 }
 
@@ -4513,7 +4542,8 @@ fn validate_composed_expr(expr: &ReturnExpr, items: &[ReturnItem]) -> Result<(),
         | ReturnExpr::Lit(_)
         | ReturnExpr::HasLabel(..)
         | ReturnExpr::PatternPredicate(..)
-        | ReturnExpr::PatternComprehension { .. } => {}
+        | ReturnExpr::PatternComprehension { .. }
+        | ReturnExpr::ExistsPattern { .. } => {}
     }
     Ok(())
 }
@@ -8405,6 +8435,9 @@ fn eval_projected_expr(
             "a pattern comprehension can only be used in RETURN/WITH position, or as an ORDER BY \
              key that repeats one of their items verbatim"
                 .into(),
+        )),
+        ReturnExpr::ExistsPattern { .. } => Err(QueryError::Semantic(
+            "an exists {} subquery can only be used inside WHERE".into(),
         )),
     }
 }

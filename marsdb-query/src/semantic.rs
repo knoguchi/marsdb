@@ -661,6 +661,24 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             require_boolean_predicate_kind(&kind, "WHERE predicate")
         }
         Expr::Pattern(pattern) => validate_pattern_predicate(pattern, scope),
+        // Unlike `Pattern` above (existential-only, never introduces a
+        // variable), `exists {}`'s pattern *can* introduce brand-new
+        // node/relationship variables (TCK's ExistentialSubquery1 `[2]`'s
+        // `m`), so it reuses `bind_match_pattern` against a scoped copy --
+        // same reasoning as `PatternComprehension`'s own handling
+        // (`infer_expr`, below) -- these bindings are local to the
+        // `exists {}` block, they don't leak into the enclosing scope.
+        Expr::Exists {
+            pattern,
+            where_clause,
+        } => {
+            let mut inner_scope = scope.clone();
+            bind_match_pattern(pattern, &mut inner_scope)?;
+            if let Some(w) = where_clause.as_deref() {
+                validate_pattern_expr(w, &inner_scope)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1040,6 +1058,11 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                 validate_pattern_expr(where_expr, &inner_scope)?;
             }
             Kind::List(Box::new(infer_expr(projection, &inner_scope)?))
+        }
+        ReturnExpr::ExistsPattern { .. } => {
+            return Err(QueryError::Semantic(
+                "an exists {} subquery can only be used inside WHERE".into(),
+            ))
         }
     })
 }

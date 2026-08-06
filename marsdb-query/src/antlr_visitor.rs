@@ -72,10 +72,11 @@ use crate::generated::cypherparser::{
     SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
     StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
     StringListNullExpressionContext, StringListNullExpressionContextAttrs, StringLitContext,
-    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
-    UnaryAddSubExpressionContextAttrs, UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs,
-    UpdatingStatementContextAll, UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext,
-    WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
+    StringLitContextAttrs, SubqueryExistContext, SubqueryExistContextAttrs, SymbolContextAll,
+    SymbolContextAttrs, UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs,
+    UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
+    UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
+    XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parse_helpers::{
@@ -1418,8 +1419,12 @@ impl AstBuilder {
                 self.build_relationships_chain_pattern(&rcp_ctx)?,
             ));
         }
+        if let Some(se_ctx) = ctx.subqueryExist() {
+            return self.build_subquery_exist(&se_ctx);
+        }
         Err(QueryError::Syntax(
-            "this expression form (path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
+            "this expression form (path-as-expression) isn't supported by the ANTLR parser yet"
+                .into(),
         ))
     }
 
@@ -1464,6 +1469,61 @@ impl AstBuilder {
             pattern: Box::new(pattern),
             where_clause,
             projection: Box::new(projection),
+        })
+    }
+
+    /// `subqueryExist : EXISTS LBRACE (regularQuery | patternWhere)
+    /// RBRACE` -- only the `patternWhere` alternative (TCK's
+    /// ExistentialSubquery1, the "simple" form: a pattern with an
+    /// optional inline `WHERE`, same grammar rule `MATCH` itself uses)
+    /// is supported. The `regularQuery` alternative (TCK's
+    /// ExistentialSubquery2, a full nested `MATCH ... RETURN ...`
+    /// subquery, arbitrarily many clauses) needs running an arbitrary
+    /// nested `Statement` correlated against the current row -- a bigger
+    /// change, not attempted here.
+    fn build_subquery_exist(
+        &mut self,
+        ctx: &SubqueryExistContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let Some(pw_ctx) = ctx.patternWhere() else {
+            return Err(QueryError::Syntax(
+                "exists { MATCH ... RETURN ... } (a full nested subquery, as opposed to \
+                 exists { (pattern) WHERE ... }) isn't supported yet"
+                    .into(),
+            ));
+        };
+        let pattern_ctx = pw_ctx.pattern().expect("patternWhere always has a pattern");
+        let mut parts = pattern_ctx.patternPart_all().into_iter();
+        let part = parts
+            .next()
+            .expect("pattern always has at least one patternPart");
+        if parts.next().is_some() {
+            return Err(QueryError::Syntax(
+                "exists {} with more than one comma-separated pattern isn't supported yet".into(),
+            ));
+        }
+        if part.ASSIGN().is_some() || part.shortestPathWrapper().is_some() {
+            return Err(QueryError::Syntax(
+                "exists {} doesn't support a named path or shortestPath()".into(),
+            ));
+        }
+        let elem_ctx = part
+            .patternElem()
+            .expect("a patternPart without ASSIGN/shortestPathWrapper always has a patternElem");
+        let pattern = self.visit(&*elem_ctx).into_pattern()?;
+        let where_clause = match pw_ctx.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(Box::new(return_expr_to_expr(expr)?))
+            }
+            None => None,
+        };
+        Ok(ReturnExpr::ExistsPattern {
+            pattern: Box::new(pattern),
+            where_clause,
         })
     }
 
@@ -2640,6 +2700,13 @@ fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
             })
         }
         ReturnExpr::PatternPredicate(pattern) => Expr::Pattern(pattern),
+        ReturnExpr::ExistsPattern {
+            pattern,
+            where_clause,
+        } => Expr::Exists {
+            pattern,
+            where_clause,
+        },
         other => Expr::GeneralBare(other),
     })
 }
