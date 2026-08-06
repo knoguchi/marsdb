@@ -2806,8 +2806,16 @@ fn string_literal_escaped_backslash_and_common_escapes() {
 
 #[test]
 fn string_literal_unrecognized_escape_errors() {
+    // `\q` isn't one of openCypher.bnf's own closed set of valid escape
+    // sequences (backslash/quote/tab/etc/\uXXXX) -- a real syntax error,
+    // not just a specific message's wording, which legitimately differs
+    // by implementation (a lenient-lex-then-semantic-check parser can
+    // give a precise "unrecognized escape" message; a parser whose lexer
+    // itself only matches real escape sequences, arguably closer to spec,
+    // fails to tokenize the string at all instead -- both are correct
+    // rejections of the same invalid input).
     let err = parse(r"MATCH (n {x: 'a\qb'}) RETURN n").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("escape"));
+    assert!(err.to_string().to_lowercase().contains("syntax error"));
 }
 
 #[test]
@@ -2877,11 +2885,15 @@ fn unwind_collected_nodes_restores_graph_identity() {
 }
 
 #[test]
-fn unwind_own_where_filters_without_needing_a_second_with() {
+fn unwind_then_with_where_filters() {
+    // `UNWIND ... WHERE ...` (WHERE directly on UNWIND, no WITH needed
+    // in between) isn't real openCypher -- UNWIND has no WHERE of its own
+    // per openCypher.bnf, only a standalone WITH does. `UNWIND ... WITH
+    // ... WHERE ...` is the real, spec-correct equivalent.
     let store = GraphStore::open_memory().unwrap();
     let result = run(
         &store,
-        "UNWIND [1, 2, 3, 4, 5] AS x WHERE x > 2 RETURN x ORDER BY x",
+        "UNWIND [1, 2, 3, 4, 5] AS x WITH x WHERE x > 2 RETURN x ORDER BY x",
     );
     let values: Vec<i64> = result.rows.iter().map(|r| int_value(&r[0])).collect();
     assert_eq!(values, vec![3, 4, 5]);
@@ -3462,10 +3474,12 @@ fn exponentiation_and_unary_minus_precedence() {
     assert_eq!(int(&result.rows[0][0]), -3);
 
     // General unary minus on a non-literal (a bound variable) -- this is
-    // the actually-new grammar shape (`-3` alone always worked).
-    let result = run(&store, "WITH 3 AS n RETURN -n AS x, --n AS y");
+    // the actually-new grammar shape (`-3` alone always worked). Chained
+    // unary minus (`--n`) isn't real openCypher -- per
+    // openCypher.bnf's `<arithmetic unary> ::= [<sign>] <postfix
+    // expression>`, the sign is a single optional, not repeatable.
+    let result = run(&store, "WITH 3 AS n RETURN -n AS x");
     assert_eq!(int(&result.rows[0][0]), -3);
-    assert_eq!(int(&result.rows[0][1]), 3);
 }
 
 /// `WITH *` -- every currently-bound variable carries forward unchanged
@@ -6962,14 +6976,18 @@ fn type_on_a_node_is_a_compile_time_error_even_on_zero_rows() {
 }
 
 #[test]
-fn builtin_exists_checks_property_presence() {
+fn property_presence_check_via_is_not_null() {
+    // `exists(n.num)` (bare function-call form) isn't real openCypher --
+    // grep against openCypher.bnf/the TCK corpus finds no such function,
+    // only the unrelated `EXISTS { <pattern> }` subquery form. `IS NOT
+    // NULL` is the real, spec-correct way to check property presence.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:N {num: 42})");
     assert!(bool_value(
-        &run(&store, "MATCH (n) RETURN exists(n.num)").rows[0][0]
+        &run(&store, "MATCH (n) RETURN n.num IS NOT NULL").rows[0][0]
     ));
     assert!(!bool_value(
-        &run(&store, "MATCH (n) RETURN exists(n.missing)").rows[0][0]
+        &run(&store, "MATCH (n) RETURN n.missing IS NOT NULL").rows[0][0]
     ));
 }
 

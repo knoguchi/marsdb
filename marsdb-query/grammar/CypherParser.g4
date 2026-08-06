@@ -393,12 +393,24 @@ nodePattern
     : LPAREN symbol? nodeLabels? properties? RPAREN
     ;
 
+// `listComprehension` tried before `literal` -- `[x IN list]` (no WHERE,
+// no `| project`) is genuinely ambiguous with a one-element `listLit`
+// containing the boolean `x IN list` membership test (`literal`'s own
+// `listLit: LBRACK expressionChain? RBRACK` alternative, since a bare `x
+// IN list` is itself a legal single `expression`). Per openCypher.bnf's
+// `<list comprehension> ::= <left bracket> <list element source> [<list
+// element filter and projection>] <right bracket>`, the filter/projection
+// half is optional, so `[x IN list]` is real, spec-valid Cypher on its
+// own -- ANTLR resolves a genuine ambiguity by picking whichever
+// alternative appears first, so this one must come first for that case
+// to win (when WHERE/`|` is present there's no ambiguity at all, since
+// `literal`'s `expressionChain` has no WHERE production).
 atom
-    : literal
+    : listComprehension
+    | literal
     | parameter
     | caseExpression
     | countAll
-    | listComprehension
     | patternComprehension
     | filterWith
     | relationshipsChainPattern

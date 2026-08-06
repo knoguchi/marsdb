@@ -2240,16 +2240,30 @@ impl AstBuilder {
         let sp_ctx = ctx
             .singlePartQ()
             .expect("multiPartQ always ends in a singlePartQ");
-        let Statement::Match {
-            clauses: tail_clauses,
-            tail,
-            order_by,
-            skip,
-            limit,
-        } = self.build_single_part_q(&sp_ctx)?
-        else {
-            unreachable!("build_single_part_q always returns Statement::Match");
-        };
+        // `build_single_part_q` can also return a bare `Statement::Create`
+        // directly (its own "CREATE with nothing else at all" special
+        // case, mirroring pest's `create_stmt_only`) -- but nested inside
+        // a `multiPartQ` (past at least one `WITH` boundary already),
+        // that's still just this statement's final `Tail::Create`, same
+        // as an ordinary trailing `CREATE` would be. Only a genuinely
+        // top-level, whole-statement bare CREATE gets the dedicated
+        // `Statement::Create` shape (`explain.rs`'s "no query plan" case).
+        let (tail_clauses, tail, order_by, skip, limit) =
+            match self.build_single_part_q(&sp_ctx)? {
+                Statement::Match {
+                    clauses,
+                    tail,
+                    order_by,
+                    skip,
+                    limit,
+                } => (clauses, tail, order_by, skip, limit),
+                Statement::Create(patterns) => {
+                    (Vec::new(), Some(Tail::Create(patterns, None)), None, None, None)
+                }
+                other => unreachable!(
+                    "build_single_part_q only ever returns Statement::Match or Statement::Create, got {other:?}"
+                ),
+            };
         clauses.extend(tail_clauses);
         Ok(Statement::Match {
             clauses,
@@ -3463,12 +3477,6 @@ mod tests {
 
     #[test]
     fn list_comprehension_with_where_no_project() {
-        // Bare `[x IN list]` with neither WHERE nor `| project` is
-        // genuinely ambiguous with a one-element `listLit` containing the
-        // boolean `x IN list` membership test -- ANTLR resolves it as the
-        // latter (`literal` is `atom`'s first alternative), which is also
-        // a real, useful expression on its own. A WHERE (or `|`) is what
-        // actually distinguishes a list comprehension here.
         assert_eq!(
             parse_expr("[x IN [1,2] WHERE x > 1]").unwrap(),
             ReturnExpr::ListComp {
@@ -3482,6 +3490,30 @@ mod tests {
                     CompareOp::Gt,
                     Box::new(ReturnExpr::Lit(Literal::Int(1))),
                 ))),
+                project: None,
+            }
+        );
+    }
+
+    #[test]
+    fn list_comprehension_bare_identity_no_where_no_project() {
+        // `[x IN list]` (neither WHERE nor `| project`) is genuinely
+        // ambiguous with a one-element `listLit` containing the boolean
+        // `x IN list` membership test -- `atom`'s alternatives are
+        // ordered so `listComprehension` wins (real, spec-valid Cypher on
+        // its own per openCypher.bnf's `<list comprehension>`, whose
+        // filter/projection half is optional; found wrong via a Phase 3
+        // behavioral dry-run, not the TCK).
+        assert_eq!(
+            parse_expr("[x IN [1, 2, 3]]").unwrap(),
+            ReturnExpr::ListComp {
+                var: "x".to_string(),
+                source: Box::new(ReturnExpr::ListLit(vec![
+                    ReturnExpr::Lit(Literal::Int(1)),
+                    ReturnExpr::Lit(Literal::Int(2)),
+                    ReturnExpr::Lit(Literal::Int(3)),
+                ])),
+                where_clause: None,
                 project: None,
             }
         );
@@ -4255,6 +4287,23 @@ mod tests {
             panic!("expected first clause to be Merge");
         };
         assert!(m.with.is_some());
+    }
+
+    #[test]
+    fn multi_part_trailing_bare_create_becomes_tail_not_top_level_statement() {
+        // Regression: build_single_part_q's "bare CREATE with nothing
+        // else" special case (-> Statement::Create directly) must NOT
+        // leak out of multiPartQ's own trailing singlePartQ -- past at
+        // least one WITH boundary, a trailing CREATE is still just this
+        // statement's Tail::Create, same as any other trailing CREATE.
+        // Previously panicked (found via a full TCK execution run).
+        let s = parse_multi_part_statement("MATCH (a) WITH a CREATE (b)").unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 1);
+        assert!(matches!(clauses[0], QueryClause::Match(_)));
+        assert!(matches!(tail, Some(Tail::Create(_, None))));
     }
 
     #[test]

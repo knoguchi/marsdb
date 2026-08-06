@@ -11560,6 +11560,12 @@ impl<'input> AtomContextExt<'input> {
 pub trait AtomContextAttrs<'input>:
     CypherParserContext<'input> + BorrowMut<AtomContextExt<'input>>
 {
+    fn listComprehension(&self) -> Option<Rc<ListComprehensionContextAll<'input>>>
+    where
+        Self: Sized,
+    {
+        self.child_of_type(0)
+    }
     fn literal(&self) -> Option<Rc<LiteralContextAll<'input>>>
     where
         Self: Sized,
@@ -11579,12 +11585,6 @@ pub trait AtomContextAttrs<'input>:
         self.child_of_type(0)
     }
     fn countAll(&self) -> Option<Rc<CountAllContextAll<'input>>>
-    where
-        Self: Sized,
-    {
-        self.child_of_type(0)
-    }
-    fn listComprehension(&self) -> Option<Rc<ListComprehensionContextAll<'input>>>
     where
         Self: Sized,
     {
@@ -11654,45 +11654,45 @@ where
                     //recog.base.enter_outer_alt(_localctx.clone(), 1)?;
                     recog.base.enter_outer_alt(None, 1)?;
                     {
-                        /*InvokeRule literal*/
+                        /*InvokeRule listComprehension*/
                         recog.base.set_state(697);
-                        recog.literal()?;
+                        recog.listComprehension()?;
                     }
                 }
                 2 => {
                     //recog.base.enter_outer_alt(_localctx.clone(), 2)?;
                     recog.base.enter_outer_alt(None, 2)?;
                     {
-                        /*InvokeRule parameter*/
+                        /*InvokeRule literal*/
                         recog.base.set_state(698);
-                        recog.parameter()?;
+                        recog.literal()?;
                     }
                 }
                 3 => {
                     //recog.base.enter_outer_alt(_localctx.clone(), 3)?;
                     recog.base.enter_outer_alt(None, 3)?;
                     {
-                        /*InvokeRule caseExpression*/
+                        /*InvokeRule parameter*/
                         recog.base.set_state(699);
-                        recog.caseExpression()?;
+                        recog.parameter()?;
                     }
                 }
                 4 => {
                     //recog.base.enter_outer_alt(_localctx.clone(), 4)?;
                     recog.base.enter_outer_alt(None, 4)?;
                     {
-                        /*InvokeRule countAll*/
+                        /*InvokeRule caseExpression*/
                         recog.base.set_state(700);
-                        recog.countAll()?;
+                        recog.caseExpression()?;
                     }
                 }
                 5 => {
                     //recog.base.enter_outer_alt(_localctx.clone(), 5)?;
                     recog.base.enter_outer_alt(None, 5)?;
                     {
-                        /*InvokeRule listComprehension*/
+                        /*InvokeRule countAll*/
                         recog.base.set_state(701);
-                        recog.listComprehension()?;
+                        recog.countAll()?;
                     }
                 }
                 6 => {
@@ -17427,8 +17427,8 @@ lazy_static! {
         192, 96, 0, 687, 686, 1, 0, 0, 0, 687, 688, 1, 0, 0, 0, 688, 690, 1, 0, 0, 0, 689, 691, 3,
         68, 34, 0, 690, 689, 1, 0, 0, 0, 690, 691, 1, 0, 0, 0, 691, 693, 1, 0, 0, 0, 692, 694, 3,
         130, 65, 0, 693, 692, 1, 0, 0, 0, 693, 694, 1, 0, 0, 0, 694, 695, 1, 0, 0, 0, 695, 696, 5,
-        13, 0, 0, 696, 133, 1, 0, 0, 0, 697, 710, 3, 172, 86, 0, 698, 710, 3, 170, 85, 0, 699, 710,
-        3, 168, 84, 0, 700, 710, 3, 164, 82, 0, 701, 710, 3, 160, 80, 0, 702, 710, 3, 156, 78, 0,
+        13, 0, 0, 696, 133, 1, 0, 0, 0, 697, 710, 3, 160, 80, 0, 698, 710, 3, 172, 86, 0, 699, 710,
+        3, 170, 85, 0, 700, 710, 3, 168, 84, 0, 701, 710, 3, 164, 82, 0, 702, 710, 3, 156, 78, 0,
         703, 710, 3, 154, 77, 0, 704, 710, 3, 158, 79, 0, 705, 710, 3, 152, 76, 0, 706, 710, 3,
         150, 75, 0, 707, 710, 3, 192, 96, 0, 708, 710, 3, 146, 73, 0, 709, 697, 1, 0, 0, 0, 709,
         698, 1, 0, 0, 0, 709, 699, 1, 0, 0, 0, 709, 700, 1, 0, 0, 0, 709, 701, 1, 0, 0, 0, 709,
