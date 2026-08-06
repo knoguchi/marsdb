@@ -911,6 +911,85 @@ fn order_by_desc_reverses_the_whole_cross_type_order_null_and_nan_included() {
 }
 
 #[test]
+fn pattern_comprehension_introduces_new_node_and_rel_vars() {
+    // TCK expressions/pattern Pattern2 [4]/[5]: a pattern comprehension
+    // can introduce brand-new node/relationship variables, unlike a
+    // pattern predicate.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a {name: 'a'}), (b {name: 'val'}), (c)");
+    run(
+        &store,
+        "MATCH (a), (b) WHERE a.name = 'a' AND b.name = 'val' CREATE (a)-[:T]->(b)",
+    );
+    run(
+        &store,
+        "MATCH (b {name: 'val'}), (c) WHERE c.name IS NULL CREATE (b)-[:T]->(c)",
+    );
+
+    let result = run(&store, "MATCH (n) RETURN [(n)-[:T]->(b) | b.name] AS list");
+    let mut lists: Vec<Vec<Option<String>>> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Property(marsdb_graph::PropertyValue::String(s)) => Some(s.clone()),
+                    Value::Null => None,
+                    other => panic!("unexpected value {other:?}"),
+                })
+                .collect(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    lists.sort();
+    assert_eq!(
+        lists,
+        vec![vec![], vec![None], vec![Some("val".to_string())]]
+    );
+}
+
+#[test]
+fn pattern_comprehension_with_named_path_and_where() {
+    // TCK expressions/pattern Pattern2 [2]/[3]: named-path capture
+    // (`p = ...`) plus a label predicate on the pattern's own end node.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A), (b:B), (c:C)");
+    run(&store, "MATCH (a:A), (b:B) CREATE (a)-[:T]->(b)");
+    run(&store, "MATCH (a:A), (c:C) CREATE (a)-[:T]->(c)");
+
+    let result = run(&store, "MATCH (n:A) RETURN [p = (n)-->(:B) | p] AS list");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(items.len(), 1);
+            assert!(matches!(items[0], Value::Path(_)));
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn pattern_comprehension_can_be_aggregated_over() {
+    // TCK expressions/pattern Pattern2 [6]: `count([p = (n)-[:HAS]->() | p])`
+    // -- a pattern comprehension used directly as an aggregate argument.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:A), (:A), (:A)");
+    run(
+        &store,
+        "MATCH (a:A) WHERE NOT (a)--() WITH a LIMIT 1 CREATE (a)-[:HAS]->()",
+    );
+    let result = run(
+        &store,
+        "MATCH (n:A) RETURN count([p = (n)-[:HAS]->() | p]) AS c",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(n)) => assert_eq!(*n, 3),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
 fn percentile_cont_and_disc_match_tck_aggregation6() {
     // TCK expressions/aggregation Aggregation6 [1]/[2]: percentileDisc/
     // percentileCont(n.price, p) over {10.0, 20.0, 30.0}.

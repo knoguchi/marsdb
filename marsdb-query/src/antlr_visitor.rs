@@ -45,7 +45,7 @@ use crate::generated::cypherparser::{
     FilterExpressionContext, FilterExpressionContextAttrs, FilterWithContext,
     FilterWithContextAttrs, FunctionInvocationContext, FunctionInvocationContextAttrs,
     InExpressionContextAttrs, InvocationNameContextAll, InvocationNameContextAttrs,
-    LimitStContextAttrs, ListComprehensionContext, ListComprehensionContextAttrs,
+    LhsContextAttrs, LimitStContextAttrs, ListComprehensionContext, ListComprehensionContextAttrs,
     ListExpressionContextAll, ListExpressionContextAttrs, ListLitContext, ListLitContextAttrs,
     LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs, MapPairContextAttrs,
     MatchStContext, MatchStContextAttrs, MergeActionContextAll, MergeActionContextAttrs,
@@ -55,7 +55,8 @@ use crate::generated::cypherparser::{
     NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
     OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
     ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
-    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    PatternComprehensionContext, PatternComprehensionContextAttrs, PatternContextAttrs,
+    PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
     PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
     PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
     ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertiesContextAll,
@@ -1409,14 +1410,61 @@ impl AstBuilder {
         if let Some(case_ctx) = ctx.caseExpression() {
             return self.build_case_expression(&case_ctx);
         }
+        if let Some(pc_ctx) = ctx.patternComprehension() {
+            return self.build_pattern_comprehension(&pc_ctx);
+        }
         if let Some(rcp_ctx) = ctx.relationshipsChainPattern() {
             return Ok(ReturnExpr::PatternPredicate(
                 self.build_relationships_chain_pattern(&rcp_ctx)?,
             ));
         }
         Err(QueryError::Syntax(
-            "this expression form (pattern comprehension/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
+            "this expression form (path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
         ))
+    }
+
+    /// `patternComprehension : LBRACK lhs? relationshipsChainPattern where?
+    /// STICK expression RBRACK` -- `lhs` (`symbol ASSIGN`) is the optional
+    /// named-path capture (`p = (n)-->()`), reusing
+    /// `build_relationships_chain_pattern` for the pattern itself (same
+    /// node+chain shape a pattern predicate already builds, just here it's
+    /// enumerated rather than existence-checked) and the same `where?`
+    /// production `build_match_st` uses for an ordinary `MATCH`'s own
+    /// pattern-level `WHERE` (not `ListComp`'s post-projection
+    /// `ReturnExpr`-shaped filter -- `patternComprehension` shares its
+    /// grammar rule with `MATCH`, not with `listComprehension`).
+    fn build_pattern_comprehension(
+        &mut self,
+        ctx: &PatternComprehensionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let path_var = ctx
+            .lhs()
+            .and_then(|lhs| lhs.symbol())
+            .map(|s| symbol_text(&s));
+        let rcp_ctx = ctx
+            .relationshipsChainPattern()
+            .expect("patternComprehension always has a relationshipsChainPattern");
+        let pattern = self.build_relationships_chain_pattern(&rcp_ctx)?;
+        let where_clause = match ctx.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(Box::new(return_expr_to_expr(expr)?))
+            }
+            None => None,
+        };
+        let proj_ctx = ctx
+            .expression()
+            .expect("patternComprehension always has a projection expression");
+        let projection = self.visit(&*proj_ctx).into_return_expr()?;
+        Ok(ReturnExpr::PatternComprehension {
+            path_var,
+            pattern: Box::new(pattern),
+            where_clause,
+            projection: Box::new(projection),
+        })
     }
 
     /// `caseExpression : CASE expression? (WHEN expression THEN

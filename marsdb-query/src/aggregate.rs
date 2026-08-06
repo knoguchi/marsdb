@@ -10,7 +10,7 @@ use marsdb_graph::PropertyValue;
 use crate::ast::Literal;
 use crate::error::QueryError;
 use crate::executor::comparable_ordering;
-use crate::value::Value;
+use crate::value::{PathElem, Value};
 
 /// A hashable, `Eq` stand-in for `Value` — `Value`/`PropertyValue` don't
 /// derive `Eq`/`Hash` themselves (`PropertyValue::Float(f64)` can't: IEEE
@@ -57,16 +57,23 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
         Value::Edge(e) => HashKey::Edge(e.id),
         Value::Property(pv) => property_value_hash_key(pv),
         Value::Literal(lit) => literal_hash_key(lit),
-        Value::List(items) => HashKey::List(items.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?),
-        // Same explicit-error stance as executor::binding_hash_key's
-        // Binding::Path arm — grouping/DISTINCT/collect(DISTINCT) by a
-        // path isn't a case any real usage needs.
-        Value::Path(_) => {
-            return Err(QueryError::Type(
-                "grouping or using DISTINCT with a path (e.g. a named-path/shortestPath() variable) isn't supported"
-                    .into(),
-            ))
-        }
+        Value::List(items) => HashKey::List(
+            items
+                .iter()
+                .map(value_hash_key)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        // Same "identity is the exact node/edge sequence" convention as
+        // executor::binding_hash_key's matching `Binding::Path` arm.
+        Value::Path(elems) => HashKey::List(
+            elems
+                .iter()
+                .map(|e| match e {
+                    PathElem::Node(n) => HashKey::Node(n.id),
+                    PathElem::Edge(edge) => HashKey::Edge(edge.id),
+                })
+                .collect(),
+        ),
         // A `BTreeMap` already iterates in sorted key order, so this is a
         // deterministic, canonical key regardless of the map literal's
         // own written order (`{a: 1, b: 2}` and `{b: 2, a: 1}` must hash
@@ -77,7 +84,10 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
         Value::Map(m) => HashKey::List(
             m.iter()
                 .map(|(k, v)| -> Result<HashKey, QueryError> {
-                    Ok(HashKey::List(vec![HashKey::Str(k.clone()), value_hash_key(v)?]))
+                    Ok(HashKey::List(vec![
+                        HashKey::Str(k.clone()),
+                        value_hash_key(v)?,
+                    ]))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),

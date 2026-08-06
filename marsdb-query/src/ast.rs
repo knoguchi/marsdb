@@ -33,7 +33,7 @@ pub enum CompareOp {
     Contains,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
@@ -258,6 +258,27 @@ pub enum ReturnExpr {
     /// existence can't be checked without a bound row to check it against,
     /// which only `WHERE`'s evaluation context has.
     PatternPredicate(Pattern),
+    /// `[p = (n)-->() | p]` / `[(n)-[:T]->(b) | b.name]` -- unlike
+    /// `PatternPredicate` (existence-only, folded into `Expr::Pattern`
+    /// before it ever reaches the executor), this enumerates *every*
+    /// match of `pattern` (each held-fixed against already-bound named
+    /// endpoints, same as `Expr::Pattern`/`PatternPredicate`) and projects
+    /// `projection` against each match's own bindings -- which include
+    /// any *new* node/relationship variables the pattern introduces
+    /// (e.g. `b`/`r` above; real Cypher allows that here, unlike a
+    /// pattern predicate) -- collecting the results into a `Value::List`.
+    /// `where_clause` is pattern-level `Expr` (not `ReturnExpr`), reusing
+    /// the exact same evaluation `Executor::eval_expr`'s `Expr::Pattern`
+    /// arm already does for a pattern's own `WHERE` -- the grammar's
+    /// `patternComprehension` rule shares its `where?` production with
+    /// ordinary `MATCH`, not with `ListComp`'s post-projection
+    /// `WithExpr`-shaped filter.
+    PatternComprehension {
+        path_var: Option<String>,
+        pattern: Box<Pattern>,
+        where_clause: Option<Box<Expr>>,
+        projection: Box<ReturnExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

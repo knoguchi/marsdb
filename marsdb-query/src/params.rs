@@ -381,6 +381,18 @@ fn substitute_return_expr(
         // No `$param`-able position -- var/labels are identifiers, not
         // expressions.
         ReturnExpr::HasLabel(..) => {}
+        ReturnExpr::PatternComprehension {
+            pattern,
+            where_clause,
+            projection,
+            ..
+        } => {
+            substitute_pattern(pattern, params)?;
+            if let Some(w) = where_clause {
+                substitute_expr(w, params)?;
+            }
+            substitute_return_expr(projection, params)?;
+        }
     }
     Ok(())
 }

@@ -1013,6 +1013,34 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                 "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
             ))
         }
+        // Unlike `PatternPredicate` (existential-only, never introduces a
+        // variable -- `validate_pattern_predicate`'s `require_kind`
+        // checks, not `bind_kind`), a pattern comprehension is allowed to
+        // introduce brand-new node/relationship variables (TCK's
+        // Pattern2 `[4]`/`[5]`), so it reuses `bind_match_pattern` (same
+        // "new var -> fresh binding, already-bound var -> compatibility
+        // check" logic a real `MATCH` pattern gets) against a scoped
+        // copy -- these bindings are local to the projection, they don't
+        // leak into the enclosing RETURN/WITH scope.
+        ReturnExpr::PatternComprehension {
+            path_var,
+            pattern,
+            where_clause,
+            projection,
+        } => {
+            if path_var.is_some() {
+                crate::parse_helpers::validate_named_path_pattern(pattern)?;
+            }
+            let mut inner_scope = scope.clone();
+            bind_match_pattern(pattern, &mut inner_scope)?;
+            if let Some(path_var) = path_var {
+                bind_kind(&mut inner_scope, path_var, Kind::Path, "path variable")?;
+            }
+            if let Some(where_expr) = where_clause {
+                validate_pattern_expr(where_expr, &inner_scope)?;
+            }
+            Kind::List(Box::new(infer_expr(projection, &inner_scope)?))
+        }
     })
 }
 

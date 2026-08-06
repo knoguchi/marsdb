@@ -20,6 +20,7 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
+use crate::parse_helpers::validate_named_path_pattern;
 use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::result::QueryResult;
 use crate::temporal;
@@ -290,6 +291,13 @@ struct VarExpandSpec<'a> {
     exclude_edge_vars: &'a [String],
 }
 
+struct PatternComprehensionSpec<'a> {
+    path_var: &'a Option<String>,
+    pattern: &'a Pattern,
+    where_clause: &'a Option<Box<Expr>>,
+    projection: &'a ReturnExpr,
+}
+
 struct IndexSeekSpec<'a> {
     var: &'a str,
     label: &'a str,
@@ -524,7 +532,7 @@ impl<'a> Executor<'a> {
         match stmt {
             Statement::Create(patterns) => {
                 guard.checkpoint()?;
-                self.execute_create(write_txn, patterns)
+                self.execute_create(write_txn, patterns, guard)
             }
             Statement::CreateIndex {
                 label,
@@ -574,6 +582,7 @@ impl<'a> Executor<'a> {
         &self,
         write_txn: &WriteTransaction,
         patterns: &[Pattern],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         // A standalone CREATE is a MATCH...CREATE tail run against a
         // single empty row -- `resolve_or_create_node` below never finds
@@ -582,7 +591,7 @@ impl<'a> Executor<'a> {
         // No trailing RETURN is possible on a standalone `CREATE` statement
         // (that's the `MATCH ... CREATE ... RETURN` tail's job instead), so
         // the resulting bindings are just discarded here.
-        self.materialize_create(write_txn, patterns, &[BindingRow::new()])?;
+        self.materialize_create(write_txn, patterns, &[BindingRow::new()], guard)?;
         Ok(QueryResult {
             columns: vec![],
             rows: vec![],
@@ -608,6 +617,7 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         patterns: &[Pattern],
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -618,7 +628,8 @@ impl<'a> Executor<'a> {
             // instead of just consulting the original incoming `row`.
             let mut row = row.clone();
             for pattern in patterns {
-                let mut prev_id = self.resolve_or_create_node(write_txn, &pattern.start, &row)?;
+                let mut prev_id =
+                    self.resolve_or_create_node(write_txn, &pattern.start, &row, guard)?;
                 if let Some(var) = &pattern.start.var {
                     row.insert(var.clone(), Binding::Node(prev_id));
                 }
@@ -628,7 +639,7 @@ impl<'a> Executor<'a> {
                             "CREATE doesn't support variable-length relationship patterns (e.g. [:TYPE*1..3])".into(),
                         ));
                     }
-                    let node_id = self.resolve_or_create_node(write_txn, node, &row)?;
+                    let node_id = self.resolve_or_create_node(write_txn, node, &row, guard)?;
                     if let Some(var) = &node.var {
                         row.insert(var.clone(), Binding::Node(node_id));
                     }
@@ -638,7 +649,7 @@ impl<'a> Executor<'a> {
                          semantic::bind_create_pattern",
                     );
                     let rel_props =
-                        self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row)?;
+                        self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &row, guard)?;
                     let (src, dst) = match rel.direction {
                         RelDirection::Right => (prev_id, node_id),
                         RelDirection::Left => (node_id, prev_id),
@@ -674,6 +685,7 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         node: &NodePattern,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<NodeId, QueryError> {
         if let Some(var) = &node.var {
             if let Some(binding) = row.get(var) {
@@ -689,7 +701,7 @@ impl<'a> Executor<'a> {
             }
         }
         let labels: Vec<&str> = node.labels.iter().map(String::as_str).collect();
-        let props = self.eval_props_to_values(Txn::Write(write_txn), &node.props, row)?;
+        let props = self.eval_props_to_values(Txn::Write(write_txn), &node.props, row, guard)?;
         Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
     }
 
@@ -706,11 +718,12 @@ impl<'a> Executor<'a> {
         txn: Txn,
         props: &[(String, ReturnExpr)],
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<BTreeMap<String, PropertyValue>, QueryError> {
         props
             .iter()
             .filter_map(|(k, expr)| {
-                let value = match self.eval_return_expr(txn, expr, row) {
+                let value = match self.eval_return_expr(txn, expr, row, guard) {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e)),
                 };
@@ -760,7 +773,7 @@ impl<'a> Executor<'a> {
             out.extend(self.merge_one_row(write_txn, clause, row, guard)?);
             guard.check_intermediate_rows(out.len())?;
         }
-        self.apply_merge_set(write_txn, clause, &mut out)?;
+        self.apply_merge_set(write_txn, clause, &mut out, guard)?;
         Ok(out)
     }
 
@@ -773,10 +786,11 @@ impl<'a> Executor<'a> {
         txn: Txn,
         clause: &MergeClause,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<bool, QueryError> {
         let any_null = |props: &[(String, ReturnExpr)]| -> Result<bool, QueryError> {
             for (_, expr) in props {
-                if matches!(self.eval_return_expr(txn, expr, row)?, Value::Null) {
+                if matches!(self.eval_return_expr(txn, expr, row, guard)?, Value::Null) {
                     return Ok(true);
                 }
             }
@@ -829,7 +843,7 @@ impl<'a> Executor<'a> {
         // MergeReadOwnWrites error, checked once per row (a property
         // expression can reference this row's other bindings, e.g.
         // `MERGE (n {x: m.missing})`).
-        if self.merge_pattern_has_null_property(Txn::Write(write_txn), clause, row)? {
+        if self.merge_pattern_has_null_property(Txn::Write(write_txn), clause, row, guard)? {
             return Err(QueryError::Semantic(
                 "MERGE pattern property is null — a MERGE's own {...} properties can never be \
                  null (searching for null never matches anything, but storing null is the same \
@@ -870,7 +884,8 @@ impl<'a> Executor<'a> {
         // already bound in the row, else create fresh" logic
         // Tail::Create/materialize_create already use.
         let mut new_row = row.clone();
-        let start_id = self.resolve_or_create_node(write_txn, &clause.pattern.start, &new_row)?;
+        let start_id =
+            self.resolve_or_create_node(write_txn, &clause.pattern.start, &new_row, guard)?;
         if let Some(var) = &clause.pattern.start.var {
             new_row.insert(var.clone(), Binding::Node(start_id));
         }
@@ -878,7 +893,7 @@ impl<'a> Executor<'a> {
         // not a loop, so there's no dangling "previous node" state to
         // thread once a 2nd+ hop is ever supported.
         if let Some((rel, node)) = clause.pattern.hops.first() {
-            let node_id = self.resolve_or_create_node(write_txn, node, &new_row)?;
+            let node_id = self.resolve_or_create_node(write_txn, node, &new_row, guard)?;
             if let Some(var) = &node.var {
                 new_row.insert(var.clone(), Binding::Node(node_id));
             }
@@ -886,7 +901,7 @@ impl<'a> Executor<'a> {
                 "MERGE relationship has exactly one type -- checked by semantic::bind_merge",
             );
             let rel_props =
-                self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row)?;
+                self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row, guard)?;
             let (src, dst) = match rel.direction {
                 RelDirection::Right => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
@@ -918,6 +933,7 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         clause: &MergeClause,
         rows: &mut [BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<(), QueryError> {
         for row in rows.iter_mut() {
             let created = match row.remove(MERGE_CREATED_KEY) {
@@ -932,7 +948,7 @@ impl<'a> Executor<'a> {
                 &clause.on_match
             };
             for item in items {
-                self.apply_set_item(Txn::Write(write_txn), write_txn, row, item)?;
+                self.apply_set_item(Txn::Write(write_txn), write_txn, row, item, guard)?;
             }
         }
         Ok(())
@@ -1025,16 +1041,18 @@ impl<'a> Executor<'a> {
                         current_rows,
                         new_vars,
                         &mut carried_vars,
+                        guard,
                     )?;
                 }
                 QueryClause::Unwind(u) => {
-                    current_rows = self.eval_unwind(txn, u, &current_rows)?;
+                    current_rows = self.eval_unwind(txn, u, &current_rows, guard)?;
                     current_rows = self.apply_with_or_carry(
                         txn,
                         &u.with,
                         current_rows,
                         HashSet::from([u.var.clone()]),
                         &mut carried_vars,
+                        guard,
                     )?;
                 }
                 QueryClause::Merge(m) => {
@@ -1052,6 +1070,7 @@ impl<'a> Executor<'a> {
                         current_rows,
                         pattern_all_vars(&m.pattern),
                         &mut carried_vars,
+                        guard,
                     )?;
                 }
                 // A statement-leading WITH -- no pattern was matched, so
@@ -1067,6 +1086,7 @@ impl<'a> Executor<'a> {
                         current_rows,
                         HashSet::new(),
                         &mut carried_vars,
+                        guard,
                     )?;
                 }
                 // `SET ... WITH ...` -- same real `.set_*_prop_in_txn`
@@ -1082,7 +1102,7 @@ impl<'a> Executor<'a> {
                     let write_txn = require_write_txn(txn);
                     for row in &current_rows {
                         for item in items {
-                            self.apply_set_item(txn, write_txn, row, item)?;
+                            self.apply_set_item(txn, write_txn, row, item, guard)?;
                         }
                     }
                 }
@@ -1109,7 +1129,7 @@ impl<'a> Executor<'a> {
                                     &mut deleted_edges,
                                 )?;
                             } else {
-                                let value = self.eval_return_expr(txn, target, row)?;
+                                let value = self.eval_return_expr(txn, target, row, guard)?;
                                 delete_value(
                                     write_txn,
                                     &value,
@@ -1144,7 +1164,8 @@ impl<'a> Executor<'a> {
                 // reflect these new names by then).
                 QueryClause::Create(patterns) => {
                     let write_txn = require_write_txn(txn);
-                    current_rows = self.materialize_create(write_txn, patterns, &current_rows)?;
+                    current_rows =
+                        self.materialize_create(write_txn, patterns, &current_rows, guard)?;
                     carried_vars.extend(patterns.iter().flat_map(pattern_all_vars));
                 }
             }
@@ -1200,7 +1221,8 @@ impl<'a> Executor<'a> {
                 rows: vec![],
             },
             Some(Tail::Return(items, distinct)) => {
-                let projected = self.materialize_return(txn, items, &current_rows, *distinct)?;
+                let projected =
+                    self.materialize_return(txn, items, &current_rows, *distinct, guard)?;
                 if let Some(ob) = order_by {
                     // DISTINCT (like aggregation) can drop rows, breaking
                     // the 1:1 correspondence `apply_order_by_with_scope`
@@ -1227,7 +1249,8 @@ impl<'a> Executor<'a> {
             }
             Some(Tail::ReturnStar(distinct)) => {
                 let items = return_star_items(carried_vars.iter().cloned())?;
-                let projected = self.materialize_return(txn, &items, &current_rows, *distinct)?;
+                let projected =
+                    self.materialize_return(txn, &items, &current_rows, *distinct, guard)?;
                 if let Some(ob) = order_by {
                     if !distinct {
                         order_by_pre_applied = true;
@@ -1247,21 +1270,27 @@ impl<'a> Executor<'a> {
                 }
             }
             Some(Tail::Delete(vars, ret)) => {
-                self.materialize_delete(txn, vars, &current_rows, false, ret)?
+                self.materialize_delete(txn, vars, &current_rows, false, ret, guard)?
             }
             Some(Tail::DetachDelete(vars, ret)) => {
-                self.materialize_delete(txn, vars, &current_rows, true, ret)?
+                self.materialize_delete(txn, vars, &current_rows, true, ret, guard)?
             }
-            Some(Tail::Set(items, ret)) => self.materialize_set(txn, items, &current_rows, ret)?,
+            Some(Tail::Set(items, ret)) => {
+                self.materialize_set(txn, items, &current_rows, ret, guard)?
+            }
             Some(Tail::Remove(items, ret)) => {
-                self.materialize_remove(txn, items, &current_rows, ret)?
+                self.materialize_remove(txn, items, &current_rows, ret, guard)?
             }
             Some(Tail::Create(patterns, ret)) => {
-                let updated_rows =
-                    self.materialize_create(require_write_txn(txn), patterns, &current_rows)?;
+                let updated_rows = self.materialize_create(
+                    require_write_txn(txn),
+                    patterns,
+                    &current_rows,
+                    guard,
+                )?;
                 match ret {
                     Some(rt) => {
-                        self.materialize_return(txn, &rt.items, &updated_rows, rt.distinct)?
+                        self.materialize_return(txn, &rt.items, &updated_rows, rt.distinct, guard)?
                     }
                     None => QueryResult {
                         columns: vec![],
@@ -1314,6 +1343,7 @@ impl<'a> Executor<'a> {
         rows: Vec<BindingRow>,
         new_vars: HashSet<String>,
         carried_vars: &mut HashSet<String>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let Some(with) = with else {
             carried_vars.extend(new_vars);
@@ -1350,7 +1380,7 @@ impl<'a> Executor<'a> {
         let pre_with_rows =
             (with.order_by.is_some() && !has_aggregate(&with.items) && !with.distinct)
                 .then(|| rows.clone());
-        let mut rows = self.materialize_with(txn, with, &rows)?;
+        let mut rows = self.materialize_with(txn, with, &rows, guard)?;
         if let Some(with_order_by) = &with.order_by {
             // Only a non-aggregating, non-`DISTINCT` WITH keeps a 1:1 row
             // correspondence with its pre-WITH input -- see
@@ -1392,10 +1422,11 @@ impl<'a> Executor<'a> {
         txn: Txn,
         clause: &UnwindClause,
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let mut out = Vec::new();
         for row in rows {
-            let source_value = self.eval_return_expr(txn, &clause.source.0, row)?;
+            let source_value = self.eval_return_expr(txn, &clause.source.0, row, guard)?;
             let elements: Vec<Binding> = match source_value {
                 Value::List(items) => items.iter().map(value_to_binding_restore).collect(),
                 // `UNWIND null AS x` behaves like unwinding an empty list
@@ -1416,7 +1447,7 @@ impl<'a> Executor<'a> {
         if let Some(where_clause) = &clause.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
             for row in out {
-                if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
+                if self.eval_with_expr(txn, where_clause, &row, guard)? == Some(true) {
                     filtered.push(row);
                 }
             }
@@ -1576,6 +1607,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         with: &WithClause,
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<BindingRow>, QueryError> {
         let is_aggregating = has_aggregate(&with.items);
         let mut out = if !is_aggregating {
@@ -1584,7 +1616,7 @@ impl<'a> Executor<'a> {
                 let mut new_row = BindingRow::new();
                 for (i, item) in with.items.iter().enumerate() {
                     let name = with_item_output_name((i, item));
-                    let binding = self.item_binding(txn, &item.expr, row)?;
+                    let binding = self.item_binding(txn, &item.expr, row, guard)?;
                     new_row.insert(name, binding);
                 }
                 out.push(new_row);
@@ -1592,7 +1624,7 @@ impl<'a> Executor<'a> {
             out
         } else {
             validate_return_items(&with.items)?;
-            let grouped = self.resolve_grouped_rows(txn, &with.items, rows)?;
+            let grouped = self.resolve_grouped_rows(txn, &with.items, rows, guard)?;
             grouped
                 .into_iter()
                 .map(|bindings| {
@@ -1618,7 +1650,7 @@ impl<'a> Executor<'a> {
                 // aggregated/deduped names, same as `RETURN`'s own
                 // aggregate WHERE.
                 for row in out {
-                    if self.eval_with_expr(txn, where_clause, &row)? == Some(true) {
+                    if self.eval_with_expr(txn, where_clause, &row, guard)? == Some(true) {
                         filtered.push(row);
                     }
                 }
@@ -1631,7 +1663,7 @@ impl<'a> Executor<'a> {
                 for (row, new_row) in rows.iter().zip(out) {
                     let mut merged = row.clone();
                     merged.extend(new_row.iter().map(|(k, v)| (k.clone(), v.clone())));
-                    if self.eval_with_expr(txn, where_clause, &merged)? == Some(true) {
+                    if self.eval_with_expr(txn, where_clause, &merged, guard)? == Some(true) {
                         filtered.push(new_row);
                     }
                 }
@@ -1651,6 +1683,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         expr: &ReturnExpr,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Binding, QueryError> {
         match expr {
             ReturnExpr::Var(v) => row
@@ -1658,7 +1691,7 @@ impl<'a> Executor<'a> {
                 .cloned()
                 .ok_or_else(|| QueryError::UnboundVariable(v.clone())),
             other => {
-                let value = self.eval_return_expr(txn, other, row)?;
+                let value = self.eval_return_expr(txn, other, row, guard)?;
                 // `value_to_property_value` collapses Node/Edge/List/Path
                 // to Null -- fine for a bare Var (handled above, never
                 // reaches here) but wrong for any *wrapped* non-Var
@@ -1872,6 +1905,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         items: &[ReturnItem],
         rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<Vec<Binding>>, QueryError> {
         struct Group {
             // Aligned to `items`: `Some` at a non-aggregate item's index,
@@ -1909,7 +1943,7 @@ impl<'a> Executor<'a> {
                 key_bindings.push(if is_top_level_aggregate(&item.expr) {
                     None
                 } else {
-                    Some(self.item_binding(txn, &item.expr, row)?)
+                    Some(self.item_binding(txn, &item.expr, row, guard)?)
                 });
             }
             let hash_key: Vec<Option<HashKey>> = key_bindings
@@ -1939,7 +1973,7 @@ impl<'a> Executor<'a> {
                 // this is what makes `count(x)` exclude a null-padded row
                 // while `count(*)` (tracked via `row_count`, not an
                 // accumulator at all) includes it.
-                let value = self.eval_return_expr(txn, &args[0], row)?;
+                let value = self.eval_return_expr(txn, &args[0], row, guard)?;
                 if is_percentile_name(name) {
                     // percentileCont/percentileDisc's second argument (the
                     // percentile) is evaluated per row too -- in practice
@@ -1947,7 +1981,7 @@ impl<'a> Executor<'a> {
                     // structurally requires that, so it's just evaluated
                     // fresh every row like any other expression rather than
                     // memoized once.
-                    let percentile = self.eval_return_expr(txn, &args[1], row)?;
+                    let percentile = self.eval_return_expr(txn, &args[1], row, guard)?;
                     if !matches!(value, Value::Null) {
                         if let Some(acc) = &mut group.accs[i] {
                             acc.fold_percentile(&value, &percentile)?;
@@ -2015,25 +2049,29 @@ impl<'a> Executor<'a> {
         txn: Txn,
         expr: &WithExpr,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Option<bool>, QueryError> {
         Ok(match expr {
             WithExpr::And(l, r) => and3(
-                self.eval_with_expr(txn, l, row)?,
-                self.eval_with_expr(txn, r, row)?,
+                self.eval_with_expr(txn, l, row, guard)?,
+                self.eval_with_expr(txn, r, row, guard)?,
             ),
             WithExpr::Or(l, r) => or3(
-                self.eval_with_expr(txn, l, row)?,
-                self.eval_with_expr(txn, r, row)?,
+                self.eval_with_expr(txn, l, row, guard)?,
+                self.eval_with_expr(txn, r, row, guard)?,
             ),
-            WithExpr::Not(e) => self.eval_with_expr(txn, e, row)?.map(|b| !b),
+            WithExpr::Not(e) => self.eval_with_expr(txn, e, row, guard)?.map(|b| !b),
             WithExpr::Compare(lhs, op, rhs) => {
-                let lv = self.eval_return_expr(txn, lhs, row)?;
-                let rv = self.eval_return_expr(txn, rhs, row)?;
+                let lv = self.eval_return_expr(txn, lhs, row, guard)?;
+                let rv = self.eval_return_expr(txn, rhs, row, guard)?;
                 compare_values(&lv, *op, &rv)
             }
             // Always definite -- same reasoning as `Expr::IsNull`.
-            WithExpr::IsNull(e) => Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null)),
-            WithExpr::Bare(e) => self.eval_return_expr_bool3(txn, e, row)?,
+            WithExpr::IsNull(e) => Some(matches!(
+                self.eval_return_expr(txn, e, row, guard)?,
+                Value::Null
+            )),
+            WithExpr::Bare(e) => self.eval_return_expr_bool3(txn, e, row, guard)?,
         })
     }
 
@@ -2613,14 +2651,15 @@ impl<'a> Executor<'a> {
                 })
             }
             Expr::GeneralCompare(lhs, op, rhs) => {
-                let lv = self.eval_return_expr(txn, lhs, row)?;
-                let rv = self.eval_return_expr(txn, rhs, row)?;
+                let lv = self.eval_return_expr(txn, lhs, row, guard)?;
+                let rv = self.eval_return_expr(txn, rhs, row, guard)?;
                 compare_values(&lv, *op, &rv)
             }
-            Expr::GeneralIsNull(e) => {
-                Some(matches!(self.eval_return_expr(txn, e, row)?, Value::Null))
-            }
-            Expr::GeneralBare(e) => self.eval_return_expr_bool3(txn, e, row)?,
+            Expr::GeneralIsNull(e) => Some(matches!(
+                self.eval_return_expr(txn, e, row, guard)?,
+                Value::Null
+            )),
+            Expr::GeneralBare(e) => self.eval_return_expr_bool3(txn, e, row, guard)?,
             // `WHERE (n)-[:REL]->()` etc (TCK's Pattern1) -- existential:
             // true iff at least one real match of `pattern` exists, with
             // every already-bound named endpoint (`n`, and `m` in `(n)-->
@@ -2751,6 +2790,7 @@ impl<'a> Executor<'a> {
         items: &[ReturnItem],
         rows: &[BindingRow],
         distinct: bool,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         let columns = items
             .iter()
@@ -2766,14 +2806,14 @@ impl<'a> Executor<'a> {
             for row in rows {
                 let mut out_row = Vec::with_capacity(items.len());
                 for item in items {
-                    out_row.push(self.eval_return_expr(txn, &item.expr, row)?);
+                    out_row.push(self.eval_return_expr(txn, &item.expr, row, guard)?);
                 }
                 out_rows.push(out_row);
             }
             out_rows
         } else {
             validate_return_items(items)?;
-            let grouped = self.resolve_grouped_rows(txn, items, rows)?;
+            let grouped = self.resolve_grouped_rows(txn, items, rows, guard)?;
             grouped
                 .into_iter()
                 .map(|bindings| {
@@ -2798,6 +2838,7 @@ impl<'a> Executor<'a> {
         txn: Txn,
         expr: &ReturnExpr,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Value, QueryError> {
         match expr {
             ReturnExpr::Var(var) => {
@@ -2826,7 +2867,7 @@ impl<'a> Executor<'a> {
                 }
                 let arg_values = args
                     .iter()
-                    .map(|a| self.eval_return_expr(txn, a, row))
+                    .map(|a| self.eval_return_expr(txn, a, row, guard))
                     .collect::<Result<Vec<_>, _>>()?;
                 call_builtin(name, &arg_values, self.now_snapshot())
             }
@@ -2835,11 +2876,11 @@ impl<'a> Executor<'a> {
             )),
             ReturnExpr::Case { test, whens, else_ } => {
                 let test_value = match test {
-                    Some(t) => Some(self.eval_return_expr(txn, t, row)?),
+                    Some(t) => Some(self.eval_return_expr(txn, t, row, guard)?),
                     None => None,
                 };
                 for (when, then) in whens {
-                    let when_value = self.eval_return_expr(txn, when, row)?;
+                    let when_value = self.eval_return_expr(txn, when, row, guard)?;
                     // Deliberately reuses the same Null == Null -> true
                     // convention as `compare()` below, not standard
                     // three-valued NULL logic — IS7's `CASE r WHEN null
@@ -2850,43 +2891,43 @@ impl<'a> Executor<'a> {
                         None => matches!(when_value, Value::Literal(Literal::Bool(true))),
                     };
                     if matched {
-                        return self.eval_return_expr(txn, then, row);
+                        return self.eval_return_expr(txn, then, row, guard);
                     }
                 }
                 match else_ {
-                    Some(e) => self.eval_return_expr(txn, e, row),
+                    Some(e) => self.eval_return_expr(txn, e, row, guard),
                     None => Ok(Value::Null),
                 }
             }
             ReturnExpr::Arith(l, op, r) => {
-                let lv = self.eval_return_expr(txn, l, row)?;
-                let rv = self.eval_return_expr(txn, r, row)?;
+                let lv = self.eval_return_expr(txn, l, row, guard)?;
+                let rv = self.eval_return_expr(txn, r, row, guard)?;
                 apply_arith(*op, &lv, &rv)
             }
             ReturnExpr::Neg(e) => {
-                let v = self.eval_return_expr(txn, e, row)?;
+                let v = self.eval_return_expr(txn, e, row, guard)?;
                 apply_neg(&v)
             }
             ReturnExpr::ListLit(items) => Ok(Value::List(
                 items
                     .iter()
-                    .map(|item| self.eval_return_expr(txn, item, row))
+                    .map(|item| self.eval_return_expr(txn, item, row, guard))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             ReturnExpr::Index(base, index) => {
-                let base_v = self.eval_return_expr(txn, base, row)?;
-                let index_v = self.eval_return_expr(txn, index, row)?;
+                let base_v = self.eval_return_expr(txn, base, row, guard)?;
+                let index_v = self.eval_return_expr(txn, index, row, guard)?;
                 apply_index(&base_v, &index_v)
             }
             ReturnExpr::Slice(base, start, end) => {
-                let base_v = self.eval_return_expr(txn, base, row)?;
+                let base_v = self.eval_return_expr(txn, base, row, guard)?;
                 let start_v = start
                     .as_deref()
-                    .map(|s| self.eval_return_expr(txn, s, row))
+                    .map(|s| self.eval_return_expr(txn, s, row, guard))
                     .transpose()?;
                 let end_v = end
                     .as_deref()
-                    .map(|e| self.eval_return_expr(txn, e, row))
+                    .map(|e| self.eval_return_expr(txn, e, row, guard))
                     .transpose()?;
                 apply_slice(&base_v, start_v.as_ref(), end_v.as_ref())
             }
@@ -2896,7 +2937,7 @@ impl<'a> Executor<'a> {
                 where_clause,
                 project,
             } => {
-                let source_v = self.eval_return_expr(txn, source, row)?;
+                let source_v = self.eval_return_expr(txn, source, row, guard)?;
                 let items = match source_v {
                     Value::List(items) => items,
                     Value::Null => return Ok(Value::Null),
@@ -2914,14 +2955,16 @@ impl<'a> Executor<'a> {
                     let mut scoped_row = row.clone();
                     scoped_row.insert(var.clone(), value_to_binding_restore(&item));
                     let keep = match where_clause {
-                        Some(w) => self.eval_return_expr_bool3(txn, w, &scoped_row)? == Some(true),
+                        Some(w) => {
+                            self.eval_return_expr_bool3(txn, w, &scoped_row, guard)? == Some(true)
+                        }
                         None => true,
                     };
                     if !keep {
                         continue;
                     }
                     result.push(match project {
-                        Some(p) => self.eval_return_expr(txn, p, &scoped_row)?,
+                        Some(p) => self.eval_return_expr(txn, p, &scoped_row, guard)?,
                         None => item,
                     });
                 }
@@ -2933,7 +2976,7 @@ impl<'a> Executor<'a> {
                 source,
                 where_clause,
             } => {
-                let source_v = self.eval_return_expr(txn, source, row)?;
+                let source_v = self.eval_return_expr(txn, source, row, guard)?;
                 let items = match source_v {
                     Value::List(items) => items,
                     Value::Null => return Ok(Value::Null),
@@ -2948,7 +2991,7 @@ impl<'a> Executor<'a> {
                     let mut scoped_row = row.clone();
                     scoped_row.insert(var.clone(), value_to_binding_restore(item));
                     preds.push(match where_clause {
-                        Some(w) => self.eval_return_expr_bool3(txn, w, &scoped_row)?,
+                        Some(w) => self.eval_return_expr_bool3(txn, w, &scoped_row, guard)?,
                         None => item_truthy(item),
                     });
                 }
@@ -2960,37 +3003,37 @@ impl<'a> Executor<'a> {
             ReturnExpr::MapLit(entries) => {
                 let mut map = BTreeMap::new();
                 for (k, v) in entries {
-                    map.insert(k.clone(), self.eval_return_expr(txn, v, row)?);
+                    map.insert(k.clone(), self.eval_return_expr(txn, v, row, guard)?);
                 }
                 Ok(Value::Map(map))
             }
             ReturnExpr::And(l, r) => Ok(bool3_to_value(and3(
-                self.eval_return_expr_bool3(txn, l, row)?,
-                self.eval_return_expr_bool3(txn, r, row)?,
+                self.eval_return_expr_bool3(txn, l, row, guard)?,
+                self.eval_return_expr_bool3(txn, r, row, guard)?,
             ))),
             ReturnExpr::Or(l, r) => Ok(bool3_to_value(or3(
-                self.eval_return_expr_bool3(txn, l, row)?,
-                self.eval_return_expr_bool3(txn, r, row)?,
+                self.eval_return_expr_bool3(txn, l, row, guard)?,
+                self.eval_return_expr_bool3(txn, r, row, guard)?,
             ))),
             ReturnExpr::Xor(l, r) => Ok(bool3_to_value(xor3(
-                self.eval_return_expr_bool3(txn, l, row)?,
-                self.eval_return_expr_bool3(txn, r, row)?,
+                self.eval_return_expr_bool3(txn, l, row, guard)?,
+                self.eval_return_expr_bool3(txn, r, row, guard)?,
             ))),
             ReturnExpr::Not(e) => Ok(bool3_to_value(
-                self.eval_return_expr_bool3(txn, e, row)?.map(|b| !b),
+                self.eval_return_expr_bool3(txn, e, row, guard)?.map(|b| !b),
             )),
             ReturnExpr::Compare(l, op, r) => {
-                let lv = self.eval_return_expr(txn, l, row)?;
-                let rv = self.eval_return_expr(txn, r, row)?;
+                let lv = self.eval_return_expr(txn, l, row, guard)?;
+                let rv = self.eval_return_expr(txn, r, row, guard)?;
                 Ok(bool3_to_value(compare_values(&lv, *op, &rv)))
             }
             ReturnExpr::IsNull(e) => {
-                let v = self.eval_return_expr(txn, e, row)?;
+                let v = self.eval_return_expr(txn, e, row, guard)?;
                 Ok(Value::Literal(Literal::Bool(matches!(v, Value::Null))))
             }
             ReturnExpr::In(needle, haystack) => {
-                let nv = self.eval_return_expr(txn, needle, row)?;
-                let hv = self.eval_return_expr(txn, haystack, row)?;
+                let nv = self.eval_return_expr(txn, needle, row, guard)?;
+                let hv = self.eval_return_expr(txn, haystack, row, guard)?;
                 Ok(bool3_to_value(list_membership_ternary(&nv, &hv)?))
             }
             ReturnExpr::HasLabel(var, labels) => {
@@ -3027,7 +3070,80 @@ impl<'a> Executor<'a> {
             ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
                 "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
             )),
+            ReturnExpr::PatternComprehension {
+                path_var,
+                pattern,
+                where_clause,
+                projection,
+            } => self.eval_pattern_comprehension(
+                txn,
+                PatternComprehensionSpec {
+                    path_var,
+                    pattern,
+                    where_clause,
+                    projection,
+                },
+                row,
+                guard,
+            ),
         }
+    }
+
+    /// `[p = (n)-->() | p]` / `[(n)-[:T]->(b) | b.name]` -- enumerates
+    /// every match of `pattern` against the graph (already-bound named
+    /// endpoints in `row` held fixed, exactly like `Expr::Pattern`'s own
+    /// existential search reuses `build_match_plan`'s "already-bound var
+    /// -> Seed, not a fresh scan" mechanism) and projects `projection`
+    /// against each match's own resulting row, collecting into a
+    /// `Value::List`. No limit on `eval_plan_with_limit` here (unlike
+    /// `Expr::Pattern`'s `Some(1)`) -- a comprehension needs every match,
+    /// not just whether one exists.
+    ///
+    /// A named path (`path_var: Some`) reuses `execute_match`'s own
+    /// `name_pattern_for_path`/`assemble_path` pair verbatim -- same
+    /// "synthesize internal names for any unnamed hop, assemble the path
+    /// from those, then strip the synthesized keys back out" approach a
+    /// real `MATCH p = ...` clause already uses. Also reuses
+    /// `validate_named_path_pattern`'s existing restriction (no
+    /// variable-length hop under a named path) for the same reason it
+    /// already applies to `MATCH` -- TCK's Pattern2 `[9]` is a real,
+    /// currently-unsupported case, not a silent-wrong-answer risk.
+    fn eval_pattern_comprehension(
+        &self,
+        txn: Txn,
+        spec: PatternComprehensionSpec<'_>,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Value, QueryError> {
+        let PatternComprehensionSpec {
+            path_var,
+            pattern,
+            where_clause,
+            projection,
+        } = spec;
+        if path_var.is_some() {
+            validate_named_path_pattern(pattern)?;
+        }
+        let carried_vars: HashSet<String> = row.keys().cloned().collect();
+        let (named_pattern, synthesized) = match path_var {
+            Some(_) => name_pattern_for_path(pattern),
+            None => (pattern.clone(), HashSet::new()),
+        };
+        let wc: Option<Expr> = where_clause.as_deref().cloned();
+        let plan = apply_index_seeks(build_match_plan(&named_pattern, &wc, &carried_vars)?, txn)?;
+        let rows = self.eval_plan_with_limit(txn, &plan, std::slice::from_ref(row), guard, None)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for mut r in rows {
+            if let Some(pv) = path_var {
+                let path_binding = assemble_path(&named_pattern, &r);
+                for key in &synthesized {
+                    r.remove(key);
+                }
+                r.insert(pv.clone(), path_binding);
+            }
+            out.push(self.eval_return_expr(txn, projection, &r, guard)?);
+        }
+        Ok(Value::List(out))
     }
 
     /// A `WHERE`-position `ReturnExpr` (list comprehension/quantifier
@@ -3039,8 +3155,9 @@ impl<'a> Executor<'a> {
         txn: Txn,
         expr: &ReturnExpr,
         row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<Option<bool>, QueryError> {
-        value_to_bool3(&self.eval_return_expr(txn, expr, row)?)
+        value_to_bool3(&self.eval_return_expr(txn, expr, row, guard)?)
     }
 
     /// `ret`, when present, is evaluated *after* the physical delete runs,
@@ -3062,6 +3179,7 @@ impl<'a> Executor<'a> {
         rows: &[BindingRow],
         detach: bool,
         ret: &Option<ReturnTail>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         let write_txn = require_write_txn(txn);
         let mut deleted_nodes = HashSet::new();
@@ -3094,7 +3212,7 @@ impl<'a> Executor<'a> {
                         &mut deleted_edges,
                     )?;
                 } else {
-                    let value = self.eval_return_expr(txn, target, row)?;
+                    let value = self.eval_return_expr(txn, target, row, guard)?;
                     delete_value(
                         write_txn,
                         &value,
@@ -3106,7 +3224,7 @@ impl<'a> Executor<'a> {
             }
         }
         let result = match ret {
-            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct)?,
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct, guard)?,
             None => QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -3121,15 +3239,16 @@ impl<'a> Executor<'a> {
         items: &[SetItem],
         rows: &[BindingRow],
         ret: &Option<ReturnTail>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         let write_txn = require_write_txn(txn);
         for row in rows {
             for item in items {
-                self.apply_set_item(txn, write_txn, row, item)?;
+                self.apply_set_item(txn, write_txn, row, item, guard)?;
             }
         }
         match ret {
-            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct),
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct, guard),
             None => Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -3143,6 +3262,7 @@ impl<'a> Executor<'a> {
         items: &[RemoveItem],
         rows: &[BindingRow],
         ret: &Option<ReturnTail>,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         let write_txn = require_write_txn(txn);
         for row in rows {
@@ -3151,7 +3271,7 @@ impl<'a> Executor<'a> {
             }
         }
         match ret {
-            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct),
+            Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct, guard),
             None => Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -3232,6 +3352,7 @@ impl<'a> Executor<'a> {
         write_txn: &WriteTransaction,
         row: &BindingRow,
         item: &SetItem,
+        guard: &ExecutionGuard<'_>,
     ) -> Result<(), QueryError> {
         match item {
             SetItem::Prop(pa, expr) => {
@@ -3262,7 +3383,7 @@ impl<'a> Executor<'a> {
                     pa.var
                 )));
                 }
-                let value = self.eval_return_expr(txn, expr, row)?;
+                let value = self.eval_return_expr(txn, expr, row, guard)?;
                 // `SET n.prop = null` *removes* the property in real Cypher
                 // (found via TCK's Set2 "Set a Property to Null" scenarios,
                 // which this codebase previously couldn't parse at all --
@@ -3343,7 +3464,7 @@ impl<'a> Executor<'a> {
                         "'{var}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding"
                     )));
                 }
-                let map_value = self.eval_return_expr(txn, value, row)?;
+                let map_value = self.eval_return_expr(txn, value, row, guard)?;
                 // A map literal is the common case, but real Cypher also
                 // allows `SET r = a`/`SET r += a` where `a` is itself a
                 // bound node/relationship -- copies its properties, same
@@ -3695,7 +3816,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::IsNull(..)
         | ReturnExpr::In(..)
         | ReturnExpr::HasLabel(..)
-        | ReturnExpr::PatternPredicate(..) => format!("col{idx}"),
+        | ReturnExpr::PatternPredicate(..)
+        | ReturnExpr::PatternComprehension { .. } => format!("col{idx}"),
     }
 }
 
@@ -3769,7 +3891,14 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
         | ReturnExpr::HasLabel(..)
-        | ReturnExpr::PatternPredicate(..) => false,
+        | ReturnExpr::PatternPredicate(..)
+        // A pattern comprehension's projection runs against its own
+        // per-match row, not the outer query's group -- an aggregate
+        // inside it wouldn't mean "aggregate across the outer group,"
+        // it'd need its own separate grouping concept this codebase
+        // doesn't have, so (like `PatternPredicate`) it's opaque here
+        // rather than searched into.
+        | ReturnExpr::PatternComprehension { .. } => false,
     }
 }
 
@@ -3836,7 +3965,11 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
         | ReturnExpr::HasLabel(..)
-        | ReturnExpr::PatternPredicate(..) => false,
+        | ReturnExpr::PatternPredicate(..)
+        // Same opaque treatment as `contains_aggregate`'s own arm above --
+        // a pattern comprehension's projection is checked once it's
+        // actually evaluated per match, not searched into ahead of time.
+        | ReturnExpr::PatternComprehension { .. } => false,
     }
 }
 
@@ -3947,17 +4080,28 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
         Binding::Node(id) => HashKey::Node(*id),
         Binding::Edge(id) => HashKey::Edge(*id),
         Binding::Value(pv) => property_value_hash_key(pv),
-        Binding::List(items) => HashKey::List(items.iter().map(value_hash_key).collect::<Result<Vec<_>, _>>()?),
-        // Explicit error, not a silent hash-by-something-arbitrary —
-        // grouping/collecting by a captured path isn't a case any real
-        // usage needs, and this codebase's stance is to reject an
-        // untested shape rather than guess at its semantics.
-        Binding::Path(_) => {
-            return Err(QueryError::Type(
-                "grouping or collecting by a path (e.g. a named-path/shortestPath() variable) isn't supported"
-                    .into(),
-            ))
-        }
+        Binding::List(items) => HashKey::List(
+            items
+                .iter()
+                .map(value_hash_key)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        // A path's identity is its exact node/edge sequence, in order --
+        // same graph-identity-by-id convention as the `Node`/`Edge` arms
+        // above, just walked element-by-element (found via TCK's
+        // Pattern2 [8]: `WITH [p = (n)-->() | p] AS ps, count(b) AS c`
+        // makes `ps` -- a list of paths -- an implicit GROUP BY key,
+        // real Cypher's own rule that every non-aggregate WITH/RETURN
+        // item groups by).
+        Binding::Path(elems) => HashKey::List(
+            elems
+                .iter()
+                .map(|e| match e {
+                    PathBinding::Node(id) => HashKey::Node(*id),
+                    PathBinding::Edge(id) => HashKey::Edge(*id),
+                })
+                .collect(),
+        ),
         // Same canonical-sorted-entries encoding as `value_hash_key`'s
         // matching `Value::Map` arm (a `BTreeMap` already iterates in
         // sorted key order).
@@ -7798,6 +7942,20 @@ fn eval_projected_expr(
         }
         ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
             "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+        )),
+        // No `Txn`/`ExecutionGuard` reachable from this post-projection
+        // path (same "no `Executor`" limitation as the `Call` arm above)
+        // -- a pattern comprehension needs a real graph traversal to
+        // re-evaluate, which this function structurally can't do. Only
+        // reachable for an ORDER BY key that references a pattern
+        // comprehension *without* repeating a RETURN/WITH item verbatim
+        // (the verbatim case matches by column position before ever
+        // reaching here -- see `apply_order_by`'s `order_by_col`) --
+        // not exercised by any current TCK scenario.
+        ReturnExpr::PatternComprehension { .. } => Err(QueryError::Semantic(
+            "a pattern comprehension can only be used in RETURN/WITH position, or as an ORDER BY \
+             key that repeats one of their items verbatim"
+                .into(),
         )),
     }
 }
