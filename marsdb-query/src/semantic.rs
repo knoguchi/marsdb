@@ -969,9 +969,16 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
         // `validate_pattern_predicate` once `return_expr_to_expr` folds
         // this into `Expr::Pattern` -- reaching `infer_expr` at all means
         // it's in a position `Expr`-folding never runs (RETURN/WITH item,
-        // function arg, ...), which is already a real error the executor
-        // raises when it tries to evaluate this variant directly.
-        ReturnExpr::PatternPredicate(_) => Kind::Scalar,
+        // function arg, ...), a real compile-time error (TCK's List6 [6]
+        // "Fail for size() on pattern predicates" expects a SyntaxError
+        // regardless of whether any row ever reaches evaluation -- found
+        // via the TCK: the executor's own runtime rejection only fires
+        // per-row, silently never triggering on an empty result set).
+        ReturnExpr::PatternPredicate(_) => {
+            return Err(QueryError::Semantic(
+                "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+            ))
+        }
     })
 }
 

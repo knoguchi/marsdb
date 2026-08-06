@@ -107,6 +107,17 @@ fn traversal_with_label_filter() {
 }
 
 #[test]
+fn pattern_predicate_outside_where_is_a_compile_time_error() {
+    // TCK's List6 [6] "Fail for size() on pattern predicates": must
+    // reject at compile time, regardless of whether any row ever reaches
+    // evaluation -- an empty MATCH (zero rows) must still error, not
+    // silently succeed with no output.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH (a), (b), (c) RETURN size((a)-->())").unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_err());
+}
+
+#[test]
 fn where_clause_filters() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice', age: 30})");

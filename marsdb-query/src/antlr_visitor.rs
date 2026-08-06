@@ -3100,10 +3100,11 @@ mod tests {
     }
 
     #[test]
-    fn pattern_predicate_outside_where_is_a_runtime_error_shape() {
+    fn pattern_predicate_outside_where_still_parses() {
         // Grammatically legal anywhere an expression is (real Cypher
-        // restricts it to WHERE) -- parses fine as a ReturnExpr, the
-        // executor is what rejects it outside a WHERE-folded position.
+        // restricts it to WHERE) -- parses fine as a ReturnExpr;
+        // semantic::infer_expr is what rejects it outside a WHERE-folded
+        // position, at compile time (see that function's own docs).
         let expr = parse_expr("(n)-->()").unwrap();
         assert!(matches!(expr, ReturnExpr::PatternPredicate(_)));
     }
