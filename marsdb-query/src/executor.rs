@@ -313,6 +313,8 @@ struct VarExpandSpec<'a> {
     exclude_edge_vars: &'a [String],
     /// See `LogicalPlan::VarExpand::path_segment_var`'s own docs.
     path_segment_var: Option<&'a str>,
+    /// See `LogicalPlan::VarExpand::rel_list_var`'s own docs.
+    rel_list_var: Option<&'a str>,
 }
 
 struct PatternComprehensionSpec<'a> {
@@ -2861,6 +2863,7 @@ impl<'a> Executor<'a> {
                 max_hops,
                 exclude_edge_vars,
                 path_segment_var,
+                rel_list_var,
             } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
                 let mut pending = Vec::new().into_iter();
@@ -2891,6 +2894,7 @@ impl<'a> Executor<'a> {
                             max_hops: *max_hops,
                             exclude_edge_vars,
                             path_segment_var: path_segment_var.as_deref(),
+                            rel_list_var: rel_list_var.as_deref(),
                         },
                         guard,
                     ) {
@@ -3117,6 +3121,9 @@ impl<'a> Executor<'a> {
             if let Some(path_segment_var) = spec.path_segment_var {
                 new_row.insert(path_segment_var.to_string(), Binding::Path(Vec::new()));
             }
+            if let Some(rel_list_var) = spec.rel_list_var {
+                new_row.insert(rel_list_var.to_string(), Binding::List(Vec::new()));
+            }
             out.push(new_row);
         }
         let unbounded = spec.max_hops.is_none();
@@ -3163,8 +3170,14 @@ impl<'a> Executor<'a> {
                         let mut new_row = row.clone();
                         new_row.insert(spec.to_var.to_string(), Binding::Node(entry.other));
                         if let Some(path_segment_var) = spec.path_segment_var {
-                            new_row
-                                .insert(path_segment_var.to_string(), Binding::Path(next_segment));
+                            new_row.insert(
+                                path_segment_var.to_string(),
+                                Binding::Path(next_segment.clone()),
+                            );
+                        }
+                        if let Some(rel_list_var) = spec.rel_list_var {
+                            let edges = segment_edges_to_list(txn, &next_segment)?;
+                            new_row.insert(rel_list_var.to_string(), edges);
                         }
                         out.push(new_row);
                         guard.check_intermediate_rows(out.len())?;
@@ -5375,6 +5388,26 @@ fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
         elems.push(PathBinding::Node(node_id));
     }
     Binding::Path(elems)
+}
+
+/// `[r:TYPE*1..3]`'s own `r` -- real Cypher binds the traversed
+/// relationships as a *list*, fully materialized (not just ids the way
+/// `path_segment_var`'s cheaper `Binding::Path` segment stays), since
+/// `Binding::List` -- like every other post-projection value shape --
+/// only ever holds already-resolved `Value`s (TCK's Match4 `[1]`/`[6]`).
+fn segment_edges_to_list(txn: Txn, segment: &[PathBinding]) -> Result<Binding, QueryError> {
+    let edges = segment
+        .iter()
+        .filter_map(|elem| match elem {
+            PathBinding::Edge(id) => Some(*id),
+            PathBinding::Node(_) => None,
+        })
+        .map(|id| {
+            let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, id)?)?;
+            Ok(Value::Edge(edge))
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    Ok(Binding::List(edges))
 }
 
 fn path_node_id(var: Option<&str>, row: &BindingRow) -> Option<NodeId> {

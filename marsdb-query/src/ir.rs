@@ -71,11 +71,7 @@ pub enum LogicalPlan {
         direction: ExpandDirection,
     },
     /// `[:TYPE*min..max]` — BFS from each input row's bound node instead of
-    /// a single fixed hop. `rel_var` isn't meaningful here (a variable-
-    /// length pattern binds a *list* of relationships in real Cypher; v1
-    /// doesn't support that, so a `rel_var` on a variable-length pattern is
-    /// rejected by the planner rather than silently bound to just the last
-    /// hop's edge).
+    /// a single fixed hop.
     VarExpand {
         input: Box<LogicalPlan>,
         from_var: String,
@@ -98,13 +94,26 @@ pub enum LogicalPlan {
         /// var-length hop binds no single edge to check against) — not
         /// needed by that scenario, since nothing follows its `VarExpand`.
         exclude_edge_vars: Vec<String>,
-        /// Set (to `executor::VAR_LEN_PATH_SEGMENT_VAR`) iff this hop's
-        /// `RelPattern::capture_path_segment` was set -- asks
-        /// `executor::expand_variable_row` to also deposit its own
-        /// internally-traversed edge/node sequence into each output row,
-        /// for `executor::assemble_path` to read back (named-path capture
-        /// over a variable-length hop, TCK's Quantifier1-4 `[8]`/`[9]`).
+        /// Set to a fresh internal name (`executor::name_pattern_for_path`)
+        /// iff this hop's `RelPattern::capture_path_segment` was set --
+        /// asks `executor::expand_variable_row` to also deposit its own
+        /// internally-traversed edge/node sequence into each output row
+        /// under that name, for `executor::assemble_path` to read back
+        /// (named-path capture over a variable-length hop, TCK's
+        /// Quantifier1-4 `[8]`/`[9]`).
         path_segment_var: Option<String>,
+        /// Set to the user's own `rel.var` when they wrote one on a
+        /// variable-length hop (`MATCH (a)-[r:TYPE*1..3]->(b)`, TCK's
+        /// Match4 `[1]`/`[6]`) -- real Cypher binds a *list* of the
+        /// traversed relationships, not a single edge the way a fixed
+        /// hop's own `rel_var` would. Mutually exclusive with
+        /// `path_segment_var` in practice (one is the user's own real
+        /// variable, the other `name_pattern_for_path`'s internal
+        /// bookkeeping for a *different*, anonymous position) --
+        /// `executor::expand_variable_row` deposits a `Binding::List` of
+        /// fully-materialized `Value::Edge`s under this name instead of
+        /// `path_segment_var`'s cheaper id-only `Binding::Path` segment.
+        rel_list_var: Option<String>,
     },
     Filter {
         input: Box<LogicalPlan>,

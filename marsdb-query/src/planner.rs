@@ -129,6 +129,22 @@ pub fn build_match_plan(
             }
         }
         let rel_is_repeat = rel.var.as_ref().is_some_and(|v| carried_vars.contains(v));
+        if rel.hop_range.is_some() && !rel.capture_path_segment && rel_is_repeat {
+            // `MATCH (a)-[rs*]->(b)` where `rs` is *already* bound (e.g.
+            // `WITH [r1, r2] AS rs`) means "match a path whose edge
+            // sequence equals `rs`" in real Cypher -- a genuinely
+            // different feature (constraining the BFS against an
+            // existing value) from the fresh-traversal-then-bind
+            // `rel_list_var` implements below, which would otherwise
+            // silently overwrite the carried binding with whatever this
+            // traversal happens to find (TCK's Match4 `[8]`: a real,
+            // silently-wrong-count bug, not just a coverage gap).
+            return Err(QueryError::Semantic(
+                "matching a variable-length relationship pattern against an already-bound list \
+                 variable isn't supported"
+                    .into(),
+            ));
+        }
         // A fixed-hop relationship is always bound to an internal name, even
         // when the user didn't write one -- needed both to filter inline
         // properties (`-[:KNOWS {name: 'x'}]->`) and to enforce edge
@@ -142,18 +158,16 @@ pub fn build_match_plan(
             } else {
                 namer.name(&rel.var)
             })
-        } else if rel.capture_path_segment {
-            // `rel.var` here is `name_pattern_for_path`'s own internal
-            // path-segment binding, not a real `Binding::Edge` -- unlike
-            // an ordinary fixed hop's `rel_filter_var`, there's no single
-            // edge to inline-property-filter or isomorphism-check against
-            // later hops (the props/edge-isomorphism `Filter`s below all
-            // assume `rel_var` names a `Binding::Edge`), so this must stay
-            // `None`, same as an ordinary (non-path-capturing)
-            // variable-length hop already does.
-            None
         } else {
-            rel.var.clone()
+            // Neither `rel.var` shape a variable-length hop can have here
+            // -- `name_pattern_for_path`'s own internal path-segment
+            // binding (`capture_path_segment`), or the user's own real
+            // relationship-*list* variable (`rel_list_var` below) -- names
+            // a single `Binding::Edge` the way an ordinary fixed hop's
+            // `rel_filter_var` would, so this must stay `None` either way
+            // (the props/edge-isomorphism `Filter`s just below both
+            // assume `rel_var` names a `Binding::Edge`).
+            None
         };
         plan = match rel.hop_range {
             None => LogicalPlan::Expand {
@@ -165,21 +179,6 @@ pub fn build_match_plan(
                 direction,
             },
             Some((min_hops, max_hops)) => {
-                if rel.var.is_some() && !rel.capture_path_segment {
-                    // Real Cypher binds a *list* of relationships for a
-                    // variable-length pattern's rel_var; v1 doesn't support
-                    // that value shape, so reject rather than silently bind
-                    // just the last hop's edge (wrong, not just incomplete).
-                    // `capture_path_segment` is a different, narrower thing
-                    // (`name_pattern_for_path`'s own internal bookkeeping
-                    // for named-path capture, not a real Cypher `rel_var`)
-                    // and doesn't trip this.
-                    return Err(QueryError::Semantic(
-                        "binding a variable name to a variable-length relationship (e.g. \
-                         [r:TYPE*1..3]) isn't supported — omit the variable name"
-                            .into(),
-                    ));
-                }
                 if !rel.props.is_empty() {
                     // Filtering each hop of a variable-length relationship by
                     // the same inline property map isn't supported -- reject
@@ -206,6 +205,13 @@ pub fn build_match_plan(
                             .clone()
                             .expect("name_pattern_for_path always sets rel.var alongside capture_path_segment")
                     }),
+                    // The user's own `[r:TYPE*1..3]` -- a real Cypher
+                    // relationship-list binding (TCK's Match4 `[1]`/`[6]`),
+                    // distinct from `capture_path_segment`'s internal,
+                    // synthesized-name bookkeeping for named-path capture.
+                    rel_list_var: (!rel.capture_path_segment)
+                        .then(|| rel.var.clone())
+                        .flatten(),
                 }
             }
         };
@@ -514,6 +520,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             max_hops,
             exclude_edge_vars,
             path_segment_var,
+            rel_list_var,
         } => LogicalPlan::VarExpand {
             input: Box::new(apply_index_seeks(*input, txn)?),
             from_var,
@@ -524,6 +531,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             max_hops,
             exclude_edge_vars,
             path_segment_var,
+            rel_list_var,
         },
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }

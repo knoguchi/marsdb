@@ -375,6 +375,7 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             max_hops,
             exclude_edge_vars: _,
             path_segment_var: _,
+            rel_list_var: _,
         } => {
             let hops = match max_hops {
                 Some(max) => format!("*{min_hops}..{max}"),

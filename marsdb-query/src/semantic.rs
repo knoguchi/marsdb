@@ -296,7 +296,15 @@ fn bind_match_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), QueryE
     }
     for (rel, node) in &pattern.hops {
         if let Some(var) = &rel.var {
-            bind_kind(scope, var, Kind::Edge, "relationship pattern")?;
+            // A variable-length hop's own `rel.var` binds a *list* of
+            // relationships (`[r:TYPE*1..3]`), not a single edge --
+            // TCK's Match4 `[1]`/`[6]`.
+            let kind = if rel.hop_range.is_some() {
+                Kind::List(Box::new(Kind::Edge))
+            } else {
+                Kind::Edge
+            };
+            bind_kind(scope, var, kind, "relationship pattern")?;
         }
         if let Some(var) = &node.var {
             bind_kind(scope, var, Kind::Node, "node pattern")?;

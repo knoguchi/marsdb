@@ -8222,3 +8222,58 @@ fn type_of_a_deleted_relationship_still_works() {
     let stmt = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
     assert!(Executor::new(&store).execute(&stmt).is_err());
 }
+
+/// `MATCH (a)-[r*1..3]->(b) RETURN r` -- binding a variable to a
+/// variable-length relationship pattern collects the traversed
+/// relationships into a list, not a single edge. TCK's Match4 [1]/[6].
+#[test]
+fn variable_length_relationship_binds_a_list_of_edges() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()-[:T]->()");
+    let result = run(&store, "MATCH (a)-[r*1..1]->(b) RETURN r");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(items.len(), 1);
+            match &items[0] {
+                Value::Edge(e) => assert_eq!(e.label, "T"),
+                other => panic!("expected an Edge, got {other:?}"),
+            }
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A), (b), (c) CREATE (a)-[:X]->(b), (b)-[:Y]->(c)",
+    );
+    let result = run(&store, "MATCH (a:A) MATCH (a)-[r*2]->() RETURN r");
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            assert_eq!(items.len(), 2);
+            let labels: Vec<&str> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Edge(e) => e.label.as_str(),
+                    other => panic!("expected an Edge, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(labels, vec!["X", "Y"]);
+        }
+        other => panic!("expected a List, got {other:?}"),
+    }
+
+    // Matching a variable-length pattern against an *already-bound* list
+    // variable (real Cypher: "match a path whose edges equal this list")
+    // is a genuinely different, unsupported feature -- must stay
+    // rejected, not silently produce the wrong count. The check lives in
+    // the planner (build_match_plan), reached at execution time, not
+    // parse time.
+    let stmt = parse(
+        "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
+         MATCH (first)-[rs*]->(second) RETURN first, second",
+    )
+    .unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("already-bound"));
+}
