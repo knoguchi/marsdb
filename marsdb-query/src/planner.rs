@@ -179,18 +179,6 @@ pub fn build_match_plan(
                 direction,
             },
             Some((min_hops, max_hops)) => {
-                if !rel.props.is_empty() {
-                    // Filtering each hop of a variable-length relationship by
-                    // the same inline property map isn't supported -- reject
-                    // rather than silently ignore the props (same reasoning
-                    // as everywhere else in this planner: a correctness trap
-                    // otherwise).
-                    return Err(QueryError::Semantic(
-                        "inline properties on a variable-length relationship pattern (e.g. \
-                         [:TYPE* {prop: 'x'}]) aren't supported"
-                            .into(),
-                    ));
-                }
                 LogicalPlan::VarExpand {
                     input: Box::new(plan),
                     from_var: from_var.clone(),
@@ -212,6 +200,7 @@ pub fn build_match_plan(
                     rel_list_var: (!rel.capture_path_segment)
                         .then(|| rel.var.clone())
                         .flatten(),
+                    rel_props: rel.props.clone(),
                 }
             }
         };
@@ -521,6 +510,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             exclude_edge_vars,
             path_segment_var,
             rel_list_var,
+            rel_props,
         } => LogicalPlan::VarExpand {
             input: Box::new(apply_index_seeks(*input, txn)?),
             from_var,
@@ -532,6 +522,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             exclude_edge_vars,
             path_segment_var,
             rel_list_var,
+            rel_props,
         },
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }

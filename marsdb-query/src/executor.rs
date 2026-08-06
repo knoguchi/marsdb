@@ -315,6 +315,8 @@ struct VarExpandSpec<'a> {
     path_segment_var: Option<&'a str>,
     /// See `LogicalPlan::VarExpand::rel_list_var`'s own docs.
     rel_list_var: Option<&'a str>,
+    /// See `LogicalPlan::VarExpand::rel_props`'s own docs.
+    rel_props: &'a [(String, ReturnExpr)],
 }
 
 struct PatternComprehensionSpec<'a> {
@@ -2864,6 +2866,7 @@ impl<'a> Executor<'a> {
                 exclude_edge_vars,
                 path_segment_var,
                 rel_list_var,
+                rel_props,
             } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
                 let mut pending = Vec::new().into_iter();
@@ -2895,6 +2898,7 @@ impl<'a> Executor<'a> {
                             exclude_edge_vars,
                             path_segment_var: path_segment_var.as_deref(),
                             rel_list_var: rel_list_var.as_deref(),
+                            rel_props,
                         },
                         guard,
                     ) {
@@ -3126,6 +3130,20 @@ impl<'a> Executor<'a> {
             }
             out.push(new_row);
         }
+        // `[:TYPE* {year: 1988}]` -- evaluated once here (constant across
+        // the whole BFS, not per-candidate; the values can reference this
+        // row's own already-bound variables, same as a fixed hop's inline
+        // props already can) and checked against each candidate edge's
+        // own stored properties during expansion below (TCK's Match4
+        // `[5]`).
+        let rel_props = spec
+            .rel_props
+            .iter()
+            .map(|(key, expr)| {
+                let value = self.eval_return_expr(txn, expr, &row, guard)?;
+                Ok::<_, QueryError>((key.as_str(), value_to_property_value(&value)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let unbounded = spec.max_hops.is_none();
         let effective_max = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
         // Real Cypher's edge-isomorphism rule (no relationship repeated
@@ -3158,6 +3176,18 @@ impl<'a> Executor<'a> {
                     guard.relationship_expansion()?;
                     if used_edges.contains(&entry.edge_id) {
                         continue;
+                    }
+                    if !rel_props.is_empty() {
+                        let edge = deleted_entity_access(GraphStore::get_edge_in_txn(
+                            txn,
+                            entry.edge_id,
+                        )?)?;
+                        let matches = rel_props
+                            .iter()
+                            .all(|(key, expected)| edge.props.get(*key) == Some(expected));
+                        if !matches {
+                            continue;
+                        }
                     }
                     let mut next_used_edges = used_edges.clone();
                     next_used_edges.insert(entry.edge_id);
