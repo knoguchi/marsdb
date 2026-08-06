@@ -500,14 +500,27 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
                  expression position, not a pattern-level property comparison)"
             )))
         }
+        // Same "no literal syntax to substitute to" gap as `List` above --
+        // there's no `Literal::Map` either. A map-valued `$param` used in
+        // ordinary expression position substitutes into a `ReturnExpr::
+        // MapLit` instead (`property_value_to_return_expr`, not this
+        // function).
+        PropertyValue::Map(_) => {
+            return Err(QueryError::Type(format!(
+                "${name}: a map-valued query parameter can't be used here (only in ordinary \
+                 expression position, not a pattern-level property comparison)"
+            )))
+        }
     })
 }
 
 /// Converts a parameter's stored `PropertyValue` into the `ReturnExpr`
 /// that should replace a `ReturnExpr::Lit(Literal::Param(name))` node --
 /// a bare `Literal` for a scalar value (delegates to
-/// `property_value_to_literal`), or a `ReturnExpr::ListLit` for a list
-/// value, recursively (a param list can itself contain nested lists).
+/// `property_value_to_literal`), a `ReturnExpr::ListLit` for a list value
+/// (recursively -- a param list can itself contain nested lists/maps), or
+/// a `ReturnExpr::MapLit` for a map value (same recursion, TCK's Map2/
+/// Map3, Unwind1 `[6]`/`[14]`).
 fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<ReturnExpr, QueryError> {
     Ok(match pv {
         PropertyValue::List(items) => ReturnExpr::ListLit(
@@ -515,6 +528,12 @@ fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<Retur
                 .iter()
                 .map(|item| property_value_to_return_expr(name, item))
                 .collect::<Result<Vec<_>, _>>()?,
+        ),
+        PropertyValue::Map(entries) => ReturnExpr::MapLit(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), property_value_to_return_expr(name, value)?)))
+                .collect::<Result<Vec<_>, QueryError>>()?,
         ),
         other => ReturnExpr::Lit(property_value_to_literal(name, other)?),
     })

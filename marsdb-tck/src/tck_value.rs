@@ -191,6 +191,18 @@ fn property_to_tck(p: &PropertyValue) -> TckValue {
     match p {
         PropertyValue::Null => TckValue::Null,
         PropertyValue::List(items) => TckValue::List(items.iter().map(property_to_tck).collect()),
+        // Same reasoning as `value_to_tck`'s own `Value::Map` arm -- a
+        // map compares the same way node props already do. Only ever
+        // reached for a `$parameter` echoed back into a result (e.g.
+        // `RETURN $mapParam`), never a real stored node/edge property
+        // (`PropertyValue::Map`'s own doc comment).
+        PropertyValue::Map(m) => TckValue::Node {
+            labels: BTreeSet::new(),
+            props: m
+                .iter()
+                .map(|(k, v)| (k.clone(), property_to_tck(v)))
+                .collect(),
+        },
         other => TckValue::Scalar(property_to_scalar(other)),
     }
 }
@@ -201,8 +213,8 @@ fn property_to_tck(p: &PropertyValue) -> TckValue {
 /// `Null`/`List` (see `property_to_tck`'s own dispatch).
 fn property_to_scalar(p: &PropertyValue) -> TckScalar {
     match p {
-        PropertyValue::Null | PropertyValue::List(_) => {
-            unreachable!("property_to_tck dispatches Null/List before reaching here")
+        PropertyValue::Null | PropertyValue::List(_) | PropertyValue::Map(_) => {
+            unreachable!("property_to_tck dispatches Null/List/Map before reaching here")
         }
         PropertyValue::Bool(b) => TckScalar::Bool(*b),
         PropertyValue::Int(i) => TckScalar::Int(*i),

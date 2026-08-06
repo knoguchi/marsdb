@@ -35,7 +35,7 @@ scope.
 | clauses/return-skip-limit | 31 | 31 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/set | 53 | 53 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/unwind | 14 | 12 | 0 | 0 | 0 | 2 | 85.7% |
+| clauses/unwind | 14 | 14 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with | 29 | 29 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with-orderBy | 292 | 292 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with-skip-limit | 9 | 9 | 0 | 0 | 0 | 0 | 100.0% |
@@ -46,9 +46,9 @@ scope.
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 5 | 0 | 0 | 5 | 0 | 50.0% |
 | expressions/graph | 61 | 61 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/list | 185 | 184 | 0 | 0 | 0 | 1 | 99.5% |
+| expressions/list | 185 | 185 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/literals | 131 | 131 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/map | 44 | 39 | 0 | 0 | 0 | 5 | 88.6% |
+| expressions/map | 44 | 44 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/null | 44 | 44 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/path | 7 | 7 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3820** | **0** | **3** | **49** | **8** | **98.5%** |
+| **TOTAL** | **3880** | **3828** | **0** | **3** | **49** | **0** | **98.7%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`

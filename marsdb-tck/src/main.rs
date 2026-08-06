@@ -255,9 +255,22 @@ fn tck_value_to_property_value(name: &str, v: &TckValue) -> Result<PropertyValue
                 .map(|item| tck_value_to_property_value(name, item))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        // A bare map-valued parameter (`{name: 'Apa'}`) parses to the
+        // same `TckValue::Node { labels: {}, .. }` shape a plain map
+        // literal *result* converts to (`tck_value::value_to_tck`'s own
+        // convention) -- empty labels is exactly what distinguishes it
+        // from a real node-valued parameter (still unsupported below,
+        // genuinely out of scope: `PropertyValue` has no `Node`/`Edge`
+        // variant, and nothing in the TCK currently needs one).
+        TckValue::Node { labels, props } if labels.is_empty() => PropertyValue::Map(
+            props
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), tck_value_to_property_value(name, v)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?,
+        ),
         other => {
             return Err(format!(
-                "param {name}: map/node/rel-valued params aren't supported: {other:?}"
+                "param {name}: node/rel-valued params aren't supported: {other:?}"
             ))
         }
     })

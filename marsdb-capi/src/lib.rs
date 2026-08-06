@@ -324,6 +324,21 @@ fn push_property_json(out: &mut String, p: &PropertyValue) {
             }
             out.push(']');
         }
+        // Only ever reached for a `$parameter` echoed back into a result
+        // (e.g. `RETURN $mapParam`) -- never a real stored node/edge
+        // property (`PropertyValue::Map`'s own doc comment).
+        PropertyValue::Map(entries) => {
+            out.push('{');
+            for (i, (key, value)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, key);
+                out.push(':');
+                push_property_json(out, value);
+            }
+            out.push('}');
+        }
     }
 }
 

@@ -89,6 +89,16 @@ fn format_property(p: &PropertyValue) -> String {
             let cells: Vec<String> = items.iter().map(format_property).collect();
             format!("[{}]", cells.join(", "))
         }
+        // Only ever reached for a `$parameter` echoed back into a result
+        // (e.g. `RETURN $mapParam`) -- never a real stored node/edge
+        // property (`PropertyValue::Map`'s own doc comment).
+        PropertyValue::Map(entries) => {
+            let cells: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", format_property(v)))
+                .collect();
+            format!("{{{}}}", cells.join(", "))
+        }
     }
 }
 
