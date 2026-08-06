@@ -24,8 +24,9 @@
 
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr, ReturnItem, SetItem, SortDir,
-    Tail, UnwindClause, UnwindSource, WithClause, WithExpr,
+    QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr, ReturnItem,
+    ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause,
+    WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -50,15 +51,18 @@ use crate::generated::cypherparser::{
     PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
     ProjectionBodyContextAttrs, ProjectionItemContextAttrs, ProjectionItemsContextAttrs,
     PropertyExpressionContext, PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
-    PropertyOrLabelExpressionContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
+    PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
+    ReadingStatementContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
     RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
     RemoveItemContextAll, RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs,
     ReturnStContext, ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext,
-    SetStContextAttrs, SkipStContextAttrs, StringExpPrefixContextAll, StringExpPrefixContextAttrs,
-    StringExpressionContextAll, StringExpressionContextAttrs, StringLitContext,
-    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
-    UnaryAddSubExpressionContextAttrs, UnwindStContext, UnwindStContextAttrs, WhereContextAttrs,
-    WithStContext, WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
+    SetStContextAttrs, SinglePartQContext, SinglePartQContextAttrs, SkipStContextAttrs,
+    StringExpPrefixContextAll, StringExpPrefixContextAttrs, StringExpressionContextAll,
+    StringExpressionContextAttrs, StringLitContext, StringLitContextAttrs, SymbolContextAll,
+    SymbolContextAttrs, UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs,
+    UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
+    UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
+    XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
@@ -85,6 +89,7 @@ pub(crate) enum AstNode {
     RemoveItems(Vec<RemoveItem>),
     CreatePatterns(Vec<Pattern>),
     MergeClause(MergeClause),
+    Statement(Statement),
     Err(QueryError),
 }
 
@@ -153,6 +158,7 @@ impl AstNode {
     ast_node_into!(into_remove_items, RemoveItems, Vec<RemoveItem>);
     ast_node_into!(into_create_patterns, CreatePatterns, Vec<Pattern>);
     ast_node_into!(into_merge_clause, MergeClause, MergeClause);
+    ast_node_into!(into_statement, Statement, Statement);
 }
 
 pub(crate) struct AstBuilder {
@@ -536,6 +542,13 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
     fn visit_mergeSt(&mut self, ctx: &MergeStContext<'input>) -> Self::Return {
         match self.build_merge_st(ctx) {
             Ok(c) => AstNode::MergeClause(c),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_singlePartQ(&mut self, ctx: &SinglePartQContext<'input>) -> Self::Return {
+        match self.build_single_part_q(ctx) {
+            Ok(s) => AstNode::Statement(s),
             Err(e) => AstNode::Err(e),
         }
     }
@@ -1580,6 +1593,195 @@ impl AstBuilder {
         let set_ctx = ctx.setSt().expect("mergeAction always has a setSt");
         self.build_set_st(&set_ctx)
     }
+
+    /// `readingStatement : matchSt | unwindSt | queryCallSt`. `matchSt` can
+    /// expand to more than one `QueryClause::Match` (comma-separated
+    /// disjoint patterns splice into separate `QueryPart`s -- see
+    /// `build_match_st`'s docs), so this appends rather than returning a
+    /// single clause. `queryCallSt` (`CALL proc(...) YIELD ...` used as a
+    /// reading clause) has no `QueryClause` variant to build at all yet --
+    /// CALL/YIELD support is a separate, tracked gap (beads mars-82w), not
+    /// part of this pass.
+    fn append_reading_statement(
+        &mut self,
+        ctx: &ReadingStatementContextAll,
+        clauses: &mut Vec<QueryClause>,
+    ) -> Result<(), QueryError> {
+        if let Some(match_ctx) = ctx.matchSt() {
+            let parts = self.visit(&*match_ctx).into_query_parts()?;
+            clauses.extend(parts.into_iter().map(QueryClause::Match));
+            return Ok(());
+        }
+        if let Some(unwind_ctx) = ctx.unwindSt() {
+            let clause = self.visit(&*unwind_ctx).into_unwind_clause()?;
+            clauses.push(QueryClause::Unwind(clause));
+            return Ok(());
+        }
+        Err(QueryError::Syntax(
+            "CALL isn't supported by the ANTLR parser yet".into(),
+        ))
+    }
+
+    /// `updatingStatement : createSt | mergeSt | deleteSt | setSt |
+    /// removeSt`, used where it's just another clause in the sequence (not
+    /// the statement's final tail -- see `build_mutating_tail` for that
+    /// position instead).
+    fn build_updating_statement_as_clause(
+        &mut self,
+        ctx: &UpdatingStatementContextAll,
+    ) -> Result<QueryClause, QueryError> {
+        if let Some(create_ctx) = ctx.createSt() {
+            return Ok(QueryClause::Create(
+                self.visit(&*create_ctx).into_create_patterns()?,
+            ));
+        }
+        if let Some(merge_ctx) = ctx.mergeSt() {
+            return Ok(QueryClause::Merge(
+                self.visit(&*merge_ctx).into_merge_clause()?,
+            ));
+        }
+        if let Some(delete_ctx) = ctx.deleteSt() {
+            let d = self.visit(&*delete_ctx).into_delete_items()?;
+            return Ok(QueryClause::Delete {
+                items: d.items,
+                detach: d.detach,
+            });
+        }
+        if let Some(set_ctx) = ctx.setSt() {
+            return Ok(QueryClause::Set(self.visit(&*set_ctx).into_set_items()?));
+        }
+        let remove_ctx = ctx
+            .removeSt()
+            .expect("updatingStatement always has one of its 5 alternatives");
+        Ok(QueryClause::Remove(
+            self.visit(&*remove_ctx).into_remove_items()?,
+        ))
+    }
+
+    /// The statement's final mutating clause (`createSt`/`deleteSt`/
+    /// `setSt`/`removeSt` -- never `mergeSt`, which has no `Tail` variant
+    /// at all and always becomes a `QueryClause::Merge` entry even when
+    /// it's last, per `Statement::Match`'s own "missing tail is only valid
+    /// with a MERGE clause" rule) folds into a `Tail::X(_, Option
+    /// <ReturnTail>)`, consuming an optional trailing `returnSt` as a
+    /// narrower `ReturnTail` (items + distinct only). Mirrors `parser.rs`'s
+    /// `parse_mutating_tail`: `RETURN *` and ORDER BY/SKIP/LIMIT aren't
+    /// supported in this specific position (`ReturnTail` has no fields for
+    /// either) even though this grammar's `returnSt` here is the exact
+    /// same full-featured rule used everywhere else, unlike pest's, which
+    /// has a dedicated narrower rule for just this position -- matching
+    /// pest's existing restriction rather than silently accepting
+    /// something it can't represent.
+    fn build_mutating_tail(
+        &mut self,
+        ctx: &UpdatingStatementContextAll,
+        return_ctx: Option<&ReturnStContext>,
+    ) -> Result<Tail, QueryError> {
+        let ret = match return_ctx {
+            Some(return_ctx) => {
+                let c = self.visit(return_ctx).into_return_clause()?;
+                if c.order_by.is_some() || c.skip.is_some() || c.limit.is_some() {
+                    return Err(QueryError::Syntax(
+                        "ORDER BY/SKIP/LIMIT aren't supported on a mutating clause's own trailing RETURN"
+                            .into(),
+                    ));
+                }
+                let Tail::Return(items, distinct) = c.tail else {
+                    return Err(QueryError::Syntax(
+                        "RETURN * isn't supported as a mutating clause's own trailing RETURN"
+                            .into(),
+                    ));
+                };
+                Some(ReturnTail { items, distinct })
+            }
+            None => None,
+        };
+        if let Some(create_ctx) = ctx.createSt() {
+            let patterns = self.visit(&*create_ctx).into_create_patterns()?;
+            return Ok(Tail::Create(patterns, ret));
+        }
+        if let Some(delete_ctx) = ctx.deleteSt() {
+            let d = self.visit(&*delete_ctx).into_delete_items()?;
+            return Ok(if d.detach {
+                Tail::DetachDelete(d.items, ret)
+            } else {
+                Tail::Delete(d.items, ret)
+            });
+        }
+        if let Some(set_ctx) = ctx.setSt() {
+            let items = self.visit(&*set_ctx).into_set_items()?;
+            return Ok(Tail::Set(items, ret));
+        }
+        let remove_ctx = ctx
+            .removeSt()
+            .expect("build_mutating_tail's caller already excluded mergeSt");
+        let items = self.visit(&*remove_ctx).into_remove_items()?;
+        Ok(Tail::Remove(items, ret))
+    }
+
+    /// `singlePartQ : readingStatement* (returnSt | updatingStatement+
+    /// returnSt?)`. No WITH chaining at this level at all (that's
+    /// `multiPartQ`'s job, not yet wired up -- see this file's module
+    /// doc). Mirrors `parser.rs`'s `parse_match_stmt` for the no-WITH
+    /// case: leading reading statements become `QueryClause`s; either a
+    /// bare `returnSt` becomes the statement's `Tail::Return`/`ReturnStar`
+    /// (with ORDER BY/SKIP/LIMIT at the statement level, where they
+    /// belong for this form), or the *last* updating statement becomes the
+    /// tail (see `build_mutating_tail`) with every earlier one just
+    /// another `QueryClause`, unless that last one is `mergeSt` (never a
+    /// tail -- see that function's docs), in which case a trailing
+    /// `returnSt`, if present, becomes the statement's own `Tail::Return`
+    /// instead.
+    fn build_single_part_q(&mut self, ctx: &SinglePartQContext) -> Result<Statement, QueryError> {
+        let mut clauses = Vec::new();
+        for rs_ctx in ctx.readingStatement_all() {
+            self.append_reading_statement(&rs_ctx, &mut clauses)?;
+        }
+
+        let updating = ctx.updatingStatement_all();
+        let return_ctx = ctx.returnSt();
+        let mut tail = None;
+        let mut order_by = None;
+        let mut skip = None;
+        let mut limit = None;
+        let mut consumed_return = false;
+
+        if let Some((last, earlier)) = updating.split_last() {
+            for us_ctx in earlier {
+                clauses.push(self.build_updating_statement_as_clause(us_ctx)?);
+            }
+            if last.mergeSt().is_some() {
+                clauses.push(self.build_updating_statement_as_clause(last)?);
+            } else {
+                tail = Some(self.build_mutating_tail(last, return_ctx.as_deref())?);
+                consumed_return = return_ctx.is_some();
+            }
+        }
+
+        if !consumed_return {
+            if let Some(return_ctx) = return_ctx {
+                let c = self.visit(&*return_ctx).into_return_clause()?;
+                tail = Some(c.tail);
+                order_by = c.order_by;
+                skip = c.skip;
+                limit = c.limit;
+            }
+        }
+
+        if tail.is_none() && !clauses.iter().any(|c| matches!(c, QueryClause::Merge(_))) {
+            return Err(QueryError::Syntax(
+                "a query needs a RETURN/DELETE/SET tail, unless it has a MERGE clause with nothing after it".into(),
+            ));
+        }
+
+        Ok(Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        })
+    }
 }
 
 /// `where`'s grammar reuses the same `expression` rule as everywhere else
@@ -1763,6 +1965,17 @@ mod tests {
             .mergeSt()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `mergeSt`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_merge_clause()
+    }
+
+    fn parse_statement(input: &str) -> Result<Statement, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .singlePartQ()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `singlePartQ`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_statement()
     }
 
     #[test]
@@ -2646,5 +2859,178 @@ mod tests {
     #[test]
     fn merge_duplicate_on_match_errors() {
         assert!(parse_merge("MERGE (a) ON MATCH SET a.x = 1 ON MATCH SET a.y = 2").is_err());
+    }
+
+    #[test]
+    fn statement_match_return() {
+        let s = parse_statement("MATCH (a) RETURN a").unwrap();
+        let Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        } = s
+        else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 1);
+        assert!(matches!(clauses[0], QueryClause::Match(_)));
+        assert!(matches!(tail, Some(Tail::Return(_, false))));
+        assert!(order_by.is_none());
+        assert!(skip.is_none());
+        assert!(limit.is_none());
+    }
+
+    #[test]
+    fn statement_return_star() {
+        let s = parse_statement("MATCH (a) RETURN *").unwrap();
+        let Statement::Match { tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::ReturnStar(false))));
+    }
+
+    #[test]
+    fn statement_order_by_skip_limit_on_bare_return() {
+        let s = parse_statement("MATCH (a) RETURN a ORDER BY a SKIP 1 LIMIT 2").unwrap();
+        let Statement::Match {
+            order_by,
+            skip,
+            limit,
+            ..
+        } = s
+        else {
+            panic!("expected Statement::Match");
+        };
+        assert!(order_by.is_some());
+        assert_eq!(skip, Some(1));
+        assert_eq!(limit, Some(2));
+    }
+
+    #[test]
+    fn statement_multiple_reading_clauses() {
+        let s = parse_statement("MATCH (a) UNWIND [1,2] AS x RETURN a, x").unwrap();
+        let Statement::Match { clauses, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(clauses[0], QueryClause::Match(_)));
+        assert!(matches!(clauses[1], QueryClause::Unwind(_)));
+    }
+
+    #[test]
+    fn statement_set_becomes_tail_with_return_tail() {
+        let s = parse_statement("MATCH (n) SET n.x = 1 RETURN n").unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 1);
+        let Some(Tail::Set(items, Some(ret))) = tail else {
+            panic!("expected Tail::Set with a ReturnTail");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(ret.items.len(), 1);
+    }
+
+    #[test]
+    fn statement_set_without_trailing_return() {
+        let s = parse_statement("MATCH (n) SET n.x = 1").unwrap();
+        let Statement::Match { tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::Set(_, None))));
+    }
+
+    #[test]
+    fn statement_detach_delete_tail() {
+        let s = parse_statement("MATCH (n) DETACH DELETE n").unwrap();
+        let Statement::Match { tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::DetachDelete(_, None))));
+    }
+
+    #[test]
+    fn statement_two_updating_clauses_last_becomes_tail() {
+        // SET is just another QueryClause; DELETE (last) becomes the Tail.
+        let s = parse_statement("MATCH (n) SET n.x = 1 DELETE n RETURN count(n)").unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(clauses[1], QueryClause::Set(_)));
+        assert!(matches!(tail, Some(Tail::Delete(_, Some(_)))));
+    }
+
+    #[test]
+    fn statement_bare_merge_no_tail() {
+        // MERGE alone (no RETURN) is the one case a missing Tail is valid
+        // -- MERGE never becomes the Tail itself (no Tail::Merge variant).
+        let s = parse_statement("MERGE (a)").unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(clauses[0], QueryClause::Merge(_)));
+        assert!(tail.is_none());
+    }
+
+    #[test]
+    fn statement_merge_with_trailing_return() {
+        // MERGE followed by RETURN: MERGE is a QueryClause, RETURN becomes
+        // the statement's own full Tail::Return (order/skip/limit-capable),
+        // not a narrower embedded ReturnTail the way SET/DELETE/REMOVE/
+        // CREATE consume their own trailing RETURN.
+        let s = parse_statement("MERGE (a) RETURN a ORDER BY a").unwrap();
+        let Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            ..
+        } = s
+        else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(clauses[0], QueryClause::Merge(_)));
+        assert!(matches!(tail, Some(Tail::Return(_, false))));
+        assert!(order_by.is_some());
+    }
+
+    #[test]
+    fn statement_bare_match_without_tail_errors() {
+        // Unlike MERGE, a bare MATCH with nothing after it is almost
+        // certainly a mistake, not a deliberate no-op.
+        assert!(parse_statement("MATCH (n)").is_err());
+    }
+
+    #[test]
+    fn statement_mutating_tail_order_by_errors() {
+        // ReturnTail (SET/DELETE/REMOVE/CREATE's own trailing RETURN) has
+        // no room for ORDER BY/SKIP/LIMIT, even though this grammar's
+        // returnSt is the same full rule used everywhere else.
+        assert!(parse_statement("MATCH (n) SET n.x = 1 RETURN n ORDER BY n.x").is_err());
+    }
+
+    #[test]
+    fn statement_mutating_tail_return_star_errors() {
+        assert!(parse_statement("MATCH (n) SET n.x = 1 RETURN *").is_err());
+    }
+
+    #[test]
+    fn statement_create_tail() {
+        let s = parse_statement("CREATE (a) RETURN a").unwrap();
+        let Statement::Match { tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::Create(_, Some(_)))));
+    }
+
+    #[test]
+    fn statement_remove_tail() {
+        let s = parse_statement("MATCH (n) REMOVE n.x").unwrap();
+        let Statement::Match { tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::Remove(_, None))));
     }
 }
