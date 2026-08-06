@@ -50,20 +50,20 @@ use crate::generated::cypherparser::{
     LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs, MapPairContextAttrs,
     MatchStContext, MatchStContextAttrs, MergeActionContextAll, MergeActionContextAttrs,
     MergeStContext, MergeStContextAttrs, MultDivExpressionContext, MultiPartQContext,
-    MultiPartQContextAttrs, NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs,
-    NotExpressionContext, NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext,
-    NumLitContextAll, NumLitContextAttrs, OrderItemContextAttrs, OrderStContext,
-    OrderStContextAttrs, ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
-    ParenthesizedExpressionContextAttrs, PatternContextAttrs, PatternElemChainContextAttrs,
-    PatternElemContext, PatternElemContextAttrs, PatternPartContextAttrs, PatternWhereContextAttrs,
-    PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
-    ProjectionBodyContextAttrs, ProjectionItemContextAttrs, ProjectionItemsContextAttrs,
-    PropertiesContextAll, PropertiesContextAttrs, PropertyExpressionContext,
-    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
-    PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
-    ReadingStatementContextAttrs, RegularQueryContext, RegularQueryContextAttrs,
-    RelationDetailContext, RelationDetailContextAttrs, RelationshipPatternContext,
-    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
+    MultiPartQContextAttrs, NameContextAll, NameContextAttrs, NodeLabelsContextAttrs,
+    NodePatternContext, NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
+    NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
+    OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
+    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
+    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
+    PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
+    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertiesContextAll,
+    PropertiesContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
+    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs,
+    ReadingStatementContextAll, ReadingStatementContextAttrs, RegularQueryContext,
+    RegularQueryContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
+    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
     RelationshipsChainPatternContext, RelationshipsChainPatternContextAttrs, RemoveItemContextAll,
     RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
     ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
@@ -645,7 +645,7 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
                 Ok(v) => v,
                 Err(e) => return AstNode::Err(e),
             };
-            items.push((name_ctx.get_text(), value));
+            items.push((name_text(&name_ctx), value));
         }
         AstNode::ReturnExpr(ReturnExpr::MapLit(items))
     }
@@ -658,6 +658,21 @@ fn symbol_text(ctx: &SymbolContextAll) -> String {
             let text = t.get_text();
             text[1..text.len() - 1].to_string()
         }
+        None => ctx.get_text(),
+    }
+}
+
+/// `name : symbol | reservedWord`, used for label/property/map-key names
+/// (unlike `symbol`, usable for bound-variable names too). Delegates to
+/// `symbol_text` (backtick-stripping) when the alternative taken is
+/// `symbol` -- a bare `.get_text()` here would keep the backticks
+/// themselves as part of the name (e.g. `` map.`name` `` would look up
+/// the map key `` `name` `` instead of `name`, always missing -- a real
+/// bug found via the TCK, not just deferred coverage). `reservedWord` has
+/// no escaping to strip either way.
+fn name_text(ctx: &NameContextAll) -> String {
+    match ctx.symbol() {
+        Some(s) => symbol_text(&s),
         None => ctx.get_text(),
     }
 }
@@ -817,7 +832,7 @@ impl AstBuilder {
         let var = ctx.symbol().map(|s| symbol_text(&s));
         let labels = ctx
             .nodeLabels()
-            .map(|nl| nl.name_all().iter().map(|n| n.get_text()).collect())
+            .map(|nl| nl.name_all().iter().map(|n| name_text(n)).collect())
             .unwrap_or_default();
         let props = self.build_properties(ctx.properties())?;
         Ok(NodePattern { var, labels, props })
@@ -827,7 +842,7 @@ impl AstBuilder {
         let var = ctx.symbol().map(|s| symbol_text(&s));
         let rel_types = ctx
             .relationshipTypes()
-            .map(|rt| rt.name_all().iter().map(|n| n.get_text()).collect())
+            .map(|rt| rt.name_all().iter().map(|n| name_text(n)).collect())
             .unwrap_or_default();
         let props = self.build_properties(ctx.properties())?;
         let hop_range = ctx
@@ -1309,7 +1324,7 @@ impl AstBuilder {
                 "a label check (`x:Label`) only applies to a bare variable".into(),
             ));
         };
-        let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+        let labels = labels_ctx.name_all().iter().map(|n| name_text(n)).collect();
         Ok(ReturnExpr::HasLabel(var, labels))
     }
 
@@ -1343,7 +1358,7 @@ impl AstBuilder {
                 };
                 Ok(ReturnExpr::Prop(PropAccess {
                     var,
-                    prop: names[0].get_text(),
+                    prop: name_text(&names[0]),
                 }))
             }
             _ => Err(QueryError::Syntax(
@@ -1770,7 +1785,7 @@ impl AstBuilder {
             .expect("setItem always has a propertyExpression or symbol");
         let var = symbol_text(&sym_ctx);
         if let Some(labels_ctx) = ctx.nodeLabels() {
-            let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+            let labels = labels_ctx.name_all().iter().map(|n| name_text(n)).collect();
             return Ok(SetItem::Labels(var, labels));
         }
         let expr_ctx = ctx
@@ -1815,7 +1830,7 @@ impl AstBuilder {
         let labels_ctx = ctx
             .nodeLabels()
             .expect("removeItem's symbol form always has nodeLabels");
-        let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+        let labels = labels_ctx.name_all().iter().map(|n| name_text(n)).collect();
         Ok(RemoveItem::Labels(symbol_text(&sym_ctx), labels))
     }
 
@@ -2300,14 +2315,16 @@ impl AstBuilder {
         ctx: &CreateIndexStContext,
     ) -> Result<Statement, QueryError> {
         let names = ctx.name_all();
-        let label = names
-            .first()
-            .expect("createIndexSt always has a label name")
-            .get_text();
-        let prop = names
-            .get(1)
-            .expect("createIndexSt always has a property name")
-            .get_text();
+        let label = name_text(
+            names
+                .first()
+                .expect("createIndexSt always has a label name"),
+        );
+        let prop = name_text(
+            names
+                .get(1)
+                .expect("createIndexSt always has a property name"),
+        );
         Ok(Statement::CreateIndex {
             label,
             prop,
@@ -3585,6 +3602,22 @@ mod tests {
             ReturnExpr::Prop(PropAccess {
                 var: "n".to_string(),
                 prop: "name".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn property_access_with_backtick_escaped_name() {
+        // Regression (found via the TCK, Map1 [5]): `.get_text()` on the
+        // `name` context kept the surrounding backticks as part of the
+        // property name (`` `name` `` instead of `name`), so this always
+        // looked up the wrong key. `name_text` strips them, same as
+        // `symbol_text` already does for backtick-escaped variable names.
+        assert_eq!(
+            parse_expr("n.`weird name`").unwrap(),
+            ReturnExpr::Prop(PropAccess {
+                var: "n".to_string(),
+                prop: "weird name".to_string(),
             })
         );
     }
