@@ -53,12 +53,29 @@ Two more fixes, same file, same discovery method:
   `<digit> [{[_]<digit>}...]` — no such restriction. `007` couldn't
   tokenize as `DIGIT` at all under the old rule. Fixed to `[0-9] (...)?`.
 
-These fixes alone raised the TCK parse-acceptance comparison below from
-90.5% to 96.4% and eliminated the entire `Temporal1/2/10` (149 cases) and
+These fixes raised the TCK parse-acceptance comparison below from 90.5%
+to 96.4% and eliminated the entire `Temporal1/2/10` (149 cases) and
 `Match5` (27 cases) disagreement categories — those weren't real grammar
 gaps, just corrupted date-string literals (`'2018-01-01T12:00'` contains
 `-`/`:`) and bounded variable-length relationship patterns
 (`[:REL*2]`/`[:REL*1..3]`) failing on their numeric bounds.
+
+One structural (not lexer) fix, in `CypherParser.g4`:
+
+- `multiPartQ : readingStatement* (updatingStatement* withSt)+ singlePartQ;`
+  only allowed `updatingStatement`s (CREATE/MERGE/DELETE/SET/REMOVE)
+  between a multi-part query's `WITH` boundaries, not `readingStatement`s
+  (MATCH/UNWIND/CALL) — so ordinary, idiomatic chains like
+  `WITH ... UNWIND ... WITH ...` or `WITH ... MATCH ... WITH ...` couldn't
+  parse at all. `readingStatement` can't satisfy `updatingStatement*`, and
+  `singlePartQ` (what the grammar falls back to once the `(...)+ ` group
+  can't continue) has no `withSt` of its own to absorb a second `WITH`.
+  Fixed to `((readingStatement | updatingStatement)* withSt)+`.
+
+This raised acceptance from 96.4% to 98.5% and eliminated the entire
+`Quantifier9/10/11/12` disagreement category (64 cases) — those TCK
+scenarios chain several `UNWIND`/`WITH` pairs, which simply couldn't
+parse under the old rule.
 
 ## Why this toolchain
 

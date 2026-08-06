@@ -98,8 +98,17 @@ singlePartQ
     : readingStatement* (returnSt | updatingStatement+ returnSt?)
     ;
 
+// Upstream (antlr/grammars-v4) only allowed `updatingStatement`s between a
+// multi-part query's WITH boundaries, not `readingStatement`s (MATCH/
+// UNWIND/CALL) -- so `WITH ... UNWIND ... WITH ...` or
+// `WITH ... MATCH ... WITH ...` (ordinary, idiomatic Cypher) couldn't
+// parse: readingStatement isn't updatingStatement, so it can't satisfy
+// `updatingStatement*` before the next `withSt`, and it can't be absorbed
+// by `singlePartQ` either since `singlePartQ` has no trailing `withSt` of
+// its own. Fixed to allow either kind of statement before each WITH,
+// matching openCypher's actual clause-chaining rules.
 multiPartQ
-    : readingStatement* (updatingStatement* withSt)+ singlePartQ
+    : readingStatement* ((readingStatement | updatingStatement)* withSt)+ singlePartQ
     ;
 
 matchSt
