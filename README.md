@@ -1,7 +1,15 @@
 # MarsDB
 
+[![CI](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml/badge.svg)](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml)
+[![Crates.io](https://img.shields.io/crates/v/marsdb.svg)](https://crates.io/crates/marsdb)
+[![docs.rs](https://img.shields.io/docsrs/marsdb)](https://docs.rs/marsdb)
+[![codecov](https://codecov.io/gh/knoguchi/marsdb/graph/badge.svg)](https://codecov.io/gh/knoguchi/marsdb)
+[![License](https://img.shields.io/crates/l/marsdb.svg)](#license)
+[![openCypher TCK](https://img.shields.io/badge/openCypher_TCK-99.9%25-brightgreen)](CYPHER_COVERAGE.md)
+
 An embeddable property-graph database with an openCypher query subset:
-single binary, single file, optional in-memory mode.
+single binary, single file, optional in-memory mode. Full manual:
+[knoguchi.github.io/marsdb](https://knoguchi.github.io/marsdb/).
 
 ```
 $ marsdb :memory:
@@ -169,7 +177,7 @@ avoid (no bare `-->` shorthand, `MERGE` capped at one hop, etc.) — see
 ```
 marsdb-storage   thin trait boundary over redb (file + in-memory backends)
 marsdb-graph     property graph model, CRUD, KV/adjacency encoding
-marsdb-query     openCypher subset: pest grammar -> AST -> IR -> executor
+marsdb-query     openCypher subset: ANTLR4 grammar -> AST -> IR -> executor
 marsdb           embeddable public Rust API (Database::open/in_memory/execute)
 marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
@@ -219,32 +227,23 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 3601/3880 TCK scenarios pass (92.8%), 1 wrong-result
-scenario (a `Duration` internal-representation edge case, not a wrong
-answer — see [CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact
-explanation).
-
-## Recent Grammar Improvements
-
-- Support for chaining any mutating clause directly into each other without requiring WITH
-- Support for ON MATCH/ON CREATE in either order in MERGE clauses  
-- Enhanced temporal builtin functions with transaction/statement/realtime variants
-- Improved handling of parenthesized variable targets in SET clauses
+Short version: 3878/3880 TCK scenarios pass (99.9%), 0 wrong-result
+scenarios. The only 2 non-passing scenarios need dates at year
+±999,999,999 — a real storage/library range limitation, not a bug (see
+[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact explanation).
+Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 
-- List-valued `$parameters`, to unblock `UNWIND $items AS x` with a
-  parameter-bound list directly (a list-valued *property* or an inline
-  list literal both already work)
-- `CALL <procedure>`/`YIELD` and `EXISTS { ... }` subqueries
-- Named-path capture over a variable-length relationship pattern
-  (`MATCH p = (a)-[:T*1..3]->(b) RETURN p`)
 - From-scratch storage engine (page format, B-tree, crash recovery) as an
   alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
-- Property and composite indexes with transactional maintenance
-- Real query optimizer: index selection, cardinality estimates, and
-  cost-based join/traversal ordering
+- Composite indexes (single-property indexes already exist) with
+  transactional maintenance
+- Real query optimizer: cardinality estimates and cost-based
+  join/traversal ordering (beyond the existing index-seek fusion and
+  top-k `ORDER BY ... LIMIT` selection)
+- Node/relationship-valued `$parameters` (map-valued already works)
 
 ## Testing
 
@@ -291,15 +290,14 @@ git submodule update --init marsdb-tck/openCypher
 cargo run --release -p marsdb-tck
 ```
 
-Attempts every scenario, including the majority that use Cypher features
-MarsDB doesn't implement at all or only partially (spatial types; list
-comprehensions; `CALL`, ...) — those report as a distinct "rejected at
-parse time" outcome, not lumped in with genuine wrong answers.
-Of the scenarios MarsDB's grammar accepts at all, it gets the *right*
-answer in the large majority — the real, checked-for-real signal this
-exists to produce, not the flat pass-rate over the whole suite. Side-effect
-assertions and the TCK's typed error taxonomy aren't checked (see the
-crate's doc comments for why).
+Attempts every scenario in the vendored TCK — currently 3878/3880 pass,
+and the 2 that don't (dates far outside the representable range, see
+[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)) report as a distinct
+"unexpected" outcome, not lumped in with genuine wrong answers. 0
+scenarios currently return the wrong answer — the real, checked-for-real
+signal this exists to produce, not the flat pass-rate over the whole
+suite. Side-effect assertions and the TCK's typed error taxonomy aren't
+checked (see the crate's doc comments for why).
 
 ## License
 

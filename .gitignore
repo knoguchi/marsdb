@@ -1,4 +1,5 @@
 /target
+/book/book
 marsdb-python/target
 marsdb-python/.venv
 __pycache__/

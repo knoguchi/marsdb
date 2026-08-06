@@ -49,6 +49,32 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --verbose
 
+  coverage:
+    name: Coverage
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # `--exclude marsdb-tck`: its own conformance-run binary is exercised
+      # via `cargo run -p marsdb-tck --release` against the vendored TCK
+      # submodule (see CYPHER_COVERAGE.md), not `cargo test` -- counting it
+      # here would show 0% on real, tested code and skew the number down
+      # for no reason. `--ignore-filename-regex 'generated/'`: vendored
+      # ANTLR output (`marsdb-query/src/generated/`), not hand-written
+      # logic -- same reasoning.
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --workspace --exclude marsdb-tck \
+            --ignore-filename-regex 'generated/' \
+            --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   bindings:
     name: Python and Go bindings
     needs: quality
