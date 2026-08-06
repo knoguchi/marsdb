@@ -24,12 +24,27 @@ pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), Qu
 
 /// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`).
 /// Fixed-hop patterns of any length are fine; a *single* variable-length
-/// hop (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/`[9]`) is also
-/// supported (`executor::name_pattern_for_path`/`assemble_path` know how
-/// to capture its own internally-traversed edge/node sequence) -- but a
-/// pattern *mixing* a variable-length hop with any other hop isn't (not
-/// exercised by the TCK, and which hop's own path-building strategy would
-/// even apply gets genuinely ambiguous once there's more than one).
+/// hop on its own (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/
+/// `[9]`) is also supported (`executor::name_pattern_for_path`/
+/// `assemble_path` know how to capture its own internally-traversed
+/// edge/node sequence, via a fresh synthesized binding name, same
+/// mechanism as any other anonymous pattern token).
+///
+/// A pattern *mixing* a variable-length hop with any other hop stays
+/// rejected, even though `assemble_path` itself already generalizes
+/// cleanly to that case (each hop's segment is independent) -- the real
+/// blocker is a *different*, pre-existing gap one level down:
+/// `LogicalPlan::VarExpand`'s own edge-isomorphism handling doesn't track
+/// a variable-length hop's internally-traversed edges for *later* hops to
+/// exclude (only the reverse direction, earlier *fixed* hops excluding a
+/// later `VarExpand`, is handled -- see that type's own docs). Found via
+/// TCK's Match4 `[7]` (`(n)-[*0..1]-()-[r]-()-[*0..1]-(m)`, an isomorphism
+/// double-count: expected 32, got 52) once the mixing restriction was
+/// briefly lifted to chase Match6 `[14]`/`[17]`/Match7 `[19]` -- those 3
+/// scenarios don't happen to trigger the gap, but nothing about this
+/// restriction can tell the difference between a pattern that would and
+/// one that wouldn't, so all mixing stays rejected until the
+/// isomorphism gap itself is fixed.
 pub(crate) fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
     let var_len_hops = pattern
         .hops

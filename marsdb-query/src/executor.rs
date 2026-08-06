@@ -1080,7 +1080,6 @@ impl<'a> Executor<'a> {
                             for key in &synthesized {
                                 row.remove(key);
                             }
-                            row.remove(VAR_LEN_PATH_SEGMENT_VAR);
                             row.insert(path_var.clone(), path_binding);
                         }
                         rows
@@ -3803,7 +3802,6 @@ impl<'a> Executor<'a> {
                 for key in &synthesized {
                     r.remove(key);
                 }
-                r.remove(VAR_LEN_PATH_SEGMENT_VAR);
                 r.insert(pv.clone(), path_binding);
             }
             out.push(self.eval_return_expr(txn, projection, &r, guard)?);
@@ -5166,13 +5164,18 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
             let mut rel = rel.clone();
             if rel.hop_range.is_some() {
                 // A variable-length hop's own internally-traversed edges
-                // are exposed via a reserved binding name (`VarExpand`'s
-                // `path_segment_var`, set by `planner::build_match_plan`
-                // when it sees this flag), not `rel.var` -- binding a
-                // *list* of relationships to a real variable name is a
-                // separate, still-unsupported feature (see that
-                // function's own rejection for it), and this flag doesn't
-                // ask for that.
+                // are exposed via a fresh synthesized binding name (same
+                // `fresh()` mechanism as every other anonymous token
+                // here, so multiple variable-length hops in one pattern
+                // each get their own, no collision -- TCK's Match6
+                // `[17]`), read by `planner::build_match_plan` (its
+                // `VarExpand`'s `path_segment_var`) and `assemble_path`.
+                // Deliberately *not* the ordinary "bind this hop's own
+                // rel_var" path -- binding a *list* of relationships to a
+                // real variable name is a separate, still-unsupported
+                // feature (see `build_match_plan`'s own rejection for
+                // that, gated on `!capture_path_segment`).
+                rel.var = Some(fresh(&mut counter, &mut synthesized));
                 rel.capture_path_segment = true;
             } else if rel.var.is_none() {
                 rel.var = Some(fresh(&mut counter, &mut synthesized));
@@ -5186,17 +5189,6 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
         .collect();
     (Pattern { start, hops }, synthesized)
 }
-
-/// Reserved `BindingRow` key `expand_variable_row` inserts a `Binding::
-/// Path` segment (that hop's own internally-traversed edges/intermediate
-/// nodes, in order) under, when its `VarExpand`'s `path_segment_var` is
-/// set -- read back by `assemble_path`. Not a real Cypher variable name
-/// (starts with `__`, same convention `name_pattern_for_path`'s own
-/// synthesized names use), and scoped to exactly one variable-length hop
-/// per pattern (`validate_named_path_pattern`'s own restriction), so
-/// there's no collision risk from reusing one fixed name rather than
-/// generating a fresh one per hop.
-pub(crate) const VAR_LEN_PATH_SEGMENT_VAR: &str = "__var_len_path_segment";
 
 /// Assembles a `Binding::Path` from `pattern`'s (fully-named, via
 /// `name_pattern_for_path`) start/hop variables, in pattern order. Falls
@@ -5215,12 +5207,12 @@ fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
     for (rel, node) in &pattern.hops {
         if rel.capture_path_segment {
             // A variable-length hop's own segment, deposited by
-            // `expand_variable_row` under the reserved
-            // `VAR_LEN_PATH_SEGMENT_VAR` key -- already the exact
-            // alternating Edge/Node/.../Node sequence this hop
-            // contributes, ending at `node`'s own binding (so no separate
-            // `path_node_id(node.var, ...)` read is needed after this).
-            let Some(Binding::Path(segment)) = row.get(VAR_LEN_PATH_SEGMENT_VAR) else {
+            // `expand_variable_row` under this hop's own synthesized
+            // `rel.var` -- already the exact alternating Edge/Node/.../
+            // Node sequence this hop contributes, ending at `node`'s own
+            // binding (so no separate `path_node_id(node.var, ...)` read
+            // is needed after this).
+            let Some(Binding::Path(segment)) = rel.var.as_deref().and_then(|v| row.get(v)) else {
                 return Binding::Value(PropertyValue::Null);
             };
             elems.extend(segment.iter().cloned());

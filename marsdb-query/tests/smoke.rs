@@ -4406,8 +4406,8 @@ fn shortest_path_requires_both_endpoints_already_bound() {
 /// Named-path capture over a *single* variable-length hop -- TCK's
 /// Quantifier1-4 [8]/[9], ReturnOrderBy2 [12], Pattern2 [9]. Assembles the
 /// path from `expand_variable_row`'s own internally-traversed edge/node
-/// sequence (deposited under the reserved `VAR_LEN_PATH_SEGMENT_VAR` key,
-/// see `assemble_path`'s docs), not a plain fixed-hop token.
+/// sequence (deposited under that hop's own synthesized `rel.var`, see
+/// `assemble_path`'s docs), not a plain fixed-hop token.
 #[test]
 fn named_path_over_a_single_variable_length_hop() {
     let store = GraphStore::open_memory().unwrap();
@@ -4433,10 +4433,15 @@ fn named_path_over_a_single_variable_length_hop() {
             other => panic!("expected a Path, got {other:?}"),
         }
     }
+}
 
-    // Mixing a variable-length hop with another hop in the same named
-    // path still isn't supported -- not a silent-wrong-answer risk.
-    let err = parse("MATCH p = (a)-[:KNOWS*1..3]->(b)-->(c) RETURN p").unwrap_err();
+/// Mixing a variable-length hop with another hop in the same named path
+/// still isn't supported -- see `validate_named_path_pattern`'s own docs
+/// (a pre-existing edge-isomorphism gap one level down makes this unsafe
+/// in general, even though path *assembly* itself handles it fine).
+#[test]
+fn named_path_mixing_variable_length_and_fixed_hops_errors() {
+    let err = parse("MATCH p = (a)-[:KNOWS*0..1]->(b)-[:FRIEND*0..1]->(c) RETURN p").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("variable-length"));
 }
 

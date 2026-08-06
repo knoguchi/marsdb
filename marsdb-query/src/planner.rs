@@ -6,7 +6,7 @@ use crate::ast::{
     CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr,
 };
 use crate::error::QueryError;
-use crate::executor::{literal_to_value, VAR_LEN_PATH_SEGMENT_VAR};
+use crate::executor::literal_to_value;
 use crate::ir::{ExpandDirection, LogicalPlan};
 
 struct VarNamer {
@@ -142,6 +142,16 @@ pub fn build_match_plan(
             } else {
                 namer.name(&rel.var)
             })
+        } else if rel.capture_path_segment {
+            // `rel.var` here is `name_pattern_for_path`'s own internal
+            // path-segment binding, not a real `Binding::Edge` -- unlike
+            // an ordinary fixed hop's `rel_filter_var`, there's no single
+            // edge to inline-property-filter or isomorphism-check against
+            // later hops (the props/edge-isomorphism `Filter`s below all
+            // assume `rel_var` names a `Binding::Edge`), so this must stay
+            // `None`, same as an ordinary (non-path-capturing)
+            // variable-length hop already does.
+            None
         } else {
             rel.var.clone()
         };
@@ -155,11 +165,15 @@ pub fn build_match_plan(
                 direction,
             },
             Some((min_hops, max_hops)) => {
-                if rel.var.is_some() {
+                if rel.var.is_some() && !rel.capture_path_segment {
                     // Real Cypher binds a *list* of relationships for a
                     // variable-length pattern's rel_var; v1 doesn't support
                     // that value shape, so reject rather than silently bind
                     // just the last hop's edge (wrong, not just incomplete).
+                    // `capture_path_segment` is a different, narrower thing
+                    // (`name_pattern_for_path`'s own internal bookkeeping
+                    // for named-path capture, not a real Cypher `rel_var`)
+                    // and doesn't trip this.
                     return Err(QueryError::Semantic(
                         "binding a variable name to a variable-length relationship (e.g. \
                          [r:TYPE*1..3]) isn't supported — omit the variable name"
@@ -187,9 +201,11 @@ pub fn build_match_plan(
                     min_hops,
                     max_hops,
                     exclude_edge_vars: prior_rel_vars.clone(),
-                    path_segment_var: rel
-                        .capture_path_segment
-                        .then(|| VAR_LEN_PATH_SEGMENT_VAR.to_string()),
+                    path_segment_var: rel.capture_path_segment.then(|| {
+                        rel.var
+                            .clone()
+                            .expect("name_pattern_for_path always sets rel.var alongside capture_path_segment")
+                    }),
                 }
             }
         };

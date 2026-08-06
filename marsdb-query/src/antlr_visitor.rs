@@ -3192,6 +3192,10 @@ mod tests {
 
     #[test]
     fn named_path_over_variable_length_mixed_with_another_hop_errors() {
+        // See `validate_named_path_pattern`'s own docs -- a pre-existing
+        // edge-isomorphism gap one level down (`LogicalPlan::VarExpand`)
+        // makes this unsafe in general, even though `assemble_path` itself
+        // would handle it fine.
         assert!(parse_match("MATCH p = (a)-[*1..3]->(b)-->(c)").is_err());
     }
 
