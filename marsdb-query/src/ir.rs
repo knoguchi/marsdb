@@ -98,6 +98,13 @@ pub enum LogicalPlan {
         /// var-length hop binds no single edge to check against) — not
         /// needed by that scenario, since nothing follows its `VarExpand`.
         exclude_edge_vars: Vec<String>,
+        /// Set (to `executor::VAR_LEN_PATH_SEGMENT_VAR`) iff this hop's
+        /// `RelPattern::capture_path_segment` was set -- asks
+        /// `executor::expand_variable_row` to also deposit its own
+        /// internally-traversed edge/node sequence into each output row,
+        /// for `executor::assemble_path` to read back (named-path capture
+        /// over a variable-length hop, TCK's Quantifier1-4 `[8]`/`[9]`).
+        path_segment_var: Option<String>,
     },
     Filter {
         input: Box<LogicalPlan>,

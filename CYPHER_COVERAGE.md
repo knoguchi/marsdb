@@ -26,17 +26,17 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/match | 381 | 357 | 0 | 0 | 24 | 0 | 93.7% |
+| clauses/match | 381 | 362 | 0 | 0 | 19 | 0 | 95.0% |
 | clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/return | 63 | 60 | 0 | 1 | 2 | 0 | 95.2% |
-| clauses/return-orderby | 35 | 34 | 0 | 0 | 1 | 0 | 97.1% |
+| clauses/return | 63 | 62 | 0 | 1 | 0 | 0 | 98.4% |
+| clauses/return-orderby | 35 | 35 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/return-skip-limit | 31 | 31 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/set | 53 | 53 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/unwind | 14 | 12 | 0 | 0 | 0 | 2 | 85.7% |
-| clauses/with | 29 | 28 | 0 | 0 | 1 | 0 | 96.6% |
+| clauses/with | 29 | 29 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with-orderBy | 292 | 292 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with-skip-limit | 9 | 9 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/with-where | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
@@ -51,16 +51,16 @@ scope.
 | expressions/map | 44 | 39 | 0 | 0 | 0 | 5 | 88.6% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/null | 44 | 44 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/path | 7 | 2 | 0 | 0 | 5 | 0 | 28.6% |
-| expressions/pattern | 50 | 49 | 0 | 0 | 1 | 0 | 98.0% |
+| expressions/path | 7 | 5 | 0 | 0 | 2 | 0 | 71.4% |
+| expressions/pattern | 50 | 50 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/quantifier | 604 | 596 | 0 | 0 | 8 | 0 | 98.7% |
+| expressions/quantifier | 604 | 604 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/temporal | 1004 | 999 | 1 | 3 | 1 | 0 | 99.5% |
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3780** | **1** | **7** | **84** | **8** | **97.4%** |
+| **TOTAL** | **3880** | **3801** | **1** | **7** | **63** | **8** | **98.0%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -480,8 +480,9 @@ cross-joins — different from the cross-join WITH-chaining above, which
 works), `MERGE` patterns with more than
 one relationship hop (whole-pattern atomicity across multiple
 simultaneously-unbound hops isn't attempted), named-path capture over a
-variable-length pattern (only `shortestPath()` tracks the hop-by-hop chain
-needed to reconstruct a path over `*`-traversal), or `shortestPath()` with
-a minimum hop count greater than 1 (a plain visited-set BFS can't
-correctly answer "shortest path of at least N hops" for N > 1 without a
-different algorithm).
+pattern *mixing* a variable-length hop with another hop (a single
+variable-length hop on its own is supported — `expand_variable_row`
+tracks its own traversed edge/node sequence for exactly that), or
+`shortestPath()` with a minimum hop count greater than 1 (a plain
+visited-set BFS can't correctly answer "shortest path of at least N
+hops" for N > 1 without a different algorithm).

@@ -6,7 +6,7 @@ use crate::ast::{
     CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr,
 };
 use crate::error::QueryError;
-use crate::executor::literal_to_value;
+use crate::executor::{literal_to_value, VAR_LEN_PATH_SEGMENT_VAR};
 use crate::ir::{ExpandDirection, LogicalPlan};
 
 struct VarNamer {
@@ -187,6 +187,9 @@ pub fn build_match_plan(
                     min_hops,
                     max_hops,
                     exclude_edge_vars: prior_rel_vars.clone(),
+                    path_segment_var: rel
+                        .capture_path_segment
+                        .then(|| VAR_LEN_PATH_SEGMENT_VAR.to_string()),
                 }
             }
         };
@@ -494,6 +497,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             min_hops,
             max_hops,
             exclude_edge_vars,
+            path_segment_var,
         } => LogicalPlan::VarExpand {
             input: Box::new(apply_index_seeks(*input, txn)?),
             from_var,
@@ -503,6 +507,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             min_hops,
             max_hops,
             exclude_edge_vars,
+            path_segment_var,
         },
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }

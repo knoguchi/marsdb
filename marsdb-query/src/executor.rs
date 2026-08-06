@@ -289,6 +289,8 @@ struct VarExpandSpec<'a> {
     /// Rel-vars bound by earlier fixed hops of the same pattern — see
     /// `LogicalPlan::VarExpand`'s own docs.
     exclude_edge_vars: &'a [String],
+    /// See `LogicalPlan::VarExpand::path_segment_var`'s own docs.
+    path_segment_var: Option<&'a str>,
 }
 
 struct PatternComprehensionSpec<'a> {
@@ -1078,6 +1080,7 @@ impl<'a> Executor<'a> {
                             for key in &synthesized {
                                 row.remove(key);
                             }
+                            row.remove(VAR_LEN_PATH_SEGMENT_VAR);
                             row.insert(path_var.clone(), path_binding);
                         }
                         rows
@@ -2757,6 +2760,7 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
                 exclude_edge_vars,
+                path_segment_var,
             } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
                 let mut pending = Vec::new().into_iter();
@@ -2786,6 +2790,7 @@ impl<'a> Executor<'a> {
                             min_hops: *min_hops,
                             max_hops: *max_hops,
                             exclude_edge_vars,
+                            path_segment_var: path_segment_var.as_deref(),
                         },
                         guard,
                     ) {
@@ -3009,6 +3014,9 @@ impl<'a> Executor<'a> {
         if spec.min_hops == 0 {
             let mut new_row = row.clone();
             new_row.insert(spec.to_var.to_string(), Binding::Node(start_id));
+            if let Some(path_segment_var) = spec.path_segment_var {
+                new_row.insert(path_segment_var.to_string(), Binding::Path(Vec::new()));
+            }
             out.push(new_row);
         }
         let unbounded = spec.max_hops.is_none();
@@ -3027,12 +3035,18 @@ impl<'a> Executor<'a> {
                 _ => None,
             })
             .collect();
-        let mut frontier = vec![(start_id, seed_used_edges)];
+        // The ordered `Edge, Node, Edge, Node, ...` sequence built up so
+        // far, alongside the existing `used_edges` isomorphism set --
+        // only actually consulted when `path_segment_var` is set (named-
+        // path capture over this hop, see `LogicalPlan::VarExpand`'s own
+        // docs), but always threaded through the BFS regardless (a plain
+        // `Vec`, cheap to carry and clone even when unused).
+        let mut frontier = vec![(start_id, seed_used_edges, Vec::<PathBinding>::new())];
         let mut depth = 0u32;
         while depth < effective_max && !frontier.is_empty() {
             depth += 1;
             let mut next_frontier = Vec::new();
-            for (node, used_edges) in frontier {
+            for (node, used_edges, segment) in frontier {
                 for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_labels)? {
                     guard.relationship_expansion()?;
                     if used_edges.contains(&entry.edge_id) {
@@ -3040,11 +3054,18 @@ impl<'a> Executor<'a> {
                     }
                     let mut next_used_edges = used_edges.clone();
                     next_used_edges.insert(entry.edge_id);
-                    next_frontier.push((entry.other, next_used_edges));
+                    let mut next_segment = segment.clone();
+                    next_segment.push(PathBinding::Edge(entry.edge_id));
+                    next_segment.push(PathBinding::Node(entry.other));
+                    next_frontier.push((entry.other, next_used_edges, next_segment.clone()));
                     guard.check_intermediate_rows(next_frontier.len())?;
                     if depth >= spec.min_hops {
                         let mut new_row = row.clone();
                         new_row.insert(spec.to_var.to_string(), Binding::Node(entry.other));
+                        if let Some(path_segment_var) = spec.path_segment_var {
+                            new_row
+                                .insert(path_segment_var.to_string(), Binding::Path(next_segment));
+                        }
                         out.push(new_row);
                         guard.check_intermediate_rows(out.len())?;
                     }
@@ -3206,8 +3227,8 @@ impl<'a> Executor<'a> {
                 let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
                 Ok(edge.props.get(&pa.prop).cloned())
             }
-            // A WITH-projected scalar (or list/map/path) has no scalar
-            // `.prop` to access via this path — e.g. `WITH message.id AS
+            // A WITH-projected scalar (or list/map) has no scalar `.prop`
+            // to access via this path — e.g. `WITH message.id AS
             // messageId` then `messageId.foo` isn't meaningful. Treat as
             // absent rather than erroring, consistent with how a missing
             // property already behaves. `Binding::Map` specifically *does*
@@ -3219,7 +3240,16 @@ impl<'a> Executor<'a> {
             // here, for the same "not always a scalar `PropertyValue`"
             // reason (well, it always *is* one here, but `lookup_prop_value`
             // is where that access actually happens either way).
-            Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => Ok(None),
+            Binding::Value(_) | Binding::List(_) | Binding::Map(_) => Ok(None),
+            // Unlike the others, a path is a real type error, not just an
+            // "absent" property -- real Cypher's `InvalidArgumentType`
+            // (TCK's MatchWhere1 `[14]`: `MATCH r = (n)-[*]->() WHERE
+            // r.name = 'apa'`). Property access never had a meaning for a
+            // path to begin with (it's not a graph-object-shaped value).
+            Binding::Path(_) => Err(QueryError::Type(format!(
+                "'{}' is a path — property access requires a node, relationship, or map",
+                pa.var
+            ))),
         }
     }
 
@@ -3735,12 +3765,13 @@ impl<'a> Executor<'a> {
     /// A named path (`path_var: Some`) reuses `execute_match`'s own
     /// `name_pattern_for_path`/`assemble_path` pair verbatim -- same
     /// "synthesize internal names for any unnamed hop, assemble the path
-    /// from those, then strip the synthesized keys back out" approach a
-    /// real `MATCH p = ...` clause already uses. Also reuses
-    /// `validate_named_path_pattern`'s existing restriction (no
-    /// variable-length hop under a named path) for the same reason it
-    /// already applies to `MATCH` -- TCK's Pattern2 `[9]` is a real,
-    /// currently-unsupported case, not a silent-wrong-answer risk.
+    /// from those, then strip the synthesized keys (and the reserved
+    /// variable-length-hop segment key, if any) back out" approach a real
+    /// `MATCH p = ...` clause already uses, including over a single
+    /// variable-length hop (TCK's Pattern2 `[9]`) -- also reuses
+    /// `validate_named_path_pattern`'s own restriction on anything wider
+    /// (a variable-length hop mixed with another hop) for the same reason
+    /// it already applies to `MATCH`.
     fn eval_pattern_comprehension(
         &self,
         txn: Txn,
@@ -3772,6 +3803,7 @@ impl<'a> Executor<'a> {
                 for key in &synthesized {
                     r.remove(key);
                 }
+                r.remove(VAR_LEN_PATH_SEGMENT_VAR);
                 r.insert(pv.clone(), path_binding);
             }
             out.push(self.eval_return_expr(txn, projection, &r, guard)?);
@@ -5132,7 +5164,17 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
         .iter()
         .map(|(rel, node)| {
             let mut rel = rel.clone();
-            if rel.var.is_none() {
+            if rel.hop_range.is_some() {
+                // A variable-length hop's own internally-traversed edges
+                // are exposed via a reserved binding name (`VarExpand`'s
+                // `path_segment_var`, set by `planner::build_match_plan`
+                // when it sees this flag), not `rel.var` -- binding a
+                // *list* of relationships to a real variable name is a
+                // separate, still-unsupported feature (see that
+                // function's own rejection for it), and this flag doesn't
+                // ask for that.
+                rel.capture_path_segment = true;
+            } else if rel.var.is_none() {
                 rel.var = Some(fresh(&mut counter, &mut synthesized));
             }
             let mut node = node.clone();
@@ -5144,6 +5186,17 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
         .collect();
     (Pattern { start, hops }, synthesized)
 }
+
+/// Reserved `BindingRow` key `expand_variable_row` inserts a `Binding::
+/// Path` segment (that hop's own internally-traversed edges/intermediate
+/// nodes, in order) under, when its `VarExpand`'s `path_segment_var` is
+/// set -- read back by `assemble_path`. Not a real Cypher variable name
+/// (starts with `__`, same convention `name_pattern_for_path`'s own
+/// synthesized names use), and scoped to exactly one variable-length hop
+/// per pattern (`validate_named_path_pattern`'s own restriction), so
+/// there's no collision risk from reusing one fixed name rather than
+/// generating a fresh one per hop.
+pub(crate) const VAR_LEN_PATH_SEGMENT_VAR: &str = "__var_len_path_segment";
 
 /// Assembles a `Binding::Path` from `pattern`'s (fully-named, via
 /// `name_pattern_for_path`) start/hop variables, in pattern order. Falls
@@ -5160,6 +5213,19 @@ fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
     };
     let mut elems = vec![PathBinding::Node(start_id)];
     for (rel, node) in &pattern.hops {
+        if rel.capture_path_segment {
+            // A variable-length hop's own segment, deposited by
+            // `expand_variable_row` under the reserved
+            // `VAR_LEN_PATH_SEGMENT_VAR` key -- already the exact
+            // alternating Edge/Node/.../Node sequence this hop
+            // contributes, ending at `node`'s own binding (so no separate
+            // `path_node_id(node.var, ...)` read is needed after this).
+            let Some(Binding::Path(segment)) = row.get(VAR_LEN_PATH_SEGMENT_VAR) else {
+                return Binding::Value(PropertyValue::Null);
+            };
+            elems.extend(segment.iter().cloned());
+            continue;
+        }
         let Some(edge_id) = path_edge_id(rel.var.as_deref(), row) else {
             return Binding::Value(PropertyValue::Null);
         };

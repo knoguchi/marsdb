@@ -414,6 +414,17 @@ pub struct RelPattern {
     /// behavior). `max: None` means unbounded, capped at a safety depth by
     /// the executor.
     pub hop_range: Option<(u32, Option<u32>)>,
+    /// Set only by `executor::name_pattern_for_path` on a variable-length
+    /// hop, when assembling a named-path capture (`p = (a)-[*1..3]->(b)`,
+    /// TCK's Quantifier1-4 `[8]`/`[9]`) -- asks the planner's `VarExpand`
+    /// to also expose its own internally-traversed edge/node sequence (in
+    /// order) for `executor::assemble_path` to splice into the whole
+    /// pattern's path, via a reserved internal binding name
+    /// (`planner::VAR_LEN_PATH_SEGMENT_VAR`), completely separate from
+    /// `var` -- which stays unset, since binding a *list* of relationships
+    /// to a real variable name is a different, still-unsupported feature
+    /// (see `planner::build_match_plan`'s own rejection for that).
+    pub capture_path_segment: bool,
 }
 
 /// A linear chain: node, (rel, node)*.

@@ -4403,9 +4403,40 @@ fn shortest_path_requires_both_endpoints_already_bound() {
     assert!(err.to_string().to_lowercase().contains("shortestpath"));
 }
 
+/// Named-path capture over a *single* variable-length hop -- TCK's
+/// Quantifier1-4 [8]/[9], ReturnOrderBy2 [12], Pattern2 [9]. Assembles the
+/// path from `expand_variable_row`'s own internally-traversed edge/node
+/// sequence (deposited under the reserved `VAR_LEN_PATH_SEGMENT_VAR` key,
+/// see `assemble_path`'s docs), not a plain fixed-hop token.
 #[test]
-fn named_path_over_variable_length_pattern_errors_at_parse_time() {
-    let err = parse("MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN p").unwrap_err();
+fn named_path_over_a_single_variable_length_hop() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:N {n: 1})-[:KNOWS]->(b:N {n: 2})-[:KNOWS]->(c:N {n: 3})",
+    );
+    let result = run(
+        &store,
+        "MATCH (a:N {n: 1}) MATCH p = (a)-[:KNOWS*1..2]->(b) RETURN p, length(p) AS len",
+    );
+    assert_eq!(result.rows.len(), 2);
+    for row in &result.rows {
+        match &row[0] {
+            Value::Path(elems) => {
+                // A path of length L has 2L+1 elements (Node, Edge, Node,
+                // ..., Node) -- `nodes.len() == edges.len() + 1`.
+                let len = int(&row[1]) as usize;
+                assert_eq!(elems.len(), 2 * len + 1);
+                assert!(matches!(elems[0], PathElem::Node(_)));
+                assert!(matches!(elems[elems.len() - 1], PathElem::Node(_)));
+            }
+            other => panic!("expected a Path, got {other:?}"),
+        }
+    }
+
+    // Mixing a variable-length hop with another hop in the same named
+    // path still isn't supported -- not a silent-wrong-answer risk.
+    let err = parse("MATCH p = (a)-[:KNOWS*1..3]->(b)-->(c) RETURN p").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("variable-length"));
 }
 
@@ -8056,4 +8087,32 @@ fn graph_builtins_on_null_argument_are_null_not_an_error() {
     for cell in &result.rows[0] {
         assert!(matches!(cell, Value::Null), "expected null, got {cell:?}");
     }
+}
+
+/// `r.name` where `r` is bound to a path -- real Cypher's
+/// `InvalidArgumentType`, not a silent null (a path was never a valid
+/// property-access target). TCK's MatchWhere1 [14].
+#[test]
+fn property_access_on_a_path_is_a_type_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH r = (n)-[*]->() WHERE r.name = 'apa' RETURN r").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("path"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `size(p)` where `p` is a path -- real Cypher rejects this at compile
+/// time, not just at runtime (a zero-row MATCH could otherwise silently
+/// skip ever evaluating it). TCK's List6 [5].
+#[test]
+fn size_on_a_path_is_a_compile_time_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH p = (a)-[*]->(b) RETURN size(p)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("size"),
+        "unexpected error: {err}"
+    );
 }

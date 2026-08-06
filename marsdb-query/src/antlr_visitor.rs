@@ -867,6 +867,7 @@ impl AstBuilder {
             // `relationshipPattern`.
             direction: RelDirection::Either,
             hop_range,
+            capture_path_segment: false,
         })
     }
 
@@ -882,6 +883,7 @@ impl AstBuilder {
                 props: Vec::new(),
                 direction: RelDirection::Either,
                 hop_range: None,
+                capture_path_segment: false,
             },
         };
         // Both LT and GT present (`<-[...]->`) is *not* "left wins" --
@@ -3180,8 +3182,17 @@ mod tests {
     }
 
     #[test]
-    fn named_path_over_variable_length_errors() {
-        assert!(parse_match("MATCH p = (a)-[*1..3]->(b)").is_err());
+    fn named_path_over_a_single_variable_length_hop_is_supported() {
+        // TCK's Quantifier1-4 [8]/[9] -- a single variable-length hop is
+        // fine; only *mixing* one with another hop stays rejected (see
+        // the next test).
+        let parts = parse_match("MATCH p = (a)-[*1..3]->(b)").unwrap();
+        assert_eq!(parts[0].path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn named_path_over_variable_length_mixed_with_another_hop_errors() {
+        assert!(parse_match("MATCH p = (a)-[*1..3]->(b)-->(c)").is_err());
     }
 
     #[test]

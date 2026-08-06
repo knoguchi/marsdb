@@ -22,14 +22,25 @@ pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), Qu
     Ok(())
 }
 
-/// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`) is
-/// limited to fixed-hop patterns — see `QueryPart::path_var`'s docs for
-/// why a variable-length hop isn't supported there.
+/// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`).
+/// Fixed-hop patterns of any length are fine; a *single* variable-length
+/// hop (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/`[9]`) is also
+/// supported (`executor::name_pattern_for_path`/`assemble_path` know how
+/// to capture its own internally-traversed edge/node sequence) -- but a
+/// pattern *mixing* a variable-length hop with any other hop isn't (not
+/// exercised by the TCK, and which hop's own path-building strategy would
+/// even apply gets genuinely ambiguous once there's more than one).
 pub(crate) fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
-    if pattern.hops.iter().any(|(rel, _)| rel.hop_range.is_some()) {
+    let var_len_hops = pattern
+        .hops
+        .iter()
+        .filter(|(rel, _)| rel.hop_range.is_some())
+        .count();
+    if var_len_hops > 0 && (var_len_hops > 1 || pattern.hops.len() > 1) {
         return Err(QueryError::Syntax(
-            "named-path capture (`p = ...`) over a variable-length relationship pattern isn't supported yet \
-             — use shortestPath() instead, or drop the path variable"
+            "named-path capture (`p = ...`) over a pattern mixing a variable-length relationship \
+             with another hop isn't supported yet — use shortestPath() instead, or drop the path \
+             variable"
                 .into(),
         ));
     }

@@ -941,7 +941,24 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     // perfectly good list comprehension source (TCK's
                     // List12 [6]).
                     "keys" | "labels" => Kind::List(Box::new(Kind::Scalar)),
-                    "id" | "size" | "exists" => Kind::Scalar,
+                    // Unlike `id`/`exists` (genuinely polymorphic over
+                    // node/relationship, left to the runtime's own
+                    // `QueryError::Type`), `size()` never accepts a `Path`
+                    // -- `size_builtin` has no arm for one, and (unlike a
+                    // wrong `Scalar`) a `Path`-kinded argument is knowable
+                    // here without ever running a row, so real Cypher
+                    // makes this compile-time (TCK's List6 `[5]`) rather
+                    // than something a zero-row `MATCH` could silently
+                    // skip checking at all.
+                    "size" => {
+                        if let Some(Kind::Path) = arg_kinds.first() {
+                            return Err(semantic(
+                                "size() doesn't accept a path -- use length() instead",
+                            ));
+                        }
+                        Kind::Scalar
+                    }
+                    "id" | "exists" => Kind::Scalar,
                     "properties" => Kind::Map,
                     "head" | "last" => match arg_kinds.first() {
                         Some(Kind::List(inner)) => (**inner).clone(),
@@ -1267,7 +1284,18 @@ fn require_property_owner(scope: &Scope, var: &str) -> Result<(), QueryError> {
     // fields, and null/other scalars yield null for a missing component in
     // the current runtime semantics. The binder resolves the name here;
     // the exact property/component remains data-dependent.
-    lookup(scope, var, "property access")?;
+    let kind = lookup(scope, var, "property access")?;
+    // `Path` is the one kind that's *never* valid here, knowable without
+    // ever running a row -- real Cypher's `InvalidArgumentType` at
+    // compile time (TCK's MatchWhere1 `[14]`: `MATCH r = (n)-[*]->()
+    // WHERE r.name = 'apa'`), not something a zero-row `MATCH` (unbounded
+    // `[*]` against an empty graph, here) could silently skip checking by
+    // never actually evaluating the predicate.
+    if matches!(kind, Kind::Path) {
+        return Err(semantic(format!(
+            "'{var}' is a path — property access requires a node, relationship, or map"
+        )));
+    }
     Ok(())
 }
 
