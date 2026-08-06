@@ -1,6 +1,6 @@
 # MarsDB
 
-[![CI](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml/badge.svg)](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml)
+[![Rust](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml/badge.svg)](https://github.com/knoguchi/marsdb/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/marsdb.svg)](https://crates.io/crates/marsdb)
 [![docs.rs](https://img.shields.io/docsrs/marsdb)](https://docs.rs/marsdb)
 [![codecov](https://codecov.io/gh/knoguchi/marsdb/graph/badge.svg)](https://codecov.io/gh/knoguchi/marsdb)
