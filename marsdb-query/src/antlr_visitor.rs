@@ -876,12 +876,19 @@ impl AstBuilder {
                 hop_range: None,
             },
         };
-        rel.direction = if ctx.LT().is_some() {
-            RelDirection::Left
-        } else if ctx.GT().is_some() {
-            RelDirection::Right
-        } else {
-            RelDirection::Either
+        // Both LT and GT present (`<-[...]->`) is *not* "left wins" --
+        // it's the same undirected/either shape as neither being present
+        // (`-[...]-`), and CREATE/MERGE already reject `Either` outright
+        // (`RequiresDirectedRelationship`, executor.rs). Found via the
+        // TCK: the old `if LT ... else if GT ...` order silently treated
+        // `<-[:FOO]->` as plain `Left`, both letting CREATE wrongly
+        // succeed (Create2 [20]) and giving MATCH's own undirected
+        // multi-hop patterns the wrong direction entirely (mars-w37,
+        // Match5 [27]/Match6 [12]'s wrong row counts).
+        rel.direction = match (ctx.LT().is_some(), ctx.GT().is_some()) {
+            (true, false) => RelDirection::Left,
+            (false, true) => RelDirection::Right,
+            (true, true) | (false, false) => RelDirection::Either,
         };
         Ok(rel)
     }
@@ -2874,6 +2881,14 @@ mod tests {
         );
         assert_eq!(
             parse_pattern("(a)--(b)").unwrap().hops[0].0.direction,
+            RelDirection::Either
+        );
+        // Both arrowheads (`<-...->`) is the same undirected/either shape
+        // as neither -- regression found via the TCK (Match6 [12]/
+        // Create2 [20]/mars-w37): used to silently resolve to Left,
+        // checking LT before GT and never noticing GT was also present.
+        assert_eq!(
+            parse_pattern("(a)<-->(b)").unwrap().hops[0].0.direction,
             RelDirection::Either
         );
     }
