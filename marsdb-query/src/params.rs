@@ -235,6 +235,11 @@ fn substitute_expr(
         Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
         Expr::VarEq(_, _) => {}
+        // Same "just variable names, no `$param`-able position" reasoning
+        // as `VarEq` above -- also planner-synthesized only, never
+        // present in the AST `substitute_params` runs against at all
+        // (built during planning, well after this pass).
+        Expr::EdgeNotInSet { .. } => {}
         Expr::GeneralCompare(lhs, _, rhs) => {
             substitute_return_expr(lhs, params)?;
             substitute_return_expr(rhs, params)?;

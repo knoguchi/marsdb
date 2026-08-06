@@ -23,42 +23,17 @@ pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), Qu
 }
 
 /// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`).
-/// Fixed-hop patterns of any length are fine; a *single* variable-length
-/// hop on its own (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/
-/// `[9]`) is also supported (`executor::name_pattern_for_path`/
-/// `assemble_path` know how to capture its own internally-traversed
-/// edge/node sequence, via a fresh synthesized binding name, same
-/// mechanism as any other anonymous pattern token).
-///
-/// A pattern *mixing* a variable-length hop with any other hop stays
-/// rejected, even though `assemble_path` itself already generalizes
-/// cleanly to that case (each hop's segment is independent) -- the real
-/// blocker is a *different*, pre-existing gap one level down:
-/// `LogicalPlan::VarExpand`'s own edge-isomorphism handling doesn't track
-/// a variable-length hop's internally-traversed edges for *later* hops to
-/// exclude (only the reverse direction, earlier *fixed* hops excluding a
-/// later `VarExpand`, is handled -- see that type's own docs). Found via
-/// TCK's Match4 `[7]` (`(n)-[*0..1]-()-[r]-()-[*0..1]-(m)`, an isomorphism
-/// double-count: expected 32, got 52) once the mixing restriction was
-/// briefly lifted to chase Match6 `[14]`/`[17]`/Match7 `[19]` -- those 3
-/// scenarios don't happen to trigger the gap, but nothing about this
-/// restriction can tell the difference between a pattern that would and
-/// one that wouldn't, so all mixing stays rejected until the
-/// isomorphism gap itself is fixed.
-pub(crate) fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
-    let var_len_hops = pattern
-        .hops
-        .iter()
-        .filter(|(rel, _)| rel.hop_range.is_some())
-        .count();
-    if var_len_hops > 0 && (var_len_hops > 1 || pattern.hops.len() > 1) {
-        return Err(QueryError::Syntax(
-            "named-path capture (`p = ...`) over a pattern mixing a variable-length relationship \
-             with another hop isn't supported yet — use shortestPath() instead, or drop the path \
-             variable"
-                .into(),
-        ));
-    }
+/// Fixed-hop patterns of any length are fine; variable-length hops
+/// (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/`[9]`), including
+/// *mixed* with other hops (fixed or variable-length) in the same
+/// pattern, are also supported -- `executor::name_pattern_for_path`/
+/// `assemble_path` capture each hop's own segment independently, and
+/// `LogicalPlan::VarExpand`'s edge-isomorphism handling
+/// (`exclude_edge_sets`/`exclude_edge_var`) now tracks a variable-length
+/// hop's internally-traversed edges in both directions (an earlier fixed
+/// hop excluding a later `VarExpand`, and vice versa) -- see `mars-pbp`,
+/// fixed via TCK's Match4 `[7]`.
+pub(crate) fn validate_named_path_pattern(_pattern: &Pattern) -> Result<(), QueryError> {
     Ok(())
 }
 

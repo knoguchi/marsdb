@@ -119,6 +119,21 @@ pub enum Expr {
         pattern: Box<Pattern>,
         where_clause: Option<Box<Expr>>,
     },
+    /// Real Cypher's edge-isomorphism rule (`VarEq`'s own docs), extended
+    /// to a variable-length hop: `edge_var`'s bound edge must not be among
+    /// the edges an *earlier* variable-length hop in the same pattern
+    /// already traversed for this row (`edge_set_var`, a `Binding::Path`
+    /// segment `planner::build_match_plan` always threads through a
+    /// `VarExpand` for exactly this purpose -- see `LogicalPlan::
+    /// VarExpand::exclude_edge_var`'s own docs). Unlike `VarEq` (one edge
+    /// vs one edge), this checks one edge against a *set* -- each row can
+    /// carry a different set, one per distinct earlier traversal.
+    /// Synthesized by the planner only; no surface syntax constructs this
+    /// directly.
+    EdgeNotInSet {
+        edge_var: String,
+        edge_set_var: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

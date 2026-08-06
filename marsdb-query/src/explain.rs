@@ -374,6 +374,8 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             min_hops,
             max_hops,
             exclude_edge_vars: _,
+            exclude_edge_sets: _,
+            exclude_edge_var: _,
             path_segment_var: _,
             rel_list_var: _,
             rel_props: _,
@@ -480,6 +482,10 @@ fn format_expr(expr: &Expr) -> String {
             pattern,
             where_clause,
         } => format!("exists {{{pattern:?} {where_clause:?}}}"),
+        Expr::EdgeNotInSet {
+            edge_var,
+            edge_set_var,
+        } => format!("{edge_var} NOT IN {edge_set_var}"),
     }
 }
 

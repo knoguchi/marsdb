@@ -89,11 +89,36 @@ pub enum LogicalPlan {
         /// over an edge an earlier hop in the same pattern already used
         /// (found via TCK's Match5 `[27]`: an earlier fixed hop's edge got
         /// silently re-walked by a later `<-[:LIKES*3]->`, producing extra
-        /// spurious rows). Later hops checking a variable-length hop's own
-        /// *internally* traversed edges is a separate, still-open gap (a
-        /// var-length hop binds no single edge to check against) — not
-        /// needed by that scenario, since nothing follows its `VarExpand`.
+        /// spurious rows). See `exclude_edge_sets` below for the
+        /// complementary case (an *earlier variable-length* hop's own
+        /// edges).
         exclude_edge_vars: Vec<String>,
+        /// Same seeding as `exclude_edge_vars` above, but for edges an
+        /// *earlier variable-length* hop of this same pattern traversed --
+        /// `build_match_plan`'s `prior_edge_sets`, each entry naming
+        /// another `VarExpand`'s own `exclude_edge_var` (below). A single
+        /// edge id can't represent "whichever edges that hop's BFS
+        /// happened to use for *this* row" the way a fixed hop's own
+        /// `rel_var` can, so this is a separate list of `Binding::Path`-
+        /// valued names, each row's own set unioned into the BFS's
+        /// excluded-edges seed alongside `exclude_edge_vars`' single ids
+        /// (TCK's Match4 `[7]`, found via a real double-count once this
+        /// direction was still missing -- see `mars-pbp`).
+        exclude_edge_sets: Vec<String>,
+        /// This hop's *own* internal, always-synthesized name (regardless
+        /// of `path_segment_var`/`rel_list_var` below) that
+        /// `executor::expand_variable_row` deposits a `Binding::Path` of
+        /// its per-row traversed edges under -- the producer half of
+        /// `exclude_edge_sets` above, letting a *later* hop (fixed, via a
+        /// new `Expr::EdgeNotInSet` `Filter`, or another `VarExpand`, via
+        /// its own `exclude_edge_sets`) exclude whatever this row's
+        /// traversal happened to use. Populated unconditionally, not just
+        /// when path capture/list-binding was actually requested --
+        /// cheap (the segment is already built for the BFS's own internal
+        /// isomorphism tracking either way), and every variable-length
+        /// hop needs to offer this to whatever comes after it, whether or
+        /// not *this* hop itself asked for anything special.
+        exclude_edge_var: String,
         /// Set to a fresh internal name (`executor::name_pattern_for_path`)
         /// iff this hop's `RelPattern::capture_path_segment` was set --
         /// asks `executor::expand_variable_row` to also deposit its own

@@ -311,6 +311,10 @@ struct VarExpandSpec<'a> {
     /// Rel-vars bound by earlier fixed hops of the same pattern — see
     /// `LogicalPlan::VarExpand`'s own docs.
     exclude_edge_vars: &'a [String],
+    /// See `LogicalPlan::VarExpand::exclude_edge_sets`'s own docs.
+    exclude_edge_sets: &'a [String],
+    /// See `LogicalPlan::VarExpand::exclude_edge_var`'s own docs.
+    exclude_edge_var: &'a str,
     /// See `LogicalPlan::VarExpand::path_segment_var`'s own docs.
     path_segment_var: Option<&'a str>,
     /// See `LogicalPlan::VarExpand::rel_list_var`'s own docs.
@@ -2864,6 +2868,8 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
                 exclude_edge_vars,
+                exclude_edge_sets,
+                exclude_edge_var,
                 path_segment_var,
                 rel_list_var,
                 rel_props,
@@ -2896,6 +2902,8 @@ impl<'a> Executor<'a> {
                             min_hops: *min_hops,
                             max_hops: *max_hops,
                             exclude_edge_vars,
+                            exclude_edge_sets,
+                            exclude_edge_var,
                             path_segment_var: path_segment_var.as_deref(),
                             rel_list_var: rel_list_var.as_deref(),
                             rel_props,
@@ -3128,6 +3136,7 @@ impl<'a> Executor<'a> {
             if let Some(rel_list_var) = spec.rel_list_var {
                 new_row.insert(rel_list_var.to_string(), Binding::List(Vec::new()));
             }
+            new_row.insert(spec.exclude_edge_var.to_string(), Binding::Path(Vec::new()));
             out.push(new_row);
         }
         // `[:TYPE* {year: 1988}]` -- evaluated once here (constant across
@@ -3152,6 +3161,10 @@ impl<'a> Executor<'a> {
         // whatever edges earlier fixed hops of this same pattern already
         // bound, so this traversal can't walk back over one of them (see
         // `LogicalPlan::VarExpand`'s docs; found via TCK's Match5 `[27]`).
+        // Complementary direction: an *earlier variable-length* hop's own
+        // traversed-edge set (deposited under its own `exclude_edge_var`,
+        // see `LogicalPlan::VarExpand`'s docs) -- union every such row's
+        // `Binding::Path` edge ids in too (TCK's Match4 `[7]`).
         let seed_used_edges: HashSet<EdgeId> = spec
             .exclude_edge_vars
             .iter()
@@ -3159,6 +3172,18 @@ impl<'a> Executor<'a> {
                 Some(Binding::Edge(id)) => Some(*id),
                 _ => None,
             })
+            .chain(spec.exclude_edge_sets.iter().flat_map(|v| {
+                match row.get(v) {
+                    Some(Binding::Path(segment)) => segment
+                        .iter()
+                        .filter_map(|p| match p {
+                            PathBinding::Edge(id) => Some(*id),
+                            PathBinding::Node(_) => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                }
+            }))
             .collect();
         // The ordered `Edge, Node, Edge, Node, ...` sequence built up so
         // far, alongside the existing `used_edges` isomorphism set --
@@ -3209,6 +3234,10 @@ impl<'a> Executor<'a> {
                             let edges = segment_edges_to_list(txn, &next_segment)?;
                             new_row.insert(rel_list_var.to_string(), edges);
                         }
+                        new_row.insert(
+                            spec.exclude_edge_var.to_string(),
+                            Binding::Path(next_segment.clone()),
+                        );
                         out.push(new_row);
                         guard.check_intermediate_rows(out.len())?;
                     }
@@ -3341,6 +3370,30 @@ impl<'a> Executor<'a> {
                     Some(1),
                 )?;
                 Some(!found.is_empty())
+            }
+            // See `Expr::EdgeNotInSet`'s own docs -- `edge_var` is always
+            // a real `Binding::Edge` (a fixed hop's own filter var, the
+            // only thing this gets generated for) and `edge_set_var` is
+            // always the `Binding::Path` `expand_variable_row` deposits
+            // for *every* variable-length hop, unconditionally (see
+            // `LogicalPlan::VarExpand::exclude_edge_var`'s own docs) --
+            // never anything else, so there's no null/wrong-kind case to
+            // handle here the way `VarEq` above has to.
+            Expr::EdgeNotInSet {
+                edge_var,
+                edge_set_var,
+            } => {
+                let Some(Binding::Edge(edge_id)) = row.get(edge_var) else {
+                    return Err(QueryError::UnboundVariable(edge_var.clone()));
+                };
+                let Some(Binding::Path(segment)) = row.get(edge_set_var) else {
+                    return Err(QueryError::UnboundVariable(edge_set_var.clone()));
+                };
+                Some(
+                    !segment
+                        .iter()
+                        .any(|elem| matches!(elem, PathBinding::Edge(id) if id == edge_id)),
+                )
             }
         })
     }
