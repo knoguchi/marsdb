@@ -34,10 +34,31 @@ widening `CHAR_LITERAL` to `*` and removing `ERRCHAR` (ANTLR's default
 lexer behavior raises a real `syntax_error` on unmatched input once there's
 no catch-all swallowing it first).
 
-This fix alone raised the TCK parse-acceptance comparison below from
-90.5% to 95.1% and eliminated the entire `Temporal1/2/10` disagreement
-category (149 cases) — those weren't a real grammar gap, just corrupted
-date-string literals (`'2018-01-01T12:00'` contains `-`/`:`).
+Two more fixes, same file, same discovery method:
+
+- `ID: LetterOrDigit+;` let an identifier start with — or be entirely
+  composed of — digits. Per `openCypher.bnf`'s
+  `<regular identifier> ::= <identifier start> [<identifier extend>...]`,
+  where `<identifier start>` is Unicode `XID_START` (excludes digits;
+  digits are only valid as `XID_CONTINUE`, i.e. after the first
+  character), an identifier can never start with a digit. Since `DIGIT`
+  and `ID` tied in length on pure-digit input and `ID` was declared
+  first, ANTLR's tie-break silently lexed numbers as identifiers
+  everywhere *except* grammar positions that specifically require
+  `DIGIT` (e.g. variable-length relationship bounds `[:REL*2]`), where
+  it hard-failed instead of parsing the number. Fixed to
+  `ID: Letter LetterOrDigit*;` (first character must be a letter).
+- `Digits: [1-9] ([0-9_]* [0-9])?;` disallowed a leading zero, but
+  `openCypher.bnf`'s `<unsigned decimal integer>` is just
+  `<digit> [{[_]<digit>}...]` — no such restriction. `007` couldn't
+  tokenize as `DIGIT` at all under the old rule. Fixed to `[0-9] (...)?`.
+
+These fixes alone raised the TCK parse-acceptance comparison below from
+90.5% to 96.4% and eliminated the entire `Temporal1/2/10` (149 cases) and
+`Match5` (27 cases) disagreement categories — those weren't real grammar
+gaps, just corrupted date-string literals (`'2018-01-01T12:00'` contains
+`-`/`:`) and bounded variable-length relationship patterns
+(`[:REL*2]`/`[:REL*1..3]`) failing on their numeric bounds.
 
 ## Why this toolchain
 

@@ -128,7 +128,18 @@ OF         : 'OF';
 ADD        : 'ADD';
 DROP       : 'DROP';
 
-ID: LetterOrDigit+;
+// Upstream (antlr/grammars-v4) allowed an identifier to start with -- or be
+// entirely composed of -- digits (`LetterOrDigit+`). Per openCypher.bnf's
+// <regular identifier> ::= <identifier start> [<identifier extend>...],
+// where <identifier start> is Unicode XID_START (excludes digits; digits
+// are only valid as XID_CONTINUE, i.e. after the first character), a bare
+// identifier can never start with a digit. The bug: since DIGIT and ID
+// tied in length on pure-digit input and ID was declared first, ANTLR's
+// tie-break silently lexed numbers like `2` or `1..3` as identifiers
+// instead of DIGIT tokens everywhere except grammar positions that
+// specifically require DIGIT (e.g. variable-length relationship bounds
+// `[:REL*2]`), where it hard-failed instead of parsing the number.
+ID: Letter LetterOrDigit*;
 
 ESC_LITERAL    : '`' .*? '`';
 // Upstream (antlr/grammars-v4) had `?` here, capping single-quoted content
@@ -164,7 +175,13 @@ fragment ExponentPart: [e] [+-]? Digits;
 fragment HexDigits  : '0x' HexDigit ((HexDigit | '_')* HexDigit)?;
 fragment HexDigit   : [0-9a-f];
 fragment OctalDigit : '0' Digits;
-fragment Digits     : [1-9] ([0-9_]* [0-9])?;
+// Upstream required the first digit to be 1-9 (no leading zero), but
+// openCypher.bnf's <unsigned decimal integer> ::= <digit> [{[_]<digit>}...]
+// has no such restriction -- e.g. `007` couldn't tokenize as DIGIT at all
+// under the old rule (OctalDigit's '0' prefix still needs its own Digits
+// sub-match to start 1-9, so multi-digit leading-zero runs matched
+// nothing). Fixed to allow a leading zero, matching spec.
+fragment Digits     : [0-9] ([0-9_]* [0-9])?;
 
 fragment LetterOrDigit: Letter | [0-9];
 

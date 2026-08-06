@@ -98,6 +98,7 @@ fn antlr_spike_report(features_dir: &Path) {
     let mut pest_accept = 0usize;
     let mut disagreements: Vec<(String, String, bool, bool)> = Vec::new();
     let mut disagreement_count = 0usize;
+    let mut antlr_rejects: Vec<(String, String)> = Vec::new();
     let filter = std::env::var("TCK_FILTER").ok();
 
     for entry in walk_feature_files(features_dir) {
@@ -119,6 +120,7 @@ fn antlr_spike_report(features_dir: &Path) {
                 antlr_accept += 1;
             } else {
                 antlr_reject += 1;
+                antlr_rejects.push((scenario.feature_name.clone(), scenario.query.clone()));
             }
             if pest_ok {
                 pest_accept += 1;
@@ -144,7 +146,9 @@ fn antlr_spike_report(features_dir: &Path) {
         "antlr: {antlr_accept:>5}/{total} accepted ({:.1}%)",
         100.0 * antlr_accept as f64 / total as f64
     );
-    println!("\n{disagreement_count} disagreements -- written to /tmp/antlr_spike_disagreements.txt");
+    println!(
+        "\n{disagreement_count} disagreements -- written to /tmp/antlr_spike_disagreements.txt"
+    );
     let mut out = String::new();
     for (feature, query, antlr_ok, pest_ok) in &disagreements {
         out.push_str(&format!(
@@ -156,6 +160,16 @@ fn antlr_spike_report(features_dir: &Path) {
     }
     std::fs::write("/tmp/antlr_spike_disagreements.txt", out)
         .expect("write /tmp/antlr_spike_disagreements.txt");
+
+    println!(
+        "{} total antlr rejects -- written to /tmp/antlr_all_rejects.txt",
+        antlr_rejects.len()
+    );
+    let mut out = String::new();
+    for (feature, query) in &antlr_rejects {
+        out.push_str(&format!("[{feature}] :: {}\n", query.replace('\n', " ")));
+    }
+    std::fs::write("/tmp/antlr_all_rejects.txt", out).expect("write /tmp/antlr_all_rejects.txt");
 }
 
 fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {
