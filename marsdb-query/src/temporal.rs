@@ -447,6 +447,23 @@ pub fn scale_duration(a: DurationParts, factor: f64) -> DurationParts {
 /// `*OfX` fields (`monthsOfYear`, `secondsOfMinute`, ...) are each the
 /// same computation's *remainder* instead of its quotient -- literally
 /// "what `d.<prop>` would be, mod the next unit up".
+/// `seconds`/`nanos` are stored the same way real Cypher's own `Duration`
+/// stores them (mirroring Java's `Duration`): `seconds` carries the whole
+/// sign, `nanos` is always non-negative (0..999_999_999) -- see
+/// `PropertyValue::Duration`'s own docs. Component accessors must read
+/// off *these two raw fields directly*, not recombine them into one
+/// signed total and re-split -- that would silently reintroduce a
+/// negative `nanos` (`-23H-59M-59.9S`'s stored form is `seconds: -86400,
+/// nanos: 100_000_000`; re-splitting `-86399.9s` via truncating division
+/// gives the wrong `seconds: -86399, nanosecondsOfSecond: -900_000_000`
+/// instead, TCK's Temporal10 `[1]`). `hours`/`minutes`/`seconds` (and
+/// their `-OfHour`/`-OfMinute` cousins) only ever divide `seconds` itself
+/// (never touch `nanos` -- a whole hour/minute can't hide inside a
+/// sub-second remainder); `milliseconds`/`microseconds`/`nanoseconds`
+/// (the fine-grained *totals*, not `-OfSecond` splits) are the one place
+/// that legitimately combines both fields, since `nanos`' own
+/// always-non-negative convention means simple addition (not `total_ns`
+/// division-then-truncation) already gives the right signed result.
 pub fn duration_component(
     months: i64,
     days: i64,
@@ -454,28 +471,28 @@ pub fn duration_component(
     nanos: i32,
     prop: &str,
 ) -> Option<i64> {
-    let total_ns: i128 = seconds as i128 * NANOS_PER_SEC + nanos as i128;
+    let nanos = nanos as i64;
     Some(match prop {
         "years" => months / 12,
         "quarters" => months / 3,
         "months" => months,
         "weeks" => days / 7,
         "days" => days,
-        "hours" => (total_ns / 3_600_000_000_000) as i64,
-        "minutes" => (total_ns / 60_000_000_000) as i64,
-        "seconds" => (total_ns / NANOS_PER_SEC) as i64,
-        "milliseconds" => (total_ns / 1_000_000) as i64,
-        "microseconds" => (total_ns / 1_000) as i64,
-        "nanoseconds" => total_ns as i64,
+        "hours" => seconds / 3600,
+        "minutes" => seconds / 60,
+        "seconds" => seconds,
+        "milliseconds" => seconds * 1000 + nanos / 1_000_000,
+        "microseconds" => seconds * 1_000_000 + nanos / 1_000,
+        "nanoseconds" => seconds * NANOS_PER_SEC as i64 + nanos,
         "quartersOfYear" => (months % 12) / 3,
         "monthsOfQuarter" => (months % 12) % 3,
         "monthsOfYear" => months % 12,
         "daysOfWeek" => days % 7,
-        "minutesOfHour" => (total_ns / 60_000_000_000) as i64 % 60,
-        "secondsOfMinute" => (total_ns / NANOS_PER_SEC) as i64 % 60,
-        "millisecondsOfSecond" => (total_ns / 1_000_000) as i64 % 1000,
-        "microsecondsOfSecond" => (total_ns / 1_000) as i64 % 1_000_000,
-        "nanosecondsOfSecond" => (total_ns % NANOS_PER_SEC) as i64,
+        "minutesOfHour" => (seconds / 60) % 60,
+        "secondsOfMinute" => seconds % 60,
+        "millisecondsOfSecond" => nanos / 1_000_000,
+        "microsecondsOfSecond" => nanos / 1_000,
+        "nanosecondsOfSecond" => nanos,
         _ => return None,
     })
 }
@@ -587,6 +604,9 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
         Some((d, t)) => (d, Some(t)),
         None => (s, None),
     };
+    if let Some(fields) = parse_combined_date_time_duration(date_part, time_part) {
+        return Some(normalize_duration(fields));
+    }
     let date_pairs = scan_number_unit_pairs(date_part)?;
     let time_pairs = match time_part {
         Some(part) => scan_number_unit_pairs(part)?,
@@ -615,6 +635,49 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
         }
     }
     Some(normalize_duration(f))
+}
+
+/// ISO-8601's alternate "combined date-time" duration representation
+/// (`P<date>T<time>`, e.g. `P2012-02-02T14:37:21.545` -- date/time
+/// formatted exactly like a calendar date/time-of-day, but each field
+/// means "this many years/months/days/hours/minutes/seconds", not an
+/// actual calendar date -- no day-of-month validity check, `P2012-13-40`
+/// is a legal 12-year-13-month-40-day duration under this form. TCK's
+/// Temporal2 `[7]`. Only matches when `date_part` genuinely has this
+/// shape (plain `N-N-N`, no unit letters) -- an ordinary `PnYnMnD`
+/// string never does, and a negative duration's leading `-` makes the
+/// first split empty rather than a valid number, so neither can be
+/// mistaken for this form.
+fn parse_combined_date_time_duration(
+    date_part: &str,
+    time_part: Option<&str>,
+) -> Option<DurationFields> {
+    let mut date_fields = date_part.splitn(3, '-');
+    let years: f64 = date_fields.next()?.parse().ok()?;
+    let months: f64 = date_fields.next()?.parse().ok()?;
+    let days: f64 = date_fields.next()?.parse().ok()?;
+    if date_fields.next().is_some() {
+        return None;
+    }
+    let mut f = DurationFields {
+        years,
+        months,
+        days,
+        ..Default::default()
+    };
+    if let Some(time_part) = time_part {
+        let mut time_fields = time_part.splitn(3, ':');
+        let hours: f64 = time_fields.next()?.parse().ok()?;
+        let minutes: f64 = time_fields.next()?.parse().ok()?;
+        let seconds: f64 = time_fields.next()?.parse().ok()?;
+        if time_fields.next().is_some() {
+            return None;
+        }
+        f.hours = hours;
+        f.minutes = minutes;
+        f.seconds = seconds;
+    }
+    Some(f)
 }
 
 /// Hand-scans `"12Y5M1.5D"`-style text into `(value, unit_letter)` pairs

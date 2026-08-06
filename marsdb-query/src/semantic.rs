@@ -686,6 +686,26 @@ fn validate_remove_item(item: &RemoveItem, scope: &Scope) -> Result<(), QueryErr
     }
 }
 
+/// An aggregate function (`count(a)`, etc) is never legal inside a
+/// pattern-level `WHERE` -- real Cypher's `InvalidAggregation` at compile
+/// time (TCK's MatchWhere1 `[15]`: `MATCH (a) WHERE count(a) > 10`), not
+/// something a zero-row `MATCH` could otherwise silently skip checking
+/// (aggregates only ever make sense as a `RETURN`/`WITH` item's own
+/// top-level expression, evaluated once *after* every row has already
+/// been matched-and-filtered -- a `WHERE` predicate runs per-row, before
+/// any such collapsing exists). `infer_expr` itself stays permissive
+/// (same "any recognized function call" treatment every other function
+/// gets) since it's shared with `RETURN`/`WITH` items, where an aggregate
+/// *is* legal -- this is the pattern-`WHERE`-specific half of that check.
+fn reject_aggregate_in_where(expr: &ReturnExpr) -> Result<(), QueryError> {
+    if crate::executor::contains_aggregate(expr) {
+        return Err(semantic(
+            "an aggregate function can't be used inside a WHERE clause",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
     match expr {
         Expr::And(left, right) | Expr::Or(left, right) => {
@@ -708,15 +728,17 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
         Expr::GeneralCompare(left, _, right) => {
             infer_expr(left, scope)?;
             infer_expr(right, scope)?;
-            Ok(())
+            reject_aggregate_in_where(left)?;
+            reject_aggregate_in_where(right)
         }
         Expr::GeneralIsNull(e) => {
             infer_expr(e, scope)?;
-            Ok(())
+            reject_aggregate_in_where(e)
         }
         Expr::GeneralBare(e) => {
             let kind = infer_expr(e, scope)?;
-            require_boolean_predicate_kind(&kind, "WHERE predicate")
+            require_boolean_predicate_kind(&kind, "WHERE predicate")?;
+            reject_aggregate_in_where(e)
         }
         Expr::Pattern(pattern) => validate_pattern_predicate(pattern, scope),
         // Unlike `Pattern` above (existential-only, never introduces a
@@ -868,7 +890,9 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     | "localdatetime.realtime"
                     | "datetime.transaction"
                     | "datetime.statement"
-                    | "datetime.realtime" => Kind::Scalar,
+                    | "datetime.realtime"
+                    | "datetime.fromepoch"
+                    | "datetime.fromepochmillis" => Kind::Scalar,
                     "length" => {
                         if let Some(kind) = arg_kinds.first() {
                             require_path_or_null(kind, "length() argument")?;

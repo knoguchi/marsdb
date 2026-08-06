@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -144,6 +144,19 @@ struct ExecutionGuard<'a> {
     options: &'a ExecutionOptions,
     deadline: Option<Instant>,
     relationship_expansions: Cell<u64>,
+    /// A relationship's *type* is immutable for its whole lifetime, so
+    /// `type(r)` is one of the few things real Cypher still lets a
+    /// statement read off `r` after `DELETE r` deleted it earlier in the
+    /// same statement -- unlike properties/labels (mutable, and a genuine
+    /// `DeletedEntityAccess` error, TCK's Return2 `[15]`-`[17]`), it
+    /// needs no live record at all, just whatever type it had at match
+    /// time. `delete_targets`/`delete_binding`/`delete_value` populate
+    /// this right before actually deleting each edge; `type()`'s own
+    /// evaluation (`Executor::eval_type_call`) falls back to it only when
+    /// the ordinary live lookup fails. `RefCell`, not `&mut` -- `guard`
+    /// is threaded everywhere as a shared reference, same interior-
+    /// mutability precedent `relationship_expansions` above already sets.
+    deleted_edge_types: RefCell<HashMap<EdgeId, String>>,
 }
 
 impl<'a> ExecutionGuard<'a> {
@@ -154,7 +167,16 @@ impl<'a> ExecutionGuard<'a> {
                 .timeout
                 .and_then(|timeout| Instant::now().checked_add(timeout)),
             relationship_expansions: Cell::new(0),
+            deleted_edge_types: RefCell::new(HashMap::new()),
         }
+    }
+
+    fn record_deleted_edge_type(&self, id: EdgeId, label: String) {
+        self.deleted_edge_types.borrow_mut().insert(id, label);
+    }
+
+    fn deleted_edge_type(&self, id: EdgeId) -> Option<String> {
+        self.deleted_edge_types.borrow().get(&id).cloned()
     }
 
     fn checkpoint(&self) -> Result<(), QueryError> {
@@ -1065,15 +1087,44 @@ impl<'a> Executor<'a> {
                         self.eval_shortest_path(txn, part, &current_rows, guard)?
                     } else if let Some(path_var) = &part.path_var {
                         let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
+                        // A named path's own inline `WHERE` can reference
+                        // the path variable itself (`WHERE length(p) =
+                        // 1`, TCK's MatchWhere1 `[12]`/`[13]`) -- `p`
+                        // isn't in the row until *after* `assemble_path`
+                        // below, so (for a plain, non-`OPTIONAL` MATCH)
+                        // it can't be pushed into the plan the way an
+                        // ordinary pattern's `WHERE` is; applied as a
+                        // post-filter instead, once every row really has
+                        // `p`. `OPTIONAL MATCH` still pushes it into the
+                        // plan -- its own null-padding semantics need the
+                        // filter fused into the "did this seed row match
+                        // anything" check `eval_optional_part` does, and
+                        // a `WHERE` referencing `p` there is a narrower,
+                        // untested-by-the-TCK edge case left as-is.
+                        let defer_where = !part.optional && part.where_clause.is_some();
+                        let plan_where = if defer_where {
+                            &None
+                        } else {
+                            &part.where_clause
+                        };
                         let plan = apply_index_seeks(
-                            build_match_plan(&named_pattern, &part.where_clause, &carried_vars)?,
+                            build_match_plan(&named_pattern, plan_where, &carried_vars)?,
                             txn,
                         )?;
                         let mut rows = if part.optional {
                             let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
                             self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
                         } else {
-                            self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
+                            // `plan_limit`'s own early-stop assumes every
+                            // emitted row is already a real, final row --
+                            // not true when the WHERE filter above got
+                            // deferred (a limited prefix could still get
+                            // filtered further below), so it's skipped
+                            // for that case (limiting instead happens
+                            // naturally via the smaller `rows` this
+                            // clause returns).
+                            let limit = plan_limit.filter(|_| !defer_where);
+                            self.eval_plan_with_limit(txn, &plan, &current_rows, guard, limit)?
                         };
                         for row in &mut rows {
                             let path_binding = assemble_path(&named_pattern, row);
@@ -1081,6 +1132,19 @@ impl<'a> Executor<'a> {
                                 row.remove(key);
                             }
                             row.insert(path_var.clone(), path_binding);
+                        }
+                        if defer_where {
+                            let where_clause = part
+                                .where_clause
+                                .as_ref()
+                                .expect("defer_where implies where_clause is Some");
+                            let mut filtered = Vec::with_capacity(rows.len());
+                            for row in rows {
+                                if self.eval_expr(txn, where_clause, &row, guard)? == Some(true) {
+                                    filtered.push(row);
+                                }
+                            }
+                            rows = filtered;
                         }
                         rows
                     } else {
@@ -2043,6 +2107,43 @@ impl<'a> Executor<'a> {
             Some(other) => Err(QueryError::Type(format!(
                 "{which}() expects a relationship, got {other:?}"
             ))),
+        }
+    }
+
+    /// `type(r)` -- unlike every other property/label access, real Cypher
+    /// still allows this after `DELETE r` deleted the relationship
+    /// earlier in the same statement (a relationship's type never
+    /// changes, so there's nothing mutable a live record could be hiding
+    /// -- unlike `labels()`/property access, which stay real
+    /// `DeletedEntityAccess` errors, TCK's Return2 `[14]`-`[17]`). Tries
+    /// the ordinary evaluation first; only on failure, and only for a
+    /// bare `Var` bound to an edge, falls back to `guard`'s cached type
+    /// from the moment it was deleted (`ExecutionGuard::
+    /// deleted_edge_types`'s own docs). Any other failure (unbound
+    /// variable, a genuinely wrong argument type, ...) propagates
+    /// unchanged.
+    fn eval_type_call(
+        &self,
+        txn: Txn,
+        arg_expr: Option<&ReturnExpr>,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Value, QueryError> {
+        let Some(arg_expr) = arg_expr else {
+            return type_builtin(None);
+        };
+        match self.eval_return_expr(txn, arg_expr, row, guard) {
+            Ok(v) => type_builtin(Some(&v)),
+            Err(err) => {
+                if let ReturnExpr::Var(v) = arg_expr {
+                    if let Some(Binding::Edge(id)) = row.get(v) {
+                        if let Some(label) = guard.deleted_edge_type(*id) {
+                            return Ok(Value::Property(PropertyValue::String(label)));
+                        }
+                    }
+                }
+                Err(err)
+            }
         }
     }
 
@@ -3520,11 +3621,20 @@ impl<'a> Executor<'a> {
                         "aggregate function '{name}' can only be used as a return item's top-level expression"
                     )));
                 }
+                let lower = name.to_ascii_lowercase();
+                if lower == "type" {
+                    // Special-cased *before* the generic arg-evaluation
+                    // below -- that would eagerly fail on a deleted
+                    // relationship (`deleted_entity_access`), before
+                    // `eval_type_call` ever gets a chance to fall back to
+                    // its cached type. See `ExecutionGuard::
+                    // deleted_edge_types`'s own docs.
+                    return self.eval_type_call(txn, args.first(), row, guard);
+                }
                 let arg_values = args
                     .iter()
                     .map(|a| self.eval_return_expr(txn, a, row, guard))
                     .collect::<Result<Vec<_>, _>>()?;
-                let lower = name.to_ascii_lowercase();
                 if lower == "startnode" || lower == "endnode" {
                     return self.start_or_end_node(txn, &lower, arg_values.first());
                 }
@@ -3871,10 +3981,23 @@ impl<'a> Executor<'a> {
                     let binding = row
                         .get(name)
                         .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
-                    delete_binding(binding, write_txn, &mut deleted_edges, &mut pending_nodes)?;
+                    delete_binding(
+                        txn,
+                        binding,
+                        write_txn,
+                        &mut deleted_edges,
+                        &mut pending_nodes,
+                        guard,
+                    )?;
                 } else {
                     let value = self.eval_return_expr(txn, target, row, guard)?;
-                    delete_value(&value, write_txn, &mut deleted_edges, &mut pending_nodes)?;
+                    delete_value(
+                        &value,
+                        write_txn,
+                        &mut deleted_edges,
+                        &mut pending_nodes,
+                        guard,
+                    )?;
                 }
             }
         }
@@ -4246,11 +4369,32 @@ impl<'a> Executor<'a> {
 /// (including the path/null/type-error handling) but over `Binding`/
 /// `PathBinding` (raw ids) instead of `Value`/`PathElem` (fully
 /// materialized records).
+/// Deletes edge `id`, first stashing its (immutable, so safe to cache)
+/// type into `guard` -- see `ExecutionGuard::deleted_edge_types`'s own
+/// docs for why. The lookup can't fail with a real error here: `id` was
+/// just read out of a live `Binding::Edge`/`PathBinding::Edge` this same
+/// transaction, so its record is still there to fetch (deletion hasn't
+/// happened yet -- that's the very next line).
+fn record_and_delete_edge(
+    txn: Txn,
+    write_txn: &WriteTransaction,
+    id: EdgeId,
+    guard: &ExecutionGuard<'_>,
+) -> Result<(), QueryError> {
+    if let Some(edge) = GraphStore::get_edge_in_txn(txn, id)? {
+        guard.record_deleted_edge_type(id, edge.label);
+    }
+    GraphStore::delete_edge_in_txn(write_txn, id)?;
+    Ok(())
+}
+
 fn delete_binding(
+    txn: Txn,
     binding: &Binding,
     write_txn: &WriteTransaction,
     deleted_edges: &mut HashSet<EdgeId>,
     pending_nodes: &mut HashSet<NodeId>,
+    guard: &ExecutionGuard<'_>,
 ) -> Result<(), QueryError> {
     match binding {
         Binding::Node(id) => {
@@ -4258,14 +4402,14 @@ fn delete_binding(
         }
         Binding::Edge(id) => {
             if deleted_edges.insert(*id) {
-                GraphStore::delete_edge_in_txn(write_txn, *id)?;
+                record_and_delete_edge(txn, write_txn, *id, guard)?;
             }
         }
         Binding::Path(elems) => {
             for elem in elems {
                 if let PathBinding::Edge(id) = elem {
                     if deleted_edges.insert(*id) {
-                        GraphStore::delete_edge_in_txn(write_txn, *id)?;
+                        record_and_delete_edge(txn, write_txn, *id, guard)?;
                     }
                 }
             }
@@ -4303,6 +4447,7 @@ fn delete_value(
     write_txn: &WriteTransaction,
     deleted_edges: &mut HashSet<EdgeId>,
     pending_nodes: &mut HashSet<NodeId>,
+    guard: &ExecutionGuard<'_>,
 ) -> Result<(), QueryError> {
     match value {
         Value::Node(n) => {
@@ -4310,6 +4455,7 @@ fn delete_value(
         }
         Value::Edge(e) => {
             if deleted_edges.insert(e.id) {
+                guard.record_deleted_edge_type(e.id, e.label.clone());
                 GraphStore::delete_edge_in_txn(write_txn, e.id)?;
             }
         }
@@ -4317,6 +4463,7 @@ fn delete_value(
             for elem in elems {
                 if let PathElem::Edge(e) = elem {
                     if deleted_edges.insert(e.id) {
+                        guard.record_deleted_edge_type(e.id, e.label.clone());
                         GraphStore::delete_edge_in_txn(write_txn, e.id)?;
                     }
                 }
@@ -5751,6 +5898,22 @@ fn as_arith_num(v: &Value) -> Option<ArithNum> {
     }
 }
 
+/// `datetime.fromepoch(seconds, nanos)`/`datetime.fromepochmillis(millis)`'s
+/// own argument check -- both take a required, definite integer, not the
+/// wider "any arithmetic-ish value" `as_arith_num` allows (no float
+/// coercion for a raw epoch count) and not optional (missing/null isn't a
+/// documented no-op the way it is for e.g. `date()`'s own no-arg form).
+fn require_int_arg(v: Option<&Value>, fn_name: &str) -> Result<i64, QueryError> {
+    match v {
+        Some(Value::Property(PropertyValue::Int(i))) | Some(Value::Literal(Literal::Int(i))) => {
+            Ok(*i)
+        }
+        other => Err(QueryError::Type(format!(
+            "{fn_name}() expects an integer argument, got {other:?}"
+        ))),
+    }
+}
+
 fn as_arith_str(v: &Value) -> Option<&str> {
     match v {
         Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => {
@@ -6302,6 +6465,23 @@ fn call_builtin(
                     nanos: now.nanos,
                     zone: GraphTzId::Offset(0),
                 })
+            }))
+        }
+        "datetime.fromepoch" => {
+            let seconds = require_int_arg(args.first(), "datetime.fromepoch")?;
+            let nanos = require_int_arg(args.get(1), "datetime.fromepoch")?;
+            Ok(Value::Property(PropertyValue::DateTime {
+                epoch_seconds: seconds,
+                nanos: nanos as i32,
+                zone: GraphTzId::Offset(0),
+            }))
+        }
+        "datetime.fromepochmillis" => {
+            let millis = require_int_arg(args.first(), "datetime.fromepochmillis")?;
+            Ok(Value::Property(PropertyValue::DateTime {
+                epoch_seconds: millis.div_euclid(1000),
+                nanos: (millis.rem_euclid(1000) * 1_000_000) as i32,
+                zone: GraphTzId::Offset(0),
             }))
         }
         "duration.between" => {

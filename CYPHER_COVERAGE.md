@@ -27,10 +27,10 @@ scope.
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/match | 381 | 362 | 0 | 0 | 19 | 0 | 95.0% |
-| clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
+| clauses/match-where | 34 | 34 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/return | 63 | 62 | 0 | 1 | 0 | 0 | 98.4% |
+| clauses/return | 63 | 63 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/return-orderby | 35 | 35 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/return-skip-limit | 31 | 31 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/set | 53 | 53 | 0 | 0 | 0 | 0 | 100.0% |
@@ -56,11 +56,11 @@ scope.
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/quantifier | 604 | 604 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/temporal | 1004 | 999 | 1 | 3 | 1 | 0 | 99.5% |
+| expressions/temporal | 1004 | 1002 | 0 | 2 | 0 | 0 | 99.8% |
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3801** | **1** | **7** | **63** | **8** | **98.0%** |
+| **TOTAL** | **3880** | **3808** | **0** | **3** | **61** | **8** | **98.1%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -70,24 +70,22 @@ snapshot of this table if useful for comparison.
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
 - **wrong** — ran successfully but returned the wrong rows. **The category
-  that means a real bug**, not a coverage gap — one known, deliberately
-  unfixed case: `expressions/temporal`'s `Temporal10 [1]`: `duration.
-  between`'s result correctly renders as the same ISO-8601 text real
-  Cypher produces, but its raw `.seconds`/`.nanosecondsOfSecond` component
-  fields can differ from Java's exact internal split for a negative,
-  sub-second-remainder duration specifically (`seconds: -86400,
-  nanosecondsOfSecond: 100000000` there vs MarsDB's `-86399, -900000000`)
-  — MarsDB's `Duration` always keeps `nanos`'s sign matching `seconds`' (a
-  real, deliberately enforced invariant every other Duration operation in
-  this codebase depends on), so matching Java's split here would mean
-  either breaking that invariant or letting two different internal
-  representations of the same duration coexist (silently wrong
-  equality/hashing) — not worth it for one accessor pair on one edge
-  case. See `duration_between`'s docs in `marsdb-query/src/temporal.rs`.
+  that means a real bug**, not a coverage gap — currently 0.
 - **unexp** — errored when success was expected, or vice versa. As of the
   typed `QueryError` taxonomy, this specifically means MarsDB *ran* the
   query and hit a real, data-dependent type mismatch (not just "never
-  parsed this shape") — see [error taxonomy](#error-taxonomy) below.
+  parsed this shape") — see [error taxonomy](#error-taxonomy) below. Two
+  known, deliberately-unfixed cases here: `expressions/temporal`'s
+  `Temporal10 [9]`/`[10]` need dates at year `±999,999,999` — chrono's own
+  `NaiveDate` only supports roughly `±262,000` years internally (a packed
+  `i32` representation), and MarsDB's own `PropertyValue::Date(i32)`
+  epoch-day storage caps out around `±5.8` million years, both far short
+  of what these scenarios need. Fixing them for real would mean hand-
+  rolled proleptic-Gregorian calendar arithmetic bypassing chrono
+  entirely for extreme years, plus widening `Date`/`LocalDateTime`/
+  `DateTime`'s storage representation across `marsdb-graph`/
+  `marsdb-storage` — a real, invasive storage-format change, not a
+  temporal-module fix.
 - **reject** — MarsDB's grammar/semantic pass rejected the query outright
   (never reached execution) — the largest bucket, and mostly an *expected*
   signal for a subset implementation, not a bug.
