@@ -911,6 +911,34 @@ fn order_by_desc_reverses_the_whole_cross_type_order_null_and_nan_included() {
 }
 
 #[test]
+fn variable_length_hop_cannot_reuse_an_earlier_fixed_hops_edge() {
+    // TCK clauses/match Match5 [27]: real Cypher's edge-isomorphism rule
+    // (no relationship repeated within one MATCH pattern) applies across a
+    // whole pattern, not just within one variable-length hop's own BFS --
+    // a var-length hop mustn't walk back over an edge an earlier fixed hop
+    // in the *same* pattern already used.
+    //
+    // A -[:R]-> B <-[:R]- C (both edges point into B). `(a:A)-[:R]->(b)`
+    // must use the A-B edge; a subsequent `<-[:R*1]->` from `b` can then
+    // only reach `C` via the B-C edge -- walking back to `A` would replay
+    // the already-used A-B edge, and (with only one real path to `C`)
+    // reusing it is the *only* way to get a second row.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {name: 'A'})-[:R]->(:B {name: 'B'})");
+    run(&store, "MATCH (b:B) CREATE (:C {name: 'C'})-[:R]->(b)");
+    let result = run(&store, "MATCH (a:A)-[:R]->(b)<-[:R*1]->(c) RETURN c.name");
+    let names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["C".to_string()]);
+}
+
+#[test]
 fn order_by_then_limit_sorts_before_truncating() {
     let store = GraphStore::open_memory().unwrap();
     for i in 0..5 {

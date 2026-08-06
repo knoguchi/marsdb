@@ -284,6 +284,9 @@ struct VarExpandSpec<'a> {
     direction: ExpandDirection,
     min_hops: u32,
     max_hops: Option<u32>,
+    /// Rel-vars bound by earlier fixed hops of the same pattern — see
+    /// `LogicalPlan::VarExpand`'s own docs.
+    exclude_edge_vars: &'a [String],
 }
 
 struct IndexSeekSpec<'a> {
@@ -2222,6 +2225,7 @@ impl<'a> Executor<'a> {
                 direction,
                 min_hops,
                 max_hops,
+                exclude_edge_vars,
             } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
                 let mut pending = Vec::new().into_iter();
@@ -2250,6 +2254,7 @@ impl<'a> Executor<'a> {
                             direction: *direction,
                             min_hops: *min_hops,
                             max_hops: *max_hops,
+                            exclude_edge_vars,
                         },
                         guard,
                     ) {
@@ -2477,7 +2482,21 @@ impl<'a> Executor<'a> {
         }
         let unbounded = spec.max_hops.is_none();
         let effective_max = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
-        let mut frontier = vec![(start_id, HashSet::<EdgeId>::new())];
+        // Real Cypher's edge-isomorphism rule (no relationship repeated
+        // within one MATCH pattern) applies across the *whole* pattern, not
+        // just within this hop's own BFS -- seed the excluded set with
+        // whatever edges earlier fixed hops of this same pattern already
+        // bound, so this traversal can't walk back over one of them (see
+        // `LogicalPlan::VarExpand`'s docs; found via TCK's Match5 `[27]`).
+        let seed_used_edges: HashSet<EdgeId> = spec
+            .exclude_edge_vars
+            .iter()
+            .filter_map(|v| match row.get(v) {
+                Some(Binding::Edge(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let mut frontier = vec![(start_id, seed_used_edges)];
         let mut depth = 0u32;
         while depth < effective_max && !frontier.is_empty() {
             depth += 1;

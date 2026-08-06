@@ -186,6 +186,7 @@ pub fn build_match_plan(
                     direction,
                     min_hops,
                     max_hops,
+                    exclude_edge_vars: prior_rel_vars.clone(),
                 }
             }
         };
@@ -492,6 +493,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             direction,
             min_hops,
             max_hops,
+            exclude_edge_vars,
         } => LogicalPlan::VarExpand {
             input: Box::new(apply_index_seeks(*input, txn)?),
             from_var,
@@ -500,6 +502,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             direction,
             min_hops,
             max_hops,
+            exclude_edge_vars,
         },
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }

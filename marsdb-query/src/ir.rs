@@ -84,6 +84,20 @@ pub enum LogicalPlan {
         direction: ExpandDirection,
         min_hops: u32,
         max_hops: Option<u32>,
+        /// Internal rel-vars bound by *earlier* fixed hops of this same
+        /// pattern (`build_match_plan`'s `prior_rel_vars` at the point this
+        /// hop was built) — real Cypher's edge-isomorphism rule (no
+        /// relationship repeated within one MATCH pattern) applies across
+        /// the whole pattern, not just within a variable-length hop's own
+        /// BFS. Seeds the BFS's excluded-edges set so it can't walk back
+        /// over an edge an earlier hop in the same pattern already used
+        /// (found via TCK's Match5 `[27]`: an earlier fixed hop's edge got
+        /// silently re-walked by a later `<-[:LIKES*3]->`, producing extra
+        /// spurious rows). Later hops checking a variable-length hop's own
+        /// *internally* traversed edges is a separate, still-open gap (a
+        /// var-length hop binds no single edge to check against) — not
+        /// needed by that scenario, since nothing follows its `VarExpand`.
+        exclude_edge_vars: Vec<String>,
     },
     Filter {
         input: Box<LogicalPlan>,
