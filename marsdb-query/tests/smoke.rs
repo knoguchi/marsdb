@@ -7969,3 +7969,59 @@ fn with_star_tolerates_an_empty_scope() {
     let count = run(&store, "MATCH (n) RETURN count(n)");
     assert_eq!(int(&count.rows[0][0]), 12);
 }
+
+/// `WITH ... WHERE (a)-->(b)` -- a pattern predicate combined with
+/// ordinary comparisons via AND/OR, in a WITH's own WHERE (not just
+/// MATCH's). TCK's WithWhere4 [2].
+#[test]
+fn with_where_pattern_predicate_combined_with_and_or() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:TheLabel {id: 0}), (b:TheLabel {id: 1}), (c:TheLabel {id: 2}) \
+         CREATE (a)-[:T]->(b), (b)-[:T]->(c)",
+    );
+    let result = run(
+        &store,
+        "MATCH (a), (b) \
+         WITH a, b \
+         WHERE a.id = 0 AND (a)-[:T]->(b:TheLabel) OR (a)-[:T*]->(b:MissingLabel) \
+         RETURN DISTINCT b.id AS id",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// `WITH DISTINCT x AS y WHERE <expr referencing the pre-WITH scope>` --
+/// unlike aggregation, `DISTINCT` alone doesn't make the pre-WITH scope
+/// ambiguous (`WHERE` runs before the dedup, not after). TCK's
+/// WithWhere1 [2].
+#[test]
+fn with_distinct_where_sees_pre_with_scope() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE ({name2: 'A'}), ({name2: 'A'}), ({name2: 'B'})",
+    );
+    let result = run(
+        &store,
+        "MATCH (a) WITH DISTINCT a.name2 AS name WHERE a.name2 = 'B' RETURN name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "B");
+}
+
+/// `nestedMap.name.name2` -- a chain of two `.prop` suffixes. TCK's
+/// With2 [2].
+#[test]
+fn chained_property_access_on_a_nested_map_literal() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH {name: {name2: 'baz'}} AS nestedMap RETURN nestedMap.name.name2",
+    );
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "baz"),
+        other => panic!("expected a string, got {other:?}"),
+    }
+}

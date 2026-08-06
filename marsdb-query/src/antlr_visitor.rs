@@ -1344,36 +1344,40 @@ impl AstBuilder {
     }
 
     /// `propertyExpression : atom (DOT name)*`. A bare atom (no `.name`
-    /// suffix) passes through unchanged; exactly one suffix on a bare
-    /// variable becomes the flat `Prop` shape (`{var, prop}`); exactly one
-    /// suffix on anything else (a function call's result, a map literal,
-    /// an indexed list element, ...) becomes `PropOf` instead -- evaluated
-    /// by evaluating the base expression first, then looking the property
-    /// up on whatever `Value` it produced (TCK's Graph6 [4]/[8], Map1
-    /// [3], Merge5 [11]). A *chain* of two or more suffixes still errors
-    /// -- neither pest nor this parser represents that (`duration.
-    /// between(a, b).days` routes through a bound variable first instead,
-    /// confirmed against the TCK's own Temporal10 fixtures).
+    /// suffix) passes through unchanged; the first suffix on a bare
+    /// variable becomes the flat `Prop` shape (`{var, prop}`); every other
+    /// suffix -- the first one when `atom` isn't a bare variable, and
+    /// every suffix after the first regardless -- becomes `PropOf`
+    /// instead, folded left-to-right (`a.b.c` -> `PropOf(Prop{a,b}, c)`),
+    /// each evaluated by evaluating its own base first, then looking the
+    /// property up on whatever `Value` that produced (TCK's Graph6 [4]/
+    /// [8], Map1 [3], Merge5 [11], With2 [2]).
     fn build_property_expression(
         &mut self,
         ctx: &PropertyExpressionContext,
     ) -> Result<ReturnExpr, QueryError> {
         let atom_ctx = ctx.atom().expect("propertyExpression always has an atom");
         let base = self.visit(&*atom_ctx).into_return_expr()?;
-        let names = ctx.name_all();
-        match names.len() {
-            0 => Ok(base),
-            1 => Ok(match base {
-                ReturnExpr::Var(var) => ReturnExpr::Prop(PropAccess {
-                    var,
-                    prop: name_text(&names[0]),
-                }),
-                other => ReturnExpr::PropOf(Box::new(other), name_text(&names[0])),
+        let mut names = ctx.name_all().into_iter();
+        let Some(first) = names.next() else {
+            return Ok(base);
+        };
+        // First suffix on a bare variable becomes the flat `Prop` shape
+        // (`{var, prop}`); every suffix after that -- including this one
+        // when `base` isn't a bare variable -- becomes `PropOf`, folded
+        // left-to-right (`a.b.c` -> `PropOf(Prop{a,b}, c)`, TCK's With2
+        // `[2]`, `nestedMap.name.name2`).
+        let mut expr = match base {
+            ReturnExpr::Var(var) => ReturnExpr::Prop(PropAccess {
+                var,
+                prop: name_text(&first),
             }),
-            _ => Err(QueryError::Syntax(
-                "chained property access (`a.b.c`) isn't supported yet".into(),
-            )),
+            other => ReturnExpr::PropOf(Box::new(other), name_text(&first)),
+        };
+        for name in names {
+            expr = ReturnExpr::PropOf(Box::new(expr), name_text(&name));
         }
+        Ok(expr)
     }
 
     fn build_atom(&mut self, ctx: &AtomContext) -> Result<ReturnExpr, QueryError> {
@@ -3751,11 +3755,6 @@ mod tests {
     }
 
     #[test]
-    fn chained_property_access_not_yet_supported() {
-        assert!(parse_expr("n.a.b").is_err());
-    }
-
-    #[test]
     fn property_access_on_computed_expr_becomes_prop_of() {
         // `<expr>.prop` where `<expr>` isn't a bare variable -- `ReturnExpr::
         // PropOf`, evaluated by evaluating the base first, then looking the
@@ -3770,8 +3769,20 @@ mod tests {
     }
 
     #[test]
-    fn chained_property_access_still_errors() {
-        assert!(parse_expr("a.b.c").is_err());
+    fn chained_property_access_folds_left_to_right() {
+        // `a.b.c` -> `PropOf(Prop{a,b}, c)` -- TCK's With2 [2].
+        let expr = parse_expr("a.b.c").unwrap();
+        let ReturnExpr::PropOf(base, prop) = expr else {
+            panic!("expected PropOf, got {expr:?}");
+        };
+        assert_eq!(prop, "c");
+        assert_eq!(
+            *base,
+            ReturnExpr::Prop(PropAccess {
+                var: "a".to_string(),
+                prop: "b".to_string(),
+            })
+        );
     }
 
     #[test]

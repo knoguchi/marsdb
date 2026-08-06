@@ -452,9 +452,13 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         // Real Cypher lets `WITH x AS y WHERE ...` see both the pre-WITH
         // binding (`x`) and the new alias (`y`) -- matches the merged-row
         // evaluation `executor::materialize_with` does at runtime for the
-        // same reason (see its docs). Aggregation/DISTINCT both collapse
-        // rows, so there's no single pre-WITH scope to fall back to there.
-        if crate::executor::has_aggregate(&with.items) || with.distinct {
+        // same reason (see its docs). Only aggregation collapses rows
+        // ambiguously here, not `DISTINCT` -- `WHERE` runs *before*
+        // `DISTINCT`'s own dedup (`materialize_with` filters first, then
+        // dedups the survivors), so every row WHERE sees still has its
+        // own single, unambiguous pre-WITH binding (TCK's WithWhere1
+        // `[2]`: `WITH DISTINCT a.name2 AS name WHERE a.name2 = 'B'`).
+        if crate::executor::has_aggregate(&with.items) {
             validate_with_expr(expr, &projected)?;
         } else {
             let mut merged = input.clone();
@@ -779,6 +783,16 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
         WithExpr::IsNull(e) => {
             infer_expr(e, scope)?;
             Ok(())
+        }
+        // Same reasoning as `executor::eval_with_expr`'s matching special
+        // case: `WithExpr` has no `Expr::Pattern`-equivalent folding, so a
+        // bare pattern predicate reaches here as `ReturnExpr::
+        // PatternPredicate` inside `Bare` -- validated the same way
+        // ordinary MATCH's own WHERE already validates one (TCK's
+        // WithWhere4 `[2]`), not `infer_expr`'s generic (and therefore
+        // rejecting) handling.
+        WithExpr::Bare(ReturnExpr::PatternPredicate(pattern)) => {
+            validate_pattern_predicate(pattern, scope)
         }
         WithExpr::Bare(e) => {
             let kind = infer_expr(e, scope)?;

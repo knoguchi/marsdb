@@ -1711,18 +1711,13 @@ impl<'a> Executor<'a> {
                 })
                 .collect()
         };
-        if with.distinct {
-            out = dedup_binding_rows(&with.items, out)?;
-        }
         if let Some(where_clause) = &with.where_clause {
             let mut filtered = Vec::with_capacity(out.len());
-            if is_aggregating || with.distinct {
-                // Aggregation collapses many input rows into one group, and
-                // DISTINCT collapses rows into deduped ones -- either way
+            if is_aggregating {
+                // Aggregation collapses many input rows into one group --
                 // there's no single pre-WITH row left to fall back to, so
                 // (matching real Cypher) WHERE only sees the grouped/
-                // aggregated/deduped names, same as `RETURN`'s own
-                // aggregate WHERE.
+                // aggregated names, same as `RETURN`'s own aggregate WHERE.
                 for row in out {
                     if self.eval_with_expr(txn, where_clause, &row, guard)? == Some(true) {
                         filtered.push(row);
@@ -1733,7 +1728,15 @@ impl<'a> Executor<'a> {
                 // following see *both* the pre-WITH binding (`x`) and the
                 // new alias (`y`) -- confirmed via the TCK's own
                 // `WithWhere7` scenarios. New aliases shadow same-named
-                // old bindings on conflict.
+                // old bindings on conflict. Still true with `DISTINCT` --
+                // unlike aggregation, `DISTINCT` alone doesn't collapse
+                // several pre-WITH rows into one *ambiguous* group; it's
+                // a dedup applied to the *surviving*, still individually-
+                // real rows, which is why the dedup itself happens below,
+                // after this filter, not before it (TCK's WithWhere1
+                // `[2]`: `WITH DISTINCT a.name2 AS name WHERE a.name2 =
+                // 'B'` needs `a` from the row that produced each
+                // candidate `name`, not just `name` itself).
                 for (row, new_row) in rows.iter().zip(out) {
                     let mut merged = row.clone();
                     merged.extend(new_row.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -1743,6 +1746,9 @@ impl<'a> Executor<'a> {
                 }
             }
             out = filtered;
+        }
+        if with.distinct {
+            out = dedup_binding_rows(&with.items, out)?;
         }
         Ok(out)
     }
@@ -2500,8 +2506,52 @@ impl<'a> Executor<'a> {
                 self.eval_return_expr(txn, e, row, guard)?,
                 Value::Null
             )),
+            // Unlike an ordinary MATCH's own `WHERE` (`Expr`), which folds
+            // a bare pattern predicate into `Expr::Pattern` at parse time
+            // (`return_expr_to_expr`), `WithExpr` has no such folding --
+            // `WITH ... WHERE a.id = 0 AND (a)-->(b)` embeds it straight
+            // as a `ReturnExpr::PatternPredicate` inside `Bare`/`And`/`Or`.
+            // Special-cased here (rather than in `eval_return_expr`, which
+            // errors on it -- a pattern predicate is only ever meaningful
+            // as a predicate, never as a real projected value) so `WITH
+            // ... WHERE` gets the same existential-search semantics MATCH's
+            // own `WHERE` already has (TCK's WithWhere4 `[2]`).
+            WithExpr::Bare(ReturnExpr::PatternPredicate(pattern)) => {
+                Some(self.eval_pattern_predicate_exists(txn, pattern, row, guard)?)
+            }
             WithExpr::Bare(e) => self.eval_return_expr_bool3(txn, e, row, guard)?,
         })
+    }
+
+    /// `WHERE (n)-[:REL]->()` etc (TCK's Pattern1) -- existential: true
+    /// iff at least one real match of `pattern` exists, with every
+    /// already-bound named endpoint (`n`, and `m` in `(n)-->(m)` when `m`
+    /// is also bound by an earlier MATCH) held fixed to this row's own
+    /// binding rather than searched freely. `semantic::
+    /// validate_pattern_predicate` already rejected any named endpoint
+    /// that ISN'T already bound (real Cypher's `UndefinedVariable`), so
+    /// every named var here is safe to seed. Reuses the exact same
+    /// `build_match_plan` "already-bound var -> Seed, not a fresh scan"
+    /// mechanism `eval_merge`'s own "try as an ordinary MATCH first" half
+    /// already relies on -- for a one-hop pattern this is a real
+    /// connected-subgraph search (Expand + Filter), not an isolated
+    /// per-node check. `Some(1)`-limited: existence is all that's needed,
+    /// so there's no reason to enumerate every match. Shared by `Expr::
+    /// Pattern` (an ordinary MATCH's own WHERE) and `WithExpr::Bare`'s
+    /// `PatternPredicate` case (a WITH's own WHERE) -- same semantics
+    /// either way, just reached from two different expression shapes.
+    fn eval_pattern_predicate_exists(
+        &self,
+        txn: Txn,
+        pattern: &Pattern,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<bool, QueryError> {
+        let carried_vars: HashSet<String> = row.keys().cloned().collect();
+        let plan = apply_index_seeks(build_match_plan(pattern, &None, &carried_vars)?, txn)?;
+        let found =
+            self.eval_plan_with_limit(txn, &plan, std::slice::from_ref(row), guard, Some(1))?;
+        Ok(!found.is_empty())
     }
 
     /// Evaluates an `OPTIONAL MATCH` part with left-outer-join semantics:
@@ -3105,17 +3155,7 @@ impl<'a> Executor<'a> {
             // `Some(1)`-limited: existence is all that's needed, so
             // there's no reason to enumerate every match.
             Expr::Pattern(pattern) => {
-                let carried_vars: HashSet<String> = row.keys().cloned().collect();
-                let plan =
-                    apply_index_seeks(build_match_plan(pattern, &None, &carried_vars)?, txn)?;
-                let found = self.eval_plan_with_limit(
-                    txn,
-                    &plan,
-                    std::slice::from_ref(row),
-                    guard,
-                    Some(1),
-                )?;
-                Some(!found.is_empty())
+                Some(self.eval_pattern_predicate_exists(txn, pattern, row, guard)?)
             }
             // `exists { (n)-->(m) WHERE ... }` (TCK's ExistentialSubquery1,
             // the "simple" form) -- same existential search as `Pattern`
