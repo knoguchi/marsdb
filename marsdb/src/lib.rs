@@ -17,7 +17,8 @@ pub use marsdb_graph::PropertyValue;
 pub use marsdb_graph::TzId;
 pub use marsdb_query::{
     temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
-    ExecutionOutcome, Literal, PathElem, QueryResult, Value,
+    ExecutionOutcome, Literal, PathElem, ProcedureProvider, ProcedureSignature, Procedures,
+    QueryResult, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -103,8 +104,9 @@ impl Database {
         options: &ExecutionOptions,
     ) -> Result<QueryResult, Error> {
         let stmt = prepare_statement(cypher, params, options)?;
+        let options = with_call_params(options, params);
         let result =
-            marsdb_query::Executor::new(&self.store).execute_with_options(&stmt, options)?;
+            marsdb_query::Executor::new(&self.store).execute_with_options(&stmt, &options)?;
         Ok(result)
     }
 
@@ -169,8 +171,9 @@ impl Transaction<'_> {
         };
         let outcome = (|| {
             let stmt = prepare_statement(cypher, params, options)?;
+            let options = with_call_params(options, params);
             Ok(marsdb_query::Executor::new(&self.db.store)
-                .execute_in_write_transaction_with_options(&stmt, write_txn, options)?)
+                .execute_in_write_transaction_with_options(&stmt, write_txn, &options)?)
         })();
         if outcome.is_err() {
             if let Some(write_txn) = self.inner.take() {
@@ -191,6 +194,19 @@ impl Transaction<'_> {
         marsdb_graph::GraphStore::abort(write_txn)?;
         Ok(())
     }
+}
+
+/// See `ExecutionOptions::params`'s own docs -- a standalone `CALL proc`
+/// with no parens needs the raw params map at execution time, after
+/// `prepare_statement` has already consumed it for ordinary `$param`
+/// substitution.
+fn with_call_params(
+    options: &ExecutionOptions,
+    params: &HashMap<String, PropertyValue>,
+) -> ExecutionOptions {
+    let mut options = options.clone();
+    options.params = params.clone();
+    options
 }
 
 fn prepare_statement(

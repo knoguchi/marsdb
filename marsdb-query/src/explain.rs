@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use marsdb_graph::{PropertyValue, Txn};
 
 use crate::ast::{
-    CompareOp, Expr, Literal, MergeClause, QueryClause, QueryPart, RemoveItem, ReturnExpr,
-    ReturnItem, SetItem, Statement, Tail, UnwindClause, WithClause,
+    CallClause, CallYield, CompareOp, Expr, Literal, MergeClause, QueryClause, QueryPart,
+    RemoveItem, ReturnExpr, ReturnItem, SetItem, Statement, Tail, UnwindClause, WithClause,
 };
 use crate::error::QueryError;
 use crate::executor::with_item_output_name;
@@ -66,7 +66,37 @@ pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, Quer
             }
             Ok(out)
         }
+        Statement::StandaloneCall(call) => Ok(vec![explain_call_clause(call)]),
     }
+}
+
+fn explain_call_clause(call: &CallClause) -> String {
+    let args = match &call.args {
+        Some(args) => format!(
+            "({})",
+            args.iter()
+                .map(|a| format!("{a:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => String::new(),
+    };
+    let yield_part = match &call.yield_items {
+        None => String::new(),
+        Some(CallYield::Star) => " YIELD *".to_string(),
+        Some(CallYield::Items(items, _)) => format!(
+            " YIELD {}",
+            items
+                .iter()
+                .map(|(name, alias)| match alias {
+                    Some(alias) => format!("{name} AS {alias}"),
+                    None => name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!("CALL {}{args}{yield_part}", call.name)
 }
 
 fn explain_clause(
@@ -138,6 +168,19 @@ fn explain_clause(
                 patterns.len(),
                 if patterns.len() == 1 { "" } else { "s" }
             ));
+            Ok(())
+        }
+        QueryClause::Call(call) => {
+            // `YIELD *`'s real output names need the procedure's
+            // signature (not available here, no registry access in
+            // EXPLAIN) -- only an explicit `YIELD` item list is known
+            // structurally, so only that case can extend `carried_vars`.
+            if let Some(CallYield::Items(items, _)) = &call.yield_items {
+                for (name, alias) in items {
+                    carried_vars.insert(alias.clone().unwrap_or_else(|| name.clone()));
+                }
+            }
+            out.push(explain_call_clause(call));
             Ok(())
         }
     }

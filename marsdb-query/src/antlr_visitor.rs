@@ -27,10 +27,10 @@
 //! type. Grows a variant per AST node kind as later increments need it.
 
 use crate::ast::{
-    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
-    PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem,
-    ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause,
-    UnwindSource, WithClause, WithExpr,
+    is_aggregate_name, ArithOp, CallClause, CallYield, CompareOp, Expr, Literal, MergeClause,
+    NodePattern, Pattern, PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection,
+    RelPattern, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail,
+    UnwindClause, UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -54,29 +54,33 @@ use crate::generated::cypherparser::{
     NodePatternContext, NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
     NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
     OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
-    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
+    ParameterContextAttrs, ParenExpressionChainContextAll, ParenExpressionChainContextAttrs,
+    ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
     PatternComprehensionContext, PatternComprehensionContextAttrs, PatternContextAttrs,
     PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
     PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
     PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
     ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertiesContextAll,
     PropertiesContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
-    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs,
-    ReadingStatementContextAll, ReadingStatementContextAttrs, RegularQueryContext,
-    RegularQueryContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
-    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
-    RelationshipsChainPatternContext, RelationshipsChainPatternContextAttrs, RemoveItemContextAll,
-    RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
-    ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
+    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs, QueryCallStContextAll,
+    QueryCallStContextAttrs, ReadingStatementContextAll, ReadingStatementContextAttrs,
+    RegularQueryContext, RegularQueryContextAttrs, RelationDetailContext,
+    RelationDetailContextAttrs, RelationshipPatternContext, RelationshipPatternContextAttrs,
+    RelationshipTypesContextAttrs, RelationshipsChainPatternContext,
+    RelationshipsChainPatternContextAttrs, RemoveItemContextAll, RemoveItemContextAttrs,
+    RemoveStContext, RemoveStContextAttrs, ReturnStContext, ReturnStContextAttrs,
+    SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
     ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
-    SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
-    StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
-    StringListNullExpressionContext, StringListNullExpressionContextAttrs, StringLitContext,
-    StringLitContextAttrs, SubqueryExistContext, SubqueryExistContextAttrs, SymbolContextAll,
-    SymbolContextAttrs, UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs,
-    UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
+    SkipStContextAttrs, StandaloneCallContext, StandaloneCallContextAttrs,
+    StringExpPrefixContextAll, StringExpPrefixContextAttrs, StringExpressionContextAll,
+    StringExpressionContextAttrs, StringListNullExpressionContext,
+    StringListNullExpressionContextAttrs, StringLitContext, StringLitContextAttrs,
+    SubqueryExistContext, SubqueryExistContextAttrs, SymbolContextAll, SymbolContextAttrs,
+    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, UnionStContextAttrs,
+    UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
     UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
-    XorExpressionContext, XorExpressionContextAttrs,
+    XorExpressionContext, XorExpressionContextAttrs, YieldItemContextAttrs, YieldItemsContextAll,
+    YieldItemsContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parse_helpers::{
@@ -597,16 +601,15 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
     // `query : explainSt | regularQuery | standaloneCall | createIndexSt`
     // -- `regularQuery`/`explainSt`/`createIndexSt` need no override of
     // their own *here* (default `visit_children` dispatch already routes
-    // to each rule's own override below), but `standaloneCall` (a bare
-    // `CALL proc(...) YIELD ...` with no MATCH at all) has no `Statement`
-    // representation yet (same CALL gap as `queryCallSt`, tracked
-    // separately as mars-82w) -- overridden so reaching it errors cleanly
-    // instead of default-recursing into its inner symbol/expression nodes
-    // and silently producing a wrong-shaped `AstNode`.
-    fn visit_standaloneCall(&mut self, _ctx: &StandaloneCallContext<'input>) -> Self::Return {
-        AstNode::Err(QueryError::Syntax(
-            "CALL isn't supported by the ANTLR parser yet".into(),
-        ))
+    // to each rule's own override below); `standaloneCall` (a bare
+    // `CALL proc(...) YIELD ...` with no MATCH at all) builds its own
+    // `Statement::StandaloneCall` directly, same reasoning `visit_
+    // regularQuery` already has for delegating to a `build_*` helper.
+    fn visit_standaloneCall(&mut self, ctx: &StandaloneCallContext<'input>) -> Self::Return {
+        match self.build_standalone_call(ctx) {
+            Ok(s) => AstNode::Statement(s),
+            Err(e) => AstNode::Err(e),
+        }
     }
 
     fn visit_explainSt(&mut self, ctx: &ExplainStContext<'input>) -> Self::Return {
@@ -1694,6 +1697,112 @@ impl AstBuilder {
         })
     }
 
+    /// `standaloneCall : CALL invocationName parenExpressionChain? (YIELD
+    /// (MULT | yieldItems))?` -- the top-level, no-MATCH form (TCK's
+    /// Call1/Call2). `parenExpressionChain?`'s absence is the implicit-
+    /// argument shape (`CALL proc`, no parens at all -- `CallClause::args:
+    /// None`, see its own docs); `MULT` (`YIELD *`) is only reachable
+    /// here, never from `queryCallSt`'s own grammar production below.
+    fn build_standalone_call(
+        &mut self,
+        ctx: &StandaloneCallContext,
+    ) -> Result<Statement, QueryError> {
+        let name_ctx = ctx
+            .invocationName()
+            .expect("standaloneCall always has an invocationName");
+        let name = invocation_name_text(&name_ctx);
+        let args = match ctx.parenExpressionChain() {
+            Some(paren_ctx) => Some(self.build_call_args(&paren_ctx)?),
+            None => None,
+        };
+        let yield_items = if ctx.MULT().is_some() {
+            Some(CallYield::Star)
+        } else if let Some(yi_ctx) = ctx.yieldItems() {
+            Some(self.build_yield_items(&yi_ctx)?)
+        } else {
+            None
+        };
+        Ok(Statement::StandaloneCall(Box::new(CallClause {
+            name,
+            args,
+            with: None,
+            yield_items,
+        })))
+    }
+
+    /// `queryCallSt : CALL invocationName parenExpressionChain (YIELD
+    /// yieldItems)?` -- the in-query reading-clause form (TCK's
+    /// Call1 `[3]`/`[4]`/etc). Parens are mandatory here (no implicit-
+    /// argument shape mid-query, TCK's Call2 `[4]`, `@skipGrammarCheck`
+    /// but structurally impossible to reach via this grammar rule either
+    /// way) and there's no `YIELD *` alternative (only `standaloneCall`
+    /// has one).
+    fn build_query_call_st(
+        &mut self,
+        ctx: &QueryCallStContextAll,
+    ) -> Result<CallClause, QueryError> {
+        let name_ctx = ctx
+            .invocationName()
+            .expect("queryCallSt always has an invocationName");
+        let name = invocation_name_text(&name_ctx);
+        let paren_ctx = ctx
+            .parenExpressionChain()
+            .expect("queryCallSt always has a parenExpressionChain");
+        let args = Some(self.build_call_args(&paren_ctx)?);
+        let yield_items = match ctx.yieldItems() {
+            Some(yi_ctx) => Some(self.build_yield_items(&yi_ctx)?),
+            None => None,
+        };
+        Ok(CallClause {
+            name,
+            args,
+            with: None,
+            yield_items,
+        })
+    }
+
+    fn build_call_args(
+        &mut self,
+        ctx: &ParenExpressionChainContextAll,
+    ) -> Result<Vec<ReturnExpr>, QueryError> {
+        let mut args = Vec::new();
+        if let Some(chain_ctx) = ctx.expressionChain() {
+            for arg_ctx in chain_ctx.expression_all() {
+                args.push(self.visit(&*arg_ctx).into_return_expr()?);
+            }
+        }
+        Ok(args)
+    }
+
+    /// `yieldItems : yieldItem (COMMA yieldItem)* where?`, `yieldItem :
+    /// (symbol AS)? symbol` -- one or two `symbol`s per item: two means
+    /// `a AS c` (the procedure's own declared output name `a`, renamed to
+    /// `c`), one means the declared name doubles as the binding name too
+    /// (no rename).
+    fn build_yield_items(&mut self, ctx: &YieldItemsContextAll) -> Result<CallYield, QueryError> {
+        let mut items = Vec::new();
+        for item_ctx in ctx.yieldItem_all() {
+            let symbols = item_ctx.symbol_all();
+            let (name, alias) = match symbols.len() {
+                1 => (symbol_text(&symbols[0]), None),
+                2 => (symbol_text(&symbols[0]), Some(symbol_text(&symbols[1]))),
+                other => unreachable!("yieldItem always has 1 or 2 symbols, got {other}"),
+            };
+            items.push((name, alias));
+        }
+        let where_clause = match ctx.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(Box::new(return_expr_to_expr(expr)?))
+            }
+            None => None,
+        };
+        Ok(CallYield::Items(items, where_clause))
+    }
+
     fn build_parameter(&mut self, ctx: &ParameterContext) -> Result<ReturnExpr, QueryError> {
         let name = if let Some(sym_ctx) = ctx.symbol() {
             symbol_text(&sym_ctx)
@@ -2101,9 +2210,11 @@ impl AstBuilder {
     /// disjoint patterns splice into separate `QueryPart`s -- see
     /// `build_match_st`'s docs), so this appends rather than returning a
     /// single clause. `queryCallSt` (`CALL proc(...) YIELD ...` used as a
-    /// reading clause) has no `QueryClause` variant to build at all yet --
-    /// CALL/YIELD support is a separate, tracked gap (beads mars-82w), not
-    /// part of this pass.
+    /// reading clause) builds a `QueryClause::Call` -- unlike
+    /// `standaloneCall`'s own grammar rule, this one's `parenExpressionChain`
+    /// is mandatory (no implicit-argument form in-query) and its `YIELD`
+    /// has no `*` alternative (only `yieldItems`), see `CallClause`'s own
+    /// docs.
     fn append_reading_statement(
         &mut self,
         ctx: &ReadingStatementContextAll,
@@ -2119,9 +2230,12 @@ impl AstBuilder {
             clauses.push(QueryClause::Unwind(clause));
             return Ok(());
         }
-        Err(QueryError::Syntax(
-            "CALL isn't supported by the ANTLR parser yet".into(),
-        ))
+        let call_ctx = ctx
+            .queryCallSt()
+            .expect("readingStatement is matchSt | unwindSt | queryCallSt");
+        let call = self.build_query_call_st(&call_ctx)?;
+        clauses.push(QueryClause::Call(call));
+        Ok(())
     }
 
     /// `updatingStatement : createSt | mergeSt | deleteSt | setSt |
@@ -2384,8 +2498,9 @@ impl AstBuilder {
                             QueryClause::Match(part) => part.with = Some(with),
                             QueryClause::Unwind(u) => u.with = Some(with),
                             QueryClause::Merge(m) => m.with = Some(with),
+                            QueryClause::Call(call) => call.with = Some(with),
                             _ => unreachable!(
-                                "attach_target is only ever set right after pushing a Match/Unwind/Merge clause"
+                                "attach_target is only ever set right after pushing a Match/Unwind/Merge/Call clause"
                             ),
                         },
                         None => clauses.push(QueryClause::With(with)),
@@ -2520,9 +2635,7 @@ impl AstBuilder {
 
 /// The real implementation behind `lib.rs`'s public `parse` (Phase 3
 /// cutover, mars-cuk/mars-nog) -- the pest-based `parser.rs`/`cypher.pest`
-/// this replaced are gone (see `grammar/README.md`). CALL is the one
-/// remaining gap versus the old parser, and it's not a regression: pest
-/// never supported it either (tracked separately as mars-82w).
+/// this replaced are gone (see `grammar/README.md`).
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
@@ -4560,8 +4673,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_antlr_standalone_call_not_supported() {
-        assert!(parse_antlr("CALL db.labels() YIELD label;").is_err());
+    fn parse_antlr_standalone_call() {
+        let stmt = parse_antlr("CALL db.labels() YIELD label").unwrap();
+        let Statement::StandaloneCall(call) = stmt else {
+            panic!("expected a Statement::StandaloneCall, got {stmt:?}");
+        };
+        assert_eq!(call.name, "db.labels");
+        assert_eq!(call.args, Some(vec![]));
+        assert!(matches!(
+            call.yield_items,
+            Some(CallYield::Items(items, None)) if items == vec![("label".to_string(), None)]
+        ));
     }
 
     #[test]

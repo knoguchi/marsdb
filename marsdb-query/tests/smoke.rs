@@ -8474,3 +8474,288 @@ fn map_valued_parameters_substitute_into_a_map_literal_expression() {
     keys.sort();
     assert_eq!(keys, vec!["address".to_string(), "name".to_string()]);
 }
+
+mod call_procedures {
+    use std::collections::HashMap;
+
+    use marsdb_graph::GraphStore;
+    use marsdb_query::{
+        parse, ExecutionOptions, Executor, ProcedureProvider, ProcedureSignature, Procedures,
+        QueryError, Value,
+    };
+
+    use super::run;
+
+    /// A minimal test-only `ProcedureProvider` -- ignores `args`
+    /// entirely and always returns the same fixed rows, since these
+    /// tests exercise MarsDB's own CALL/YIELD mechanics (arity, renaming,
+    /// WHERE, WITH-chaining, standalone auto-yield), not a real
+    /// table-lookup mock protocol (that's `marsdb-tck`'s own concern, see
+    /// its `TckProcedureProvider`).
+    /// `(input names, output names, fixed output rows)`.
+    type ProcFixture = (Vec<&'static str>, Vec<&'static str>, Vec<Vec<Value>>);
+
+    struct TestProvider {
+        procs: HashMap<&'static str, ProcFixture>,
+    }
+
+    impl ProcedureProvider for TestProvider {
+        fn signature(&self, name: &str) -> Option<ProcedureSignature> {
+            let (inputs, outputs, _) = self.procs.get(name)?;
+            Some(ProcedureSignature {
+                inputs: inputs.iter().map(|s| s.to_string()).collect(),
+                // Unrecognized -- `value_matches_declared_type` accepts
+                // anything for a type name it doesn't know, so these
+                // tests (which exercise CALL's own mechanics, not
+                // argument-type checking) aren't accidentally blocked by
+                // whatever shape a test happens to pass.
+                input_types: inputs.iter().map(|_| "ANY".to_string()).collect(),
+                outputs: outputs.iter().map(|s| s.to_string()).collect(),
+            })
+        }
+
+        fn call(&self, name: &str, _args: &[Value]) -> Result<Vec<Vec<Value>>, QueryError> {
+            Ok(self
+                .procs
+                .get(name)
+                .expect("checked by signature")
+                .2
+                .clone())
+        }
+    }
+
+    fn options(procs: TestProvider) -> ExecutionOptions {
+        ExecutionOptions {
+            procedures: Some(Procedures(std::sync::Arc::new(procs))),
+            ..Default::default()
+        }
+    }
+
+    fn int(v: &Value) -> i64 {
+        match v {
+            Value::Literal(marsdb_query::Literal::Int(i)) => *i,
+            Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+            other => panic!("expected an Int, got {other:?}"),
+        }
+    }
+
+    fn str_val(v: &Value) -> String {
+        match v {
+            Value::Literal(marsdb_query::Literal::String(s)) => s.clone(),
+            other => panic!("expected a String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standalone_call_auto_yields_every_output_with_no_yield_written() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.labels",
+                (
+                    vec![],
+                    vec!["label"],
+                    vec![
+                        vec![Value::Literal(marsdb_query::Literal::String("A".into()))],
+                        vec![Value::Literal(marsdb_query::Literal::String("B".into()))],
+                    ],
+                ),
+            )]),
+        };
+        let stmt = parse("CALL test.labels()").unwrap();
+        let result = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap();
+        assert_eq!(result.columns, vec!["label"]);
+        let labels: Vec<String> = result.rows.iter().map(|r| str_val(&r[0])).collect();
+        assert_eq!(labels, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn in_query_call_with_yield_fans_out_and_renames() {
+        let store = GraphStore::open_memory().unwrap();
+        run(&store, "CREATE (:N {x: 1}), (:N {x: 2})");
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.proc",
+                (
+                    vec!["in"],
+                    vec!["a", "b"],
+                    vec![vec![
+                        Value::Literal(marsdb_query::Literal::Int(1)),
+                        Value::Literal(marsdb_query::Literal::Int(2)),
+                    ]],
+                ),
+            )]),
+        };
+        let stmt =
+            parse("MATCH (n:N) CALL test.proc(n.x) YIELD a, b AS c RETURN n.x, a, c").unwrap();
+        let result = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap();
+        assert_eq!(result.columns, vec!["n.x", "a", "c"]);
+        // Fans out once per input row -- 2 nodes x 1 proc row each = 2.
+        assert_eq!(result.rows.len(), 2);
+        for row in &result.rows {
+            assert_eq!(int(&row[1]), 1);
+            assert_eq!(int(&row[2]), 2);
+        }
+    }
+
+    #[test]
+    fn in_query_call_without_yield_discards_outputs_but_keeps_rows() {
+        let store = GraphStore::open_memory().unwrap();
+        run(&store, "CREATE (:A), (:B), (:C)");
+        let procs = TestProvider {
+            procs: HashMap::from([("test.doNothing", (vec![], vec![], vec![vec![]]))]),
+        };
+        let stmt = parse("MATCH (n) CALL test.doNothing() RETURN count(n) AS c").unwrap();
+        let result = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap();
+        assert_eq!(int(&result.rows[0][0]), 3);
+    }
+
+    #[test]
+    fn call_without_yield_then_referencing_output_is_undefined_variable() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.proc",
+                (vec!["in"], vec!["out"], vec![vec![Value::Null]]),
+            )]),
+        };
+        let stmt = parse("CALL test.proc(1) RETURN out").unwrap();
+        let err = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Semantic(_)));
+    }
+
+    #[test]
+    fn wrong_arity_is_a_compile_time_error() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([("test.proc", (vec!["a", "b"], vec!["out"], vec![]))]),
+        };
+        let stmt = parse("CALL test.proc(1)").unwrap();
+        let err = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Semantic(_)));
+    }
+
+    #[test]
+    fn unknown_procedure_errors() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::new(),
+        };
+        let stmt = parse("CALL test.nope()").unwrap();
+        let err = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Semantic(_)));
+    }
+
+    #[test]
+    fn yield_shadowing_an_already_bound_variable_is_a_compile_time_error() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.labels",
+                (
+                    vec![],
+                    vec!["label"],
+                    vec![vec![Value::Literal(marsdb_query::Literal::String(
+                        "A".into(),
+                    ))]],
+                ),
+            )]),
+        };
+        let stmt = parse("WITH 'Hi' AS label CALL test.labels() YIELD label RETURN *").unwrap();
+        let err = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap_err();
+        assert!(matches!(err, QueryError::Semantic(_)));
+    }
+
+    #[test]
+    fn implicit_arguments_resolve_from_same_named_params() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.proc",
+                (
+                    vec!["name"],
+                    vec!["out"],
+                    vec![vec![Value::Literal(marsdb_query::Literal::String(
+                        "found".into(),
+                    ))]],
+                ),
+            )]),
+        };
+        let stmt = parse("CALL test.proc").unwrap();
+        let mut params = HashMap::new();
+        params.insert(
+            "name".to_string(),
+            marsdb_graph::PropertyValue::String("Stefan".to_string()),
+        );
+        // `substitute_params` has nothing to do here (no `$param` literal
+        // position exists for the implicit-argument form) -- the raw
+        // params map itself has to flow through `ExecutionOptions`
+        // instead, same as `marsdb::Database` already wires up.
+        let mut opts = options(procs);
+        opts.params = params;
+        let result = Executor::new(&store)
+            .execute_with_options(&stmt, &opts)
+            .unwrap();
+        assert_eq!(str_val(&result.rows[0][0]), "found");
+    }
+
+    #[test]
+    fn implicit_arguments_missing_param_errors() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([("test.proc", (vec!["name"], vec!["out"], vec![]))]),
+        };
+        let stmt = parse("CALL test.proc").unwrap();
+        let err = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap_err();
+        assert!(matches!(err, QueryError::MissingParam(_)));
+    }
+
+    #[test]
+    fn call_then_with_then_call_again_chains_correctly() {
+        let store = GraphStore::open_memory().unwrap();
+        let procs = TestProvider {
+            procs: HashMap::from([(
+                "test.labels",
+                (
+                    vec![],
+                    vec!["label"],
+                    vec![
+                        vec![Value::Literal(marsdb_query::Literal::String("A".into()))],
+                        vec![Value::Literal(marsdb_query::Literal::String("B".into()))],
+                        vec![Value::Literal(marsdb_query::Literal::String("C".into()))],
+                    ],
+                ),
+            )]),
+        };
+        let stmt = parse(
+            "CALL test.labels() YIELD label \
+             WITH count(*) AS c \
+             CALL test.labels() YIELD label \
+             RETURN *",
+        )
+        .unwrap();
+        let result = Executor::new(&store)
+            .execute_with_options(&stmt, &options(procs))
+            .unwrap();
+        assert_eq!(result.rows.len(), 3);
+        for row in &result.rows {
+            assert_eq!(int(&row[0]), 3);
+        }
+    }
+}

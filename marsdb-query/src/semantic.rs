@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    is_aggregate_name, ArithOp, Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause,
-    RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, Statement, Tail, UnwindClause,
-    WithClause, WithExpr,
+    is_aggregate_name, ArithOp, CallClause, CallYield, Expr, Literal, MergeClause, NodePattern,
+    Pattern, QueryClause, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, Statement, Tail,
+    UnwindClause, WithClause, WithExpr,
 };
 use crate::QueryError;
 
@@ -58,7 +58,57 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
             order_by,
             ..
         } => validate_match_clauses(clauses, tail, order_by, Scope::new(), true),
+        // Always an empty starting scope -- a standalone CALL *is* the
+        // whole statement, nothing precedes it to shadow (unlike
+        // `QueryClause::Call`'s own in-query form, TCK's Call1 `[15]`).
+        Statement::StandaloneCall(call) => validate_call_clause(call, &mut Scope::new()),
     }
+}
+
+/// `CALL proc.name(args) [YIELD ...]` -- no procedure registry is
+/// available at this pass (see `executor::ExecutionOptions::procedures`'s
+/// own docs for why arity/existence/argument-type checks have to happen
+/// at execution time instead, once the registry is on hand), so this only
+/// covers what's knowable from AST structure alone: an aggregate inside
+/// an argument expression (real Cypher's `InvalidAggregation`, TCK's
+/// Call1 `[16]`) and a `YIELD` output name that's already bound --
+/// shadowing an outer variable or repeating an earlier item's own output
+/// name within the same `YIELD` are the same check, since `scope` is
+/// mutated as each item is processed (real Cypher's
+/// `VariableAlreadyBound`, TCK's Call1 `[15]`, Call5 `[5]`/`[6]`).
+/// `CallYield::Star` is never reached with a non-empty `scope` in
+/// practice -- the in-query grammar (`queryCallSt`) has no `YIELD *`
+/// alternative at all (only `standaloneCall` does), so it can't shadow
+/// anything; nothing here needs a procedure's real output names to bind
+/// into scope for it either way, since a standalone call is the whole
+/// statement.
+fn validate_call_clause(call: &CallClause, scope: &mut Scope) -> Result<(), QueryError> {
+    if let Some(args) = &call.args {
+        for arg in args {
+            infer_expr(arg, scope)?;
+            if crate::executor::contains_aggregate(arg) {
+                return Err(semantic(
+                    "an aggregate function can't be used as a CALL argument",
+                ));
+            }
+        }
+    }
+    if let Some(CallYield::Items(items, where_expr)) = &call.yield_items {
+        for (name, alias) in items {
+            let out_name = alias.clone().unwrap_or_else(|| name.clone());
+            if scope.contains_key(&out_name) {
+                return Err(semantic(format!(
+                    "'{out_name}' is already bound -- CALL's YIELD can't reuse an already-bound \
+                     name, whether from an outer scope or another output in the same YIELD"
+                )));
+            }
+            scope.insert(out_name, Kind::Unknown);
+        }
+        if let Some(w) = where_expr.as_deref() {
+            validate_pattern_expr(w, scope)?;
+        }
+    }
+    Ok(())
 }
 
 /// The body of `Statement::Match`'s own validation, factored out so
@@ -140,6 +190,15 @@ fn validate_match_clauses(
                 for pattern in patterns {
                     bind_create_pattern(pattern, &mut scope)?;
                 }
+            }
+            // A procedure is opaque to MarsDB -- it might write, same
+            // conservative reasoning `executor::is_read_only` already
+            // applies -- so it's rejected inside `exists {}` too, even
+            // though no current TCK scenario combines the two.
+            QueryClause::Call(call) => {
+                reject_mutation("CALL")?;
+                validate_call_clause(call, &mut scope)?;
+                apply_with(&call.with, &mut scope)?;
             }
         }
     }
