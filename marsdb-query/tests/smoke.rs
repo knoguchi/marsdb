@@ -8302,3 +8302,34 @@ fn null_bound_variable_reused_as_pattern_token_is_legal() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("node"));
 }
+
+/// `MATCH (a)-[:TYPE* {prop: 'x'}]->(b)` -- filters *every* hop of the
+/// variable-length traversal by the same inline property map, not just
+/// the final one. A 2-hop path where only the second hop matches doesn't
+/// survive as a 1-hop match either -- the whole path from the first
+/// non-matching hop onward is excluded. TCK's Match4 [5].
+#[test]
+fn inline_properties_on_a_variable_length_relationship_pattern() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:Artist:A), (b:Artist:B), (c:Artist:C) \
+         CREATE (a)-[:WORKED_WITH {year: 1987}]->(b), \
+                (b)-[:WORKED_WITH {year: 1988}]->(c)",
+    );
+    let result = run(
+        &store,
+        "MATCH (a:Artist)-[:WORKED_WITH* {year: 1988}]->(b:Artist) RETURN a, b",
+    );
+    assert_eq!(result.rows.len(), 1);
+    let a_labels = match &result.rows[0][0] {
+        Value::Node(n) => &n.labels,
+        other => panic!("expected a Node, got {other:?}"),
+    };
+    let b_labels = match &result.rows[0][1] {
+        Value::Node(n) => &n.labels,
+        other => panic!("expected a Node, got {other:?}"),
+    };
+    assert!(a_labels.contains(&"B".to_string()));
+    assert!(b_labels.contains(&"C".to_string()));
+}

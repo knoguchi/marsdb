@@ -14,7 +14,7 @@
 
 use marsdb_graph::PropertyValue;
 
-use crate::ast::Expr;
+use crate::ast::{Expr, ReturnExpr};
 
 /// Traversal direction for `Expand`. Distinct from `marsdb_graph::Direction`
 /// (which only has `Out`/`In`) because `Either` (undirected patterns,
@@ -114,6 +114,16 @@ pub enum LogicalPlan {
         /// fully-materialized `Value::Edge`s under this name instead of
         /// `path_segment_var`'s cheaper id-only `Binding::Path` segment.
         rel_list_var: Option<String>,
+        /// `[:TYPE* {year: 1988}]` -- filters *every* hop of the
+        /// traversal by this same inline property map, not just the
+        /// final one (TCK's Match4 `[5]`: only a path where every hop's
+        /// own edge matches survives, so a 2-hop path can't "average out"
+        /// -- one non-matching hop excludes the whole path from that
+        /// point on). Evaluated once per `expand_variable_row` call
+        /// (constant across the whole BFS, not per-candidate), then
+        /// checked against each candidate edge's own stored properties
+        /// during expansion.
+        rel_props: Vec<(String, ReturnExpr)>,
     },
     Filter {
         input: Box<LogicalPlan>,

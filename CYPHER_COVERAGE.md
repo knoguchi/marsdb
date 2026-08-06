@@ -26,7 +26,7 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/match | 381 | 371 | 0 | 1 | 9 | 0 | 97.4% |
+| clauses/match | 381 | 372 | 0 | 1 | 8 | 0 | 97.6% |
 | clauses/match-where | 34 | 34 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3819** | **0** | **3** | **50** | **8** | **98.4%** |
+| **TOTAL** | **3880** | **3820** | **0** | **3** | **49** | **8** | **98.5%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
