@@ -150,6 +150,13 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
             }
             out
         }
+        // Never reaches here: `Map` is only ever constructed on the
+        // parameter-passing path (`PropertyValue`'s own doc comment), and
+        // nothing ever stores -- so nothing ever indexes -- a real node/
+        // edge property this way.
+        PropertyValue::Map(_) => {
+            unreachable!("PropertyValue::Map is never a real stored/indexed property value")
+        }
     }
 }
 

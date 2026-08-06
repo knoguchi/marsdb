@@ -7221,7 +7221,8 @@ fn to_integer(v: &Value) -> Result<Value, QueryError> {
             | PropertyValue::Time { .. }
             | PropertyValue::LocalDateTime { .. }
             | PropertyValue::DateTime { .. }
-            | PropertyValue::List(_),
+            | PropertyValue::List(_)
+            | PropertyValue::Map(_),
         )
         | Value::Node(_)
         | Value::Edge(_)
@@ -7278,7 +7279,7 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
         Value::Literal(Literal::Param(name)) => {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
-        Value::Property(PropertyValue::List(_))
+        Value::Property(PropertyValue::List(_) | PropertyValue::Map(_))
         | Value::Node(_)
         | Value::Edge(_)
         | Value::List(_)

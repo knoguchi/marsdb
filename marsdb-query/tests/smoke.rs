@@ -8333,3 +8333,65 @@ fn inline_properties_on_a_variable_length_relationship_pattern() {
     assert!(a_labels.contains(&"B".to_string()));
     assert!(b_labels.contains(&"C".to_string()));
 }
+
+/// A map-valued `$param` (`{name: 'Apa'}`) -- substitutes into a
+/// `ReturnExpr::MapLit`, same recursive "no literal syntax, rewrite the
+/// whole Lit node" treatment list-valued params already get. TCK's
+/// Map2/Map3.
+#[test]
+fn map_valued_parameters_substitute_into_a_map_literal_expression() {
+    use std::collections::{BTreeMap, HashMap};
+    let store = GraphStore::open_memory().unwrap();
+    let mut stmt = parse("WITH $expr AS expr, $idx AS idx RETURN expr[idx]").unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Apa".to_string()),
+    );
+    let mut params = HashMap::new();
+    params.insert("expr".to_string(), marsdb_graph::PropertyValue::Map(map));
+    params.insert(
+        "idx".to_string(),
+        marsdb_graph::PropertyValue::String("name".to_string()),
+    );
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s))
+        | Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "Apa"),
+        other => panic!("expected a string, got {other:?}"),
+    }
+
+    // keys($param) on a (possibly nested) map-valued parameter.
+    let mut stmt = parse("RETURN keys($param) AS k").unwrap();
+    let mut inner = BTreeMap::new();
+    inner.insert(
+        "city".to_string(),
+        marsdb_graph::PropertyValue::String("London".to_string()),
+    );
+    let mut outer = BTreeMap::new();
+    outer.insert(
+        "name".to_string(),
+        marsdb_graph::PropertyValue::String("Alice".to_string()),
+    );
+    outer.insert(
+        "address".to_string(),
+        marsdb_graph::PropertyValue::Map(inner),
+    );
+    let mut params = HashMap::new();
+    params.insert("param".to_string(), marsdb_graph::PropertyValue::Map(outer));
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    let mut keys: Vec<String> = match &result.rows[0][0] {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected a List, got {other:?}"),
+    };
+    keys.sort();
+    assert_eq!(keys, vec!["address".to_string(), "name".to_string()]);
+}

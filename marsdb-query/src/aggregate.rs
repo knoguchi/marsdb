@@ -125,6 +125,16 @@ pub(crate) fn property_value_hash_key(pv: &PropertyValue) -> HashKey {
         PropertyValue::List(items) => {
             HashKey::List(items.iter().map(property_value_hash_key).collect())
         }
+        // Same encoding as `value_hash_key`'s own `Value::Map` arm above --
+        // each entry becomes its own 2-element `HashKey::List` (key,
+        // value), all wrapped in one outer list.
+        PropertyValue::Map(m) => HashKey::List(
+            m.iter()
+                .map(|(k, v)| {
+                    HashKey::List(vec![HashKey::Str(k.clone()), property_value_hash_key(v)])
+                })
+                .collect(),
+        ),
     }
 }
 

@@ -19,15 +19,21 @@ pub struct EdgeId(pub u64);
 /// fine, but a plain `Int` and a `Date` would then be indistinguishable
 /// once read back (Temporal4's "store a date, read it back, it must
 /// still print/compare/access-components as a date" scenarios need that
-/// distinction to survive the storage boundary, unlike a `Map`-valued
-/// property, which genuinely has no dedicated storage variant and is
-/// rejected outright -- see `marsdb-query::executor::
-/// value_to_storable_property`). `LocalTime`/`Time`/
+/// distinction to survive the storage boundary). `LocalTime`/`Time`/
 /// `LocalDateTime`/`DateTime` (Cypher's other four temporal types) follow
 /// the same reasoning below. `Time` only accepts a *fixed* UTC offset --
 /// it carries no calendar date, so a named zone's DST-dependent offset
 /// has nothing to resolve against; `DateTime` accepts either a fixed
 /// offset or a named zone (`TzId`).
+///
+/// `Map` exists here for exactly one reason: a `$parameter`'s value can be
+/// map-shaped (`{name: 'Apa'}`, TCK's Map2/Map3), and query-time
+/// parameters flow in as `PropertyValue` (this is the one place a
+/// non-storable shape has to travel through). A node/edge *property*
+/// value is never actually a `Map` though -- real Cypher forbids storing
+/// one (`marsdb-query::executor::value_to_storable_property` rejects it
+/// outright before anything reaches `GraphStore`), so this variant is
+/// only ever constructed on the parameter-passing path, never persisted.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     Null,
@@ -118,6 +124,9 @@ pub enum PropertyValue {
     /// given). Appended last (see this enum's own doc comment on why
     /// variant order is a real, one-way storage-compat constraint).
     List(Vec<PropertyValue>),
+    /// See this enum's own doc comment -- parameter-passing only, never a
+    /// real stored property value.
+    Map(BTreeMap<String, PropertyValue>),
 }
 
 /// A `DateTime`'s zone: a fixed UTC offset, or a named IANA timezone
