@@ -3535,6 +3535,62 @@ fn numeric_named_parameters() {
     assert_eq!(int(&result.rows[0][0]), 42);
 }
 
+/// A list-valued (including nested-list) `$param` -- `Literal` has no
+/// list variant (no list-literal *syntax* to substitute one into), so
+/// `substitute_params` rewrites the whole `ReturnExpr::Lit(Literal::
+/// Param(_))` node into a `ReturnExpr::ListLit` instead, recursively.
+/// TCK's List1 [3]/[5], Null3 [4].
+#[test]
+fn list_valued_parameters_substitute_into_a_list_literal_expression() {
+    use std::collections::HashMap;
+    let store = GraphStore::open_memory().unwrap();
+
+    let mut stmt = parse("RETURN $coll[1] AS x").unwrap();
+    let mut params = HashMap::new();
+    params.insert(
+        "coll".to_string(),
+        marsdb_graph::PropertyValue::List(vec![
+            marsdb_graph::PropertyValue::String("a".into()),
+            marsdb_graph::PropertyValue::String("b".into()),
+        ]),
+    );
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    match &result.rows[0][0] {
+        Value::Literal(marsdb_query::Literal::String(s)) => assert_eq!(s, "b"),
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    // Three-valued `IN`: a `null` element present, no definite match ->
+    // "unknown" (null), not `false`.
+    let mut stmt = parse("RETURN 2 IN $coll AS x").unwrap();
+    let mut params = HashMap::new();
+    params.insert(
+        "coll".to_string(),
+        marsdb_graph::PropertyValue::List(vec![
+            marsdb_graph::PropertyValue::Int(1),
+            marsdb_graph::PropertyValue::Null,
+        ]),
+    );
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert!(matches!(&result.rows[0][0], Value::Null));
+
+    // Nested list -- a param list can itself contain lists.
+    let mut stmt = parse("RETURN $coll[1][0] AS x").unwrap();
+    let mut params = HashMap::new();
+    params.insert(
+        "coll".to_string(),
+        marsdb_graph::PropertyValue::List(vec![
+            marsdb_graph::PropertyValue::Int(1),
+            marsdb_graph::PropertyValue::List(vec![marsdb_graph::PropertyValue::Int(2)]),
+        ]),
+    );
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int(&result.rows[0][0]), 2);
+}
+
 /// A bare (unparenthesized) `var:Label` used directly as a `WITH ...
 /// WHERE` predicate (`WHERE i.var > 'te' AND i:TextNode`) -- distinct
 /// from `label_check_expr`'s own `(n:Foo)` parenthesized general-

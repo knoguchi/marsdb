@@ -294,7 +294,24 @@ fn substitute_return_expr(
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
         ReturnExpr::PatternPredicate(pattern) => substitute_pattern(pattern, params)?,
-        ReturnExpr::Lit(lit) => substitute_literal(lit, params)?,
+        // A list-valued `$param` can't substitute into a bare `Literal`
+        // (no `Literal::List` -- there's no list *literal* syntax in
+        // Cypher for one to mean, see `cypher.pest`'s docs) the way a
+        // scalar one does, so this replaces the *whole* `ReturnExpr::Lit`
+        // node with a `ReturnExpr::ListLit` instead, recursively (a param
+        // list can itself contain nested lists) -- everything downstream
+        // (indexing, `IN`, iteration, ...) already handles `ListLit` like
+        // any other list-valued expression, so nothing else needs to know
+        // this value originated from a parameter rather than `[1, 2, 3]`
+        // literal syntax.
+        ReturnExpr::Lit(Literal::Param(name)) => {
+            let value = params
+                .get(name)
+                .ok_or_else(|| QueryError::MissingParam(name.clone()))?
+                .clone();
+            *expr = property_value_to_return_expr(name, &value)?;
+        }
+        ReturnExpr::Lit(_) => {}
         ReturnExpr::Call { args, .. } => {
             for arg in args {
                 substitute_return_expr(arg, params)?;
@@ -435,14 +452,39 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
             )))
         }
         // Same "no literal syntax to substitute to" gap as the temporal
-        // variants above -- there's no `Literal::List`, general list
-        // values are only ever reachable via `ReturnExpr::ListLit`
-        // (built from real list-literal syntax `[1, 2, 3]`), not as a
-        // `$param` substitution target.
+        // variants above -- there's no `Literal::List`. A list-valued
+        // `$param` used in ordinary expression position (`RETURN $x`,
+        // `WHERE y IN $x`, ...) substitutes into a `ReturnExpr::ListLit`
+        // instead (`property_value_to_return_expr`, used by
+        // `substitute_return_expr`'s own `Lit` arm, not this function) --
+        // reaching here at all means a list-valued param was used
+        // somewhere a bare `Literal` is structurally required (only
+        // pattern-level `Expr::Compare`'s RHS, `n.prop = $x`), which
+        // doesn't have an equivalent list-valued shape to fall back to
+        // either (comparing a scalar property against a list isn't
+        // meaningful).
         PropertyValue::List(_) => {
             return Err(QueryError::Type(format!(
-                "${name}: passing a list value as a query parameter isn't supported yet"
+                "${name}: a list-valued query parameter can't be used here (only in ordinary \
+                 expression position, not a pattern-level property comparison)"
             )))
         }
+    })
+}
+
+/// Converts a parameter's stored `PropertyValue` into the `ReturnExpr`
+/// that should replace a `ReturnExpr::Lit(Literal::Param(name))` node --
+/// a bare `Literal` for a scalar value (delegates to
+/// `property_value_to_literal`), or a `ReturnExpr::ListLit` for a list
+/// value, recursively (a param list can itself contain nested lists).
+fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<ReturnExpr, QueryError> {
+    Ok(match pv {
+        PropertyValue::List(items) => ReturnExpr::ListLit(
+            items
+                .iter()
+                .map(|item| property_value_to_return_expr(name, item))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        other => ReturnExpr::Lit(property_value_to_literal(name, other)?),
     })
 }

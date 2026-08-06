@@ -230,21 +230,37 @@ fn convert_params(params: &[(String, String)]) -> Result<HashMap<String, Propert
     for (name, literal_text) in params {
         let tck_val =
             tck_value::parse_cell(literal_text).map_err(|e| format!("param {name}: {e}"))?;
-        let pv = match tck_val {
-            TckValue::Null => PropertyValue::Null,
-            TckValue::Scalar(TckScalar::Int(i)) => PropertyValue::Int(i),
-            TckValue::Scalar(TckScalar::Float(f)) => PropertyValue::Float(f),
-            TckValue::Scalar(TckScalar::Str(s)) => PropertyValue::String(s),
-            TckValue::Scalar(TckScalar::Bool(b)) => PropertyValue::Bool(b),
-            other => {
-                return Err(format!(
-                    "param {name}: list/node/rel-valued params aren't supported: {other:?}"
-                ))
-            }
-        };
+        let pv = tck_value_to_property_value(name, &tck_val)?;
         out.insert(name.clone(), pv);
     }
     Ok(out)
+}
+
+/// `marsdb::Database::execute_with_params` takes `PropertyValue` (the
+/// storage-only scalar type -- no `Map`/`Node`/`Edge` variant, since a
+/// stored node/edge property can't itself be one of those), not
+/// `marsdb_query::Value`, so a map/node/rel-valued TCK parameter still
+/// has nowhere to go -- only `Null`/`Scalar`/`List` (recursively, a param
+/// list can itself contain nested lists) convert.
+fn tck_value_to_property_value(name: &str, v: &TckValue) -> Result<PropertyValue, String> {
+    Ok(match v {
+        TckValue::Null => PropertyValue::Null,
+        TckValue::Scalar(TckScalar::Int(i)) => PropertyValue::Int(*i),
+        TckValue::Scalar(TckScalar::Float(f)) => PropertyValue::Float(*f),
+        TckValue::Scalar(TckScalar::Str(s)) => PropertyValue::String(s.clone()),
+        TckValue::Scalar(TckScalar::Bool(b)) => PropertyValue::Bool(*b),
+        TckValue::List(items) => PropertyValue::List(
+            items
+                .iter()
+                .map(|item| tck_value_to_property_value(name, item))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        other => {
+            return Err(format!(
+                "param {name}: map/node/rel-valued params aren't supported: {other:?}"
+            ))
+        }
+    })
 }
 
 fn compare_rows(
