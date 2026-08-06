@@ -99,6 +99,11 @@ fn antlr_spike_report(features_dir: &Path) {
     let mut disagreements: Vec<(String, String, bool, bool)> = Vec::new();
     let mut disagreement_count = 0usize;
     let mut antlr_rejects: Vec<(String, String, bool)> = Vec::new();
+    let mut antlr_wrongly_accepted: Vec<(String, String)> = Vec::new();
+    let mut positive_cases = 0usize;
+    let mut negative_cases = 0usize;
+    let mut negative_syntax_cases = 0usize;
+    let mut negative_syntax_wrongly_accepted = 0usize;
     let filter = std::env::var("TCK_FILTER").ok();
 
     for entry in walk_feature_files(features_dir) {
@@ -117,8 +122,27 @@ fn antlr_spike_report(features_dir: &Path) {
             let antlr_ok = marsdb_query::antlr_accepts(&scenario.query);
             let pest_ok = marsdb_query::parse(&scenario.query).is_ok();
             let expects_error = matches!(scenario.expected, Expected::AnyError);
+            let expects_syntax_error = scenario
+                .expected_error_line
+                .as_deref()
+                .is_some_and(|l| l.contains("SyntaxError"));
+            if expects_error {
+                negative_cases += 1;
+                if expects_syntax_error {
+                    negative_syntax_cases += 1;
+                }
+            } else {
+                positive_cases += 1;
+            }
             if antlr_ok {
                 antlr_accept += 1;
+                if expects_error {
+                    antlr_wrongly_accepted
+                        .push((scenario.feature_name.clone(), scenario.query.clone()));
+                    if expects_syntax_error {
+                        negative_syntax_wrongly_accepted += 1;
+                    }
+                }
             } else {
                 antlr_reject += 1;
                 antlr_rejects.push((
@@ -143,6 +167,10 @@ fn antlr_spike_report(features_dir: &Path) {
     }
 
     let total = antlr_accept + antlr_reject;
+    println!(
+        "{total} total scenarios: {positive_cases} positive (should parse), {negative_cases} negative (should reject, Expected::AnyError), of which {negative_syntax_cases} are tagged SyntaxError specifically ({} semantic/type/other) -- antlr wrongly accepts {negative_syntax_wrongly_accepted} of the {negative_syntax_cases} SyntaxError cases",
+        negative_cases - negative_syntax_cases,
+    );
     println!(
         "pest:  {pest_accept:>5}/{total} accepted ({:.1}%)",
         100.0 * pest_accept as f64 / total as f64
@@ -185,6 +213,17 @@ fn antlr_spike_report(features_dir: &Path) {
         ));
     }
     std::fs::write("/tmp/antlr_all_rejects.txt", out).expect("write /tmp/antlr_all_rejects.txt");
+
+    println!(
+        "{} wrongly accepted (should have rejected per Expected::AnyError) -- written to /tmp/antlr_wrongly_accepted.txt",
+        antlr_wrongly_accepted.len()
+    );
+    let mut out = String::new();
+    for (feature, query) in &antlr_wrongly_accepted {
+        out.push_str(&format!("[{feature}] :: {}\n", query.replace('\n', " ")));
+    }
+    std::fs::write("/tmp/antlr_wrongly_accepted.txt", out)
+        .expect("write /tmp/antlr_wrongly_accepted.txt");
 }
 
 fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {
