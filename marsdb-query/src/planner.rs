@@ -65,6 +65,13 @@ pub fn build_match_plan(
     // MATCH clause, or a separate comma-separated pattern, may reuse the
     // same relationship freely.
     let mut prior_rel_vars: Vec<String> = Vec::new();
+    // Complementary to `prior_rel_vars` above -- edges an *earlier
+    // variable-length* hop of this same pattern traversed can't be named
+    // by a single id the way a fixed hop's own `rel_var` can (each row's
+    // own BFS can use a different set of edges), so this tracks each such
+    // hop's own `exclude_edge_var` name instead (see `LogicalPlan::
+    // VarExpand::exclude_edge_sets`'s own docs).
+    let mut prior_edge_sets: Vec<String> = Vec::new();
     // A node variable can repeat *within* one pattern too, not just across
     // a `WITH` boundary -- `MATCH (n)-[r]->(n)` (a self-relationship) reuses
     // `n` for both ends of the same pattern. Seeded with the start node so
@@ -179,7 +186,12 @@ pub fn build_match_plan(
                 direction,
             },
             Some((min_hops, max_hops)) => {
-                LogicalPlan::VarExpand {
+                // Always synthesized, regardless of whether this hop's
+                // own path/list capture was requested -- see
+                // `exclude_edge_var`'s own docs on `LogicalPlan::
+                // VarExpand`.
+                let exclude_edge_var = namer.name(&None);
+                let plan = LogicalPlan::VarExpand {
                     input: Box::new(plan),
                     from_var: from_var.clone(),
                     to_var: to_var.clone(),
@@ -188,6 +200,8 @@ pub fn build_match_plan(
                     min_hops,
                     max_hops,
                     exclude_edge_vars: prior_rel_vars.clone(),
+                    exclude_edge_sets: prior_edge_sets.clone(),
+                    exclude_edge_var: exclude_edge_var.clone(),
                     path_segment_var: rel.capture_path_segment.then(|| {
                         rel.var
                             .clone()
@@ -201,7 +215,14 @@ pub fn build_match_plan(
                         .then(|| rel.var.clone())
                         .flatten(),
                     rel_props: rel.props.clone(),
-                }
+                };
+                // Propagate forward -- a *later* hop (fixed, via a new
+                // `Expr::EdgeNotInSet` `Filter` below, or another
+                // `VarExpand`, via its own `exclude_edge_sets`) must
+                // exclude whatever this row's traversal happened to use
+                // (TCK's Match4 `[7]`, `mars-pbp`).
+                prior_edge_sets.push(exclude_edge_var);
+                plan
             }
         };
         // Hop nodes reach this point via Expand/VarExpand, which don't
@@ -220,6 +241,18 @@ pub fn build_match_plan(
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: Expr::Not(Box::new(Expr::VarEq(rel_var.clone(), prior.clone()))),
+                };
+            }
+            // Complementary direction: this fixed hop's own edge must not
+            // be one an *earlier variable-length* hop of this same pattern
+            // already traversed (TCK's Match4 `[7]`, `mars-pbp`).
+            for prior_set in &prior_edge_sets {
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate: Expr::EdgeNotInSet {
+                        edge_var: rel_var.clone(),
+                        edge_set_var: prior_set.clone(),
+                    },
                 };
             }
             if rel_is_repeat {
@@ -508,6 +541,8 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             min_hops,
             max_hops,
             exclude_edge_vars,
+            exclude_edge_sets,
+            exclude_edge_var,
             path_segment_var,
             rel_list_var,
             rel_props,
@@ -520,6 +555,8 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             min_hops,
             max_hops,
             exclude_edge_vars,
+            exclude_edge_sets,
+            exclude_edge_var,
             path_segment_var,
             rel_list_var,
             rel_props,

@@ -26,7 +26,7 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/match | 381 | 372 | 0 | 1 | 8 | 0 | 97.6% |
+| clauses/match | 381 | 376 | 0 | 1 | 4 | 0 | 98.7% |
 | clauses/match-where | 34 | 34 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3828** | **0** | **3** | **49** | **0** | **98.7%** |
+| **TOTAL** | **3880** | **3832** | **0** | **3** | **45** | **0** | **98.8%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -208,10 +208,11 @@ a second `WITH`) — `<list>` is an inline Cypher-text list literal
 (`[1, 2, 'a', $p]`), a variable bound by a preceding
 `WITH ... collect(...)`/a list-valued node or relationship property, or
 `$param` itself naming a list (including nested lists) directly. A
-map/node/relationship-*valued* `$param`, though, still isn't supported —
-the public parameter type (`PropertyValue`, marsdb-graph) has no
-Map/Node/Edge variant at all, unlike a list-valued property (a
-different, already-supported thing, see below). `MERGE <pattern> [ON
+map-valued `$param` (`{name: 'A'}`, including nested maps/lists) is also
+supported — `PropertyValue::Map`, parameter-passing only, never a real
+stored/indexed property. A node/relationship-*valued* `$param`, though,
+still isn't supported — `PropertyValue` has no Node/Edge variant at all.
+`MERGE <pattern> [ON
 CREATE SET ...] [ON MATCH SET ...]`
 (match-or-create: tries the pattern as an ordinary MATCH first, creates
 exactly one new instance if nothing matched) — capped at one relationship
@@ -474,10 +475,7 @@ checkpoint — see `marsdb-query/tests/smoke.rs`), comma-separated patterns
 cross-joins — different from the cross-join WITH-chaining above, which
 works), `MERGE` patterns with more than
 one relationship hop (whole-pattern atomicity across multiple
-simultaneously-unbound hops isn't attempted), named-path capture over a
-pattern *mixing* a variable-length hop with another hop (a single
-variable-length hop on its own is supported — `expand_variable_row`
-tracks its own traversed edge/node sequence for exactly that), or
+simultaneously-unbound hops isn't attempted), or
 `shortestPath()` with a minimum hop count greater than 1 (a plain
 visited-set BFS can't correctly answer "shortest path of at least N
 hops" for N > 1 without a different algorithm).

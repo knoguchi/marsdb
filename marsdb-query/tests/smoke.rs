@@ -4435,14 +4435,34 @@ fn named_path_over_a_single_variable_length_hop() {
     }
 }
 
-/// Mixing a variable-length hop with another hop in the same named path
-/// still isn't supported -- see `validate_named_path_pattern`'s own docs
-/// (a pre-existing edge-isomorphism gap one level down makes this unsafe
-/// in general, even though path *assembly* itself handles it fine).
+/// Named-path capture over a pattern *mixing* variable-length hops with
+/// other hops -- was rejected until the `LogicalPlan::VarExpand`
+/// edge-isomorphism gap (`mars-pbp`) was fixed (TCK's Match4 `[7]`: an
+/// earlier double-count bug in exactly this shape). Two `*0..1` hops
+/// around a fixed middle hop -- each of `a`, `b`, `c` optionally coincide,
+/// so this must not silently drop or duplicate rows.
 #[test]
-fn named_path_mixing_variable_length_and_fixed_hops_errors() {
-    let err = parse("MATCH p = (a)-[:KNOWS*0..1]->(b)-[:FRIEND*0..1]->(c) RETURN p").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("variable-length"));
+fn named_path_mixing_variable_length_and_fixed_hops() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (:N {n: 1})-[:KNOWS]->(:N {n: 2})-[:LIKES]->(:N {n: 3})-[:KNOWS]->(:N {n: 4})",
+    );
+    let result = run(
+        &store,
+        "MATCH p = (a)-[:KNOWS*0..1]->(b)-[:LIKES]->(c)-[:KNOWS*0..1]->(d) RETURN p",
+    );
+    for row in &result.rows {
+        match &row[0] {
+            Value::Path(elems) => {
+                assert_eq!(elems.len() % 2, 1, "alternating node/edge, odd length");
+                assert!(matches!(elems[0], PathElem::Node(_)));
+                assert!(matches!(elems[elems.len() - 1], PathElem::Node(_)));
+            }
+            other => panic!("expected a Path, got {other:?}"),
+        }
+    }
+    assert!(!result.rows.is_empty());
 }
 
 #[test]

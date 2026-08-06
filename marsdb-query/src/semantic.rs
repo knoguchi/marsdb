@@ -767,6 +767,13 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             }
             Ok(())
         }
+        // Never reaches here: synthesized by the planner (`build_match_
+        // plan`), well after this pass already validated the original
+        // parsed AST -- no surface syntax constructs this directly (see
+        // its own doc comment).
+        Expr::EdgeNotInSet { .. } => {
+            unreachable!("Expr::EdgeNotInSet is only ever synthesized by the planner")
+        }
     }
 }
 
