@@ -23,10 +23,10 @@
 //! type. Grows a variant per AST node kind as later increments need it.
 
 use crate::ast::{
-    is_aggregate_name, ArithOp, CompareOp, Literal, MergeClause, NodePattern, Pattern, PropAccess,
-    QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr, ReturnItem,
-    ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource, WithClause,
-    WithExpr,
+    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
+    PropAccess, QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr,
+    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
+    WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -809,11 +809,16 @@ impl AstBuilder {
         let pw = ctx
             .patternWhere()
             .expect("matchSt always has a patternWhere");
-        if pw.where_().is_some() {
-            return Err(QueryError::Syntax(
-                "WHERE isn't supported by the ANTLR parser yet".into(),
-            ));
-        }
+        let where_clause = match pw.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(return_expr_to_expr(expr)?)
+            }
+            None => None,
+        };
         let pattern_ctx = pw.pattern().expect("patternWhere always has a pattern");
 
         let mut path_var = None;
@@ -847,12 +852,14 @@ impl AstBuilder {
             validate_named_path_pattern(&groups[0])?;
         }
 
-        // `where_clause`/`with` are unconditionally `None` here -- WHERE
-        // already errors out above (before `groups` even exists), and
-        // this grammar's `matchSt` has no trailing WITH of its own (that's
-        // a separate clause in the statement's clause list). Once WHERE
-        // support lands, only the *last* group should carry it, same as
-        // `parser.rs`'s `parse_match_part`.
+        // `where_clause` attaches to the *last* group only, same as
+        // `parser.rs`'s `parse_match_part` -- a comma-separated cross join
+        // sees every group's bindings by the time WHERE runs. `with` stays
+        // unconditionally `None` here: this grammar's `matchSt` has no
+        // trailing WITH of its own (that's a separate clause in the
+        // statement's clause list, attached by whichever caller builds
+        // that list, not here).
+        let last = groups.len() - 1;
         Ok(groups
             .into_iter()
             .enumerate()
@@ -864,7 +871,11 @@ impl AstBuilder {
                 // -- a real gap, not deferred-for-now like WHERE/props.
                 shortest_path: false,
                 pattern,
-                where_clause: None,
+                where_clause: if i == last {
+                    where_clause.clone()
+                } else {
+                    None
+                },
                 with: None,
             })
             .collect())
@@ -1810,6 +1821,66 @@ fn return_expr_to_with_expr(expr: ReturnExpr) -> WithExpr {
     }
 }
 
+/// `matchSt`'s `where`, like `withSt`'s, reuses the same generic
+/// `expression` rule as everywhere else (unlike pest, which has dedicated
+/// narrower grammar rules -- `comparison`/`general_comparison`/
+/// `label_predicate`/`var_compare` -- picking the right `Expr` variant
+/// directly at parse time). So the same fold-down-after-the-fact approach
+/// as `return_expr_to_with_expr` applies here too, just against `Expr`'s
+/// wider shape: a `Compare` between two bare `Prop`s becomes `PropCompare`,
+/// a `Prop` compared to a `Lit` keeps the planner-fusable `Compare` variant
+/// pest's `comparison` rule reserves for exactly that shape, two bare
+/// `Var`s becomes identity comparison (`VarEq`/`Not(VarEq)`, matching
+/// pest's `var_compare`'s restriction to `=`/`<>` — anything else is a real
+/// error, not a silent `GeneralCompare` fallback, since no ordering exists
+/// between two nodes/relationships), anything else falls back to
+/// `GeneralCompare`. Similarly `IsNull` on a bare `Prop` keeps the narrow
+/// variant, anything else becomes `GeneralIsNull`. `HasLabel` folds
+/// multiple labels into a `HasLabel` `And` chain exactly like pest's
+/// `parse_label_predicate`. Everything else becomes `GeneralBare`.
+fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
+    Ok(match expr {
+        ReturnExpr::And(l, r) => Expr::And(
+            Box::new(return_expr_to_expr(*l)?),
+            Box::new(return_expr_to_expr(*r)?),
+        ),
+        ReturnExpr::Or(l, r) => Expr::Or(
+            Box::new(return_expr_to_expr(*l)?),
+            Box::new(return_expr_to_expr(*r)?),
+        ),
+        ReturnExpr::Not(inner) => Expr::Not(Box::new(return_expr_to_expr(*inner)?)),
+        ReturnExpr::Compare(l, op, r) => match (*l, *r) {
+            (ReturnExpr::Prop(pa), ReturnExpr::Lit(lit)) => Expr::Compare(pa, op, lit),
+            (ReturnExpr::Prop(pa1), ReturnExpr::Prop(pa2)) => Expr::PropCompare(pa1, op, pa2),
+            (ReturnExpr::Var(a), ReturnExpr::Var(b)) => match op {
+                CompareOp::Eq => Expr::VarEq(a, b),
+                CompareOp::Ne => Expr::Not(Box::new(Expr::VarEq(a, b))),
+                _ => {
+                    return Err(QueryError::Syntax(format!(
+                        "{a} {op:?} {b}: only = and <> are meaningful for comparing two \
+                         nodes/relationships by identity (no ordering exists between them)"
+                    )))
+                }
+            },
+            (l, r) => Expr::GeneralCompare(l, op, r),
+        },
+        ReturnExpr::IsNull(inner) => match *inner {
+            ReturnExpr::Prop(pa) => Expr::IsNull(pa),
+            other => Expr::GeneralIsNull(other),
+        },
+        ReturnExpr::HasLabel(var, labels) => {
+            let mut labels = labels.into_iter();
+            let first = labels
+                .next()
+                .expect("HasLabel always carries at least one label");
+            labels.fold(Expr::HasLabel(var.clone(), first), |acc, label| {
+                Expr::And(Box::new(acc), Box::new(Expr::HasLabel(var.clone(), label)))
+            })
+        }
+        other => Expr::GeneralBare(other),
+    })
+}
+
 /// `skipSt`/`limitSt` grammar-allow any `expression` (`SKIP_W expression`),
 /// wider than pest's grammar, which structurally requires a bare
 /// `int_literal` there. Matching pest's existing behavior rather than
@@ -2199,8 +2270,37 @@ mod tests {
     }
 
     #[test]
-    fn where_not_yet_supported() {
-        assert!(parse_match("MATCH (a) WHERE a.x = 1").is_err());
+    fn match_where() {
+        let parts = parse_match("MATCH (a) WHERE a.x = 1").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            parts[0].where_clause,
+            Some(Expr::Compare(
+                PropAccess { .. },
+                CompareOp::Eq,
+                Literal::Int(1),
+            ))
+        ));
+    }
+
+    #[test]
+    fn match_where_var_eq() {
+        let parts = parse_match("MATCH (a), (b) WHERE a = b").unwrap();
+        assert!(matches!(parts[1].where_clause, Some(Expr::VarEq(_, _))));
+    }
+
+    #[test]
+    fn match_where_label_predicate() {
+        let parts = parse_match("MATCH (a) WHERE a:A:B").unwrap();
+        assert!(matches!(parts[0].where_clause, Some(Expr::And(_, _))));
+    }
+
+    #[test]
+    fn match_where_on_last_group_of_cross_join() {
+        let parts = parse_match("MATCH (a), (b) WHERE b.x = 1").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].where_clause.is_none());
+        assert!(parts[1].where_clause.is_some());
     }
 
     #[test]
