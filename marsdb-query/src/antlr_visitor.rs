@@ -22,24 +22,41 @@
 //! exactly one `Return` type for the entire tree walk, not a per-rule
 //! type. Grows a variant per AST node kind as later increments need it.
 
-use crate::ast::{Literal, NodePattern, Pattern, QueryPart, RelDirection, RelPattern};
+use crate::ast::{
+    is_aggregate_name, ArithOp, CompareOp, Literal, NodePattern, Pattern, PropAccess, QueryPart,
+    RelDirection, RelPattern, ReturnExpr,
+};
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
-    BoolLitContext, BoolLitContextAttrs, CharLitContext, CharLitContextAttrs, LiteralContext,
-    LiteralContextAttrs, MatchStContext, MatchStContextAttrs, NodeLabelsContextAttrs,
-    NodePatternContext, NodePatternContextAttrs, NumLitContext, NumLitContextAttrs,
-    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
-    PatternPartContextAttrs, PatternWhereContextAttrs, RelationDetailContext,
+    AddSubExpressionContext, AndExpressionContext, AndExpressionContextAttrs, AtomContext,
+    AtomContextAttrs, AtomicExpressionContext, AtomicExpressionContextAll,
+    AtomicExpressionContextAttrs, BoolLitContext, BoolLitContextAttrs, CharLitContext,
+    CharLitContextAttrs, ComparisonExpressionContext, ComparisonExpressionContextAttrs,
+    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext,
+    ExpressionChainContextAttrs, ExpressionContext, ExpressionContextAttrs,
+    FunctionInvocationContext, FunctionInvocationContextAttrs, InvocationNameContextAll,
+    InvocationNameContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs,
+    LiteralContext, LiteralContextAttrs, MatchStContext, MatchStContextAttrs,
+    MultDivExpressionContext, NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs,
+    NotExpressionContext, NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext,
+    NumLitContextAll, NumLitContextAttrs, ParameterContext, ParameterContextAttrs,
+    ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs, PatternContextAttrs,
+    PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
+    PowerExpressionContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
+    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs, RelationDetailContext,
     RelationDetailContextAttrs, RelationshipPatternContext, RelationshipPatternContextAttrs,
-    RelationshipTypesContextAttrs, StringLitContext, StringLitContextAttrs, SymbolContextAll,
-    SymbolContextAttrs,
+    RelationshipTypesContextAttrs, StringExpPrefixContextAll, StringExpPrefixContextAttrs,
+    StringExpressionContextAll, StringExpressionContextAttrs, StringLitContext,
+    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
+    UnaryAddSubExpressionContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
     group_into_linear_patterns, parse_int_literal, parse_rel_range, unescape_string,
     validate_named_path_pattern,
 };
-use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat};
+use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat, Tree};
 
 #[derive(Debug, Default)]
 pub(crate) enum AstNode {
@@ -50,6 +67,7 @@ pub(crate) enum AstNode {
     RelPattern(RelPattern),
     Pattern(Pattern),
     QueryParts(Vec<QueryPart>),
+    ReturnExpr(ReturnExpr),
     Err(QueryError),
 }
 
@@ -71,6 +89,7 @@ impl AstNode {
     ast_node_into!(into_rel_pattern, RelPattern, RelPattern);
     ast_node_into!(into_pattern, Pattern, Pattern);
     ast_node_into!(into_query_parts, QueryParts, Vec<QueryPart>);
+    ast_node_into!(into_return_expr, ReturnExpr, ReturnExpr);
 }
 
 pub(crate) struct AstBuilder {
@@ -124,33 +143,7 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             .DIGIT()
             .expect("numLit context always has a DIGIT token")
             .get_text();
-        let is_float = text.contains('.')
-            || text.ends_with(['f', 'F', 'd', 'D'])
-            || text
-                .rfind(['e', 'E'])
-                .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-'));
-        let result = if is_float {
-            text.parse::<f64>()
-                .map_err(|_| QueryError::Syntax(format!("invalid float literal '{text}'")))
-                .and_then(|f| {
-                    // `str::parse::<f64>()` silently returns `f64::INFINITY`
-                    // for a magnitude beyond f64's representable range
-                    // instead of erroring (`"1e999".parse::<f64>()` is
-                    // `Ok(inf)`) -- real Cypher requires this to be a
-                    // compile-time error (TCK Literals5 [27],
-                    // `FloatingPointOverflow`).
-                    if f.is_infinite() {
-                        Err(QueryError::Syntax(format!(
-                            "float literal '{text}' is too large to represent"
-                        )))
-                    } else {
-                        Ok(Literal::Float(f))
-                    }
-                })
-        } else {
-            parse_int_literal(&text).map(Literal::Int)
-        };
-        match result {
+        match parse_num_lit_text(&text) {
             Ok(lit) => AstNode::Literal(lit),
             Err(e) => AstNode::Err(e),
         }
@@ -215,6 +208,215 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             Err(e) => AstNode::Err(e),
         }
     }
+
+    fn visit_expression(&mut self, ctx: &ExpressionContext<'input>) -> Self::Return {
+        let mut operands = ctx.xorExpression_all().into_iter();
+        let mut lhs = match self
+            .visit(
+                &*operands
+                    .next()
+                    .expect("expression has at least one xorExpression"),
+            )
+            .into_return_expr()
+        {
+            Ok(e) => e,
+            Err(e) => return AstNode::Err(e),
+        };
+        for rhs_ctx in operands {
+            let rhs = match self.visit(&*rhs_ctx).into_return_expr() {
+                Ok(e) => e,
+                Err(e) => return AstNode::Err(e),
+            };
+            lhs = ReturnExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        AstNode::ReturnExpr(lhs)
+    }
+
+    fn visit_xorExpression(&mut self, ctx: &XorExpressionContext<'input>) -> Self::Return {
+        let mut operands = ctx.andExpression_all().into_iter();
+        let mut lhs = match self
+            .visit(
+                &*operands
+                    .next()
+                    .expect("xorExpression has at least one andExpression"),
+            )
+            .into_return_expr()
+        {
+            Ok(e) => e,
+            Err(e) => return AstNode::Err(e),
+        };
+        for rhs_ctx in operands {
+            let rhs = match self.visit(&*rhs_ctx).into_return_expr() {
+                Ok(e) => e,
+                Err(e) => return AstNode::Err(e),
+            };
+            lhs = ReturnExpr::Xor(Box::new(lhs), Box::new(rhs));
+        }
+        AstNode::ReturnExpr(lhs)
+    }
+
+    fn visit_andExpression(&mut self, ctx: &AndExpressionContext<'input>) -> Self::Return {
+        let mut operands = ctx.notExpression_all().into_iter();
+        let mut lhs = match self
+            .visit(
+                &*operands
+                    .next()
+                    .expect("andExpression has at least one notExpression"),
+            )
+            .into_return_expr()
+        {
+            Ok(e) => e,
+            Err(e) => return AstNode::Err(e),
+        };
+        for rhs_ctx in operands {
+            let rhs = match self.visit(&*rhs_ctx).into_return_expr() {
+                Ok(e) => e,
+                Err(e) => return AstNode::Err(e),
+            };
+            lhs = ReturnExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        AstNode::ReturnExpr(lhs)
+    }
+
+    fn visit_notExpression(&mut self, ctx: &NotExpressionContext<'input>) -> Self::Return {
+        let inner = ctx
+            .comparisonExpression()
+            .expect("notExpression always has a comparisonExpression");
+        match self.visit(&*inner).into_return_expr() {
+            Ok(mut expr) => {
+                for _ in ctx.NOT_all() {
+                    expr = ReturnExpr::Not(Box::new(expr));
+                }
+                AstNode::ReturnExpr(expr)
+            }
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_comparisonExpression(
+        &mut self,
+        ctx: &ComparisonExpressionContext<'input>,
+    ) -> Self::Return {
+        match self.build_comparison_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_addSubExpression(&mut self, ctx: &AddSubExpressionContext<'input>) -> Self::Return {
+        match self.build_add_sub_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_multDivExpression(&mut self, ctx: &MultDivExpressionContext<'input>) -> Self::Return {
+        match self.build_mult_div_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    /// Left-associative (`4 ^ 3 ^ 2` is `(4 ^ 3) ^ 2`), same as every
+    /// other binary chain here -- matches `parser.rs`'s `parse_pow_expr`,
+    /// confirmed against the real TCK fixture (see that function's docs).
+    fn visit_powerExpression(&mut self, ctx: &PowerExpressionContext<'input>) -> Self::Return {
+        let mut operands = ctx.unaryAddSubExpression_all().into_iter();
+        let mut lhs = match self
+            .visit(
+                &*operands
+                    .next()
+                    .expect("powerExpression has at least one unaryAddSubExpression"),
+            )
+            .into_return_expr()
+        {
+            Ok(e) => e,
+            Err(e) => return AstNode::Err(e),
+        };
+        for rhs_ctx in operands {
+            let rhs = match self.visit(&*rhs_ctx).into_return_expr() {
+                Ok(e) => e,
+                Err(e) => return AstNode::Err(e),
+            };
+            lhs = ReturnExpr::Arith(Box::new(lhs), ArithOp::Pow, Box::new(rhs));
+        }
+        AstNode::ReturnExpr(lhs)
+    }
+
+    fn visit_unaryAddSubExpression(
+        &mut self,
+        ctx: &UnaryAddSubExpressionContext<'input>,
+    ) -> Self::Return {
+        match self.build_unary_add_sub_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_atomicExpression(&mut self, ctx: &AtomicExpressionContext<'input>) -> Self::Return {
+        match self.build_atomic_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_propertyOrLabelExpression(
+        &mut self,
+        ctx: &PropertyOrLabelExpressionContext<'input>,
+    ) -> Self::Return {
+        match self.build_property_or_label_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_propertyExpression(
+        &mut self,
+        ctx: &PropertyExpressionContext<'input>,
+    ) -> Self::Return {
+        match self.build_property_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_atom(&mut self, ctx: &AtomContext<'input>) -> Self::Return {
+        match self.build_atom(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_parenthesizedExpression(
+        &mut self,
+        ctx: &ParenthesizedExpressionContext<'input>,
+    ) -> Self::Return {
+        let inner = ctx
+            .expression()
+            .expect("parenthesizedExpression always has an expression");
+        self.visit(&*inner)
+    }
+
+    fn visit_functionInvocation(
+        &mut self,
+        ctx: &FunctionInvocationContext<'input>,
+    ) -> Self::Return {
+        match self.build_function_invocation(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_parameter(&mut self, ctx: &ParameterContext<'input>) -> Self::Return {
+        match self.build_parameter(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_countAll(&mut self, _ctx: &CountAllContext<'input>) -> Self::Return {
+        AstNode::ReturnExpr(ReturnExpr::CountStar)
+    }
 }
 
 fn symbol_text(ctx: &SymbolContextAll) -> String {
@@ -225,6 +427,37 @@ fn symbol_text(ctx: &SymbolContextAll) -> String {
             text[1..text.len() - 1].to_string()
         }
         None => ctx.get_text(),
+    }
+}
+
+/// Shared by `visit_numLit` (unsigned) and `build_unary_add_sub_expr`'s
+/// sign-folding special case (`text` prefixed with `-`) -- see that
+/// function's docs for why a leading sign has to be handled there instead
+/// of in `DIGIT` itself.
+fn parse_num_lit_text(text: &str) -> Result<Literal, QueryError> {
+    let is_float = text.contains('.')
+        || text.ends_with(['f', 'F', 'd', 'D'])
+        || text
+            .rfind(['e', 'E'])
+            .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-'));
+    if is_float {
+        let f: f64 = text
+            .parse()
+            .map_err(|_| QueryError::Syntax(format!("invalid float literal '{text}'")))?;
+        // `str::parse::<f64>()` silently returns `f64::INFINITY` for a
+        // magnitude beyond f64's representable range instead of erroring
+        // (`"1e999".parse::<f64>()` is `Ok(inf)`) -- real Cypher requires
+        // this to be a compile-time error (TCK Literals5 [27],
+        // `FloatingPointOverflow`).
+        if f.is_infinite() {
+            Err(QueryError::Syntax(format!(
+                "float literal '{text}' is too large to represent"
+            )))
+        } else {
+            Ok(Literal::Float(f))
+        }
+    } else {
+        parse_int_literal(text).map(Literal::Int)
     }
 }
 
@@ -239,6 +472,84 @@ fn no_properties_yet<T>(properties_present: bool) -> Result<Vec<(String, T)>, Qu
     } else {
         Ok(Vec::new())
     }
+}
+
+fn compare_sign(ctx: &ComparisonSignsContextAll) -> CompareOp {
+    if ctx.LE().is_some() {
+        CompareOp::Le
+    } else if ctx.GE().is_some() {
+        CompareOp::Ge
+    } else if ctx.GT().is_some() {
+        CompareOp::Gt
+    } else if ctx.LT().is_some() {
+        CompareOp::Lt
+    } else if ctx.NOT_EQUAL().is_some() {
+        CompareOp::Ne
+    } else {
+        // Only ASSIGN ('=') left -- comparisonSigns' six alternatives are
+        // exhaustive.
+        CompareOp::Eq
+    }
+}
+
+fn string_exp_op(ctx: &StringExpPrefixContextAll) -> CompareOp {
+    if ctx.STARTS().is_some() {
+        CompareOp::StartsWith
+    } else if ctx.ENDS().is_some() {
+        CompareOp::EndsWith
+    } else {
+        CompareOp::Contains
+    }
+}
+
+fn invocation_name_text(ctx: &InvocationNameContextAll) -> String {
+    ctx.symbol_all()
+        .iter()
+        .map(|s| symbol_text(s))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Whether `atomicExpression` reduces to exactly a bare numeric literal --
+/// no property/label/postfix suffixes at any level between it and the
+/// `numLit` itself. Used by `build_unary_add_sub_expression` to fold a
+/// leading `-` directly into the literal (see that function's docs).
+fn bare_num_lit<'i>(
+    ctx: &AtomicExpressionContextAll<'i>,
+) -> Option<std::rc::Rc<NumLitContextAll<'i>>> {
+    if !ctx.stringExpression_all().is_empty()
+        || !ctx.listExpression_all().is_empty()
+        || !ctx.nullExpression_all().is_empty()
+    {
+        return None;
+    }
+    let prop_or_label = ctx.propertyOrLabelExpression()?;
+    if prop_or_label.nodeLabels().is_some() {
+        return None;
+    }
+    let prop_expr = prop_or_label.propertyExpression()?;
+    if !prop_expr.name_all().is_empty() {
+        return None;
+    }
+    prop_expr.atom()?.literal()?.numLit()
+}
+
+/// For a single-bound `list[..N]`/`list[N..]` slice, `expression_all()`
+/// alone can't say which side of `RANGE` the one present bound is on --
+/// walk the raw children between `LBRACK` and `RBRACK` to find out, same
+/// "read raw children in source order" approach `build_add_sub_expression`
+/// uses. `[`/`]`/`..` are the only fixed-text children possible here; the
+/// one remaining child is the expression itself.
+fn list_expr_bound_is_before_range(ctx: &ListExpressionContextAll) -> bool {
+    let mut seen_range = false;
+    for child in ctx.get_children() {
+        match child.get_text().as_str() {
+            "[" | "]" => continue,
+            ".." => seen_range = true,
+            _ => return !seen_range,
+        }
+    }
+    unreachable!("listExpression slice form always has exactly one expression child")
 }
 
 impl AstBuilder {
@@ -394,6 +705,366 @@ impl AstBuilder {
             })
             .collect())
     }
+
+    /// Mirrors `parser.rs`'s `parse_compare_expr` -- a chain folds into
+    /// nested `And`s of each *adjacent* pair (`a op0 b op1 c` -> `(a op0
+    /// b) AND (b op1 c)`, real Cypher's own chained-comparison semantics),
+    /// not a separate AST shape.
+    fn build_comparison_expression(
+        &mut self,
+        ctx: &ComparisonExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let mut operands = Vec::new();
+        for operand_ctx in ctx.addSubExpression_all() {
+            operands.push(self.visit(&*operand_ctx).into_return_expr()?);
+        }
+        let mut ops = Vec::new();
+        for sign_ctx in ctx.comparisonSigns_all() {
+            ops.push(compare_sign(&sign_ctx));
+        }
+        if ops.is_empty() {
+            return Ok(operands
+                .into_iter()
+                .next()
+                .expect("comparisonExpression has at least one addSubExpression"));
+        }
+        let mut pairs = operands.windows(2).zip(&ops).map(|(pair, op)| {
+            ReturnExpr::Compare(Box::new(pair[0].clone()), *op, Box::new(pair[1].clone()))
+        });
+        let mut acc = pairs
+            .next()
+            .expect("a comparison chain has at least one pair");
+        for next in pairs {
+            acc = ReturnExpr::And(Box::new(acc), Box::new(next));
+        }
+        Ok(acc)
+    }
+
+    /// `SUB_all()`/`PLUS_all()` each only return same-type tokens, losing
+    /// which operator occupies which position among possibly-mixed `+`/`-`
+    /// -- walking the raw children directly instead recovers real source
+    /// order for free, and lets ANTLR's own dispatch (`self.visit` on a
+    /// generic child) route each operand to `visit_multDivExpression`
+    /// rather than needing the typed `multDivExpression_all()` accessor at
+    /// all. The grammar shape (`multDivExpression ((PLUS | SUB)
+    /// multDivExpression)*`) guarantees strict operand/operator
+    /// alternation, so no type check is needed to tell them apart.
+    fn build_add_sub_expression(
+        &mut self,
+        ctx: &AddSubExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let mut children = ctx.get_children();
+        let mut lhs = self
+            .visit(
+                &*children
+                    .next()
+                    .expect("addSubExpression has at least one multDivExpression"),
+            )
+            .into_return_expr()?;
+        while let Some(op_node) = children.next() {
+            let op = match op_node.get_text().as_str() {
+                "+" => ArithOp::Add,
+                "-" => ArithOp::Sub,
+                other => unreachable!("unexpected addSubExpression operator {other:?}"),
+            };
+            let rhs_node = children
+                .next()
+                .expect("addSubExpression operator has a following multDivExpression");
+            let rhs = self.visit(&*rhs_node).into_return_expr()?;
+            lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn build_mult_div_expression(
+        &mut self,
+        ctx: &MultDivExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let mut children = ctx.get_children();
+        let mut lhs = self
+            .visit(
+                &*children
+                    .next()
+                    .expect("multDivExpression has at least one powerExpression"),
+            )
+            .into_return_expr()?;
+        while let Some(op_node) = children.next() {
+            let op = match op_node.get_text().as_str() {
+                "*" => ArithOp::Mul,
+                "/" => ArithOp::Div,
+                "%" => ArithOp::Mod,
+                other => unreachable!("unexpected multDivExpression operator {other:?}"),
+            };
+            let rhs_node = children
+                .next()
+                .expect("multDivExpression operator has a following powerExpression");
+            let rhs = self.visit(&*rhs_node).into_return_expr()?;
+            lhs = ReturnExpr::Arith(Box::new(lhs), op, Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    /// The parser already has correct unary-minus handling at this
+    /// precedence level (`(PLUS | SUB)? atomicExpression`), but for
+    /// `i64::MIN` (`-9223372036854775808`) to round-trip, the sign has to
+    /// fold directly into the literal's own parse rather than building
+    /// `Neg(Lit(Int(9223372036854775808)))` -- `9223372036854775808`
+    /// itself doesn't fit in a positive `i64` at all (only `i64::MIN`'s
+    /// magnitude does, via `parse_int_literal`'s two's-complement special
+    /// case, which needs the sign in its input string up front). Pest's
+    /// grammar sidestepped this by including an optional leading `-` in
+    /// `int_literal`/`float_literal` themselves; this grammar's `DIGIT`
+    /// deliberately doesn't (see the binary-minus fix), so the fold has to
+    /// happen here instead, for the one case where the operand is exactly
+    /// a bare numeric literal with no other operators/suffixes.
+    fn build_unary_add_sub_expression(
+        &mut self,
+        ctx: &UnaryAddSubExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let atomic_ctx = ctx
+            .atomicExpression()
+            .expect("unaryAddSubExpression always has an atomicExpression");
+        if ctx.SUB().is_some() {
+            if let Some(numlit_ctx) = bare_num_lit(&atomic_ctx) {
+                let text = numlit_ctx
+                    .DIGIT()
+                    .expect("numLit context always has a DIGIT token")
+                    .get_text();
+                return parse_num_lit_text(&format!("-{text}")).map(ReturnExpr::Lit);
+            }
+            let operand = self.visit(&*atomic_ctx).into_return_expr()?;
+            return Ok(ReturnExpr::Neg(Box::new(operand)));
+        }
+        // A leading `+` is always a no-op in Cypher (`+x` is just `x`).
+        self.visit(&*atomic_ctx).into_return_expr()
+    }
+
+    fn build_atomic_expression(
+        &mut self,
+        ctx: &AtomicExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let base_ctx = ctx
+            .propertyOrLabelExpression()
+            .expect("atomicExpression always has a propertyOrLabelExpression");
+        let base = self.visit(&*base_ctx).into_return_expr()?;
+        let string_suffixes = ctx.stringExpression_all();
+        let list_suffixes = ctx.listExpression_all();
+        let null_suffixes = ctx.nullExpression_all();
+        let total = string_suffixes.len() + list_suffixes.len() + null_suffixes.len();
+        if total == 0 {
+            return Ok(base);
+        }
+        if total > 1 {
+            return Err(QueryError::Syntax(
+                "chaining multiple STARTS WITH/ENDS WITH/CONTAINS/IN/[]/IS NULL suffixes on one expression isn't supported yet".into(),
+            ));
+        }
+        if let Some(s) = string_suffixes.into_iter().next() {
+            return self.build_string_expression(&s, base);
+        }
+        if let Some(l) = list_suffixes.into_iter().next() {
+            return self.build_list_expression(&l, base);
+        }
+        let n = null_suffixes
+            .into_iter()
+            .next()
+            .expect("total == 1 and string/list suffixes are empty");
+        Ok(if n.NOT().is_some() {
+            ReturnExpr::Not(Box::new(ReturnExpr::IsNull(Box::new(base))))
+        } else {
+            ReturnExpr::IsNull(Box::new(base))
+        })
+    }
+
+    fn build_string_expression(
+        &mut self,
+        ctx: &StringExpressionContextAll,
+        base: ReturnExpr,
+    ) -> Result<ReturnExpr, QueryError> {
+        let prefix_ctx = ctx
+            .stringExpPrefix()
+            .expect("stringExpression always has a stringExpPrefix");
+        let op = string_exp_op(&prefix_ctx);
+        let rhs_ctx = ctx
+            .propertyOrLabelExpression()
+            .expect("stringExpression always has a propertyOrLabelExpression");
+        let rhs = self.visit(&*rhs_ctx).into_return_expr()?;
+        Ok(ReturnExpr::Compare(Box::new(base), op, Box::new(rhs)))
+    }
+
+    fn build_list_expression(
+        &mut self,
+        ctx: &ListExpressionContextAll,
+        base: ReturnExpr,
+    ) -> Result<ReturnExpr, QueryError> {
+        if ctx.IN().is_some() {
+            let haystack_ctx = ctx
+                .propertyOrLabelExpression()
+                .expect("`IN` listExpression always has a propertyOrLabelExpression");
+            let haystack = self.visit(&*haystack_ctx).into_return_expr()?;
+            return Ok(ReturnExpr::In(Box::new(base), Box::new(haystack)));
+        }
+        let exprs = ctx.expression_all();
+        if ctx.RANGE().is_some() {
+            // `list[start..end]` -- either bound can be omitted.
+            // `expression_all()` in source order: 0, 1, or 2 present.
+            let (start, end) = match exprs.len() {
+                0 => (None, None),
+                1 => {
+                    // One bound present -- is it before or after `RANGE`?
+                    // Same alternating-children approach as
+                    // `build_add_sub_expression`: walk raw children past
+                    // `LBRACK` and see whether the expression comes before
+                    // or after the `..` token.
+                    let before_range = list_expr_bound_is_before_range(ctx);
+                    let e = self.visit(&*exprs[0].clone()).into_return_expr()?;
+                    if before_range {
+                        (Some(Box::new(e)), None)
+                    } else {
+                        (None, Some(Box::new(e)))
+                    }
+                }
+                2 => {
+                    let start = self.visit(&*exprs[0].clone()).into_return_expr()?;
+                    let end = self.visit(&*exprs[1].clone()).into_return_expr()?;
+                    (Some(Box::new(start)), Some(Box::new(end)))
+                }
+                n => unreachable!("listExpression slice form has {n} expressions, expected 0-2"),
+            };
+            return Ok(ReturnExpr::Slice(Box::new(base), start, end));
+        }
+        let index_ctx = exprs
+            .into_iter()
+            .next()
+            .expect("non-slice, non-IN listExpression always has exactly one expression");
+        let index = self.visit(&*index_ctx).into_return_expr()?;
+        Ok(ReturnExpr::Index(Box::new(base), Box::new(index)))
+    }
+
+    fn build_property_or_label_expression(
+        &mut self,
+        ctx: &PropertyOrLabelExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let prop_ctx = ctx
+            .propertyExpression()
+            .expect("propertyOrLabelExpression always has a propertyExpression");
+        let base = self.visit(&*prop_ctx).into_return_expr()?;
+        let Some(labels_ctx) = ctx.nodeLabels() else {
+            return Ok(base);
+        };
+        let ReturnExpr::Var(var) = base else {
+            return Err(QueryError::Syntax(
+                "a label check (`x:Label`) only applies to a bare variable".into(),
+            ));
+        };
+        let labels = labels_ctx.name_all().iter().map(|n| n.get_text()).collect();
+        Ok(ReturnExpr::HasLabel(var, labels))
+    }
+
+    /// `propertyExpression : atom (DOT name)*`. Mars's `ReturnExpr::Prop`
+    /// is a flat `{var, prop}` pair, not a recursive/chainable node --
+    /// matching pest's own `prop_access` rule, which is likewise a
+    /// dedicated single-level `identifier DOT identifier` production, not
+    /// a generic postfix chain over any atom. So a bare atom (no `.name`
+    /// suffix) passes through unchanged, exactly one suffix on a bare
+    /// variable becomes `Prop`, and anything wider (a chain, or a suffix
+    /// on a non-variable base like a function call's result) errors
+    /// clearly rather than silently mishandling -- neither pest nor this
+    /// parser can represent `duration.between(a, b).days` directly today
+    /// (real queries route it through a bound variable first instead,
+    /// confirmed against the TCK's own Temporal10 fixtures).
+    fn build_property_expression(
+        &mut self,
+        ctx: &PropertyExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let atom_ctx = ctx.atom().expect("propertyExpression always has an atom");
+        let base = self.visit(&*atom_ctx).into_return_expr()?;
+        let names = ctx.name_all();
+        match names.len() {
+            0 => Ok(base),
+            1 => {
+                let ReturnExpr::Var(var) = base else {
+                    return Err(QueryError::Syntax(
+                        "property access (`x.prop`) is only supported on a bare variable, not a computed expression"
+                            .into(),
+                    ));
+                };
+                Ok(ReturnExpr::Prop(PropAccess {
+                    var,
+                    prop: names[0].get_text(),
+                }))
+            }
+            _ => Err(QueryError::Syntax(
+                "chained property access (`a.b.c`) isn't supported yet".into(),
+            )),
+        }
+    }
+
+    fn build_atom(&mut self, ctx: &AtomContext) -> Result<ReturnExpr, QueryError> {
+        if let Some(lit_ctx) = ctx.literal() {
+            return self.visit(&*lit_ctx).into_literal().map(ReturnExpr::Lit);
+        }
+        if let Some(param_ctx) = ctx.parameter() {
+            return self.build_parameter(&param_ctx);
+        }
+        if let Some(paren_ctx) = ctx.parenthesizedExpression() {
+            return self.visit(&*paren_ctx).into_return_expr();
+        }
+        if let Some(func_ctx) = ctx.functionInvocation() {
+            return self.build_function_invocation(&func_ctx);
+        }
+        if let Some(count_ctx) = ctx.countAll() {
+            let _ = self.visit(&*count_ctx);
+            return Ok(ReturnExpr::CountStar);
+        }
+        if let Some(sym_ctx) = ctx.symbol() {
+            return Ok(ReturnExpr::Var(symbol_text(&sym_ctx)));
+        }
+        Err(QueryError::Syntax(
+            "this expression form (CASE/list comprehension/pattern comprehension/filter/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
+        ))
+    }
+
+    fn build_function_invocation(
+        &mut self,
+        ctx: &FunctionInvocationContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let name_ctx = ctx
+            .invocationName()
+            .expect("functionInvocation always has an invocationName");
+        let name = invocation_name_text(&name_ctx);
+        let distinct = ctx.DISTINCT().is_some();
+        let mut args = Vec::new();
+        if let Some(chain_ctx) = ctx.expressionChain() {
+            for arg_ctx in chain_ctx.expression_all() {
+                args.push(self.visit(&*arg_ctx).into_return_expr()?);
+            }
+        }
+        if distinct && !is_aggregate_name(&name) {
+            return Err(QueryError::Syntax(format!(
+                "'{name}(DISTINCT ...)' isn't valid — DISTINCT is only meaningful inside an aggregate function"
+            )));
+        }
+        Ok(ReturnExpr::Call {
+            name,
+            args,
+            distinct,
+        })
+    }
+
+    fn build_parameter(&mut self, ctx: &ParameterContext) -> Result<ReturnExpr, QueryError> {
+        let name = if let Some(sym_ctx) = ctx.symbol() {
+            symbol_text(&sym_ctx)
+        } else if let Some(num_ctx) = ctx.numLit() {
+            num_ctx
+                .DIGIT()
+                .expect("numLit context always has a DIGIT token")
+                .get_text()
+        } else {
+            unreachable!("parameter always has a symbol or numLit")
+        };
+        Ok(ReturnExpr::Lit(Literal::Param(name)))
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +1106,17 @@ mod tests {
             .matchSt()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `matchSt`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_query_parts()
+    }
+
+    fn parse_expr(input: &str) -> Result<ReturnExpr, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .expression()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `expression`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_return_expr()
     }
 
     #[test]
@@ -660,5 +1342,358 @@ mod tests {
     #[test]
     fn where_not_yet_supported() {
         assert!(parse_match("MATCH (a) WHERE a.x = 1").is_err());
+    }
+
+    #[test]
+    fn arithmetic_precedence() {
+        // 1 + 2 * 3 = 7, not 9 -- * binds tighter than +.
+        assert_eq!(
+            parse_expr("1 + 2 * 3").unwrap(),
+            ReturnExpr::Arith(
+                Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                ArithOp::Add,
+                Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Lit(Literal::Int(2))),
+                    ArithOp::Mul,
+                    Box::new(ReturnExpr::Lit(Literal::Int(3))),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn arithmetic_left_associative() {
+        // 10 - 2 - 3 = (10 - 2) - 3 = 5, not 10 - (2 - 3) = 11.
+        assert_eq!(
+            parse_expr("10 - 2 - 3").unwrap(),
+            ReturnExpr::Arith(
+                Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Lit(Literal::Int(10))),
+                    ArithOp::Sub,
+                    Box::new(ReturnExpr::Lit(Literal::Int(2))),
+                )),
+                ArithOp::Sub,
+                Box::new(ReturnExpr::Lit(Literal::Int(3))),
+            )
+        );
+    }
+
+    #[test]
+    fn power_left_associative() {
+        assert_eq!(
+            parse_expr("4 ^ 3 ^ 2").unwrap(),
+            ReturnExpr::Arith(
+                Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Lit(Literal::Int(4))),
+                    ArithOp::Pow,
+                    Box::new(ReturnExpr::Lit(Literal::Int(3))),
+                )),
+                ArithOp::Pow,
+                Box::new(ReturnExpr::Lit(Literal::Int(2))),
+            )
+        );
+    }
+
+    #[test]
+    fn binary_minus_no_whitespace() {
+        // Exercises the DIGIT-sign-removal grammar fix end to end: `5-1`
+        // used to tokenize as two adjacent DIGIT tokens with no operator.
+        assert_eq!(
+            parse_expr("5-1").unwrap(),
+            ReturnExpr::Arith(
+                Box::new(ReturnExpr::Lit(Literal::Int(5))),
+                ArithOp::Sub,
+                Box::new(ReturnExpr::Lit(Literal::Int(1))),
+            )
+        );
+    }
+
+    #[test]
+    fn unary_minus_on_variable() {
+        assert_eq!(
+            parse_expr("-x").unwrap(),
+            ReturnExpr::Neg(Box::new(ReturnExpr::Var("x".to_string())))
+        );
+    }
+
+    #[test]
+    fn unary_minus_folds_into_literal() {
+        assert_eq!(parse_expr("-5").unwrap(), ReturnExpr::Lit(Literal::Int(-5)));
+        assert_eq!(
+            parse_expr("-5.5").unwrap(),
+            ReturnExpr::Lit(Literal::Float(-5.5))
+        );
+    }
+
+    #[test]
+    fn unary_minus_int_min_two_complement_edge_case() {
+        // 9223372036854775808 (2^63) doesn't fit in a positive i64 at all
+        // -- only i64::MIN's magnitude does. Folding the sign directly
+        // into the literal (rather than building Neg(Lit(Int(...)))) is
+        // what makes this representable.
+        assert_eq!(
+            parse_expr("-9223372036854775808").unwrap(),
+            ReturnExpr::Lit(Literal::Int(i64::MIN))
+        );
+    }
+
+    #[test]
+    fn comparison_chain_folds_into_nested_and() {
+        // 1 < x < 3 -> (1 < x) AND (x < 3), real Cypher's chained-
+        // comparison semantics, not a separate AST shape.
+        assert_eq!(
+            parse_expr("1 < x < 3").unwrap(),
+            ReturnExpr::And(
+                Box::new(ReturnExpr::Compare(
+                    Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                    CompareOp::Lt,
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                )),
+                Box::new(ReturnExpr::Compare(
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                    CompareOp::Lt,
+                    Box::new(ReturnExpr::Lit(Literal::Int(3))),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn boolean_operators() {
+        assert_eq!(
+            parse_expr("true AND false").unwrap(),
+            ReturnExpr::And(
+                Box::new(ReturnExpr::Lit(Literal::Bool(true))),
+                Box::new(ReturnExpr::Lit(Literal::Bool(false))),
+            )
+        );
+        assert_eq!(
+            parse_expr("true OR false").unwrap(),
+            ReturnExpr::Or(
+                Box::new(ReturnExpr::Lit(Literal::Bool(true))),
+                Box::new(ReturnExpr::Lit(Literal::Bool(false))),
+            )
+        );
+        assert_eq!(
+            parse_expr("true XOR false").unwrap(),
+            ReturnExpr::Xor(
+                Box::new(ReturnExpr::Lit(Literal::Bool(true))),
+                Box::new(ReturnExpr::Lit(Literal::Bool(false))),
+            )
+        );
+    }
+
+    #[test]
+    fn double_negation() {
+        // Exercises the notExpression NOT* grammar fix end to end.
+        assert_eq!(
+            parse_expr("NOT NOT true").unwrap(),
+            ReturnExpr::Not(Box::new(ReturnExpr::Not(Box::new(ReturnExpr::Lit(
+                Literal::Bool(true)
+            )))))
+        );
+    }
+
+    #[test]
+    fn is_null() {
+        assert_eq!(
+            parse_expr("x IS NULL").unwrap(),
+            ReturnExpr::IsNull(Box::new(ReturnExpr::Var("x".to_string())))
+        );
+        assert_eq!(
+            parse_expr("x IS NOT NULL").unwrap(),
+            ReturnExpr::Not(Box::new(ReturnExpr::IsNull(Box::new(ReturnExpr::Var(
+                "x".to_string()
+            )))))
+        );
+    }
+
+    #[test]
+    fn in_operator() {
+        assert_eq!(
+            parse_expr("x IN y").unwrap(),
+            ReturnExpr::In(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                Box::new(ReturnExpr::Var("y".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn string_predicates() {
+        assert_eq!(
+            parse_expr("x STARTS WITH y").unwrap(),
+            ReturnExpr::Compare(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                CompareOp::StartsWith,
+                Box::new(ReturnExpr::Var("y".to_string())),
+            )
+        );
+        assert_eq!(
+            parse_expr("x ENDS WITH y").unwrap(),
+            ReturnExpr::Compare(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                CompareOp::EndsWith,
+                Box::new(ReturnExpr::Var("y".to_string())),
+            )
+        );
+        assert_eq!(
+            parse_expr("x CONTAINS y").unwrap(),
+            ReturnExpr::Compare(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                CompareOp::Contains,
+                Box::new(ReturnExpr::Var("y".to_string())),
+            )
+        );
+    }
+
+    #[test]
+    fn index_and_slice() {
+        assert_eq!(
+            parse_expr("list[0]").unwrap(),
+            ReturnExpr::Index(
+                Box::new(ReturnExpr::Var("list".to_string())),
+                Box::new(ReturnExpr::Lit(Literal::Int(0))),
+            )
+        );
+        assert_eq!(
+            parse_expr("list[1..3]").unwrap(),
+            ReturnExpr::Slice(
+                Box::new(ReturnExpr::Var("list".to_string())),
+                Some(Box::new(ReturnExpr::Lit(Literal::Int(1)))),
+                Some(Box::new(ReturnExpr::Lit(Literal::Int(3)))),
+            )
+        );
+        assert_eq!(
+            parse_expr("list[..3]").unwrap(),
+            ReturnExpr::Slice(
+                Box::new(ReturnExpr::Var("list".to_string())),
+                None,
+                Some(Box::new(ReturnExpr::Lit(Literal::Int(3)))),
+            )
+        );
+        assert_eq!(
+            parse_expr("list[1..]").unwrap(),
+            ReturnExpr::Slice(
+                Box::new(ReturnExpr::Var("list".to_string())),
+                Some(Box::new(ReturnExpr::Lit(Literal::Int(1)))),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn property_access() {
+        assert_eq!(
+            parse_expr("n.name").unwrap(),
+            ReturnExpr::Prop(PropAccess {
+                var: "n".to_string(),
+                prop: "name".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn chained_property_access_not_yet_supported() {
+        assert!(parse_expr("n.a.b").is_err());
+    }
+
+    #[test]
+    fn property_access_on_computed_expr_not_supported() {
+        assert!(parse_expr("duration.between(a, b).days").is_err());
+    }
+
+    #[test]
+    fn has_label() {
+        assert_eq!(
+            parse_expr("n:Person").unwrap(),
+            ReturnExpr::HasLabel("n".to_string(), vec!["Person".to_string()])
+        );
+    }
+
+    #[test]
+    fn function_call() {
+        assert_eq!(
+            parse_expr("size(list)").unwrap(),
+            ReturnExpr::Call {
+                name: "size".to_string(),
+                args: vec![ReturnExpr::Var("list".to_string())],
+                distinct: false,
+            }
+        );
+    }
+
+    #[test]
+    fn namespaced_function_call() {
+        assert_eq!(
+            parse_expr("duration.between(a, b)").unwrap(),
+            ReturnExpr::Call {
+                name: "duration.between".to_string(),
+                args: vec![
+                    ReturnExpr::Var("a".to_string()),
+                    ReturnExpr::Var("b".to_string())
+                ],
+                distinct: false,
+            }
+        );
+    }
+
+    #[test]
+    fn count_star() {
+        assert_eq!(parse_expr("count(*)").unwrap(), ReturnExpr::CountStar);
+    }
+
+    #[test]
+    fn aggregate_distinct() {
+        assert_eq!(
+            parse_expr("count(DISTINCT x)").unwrap(),
+            ReturnExpr::Call {
+                name: "count".to_string(),
+                args: vec![ReturnExpr::Var("x".to_string())],
+                distinct: true,
+            }
+        );
+    }
+
+    #[test]
+    fn distinct_on_non_aggregate_errors() {
+        assert!(parse_expr("size(DISTINCT x)").is_err());
+    }
+
+    #[test]
+    fn distinct_on_namespaced_call_errors() {
+        assert!(parse_expr("duration.between(DISTINCT a, b)").is_err());
+    }
+
+    #[test]
+    fn parameter_by_name() {
+        assert_eq!(
+            parse_expr("$name").unwrap(),
+            ReturnExpr::Lit(Literal::Param("name".to_string()))
+        );
+    }
+
+    #[test]
+    fn parameter_by_position() {
+        assert_eq!(
+            parse_expr("$0").unwrap(),
+            ReturnExpr::Lit(Literal::Param("0".to_string()))
+        );
+    }
+
+    #[test]
+    fn parenthesized_expression() {
+        assert_eq!(
+            parse_expr("(1 + 2) * 3").unwrap(),
+            ReturnExpr::Arith(
+                Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                    ArithOp::Add,
+                    Box::new(ReturnExpr::Lit(Literal::Int(2))),
+                )),
+                ArithOp::Mul,
+                Box::new(ReturnExpr::Lit(Literal::Int(3))),
+            )
+        );
     }
 }
