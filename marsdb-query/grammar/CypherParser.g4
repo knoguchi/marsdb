@@ -39,6 +39,15 @@ script
     : query SEMI? EOF
     ;
 
+// mars-specific extension (see grammar/README.md) -- a `;`-separated batch
+// of one or more statements, e.g. `CREATE (a); CREATE (b); MATCH (n)
+// RETURN n`. Mirrors cypher.pest's `queries` rule exactly: no trailing
+// SEMI here either (parse_antlr_many strips a single genuinely-trailing
+// `;` in Rust first, same as parser::parse_many does).
+queries
+    : query (SEMI query)* EOF
+    ;
+
 // statements
 query
     : explainSt

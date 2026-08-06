@@ -13,6 +13,11 @@ pub trait CypherParserBaseVisitor<'input>:
         self.visit_children(ctx)
     }
 
+    // Visit a parse tree produced by CypherParser#queries.
+    fn visit_queries(&mut self, ctx: &QueriesContext<'input>) {
+        self.visit_children(ctx)
+    }
+
     // Visit a parse tree produced by CypherParser#query.
     fn visit_query(&mut self, ctx: &QueryContext<'input>) {
         self.visit_children(ctx)

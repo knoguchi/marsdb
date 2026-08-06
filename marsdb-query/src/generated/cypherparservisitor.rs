@@ -17,6 +17,14 @@ pub trait CypherParserVisitor<'input>: ParseTreeVisitor<'input, CypherParserCont
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#queries}.
+     * @param ctx the parse tree
+     */
+    fn visit_queries(&mut self, ctx: &QueriesContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#query}.
      * @param ctx the parse tree
      */
@@ -777,6 +785,14 @@ pub trait CypherParserVisitorCompat<'input>:
      * @param ctx the parse tree
      */
     fn visit_script(&mut self, ctx: &ScriptContext<'input>) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#queries}.
+     * @param ctx the parse tree
+     */
+    fn visit_queries(&mut self, ctx: &QueriesContext<'input>) -> Self::Return {
         self.visit_children(ctx)
     }
 
@@ -1572,6 +1588,11 @@ where
 {
     fn visit_script(&mut self, ctx: &ScriptContext<'input>) {
         let result = <Self as CypherParserVisitorCompat>::visit_script(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_queries(&mut self, ctx: &QueriesContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_queries(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
     }
 

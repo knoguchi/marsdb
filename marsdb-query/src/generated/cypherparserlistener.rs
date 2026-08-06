@@ -15,6 +15,16 @@ pub trait CypherParserListener<'input>: ParseTreeListener<'input, CypherParserCo
      */
     fn exit_script(&mut self, _ctx: &ScriptContext<'input>) {}
     /**
+     * Enter a parse tree produced by {@link CypherParser#queries}.
+     * @param ctx the parse tree
+     */
+    fn enter_queries(&mut self, _ctx: &QueriesContext<'input>) {}
+    /**
+     * Exit a parse tree produced by {@link CypherParser#queries}.
+     * @param ctx the parse tree
+     */
+    fn exit_queries(&mut self, _ctx: &QueriesContext<'input>) {}
+    /**
      * Enter a parse tree produced by {@link CypherParser#query}.
      * @param ctx the parse tree
      */

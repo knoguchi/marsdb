@@ -23,6 +23,17 @@ pub trait CypherParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_queries(&mut self, _ctx: &QueriesContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_queries(&mut self, _ctx: &QueriesContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_query(&mut self, _ctx: &QueryContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.

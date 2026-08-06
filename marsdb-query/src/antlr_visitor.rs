@@ -2337,6 +2337,66 @@ pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     AstBuilder::new().visit(&*query_ctx).into_statement()
 }
 
+/// Parallel entry point alongside `parser::parse_many` -- parses a
+/// `;`-separated batch of one or more statements (`"CREATE (a); CREATE
+/// (b); MATCH (n) RETURN n"`). `queries : query (SEMI query)* EOF` is a
+/// mars-specific grammar extension (see `grammar/README.md`), mirroring
+/// `cypher.pest`'s own `queries` rule exactly, including stripping a
+/// single genuinely-trailing `;` in Rust before parsing (same reason
+/// `parser::parse_many` does: the grammar rule itself has no trailing
+/// `SEMI?`, to avoid the same ambiguity its own doc comment describes).
+pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
+    use crate::generated::cypherlexer::CypherLexer;
+    use crate::generated::cypherparser::{CypherParser, QueriesContextAttrs};
+    use antlr4rust::common_token_stream::CommonTokenStream;
+    use antlr4rust::error_listener::ErrorListener;
+    use antlr4rust::recognizer::Recognizer;
+    use antlr4rust::token_factory::TokenFactory;
+    use antlr4rust::InputStream;
+    use antlr4rust::Parser as _;
+    use std::cell::RefCell;
+
+    struct CollectErrors(Rc<RefCell<Vec<String>>>);
+    impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectErrors {
+        fn syntax_error(
+            &self,
+            _recognizer: &T,
+            _offending_symbol: Option<&<T::TF as TokenFactory<'a>>::Inner>,
+            line: isize,
+            column: isize,
+            msg: &str,
+            _e: Option<&antlr4rust::errors::ANTLRError>,
+        ) {
+            self.0
+                .borrow_mut()
+                .push(format!("line {line}:{column} {msg}"));
+        }
+    }
+
+    let trimmed = input.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
+
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let stream = InputStream::new(trimmed);
+    let mut lexer = CypherLexer::new(stream);
+    lexer.remove_error_listeners();
+    lexer.add_error_listener(Box::new(CollectErrors(errors.clone())));
+    let tokens = CommonTokenStream::new(lexer);
+    let mut parser = CypherParser::new(tokens);
+    parser.remove_error_listeners();
+    parser.add_error_listener(Box::new(CollectErrors(errors.clone())));
+    let ctx = parser
+        .queries()
+        .map_err(|e| QueryError::Syntax(e.to_string()))?;
+    if let Some(msg) = errors.borrow().first() {
+        return Err(QueryError::Syntax(format!("syntax error: {msg}")));
+    }
+    ctx.query_all()
+        .into_iter()
+        .map(|q| AstBuilder::new().visit(&*q).into_statement())
+        .collect()
+}
+
 /// `where`'s grammar reuses the same `expression` rule as everywhere else
 /// (unlike pest, which has a separate, narrower `with_expr` grammar chain
 /// building `WithExpr` directly) -- so a full `ReturnExpr` has to be built
@@ -4094,6 +4154,32 @@ mod tests {
     #[test]
     fn parse_antlr_syntax_error() {
         assert!(parse_antlr("MATCH (a RETURN a;").is_err());
+    }
+
+    #[test]
+    fn parse_antlr_many_basic() {
+        let stmts = parse_antlr_many("CREATE (a); CREATE (b); MATCH (n) RETURN n").unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(stmts[0], Statement::Match { .. }));
+        assert!(matches!(stmts[2], Statement::Match { .. }));
+    }
+
+    #[test]
+    fn parse_antlr_many_single_statement() {
+        let stmts = parse_antlr_many("RETURN 1").unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn parse_antlr_many_strips_single_trailing_semicolon() {
+        let stmts = parse_antlr_many("CREATE (a);").unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn parse_antlr_many_semicolon_inside_string_literal_not_a_separator() {
+        let stmts = parse_antlr_many("RETURN ';'").unwrap();
+        assert_eq!(stmts.len(), 1);
     }
 
     #[test]

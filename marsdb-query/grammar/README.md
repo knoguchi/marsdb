@@ -147,6 +147,17 @@ a local extension here too, mirroring `cypher.pest`'s own
   the exact constraint" split already used for `(symbol ASSIGN)?` on the
   same rule.
 
+A fourth: `queries : query (SEMI query)* EOF` — a `;`-separated batch of
+one or more statements (`"CREATE (a); CREATE (b); MATCH (n) RETURN n"`),
+parsed via `parse_antlr_many`. Mirrors `cypher.pest`'s own `queries` rule
+exactly, including having no trailing `SEMI?` of its own (a single
+genuinely-trailing `;` is stripped in Rust before parsing, same as
+`parser::parse_many` already does, avoiding the same ambiguity its own
+doc comment describes). Not from openCypher either — real Cypher has no
+concept of a single textual submission containing multiple statements at
+all — but needed for parity with `parser::parse_many`, part of this
+crate's real public API.
+
 ## Why this toolchain
 
 ANTLR4's Rust code-generation target is not in mainline ANTLR4 (never merged
