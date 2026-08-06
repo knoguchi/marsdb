@@ -848,6 +848,21 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             infer_expr(base, scope)?;
             Kind::Scalar
         }
+        // `null` specifically types as `Unknown`, not `Scalar` -- real
+        // Cypher's `null` is compatible with *any* type (it's not "some
+        // scalar that happens to be null," it's the universal "unknown
+        // value" every type check already treats `Unknown` as compatible
+        // with). Using `Scalar` here used to force a pile of individual
+        // "Scalar tolerated too, not just Unknown" call-site exceptions
+        // (`Index`, `type()`, `nodes()`/`relationships()`/`length()`) just
+        // to let `null` through checks that already handle `Unknown` for
+        // free -- and still didn't cover every site (`bind_kind` reusing
+        // an already-bound `null` variable as a node/relationship pattern
+        // token, TCK's Path1 `[1]`/Path2 `[3]`: `WITH null AS a OPTIONAL
+        // MATCH p = (a)-[r]->()`). A real, non-null scalar (`1`, `'x'`,
+        // `true`) still types as `Scalar` -- only the literal `null`
+        // keyword changes.
+        ReturnExpr::Lit(Literal::Null) => Kind::Unknown,
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => Kind::Scalar,
         ReturnExpr::Call { name, args, .. } => {
             let arg_kinds = args

@@ -51,7 +51,7 @@ scope.
 | expressions/map | 44 | 39 | 0 | 0 | 0 | 5 | 88.6% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/null | 44 | 44 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/path | 7 | 5 | 0 | 0 | 2 | 0 | 71.4% |
+| expressions/path | 7 | 7 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/pattern | 50 | 50 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/quantifier | 604 | 604 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3817** | **0** | **3** | **52** | **8** | **98.4%** |
+| **TOTAL** | **3880** | **3819** | **0** | **3** | **50** | **8** | **98.4%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
