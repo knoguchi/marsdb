@@ -56,11 +56,24 @@ scope.
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/quantifier | 604 | 604 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/temporal | 1004 | 1002 | 0 | 2 | 0 | 0 | 99.8% |
+| expressions/temporal* | 1004 | 1002 | 0 | 2 | 0 | 0 | 99.8% |
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
 | **TOTAL** | **3880** | **3878** | **0** | **2** | **0** | **0** | **99.9%** |
+
+\* The 2 `unexp` in `expressions/temporal` are `Temporal10 [9]`/`[10]`
+(`date`/`localdatetime` at year ±999,999,999, `duration.between`/
+`duration.inSeconds` over that range) — a real, structural limitation,
+not a bug: `PropertyValue::Date`/`DateTime` store an `i32` epoch-day
+count (max ~5.9M years, not the ~1B TCK exercises), and `chrono::
+NaiveDate` itself can't construct a date that extreme regardless of
+storage width (its own internal range caps around ±262,000 years).
+Fixing this for real needs both a storage-format change (`i32` ->
+`i64` epoch-day, a breaking on-disk migration) and hand-rolled
+proleptic-Gregorian calendar arithmetic bypassing `chrono` entirely
+for the extreme range — deliberately left as-is; see git history for
+the investigation.
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
