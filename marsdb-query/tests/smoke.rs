@@ -8339,18 +8339,22 @@ fn variable_length_relationship_binds_a_list_of_edges() {
     }
 
     // Matching a variable-length pattern against an *already-bound* list
-    // variable (real Cypher: "match a path whose edges equal this list")
-    // is a genuinely different, unsupported feature -- must stay
-    // rejected, not silently produce the wrong count. The check lives in
-    // the planner (build_match_plan), reached at execution time, not
-    // parse time.
-    let stmt = parse(
+    // variable (TCK's Match4 [8]) means "match a path whose edges equal
+    // this list" -- deterministic (the edges are already concrete, so
+    // there's exactly one possible walk to check), not a fresh BFS search.
+    let result = run(
+        &store,
         "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
          MATCH (first)-[rs*]->(second) RETURN first, second",
-    )
-    .unwrap();
-    let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("already-bound"));
+    );
+    assert_eq!(result.rows.len(), 1);
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (Value::Node(first), Value::Node(second)) => {
+            assert!(first.labels.contains(&"A".to_string()));
+            assert_eq!(second.labels, Vec::<String>::new());
+        }
+        other => panic!("expected two nodes, got {other:?}"),
+    }
 }
 
 /// `WITH null AS a OPTIONAL MATCH p = (a)-[r]->()` -- reusing an

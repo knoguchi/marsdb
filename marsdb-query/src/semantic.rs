@@ -1115,8 +1115,23 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             // append/prepend (`[1,2] + [3]`, `[1,2] + 3`, `3 + [1,2]`) --
             // `-`/`*`/`/`/`%` have no defined meaning for a list, so
             // those still reject one outright via `require_scalarish`.
+            // The resulting element kind unifies whichever side(s) are
+            // themselves a list with the other operand's own kind (an
+            // append/prepend puts that whole value in as one more element)
+            // -- not hardcoded to `Scalar`, which would wrongly forget a
+            // concatenated node/relationship list's real element kind
+            // (`[a] + collect(n) + [b]` must still type as `List(Node)`,
+            // not `List(Scalar)`, or a later `CREATE` off one of its
+            // elements gets rejected at compile time even though it's a
+            // real node -- TCK's Match4 `[4]`). `unify_many` already
+            // widens to `Unknown` on any real mismatch, same safe fallback
+            // every other composed-kind check here uses.
             if *op == ArithOp::Add && (matches!(lk, Kind::List(_)) || matches!(rk, Kind::List(_))) {
-                Kind::List(Box::new(Kind::Scalar))
+                let elem = |k: Kind| match k {
+                    Kind::List(inner) => *inner,
+                    other => other,
+                };
+                Kind::List(Box::new(unify_many(&[elem(lk), elem(rk)])))
             } else {
                 require_scalarish(&lk, "arithmetic operand")?;
                 require_scalarish(&rk, "arithmetic operand")?;

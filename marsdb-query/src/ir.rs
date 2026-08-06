@@ -150,6 +150,30 @@ pub enum LogicalPlan {
         /// during expansion.
         rel_props: Vec<(String, ReturnExpr)>,
     },
+    /// `MATCH (first)-[rs*]->(second)` where `rs` was already bound
+    /// earlier (e.g. `WITH [r1, r2] AS rs`) -- real Cypher's semantics
+    /// here are "verify this *exact*, already-fixed relationship sequence
+    /// forms a connected path from `from_var`," not `VarExpand`'s fresh
+    /// BFS search (which would silently overwrite `rs`'s carried binding
+    /// with whatever a new traversal happens to find -- TCK's Match4
+    /// `[8]`, Match9 `[6]`/`[7]`). Deterministic: `rs`'s edges are already
+    /// concrete, so there's exactly one possible walk to check, starting
+    /// from `from_var`'s own already-bound node -- `executor::
+    /// match_bound_rel_list_row` walks them in order, each edge's
+    /// `direction`-appropriate endpoint must equal the current node, and
+    /// binds `to_var` to wherever the walk ends up (0 output rows if the
+    /// list doesn't chain, is out of `min_hops`/`max_hops` range, or an
+    /// edge's label isn't in `rel_labels`).
+    MatchRelList {
+        input: Box<LogicalPlan>,
+        from_var: String,
+        to_var: String,
+        rel_list_var: String,
+        rel_labels: Vec<String>,
+        direction: ExpandDirection,
+        min_hops: u32,
+        max_hops: Option<u32>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: Expr,

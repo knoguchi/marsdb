@@ -457,12 +457,22 @@ pub struct RelPattern {
     /// TCK's Quantifier1-4 `[8]`/`[9]`) -- asks the planner's `VarExpand`
     /// to also expose its own internally-traversed edge/node sequence (in
     /// order) for `executor::assemble_path` to splice into the whole
-    /// pattern's path, via a reserved internal binding name
-    /// (`planner::VAR_LEN_PATH_SEGMENT_VAR`), completely separate from
-    /// `var` -- which stays unset, since binding a *list* of relationships
-    /// to a real variable name is a different, still-unsupported feature
-    /// (see `planner::build_match_plan`'s own rejection for that).
+    /// pattern's path, via a fresh internal binding name that `var` gets
+    /// overwritten to hold (see `name_pattern_for_path`'s own docs). The
+    /// user's own real relationship-list variable, if this hop had one
+    /// (`p = (a)-[r*1..3]->(b)`, TCK's Match9 `[9]`), is preserved
+    /// separately in `rel_list_var` below rather than lost to that
+    /// overwrite.
     pub capture_path_segment: bool,
+    /// The user's own `[r:TYPE*1..3]` relationship-list variable name, for
+    /// a hop that has `capture_path_segment` set -- `None` for an
+    /// anonymous hop (`p = (a)-[*1..3]->(b)`, nothing to bind). For a
+    /// var-length hop *without* named-path capture, `var` itself already
+    /// holds this directly (this field stays `None` in that case; the
+    /// planner reads whichever of the two applies). Two separate fields
+    /// rather than reusing `var` for both, since `capture_path_segment`
+    /// already needs `var` for its own internal bookkeeping name.
+    pub rel_list_var: Option<String>,
 }
 
 /// A linear chain: node, (rel, node)*.

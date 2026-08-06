@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use marsdb_graph::{
-    AdjEntry, Direction, EdgeId, GraphStore, NodeId, PropertyValue, Txn, TzId as GraphTzId,
+    AdjEntry, Direction, Edge, EdgeId, GraphStore, NodeId, PropertyValue, Txn, TzId as GraphTzId,
     WriteTransaction,
 };
 
@@ -321,6 +321,16 @@ struct VarExpandSpec<'a> {
     rel_list_var: Option<&'a str>,
     /// See `LogicalPlan::VarExpand::rel_props`'s own docs.
     rel_props: &'a [(String, ReturnExpr)],
+}
+
+struct MatchRelListSpec<'a> {
+    from_var: &'a str,
+    to_var: &'a str,
+    rel_list_var: &'a str,
+    rel_labels: &'a [String],
+    direction: ExpandDirection,
+    min_hops: u32,
+    max_hops: Option<u32>,
 }
 
 struct PatternComprehensionSpec<'a> {
@@ -2991,6 +3001,51 @@ impl<'a> Executor<'a> {
                 });
                 Self::count_stream(Box::new(stream), guard)
             }
+            LogicalPlan::MatchRelList {
+                input,
+                from_var,
+                to_var,
+                rel_list_var,
+                rel_labels,
+                direction,
+                min_hops,
+                max_hops,
+            } => {
+                let mut input = self.stream_plan(txn, input, seed, guard, None);
+                let mut done = false;
+                let stream = std::iter::from_fn(move || loop {
+                    if done {
+                        return None;
+                    }
+                    let row = match input.next()? {
+                        Ok(row) => row,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    };
+                    match self.match_bound_rel_list_row(
+                        row,
+                        MatchRelListSpec {
+                            from_var,
+                            to_var,
+                            rel_list_var,
+                            rel_labels,
+                            direction: *direction,
+                            min_hops: *min_hops,
+                            max_hops: *max_hops,
+                        },
+                    ) {
+                        Ok(Some(row)) => return Some(Ok(row)),
+                        Ok(None) => continue,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    }
+                });
+                Self::count_stream(Box::new(stream), guard)
+            }
             LogicalPlan::Filter { input, predicate } => {
                 let mut input = self.stream_plan(txn, input, seed, guard, None);
                 let mut done = false;
@@ -3325,6 +3380,62 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// `LogicalPlan::MatchRelList`'s own docs -- deterministic, no search:
+    /// `spec.rel_list_var`'s edges are already concrete, so there's
+    /// exactly one possible walk to check, starting from `spec.from_var`'s
+    /// already-bound node. Returns `Ok(None)` (row dropped, not an error)
+    /// for every "doesn't match" case -- wrong hop count, a broken chain,
+    /// an edge whose label isn't in `spec.rel_labels` -- same "no match
+    /// survives" convention `Expand`/`VarExpand` already use for a filter
+    /// that simply excludes a row.
+    fn match_bound_rel_list_row(
+        &self,
+        row: BindingRow,
+        spec: MatchRelListSpec<'_>,
+    ) -> Result<Option<BindingRow>, QueryError> {
+        let start_id = match row.get(spec.from_var) {
+            Some(Binding::Node(id)) => *id,
+            Some(Binding::Value(PropertyValue::Null)) => return Ok(None),
+            _ => return Err(QueryError::UnboundVariable(spec.from_var.to_string())),
+        };
+        let edges: Vec<&Edge> = match row.get(spec.rel_list_var) {
+            Some(Binding::List(items)) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Edge(e) => Ok(e),
+                    other => Err(QueryError::Type(format!(
+                        "'{}' must be a list of relationships, found {other:?} in it",
+                        spec.rel_list_var
+                    ))),
+                })
+                .collect::<Result<_, _>>()?,
+            Some(Binding::Value(PropertyValue::Null)) => return Ok(None),
+            _ => return Err(QueryError::UnboundVariable(spec.rel_list_var.to_string())),
+        };
+        let hops = edges.len() as u32;
+        if hops < spec.min_hops || spec.max_hops.is_some_and(|max| hops > max) {
+            return Ok(None);
+        }
+        if !spec.rel_labels.is_empty() && edges.iter().any(|e| !spec.rel_labels.contains(&e.label))
+        {
+            return Ok(None);
+        }
+        let mut current = start_id;
+        for edge in &edges {
+            let next = match spec.direction {
+                ExpandDirection::Out if edge.src == current => edge.dst,
+                ExpandDirection::In if edge.dst == current => edge.src,
+                ExpandDirection::Either if edge.src == current => edge.dst,
+                ExpandDirection::Either if edge.dst == current => edge.src,
+                _ => return Ok(None),
+            };
+            current = next;
+        }
+        let mut new_row = row.clone();
+        new_row.insert(spec.to_var.to_string(), Binding::Node(current));
+        Ok(Some(new_row))
     }
 
     /// `Option<bool>` — see `eval_with_expr`'s docs, same reasoning.
@@ -5495,11 +5606,12 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
                 // each get their own, no collision -- TCK's Match6
                 // `[17]`), read by `planner::build_match_plan` (its
                 // `VarExpand`'s `path_segment_var`) and `assemble_path`.
-                // Deliberately *not* the ordinary "bind this hop's own
-                // rel_var" path -- binding a *list* of relationships to a
-                // real variable name is a separate, still-unsupported
-                // feature (see `build_match_plan`'s own rejection for
-                // that, gated on `!capture_path_segment`).
+                // The user's own real rel-list variable, if this hop had
+                // one (`p = (a)-[r*1..3]->(b)`, TCK's Match9 `[9]`), is
+                // preserved separately in `rel_list_var` rather than lost
+                // to this overwrite -- `var` itself is always this hop's
+                // internal path-segment bookkeeping name from here on.
+                rel.rel_list_var = rel.var.take();
                 rel.var = Some(fresh(&mut counter, &mut synthesized));
                 rel.capture_path_segment = true;
             } else if rel.var.is_none() {

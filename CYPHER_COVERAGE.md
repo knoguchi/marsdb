@@ -26,7 +26,7 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/match | 381 | 376 | 0 | 1 | 4 | 0 | 98.7% |
+| clauses/match | 381 | 381 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/match-where | 34 | 34 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3837** | **0** | **3** | **40** | **0** | **98.9%** |
+| **TOTAL** | **3880** | **3842** | **0** | **2** | **36** | **0** | **99.0%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -113,11 +113,6 @@ ISO-8601 combined date-time duration syntax
 are both supported. The one remaining temporal gap: dates outside
 `chrono`'s representable range (`'-999999999-01-01'`) — see the `unexp`
 column's own docs above for why this one's deliberately left as-is.
-
-The only other non-temporal `unexp` left, `Match9 [9]`, is inside TCK's
-own "deprecated scenarios" feature file (`Match9` — excluded from this
-project's conformance push by design, see git history for the reasoning),
-not a real gap in currently-supported syntax.
 
 ## Clauses
 
