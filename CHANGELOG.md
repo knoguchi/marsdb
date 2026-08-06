@@ -5,16 +5,75 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-06
+
 ### Added
 - `marsdb-capi`, a workspace-built C ABI with opaque database handles and
   JSON query results, plus `marsdb-go`, a cgo binding with in-memory and
   persistent databases, exact 64-bit integer decoding, temporal values,
   synchronized close/query access, examples, tests, and CI coverage.
+- Parser replaced: ANTLR4-generated grammar (`marsdb-query/grammar/`)
+  instead of the hand-rolled `pest` grammar — closer to real openCypher
+  grammar coverage, the foundation for everything else in this release.
+- List-valued node/edge properties, and `$parameters` naming a list
+  (including nested lists) or a map (`PropertyValue::Map`,
+  parameter-passing only).
+- `SET n = {...}` / `SET n += {...}` map assignment; `MERGE`/`CREATE`/
+  `DELETE`/`SET`/`REMOVE` can now chain directly into each other (via
+  `WITH` or a trailing `RETURN`) instead of only ever being one mutating
+  clause immediately before a single terminal `RETURN`; `ON MATCH`/
+  `ON CREATE` accepted in either order in `MERGE`.
+- Variable-length relationship patterns: binding `[r*1..3]` to a real
+  list-of-relationships variable, matching a variable-length pattern
+  against an *already-bound* list (`MATCH (a)-[rs*]->(b)` after
+  `WITH [r1, r2] AS rs`), and inline properties on the hop itself
+  (`[:TYPE* {prop: val}]`, checked against every hop in the traversal).
+- Named-path capture over patterns mixing a variable-length hop with
+  other hops, and over a hop that has both named-path capture *and* its
+  own real relationship-list variable at once.
+- `exists { MATCH ... RETURN ... }`, the full nested-subquery form of
+  existential subqueries (alongside the already-supported simple
+  pattern-only form) — its own aggregation/`WITH`/nested `exists {}` all
+  allowed, correlated against the enclosing row.
+- `CALL proc(args) [YIELD ...]` (standalone, implicit-argument, and
+  in-query forms) against a pluggable `ProcedureProvider` supplied via
+  `ExecutionOptions::procedures` — MarsDB itself ships no built-in
+  procedures.
+- A real manual: [knoguchi.github.io/marsdb](https://knoguchi.github.io/marsdb/)
+  (mdBook, deployed via GitHub Pages), README badges (CI, crates.io,
+  docs.rs, Codecov, license, openCypher TCK conformance), and measured
+  test coverage in CI (`cargo-llvm-cov` + Codecov).
 
 ### Fixed
 - Integer arithmetic overflow now returns a query error instead of panicking;
   unexpected engine panics are also contained at the C ABI boundary rather
   than unwinding into or aborting a foreign-language host.
+- `duration.between()`/`duration.inSeconds()` component-accessor math, and
+  combined ISO-8601 date-time duration string parsing.
+- The `null` literal now types as `Kind::Unknown` instead of `Kind::Scalar`,
+  fixing several compile-time-rejected cases that should have deferred to
+  runtime (e.g. `WITH null AS a MATCH (a)-->()`).
+- A variable-length hop's own traversed edges weren't excluded from
+  *later* hops of the same pattern (only the reverse direction was
+  handled), causing a silent double-count in some named-path-capture
+  patterns.
+- List-concat (`+`) type inference hardcoded the result's element kind to
+  `Scalar` regardless of the operands' real element kinds, wrongly
+  rejecting a later `CREATE` off a concatenated node/relationship list.
+- `marsdb-go`'s list-valued property JSON round-trip.
+- `marsdb-python`'s `PropertyValue` conversion was missing a match arm
+  for the newly-added `Map` variant (silently broke that binding's CI
+  job for a while — see the new `cargo check`-only CI step added
+  alongside the fix, which catches this class of bug without needing
+  marsdb-python's full maturin/link pipeline).
+
+### openCypher TCK conformance
+3878/3880 scenarios pass (99.9%), 0 wrong-result scenarios — up from
+94.4% right after the ANTLR migration landed. The only 2 non-passing
+scenarios need dates at year ±999,999,999, a real storage/library range
+limitation (`PropertyValue::Date`'s `i32` epoch-day width, and
+`chrono::NaiveDate`'s own ~262,000-year internal cap), not a bug — see
+`CYPHER_COVERAGE.md`.
 
 ## [0.5.0] - 2026-08-03
 
