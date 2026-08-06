@@ -25,10 +25,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # marsdb-python is workspace-excluded (see Cargo.toml's own comment
+      # on `exclude` -- it only fully builds/links via maturin), so
+      # nothing above touches it. `cargo check` stops before linking and
+      # still catches real type errors (e.g. a shared PropertyValue/Value
+      # match missing a new variant) that silently broke CI here before.
+      - name: Check marsdb-python compiles (type-check only, no link)
+        run: cargo check --manifest-path marsdb-python/Cargo.toml
 
   test:
     name: Test (${{ matrix.os }})
