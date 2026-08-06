@@ -24,30 +24,30 @@ scope.
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
-| clauses/create | 78 | 75 | 0 | 1 | 2 | 0 | 96.2% |
+| clauses/create | 78 | 76 | 0 | 0 | 2 | 0 | 97.4% |
 | clauses/delete | 41 | 38 | 0 | 0 | 3 | 0 | 92.7% |
-| clauses/match | 381 | 343 | 1 | 0 | 24 | 13 | 90.0% |
+| clauses/match | 381 | 357 | 0 | 0 | 24 | 0 | 93.7% |
 | clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
-| clauses/merge | 75 | 71 | 0 | 1 | 3 | 0 | 94.7% |
+| clauses/merge | 75 | 72 | 0 | 0 | 3 | 0 | 96.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/return | 63 | 48 | 0 | 1 | 13 | 1 | 76.2% |
-| clauses/return-orderby | 35 | 28 | 0 | 0 | 5 | 2 | 80.0% |
+| clauses/return | 63 | 49 | 0 | 1 | 13 | 0 | 77.8% |
+| clauses/return-orderby | 35 | 30 | 0 | 0 | 5 | 0 | 85.7% |
 | clauses/return-skip-limit | 31 | 27 | 0 | 0 | 4 | 0 | 87.1% |
 | clauses/set | 53 | 53 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/unwind | 14 | 12 | 0 | 0 | 0 | 2 | 85.7% |
-| clauses/with | 29 | 22 | 0 | 0 | 6 | 1 | 75.9% |
-| clauses/with-orderBy | 292 | 283 | 0 | 0 | 7 | 2 | 96.9% |
+| clauses/with | 29 | 23 | 0 | 0 | 6 | 0 | 79.3% |
+| clauses/with-orderBy | 292 | 285 | 0 | 0 | 7 | 0 | 97.6% |
 | clauses/with-skip-limit | 9 | 8 | 0 | 0 | 1 | 0 | 88.9% |
 | clauses/with-where | 19 | 17 | 0 | 0 | 2 | 0 | 89.5% |
-| expressions/aggregation | 35 | 29 | 0 | 0 | 6 | 0 | 82.9% |
+| expressions/aggregation | 35 | 35 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/boolean | 150 | 150 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/comparison | 72 | 72 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
 | expressions/graph | 61 | 55 | 0 | 0 | 6 | 0 | 90.2% |
 | expressions/list | 185 | 170 | 0 | 0 | 8 | 7 | 91.9% |
-| expressions/literals | 131 | 125 | 0 | 0 | 0 | 6 | 95.4% |
+| expressions/literals | 131 | 131 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/map | 44 | 38 | 0 | 0 | 1 | 5 | 86.4% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/null | 44 | 38 | 0 | 0 | 0 | 6 | 86.4% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3663** | **2** | **9** | **161** | **45** | **94.4%** |
+| **TOTAL** | **3880** | **3697** | **1** | **7** | **155** | **20** | **95.3%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -70,24 +70,20 @@ snapshot of this table if useful for comparison.
 Column meanings:
 - **pass** — matched (or, for an error-expecting scenario, errored at all).
 - **wrong** — ran successfully but returned the wrong rows. **The category
-  that means a real bug**, not a coverage gap — two known cases:
-  `expressions/temporal`'s `Temporal10 [1]`: `duration.between`'s result
-  correctly renders as the same ISO-8601 text real Cypher produces, but its
-  raw `.seconds`/`.nanosecondsOfSecond` component fields can differ from
-  Java's exact internal split for a negative, sub-second-remainder duration
-  specifically (`seconds: -86400, nanosecondsOfSecond: 100000000` there vs
-  MarsDB's `-86399, -900000000`) — MarsDB's `Duration` always keeps
-  `nanos`'s sign matching `seconds`' (a real, deliberately enforced
-  invariant every other Duration operation in this codebase depends on), so
-  matching Java's split here would mean either breaking that invariant or
-  letting two different internal representations of the same duration
-  coexist (silently wrong equality/hashing) — not worth it for one accessor
-  pair on one edge case. See `duration_between`'s docs in `marsdb-query/src/
-  temporal.rs`. And `clauses/match`'s `Match5 [27]`: an undirected
-  variable-length pattern (`<-[:TYPE*3]->`) combined with a repeated
-  end-node variable returns the wrong row count — tracked as `mars-w37`,
-  likely a separate bug in the executor's variable-length traversal not
-  correctly handling an undirected hop range.
+  that means a real bug**, not a coverage gap — one known, deliberately
+  unfixed case: `expressions/temporal`'s `Temporal10 [1]`: `duration.
+  between`'s result correctly renders as the same ISO-8601 text real
+  Cypher produces, but its raw `.seconds`/`.nanosecondsOfSecond` component
+  fields can differ from Java's exact internal split for a negative,
+  sub-second-remainder duration specifically (`seconds: -86400,
+  nanosecondsOfSecond: 100000000` there vs MarsDB's `-86399, -900000000`)
+  — MarsDB's `Duration` always keeps `nanos`'s sign matching `seconds`' (a
+  real, deliberately enforced invariant every other Duration operation in
+  this codebase depends on), so matching Java's split here would mean
+  either breaking that invariant or letting two different internal
+  representations of the same duration coexist (silently wrong
+  equality/hashing) — not worth it for one accessor pair on one edge
+  case. See `duration_between`'s docs in `marsdb-query/src/temporal.rs`.
 - **unexp** — errored when success was expected, or vice versa. As of the
   typed `QueryError` taxonomy, this specifically means MarsDB *ran* the
   query and hit a real, data-dependent type mismatch (not just "never
@@ -123,14 +119,10 @@ The remaining non-temporal `unexp` scenarios are each their own narrow,
 specific gap, not one common cause: `Return2 [14]` (returning the *type*
 of an already-deleted relationship — MarsDB's `DeletedEntityAccess` check
 fires eagerly on any access to a deleted entity, real Cypher's own `type()`
-apparently doesn't need the record itself so it's exempt), `Create1 [19]`/
-`Merge5 [22]` (adding a new label/relationship predicate on a node
-variable that's already bound elsewhere in the same statement is accepted
-here, real Cypher rejects it as `VariableAlreadyBound` — no such check
-exists yet), and `MatchWhere1 [12,13,15]` (a path-length
-predicate and an aggregate used directly inside pattern-level `WHERE`,
-both real Cypher restrictions this codebase doesn't enforce at compile
-time).
+apparently doesn't need the record itself so it's exempt), and
+`MatchWhere1 [12,13,15]` (a path-length predicate and an aggregate used
+directly inside pattern-level `WHERE`, both real Cypher restrictions this
+codebase doesn't enforce at compile time).
 
 ## Clauses
 
@@ -181,9 +173,10 @@ one mutating clause immediately before a single terminal `RETURN`.
 Multi-key `ORDER BY`, `SKIP`/`LIMIT` (on both `RETURN` and `WITH`; `SKIP`
 always applies after `ORDER BY` and before `LIMIT` regardless of clause
 order in the query text, matching real Cypher), `CASE`, and implicit-GROUP-BY aggregation
-(`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`, with
-`DISTINCT` inside an aggregate call — including grouping/`DISTINCT` by a
-list or map value, structurally, not just a scalar). `RETURN DISTINCT`
+(`count()`/`count(*)`/`sum()`/`avg()`/`min()`/`max()`/`collect()`/
+`percentileCont()`/`percentileDisc()`, with `DISTINCT` inside an
+aggregate call — including grouping/`DISTINCT` by a list or map value,
+structurally, not just a scalar). `RETURN DISTINCT`
 (result-set-level dedup of the whole projected row, applied after
 grouping for an aggregating `RETURN` — a separate mechanism from
 `DISTINCT` inside one aggregate call, which only affects that aggregate's
