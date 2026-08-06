@@ -475,7 +475,7 @@ fn parse_path_pattern(pair: Pair<Rule>) -> Result<(Option<String>, bool, Pattern
 /// to search shortest-among), not multi-hop (which hop would even be the
 /// variable-length one is ambiguous), not hopless (no relationship to
 /// traverse at all).
-fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
+pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
     if pattern.hops.len() != 1 || pattern.hops[0].0.hop_range.is_none() {
         return Err(QueryError::Syntax(
             "shortestPath() requires exactly one variable-length relationship pattern (e.g. (a)-[:TYPE*..5]-(b))"
@@ -488,7 +488,7 @@ fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
 /// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`) is
 /// limited to fixed-hop patterns — see `QueryPart::path_var`'s docs for
 /// why a variable-length hop isn't supported there.
-fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
+pub(crate) fn validate_named_path_pattern(pattern: &Pattern) -> Result<(), QueryError> {
     if pattern.hops.iter().any(|(rel, _)| rel.hop_range.is_some()) {
         return Err(QueryError::Syntax(
             "named-path capture (`p = ...`) over a variable-length relationship pattern isn't supported yet \
@@ -672,7 +672,9 @@ fn parse_skip_clause(pair: Pair<Rule>) -> Result<i64, QueryError> {
 /// the executor's existing already-bound-variable handling (used for
 /// chained MATCH clauses generally) resolves the reference correctly
 /// once both clauses run in order.
-fn group_into_linear_patterns(mut patterns: Vec<Pattern>) -> Result<Vec<Pattern>, QueryError> {
+pub(crate) fn group_into_linear_patterns(
+    mut patterns: Vec<Pattern>,
+) -> Result<Vec<Pattern>, QueryError> {
     if patterns.is_empty() {
         return Err(QueryError::Syntax("MATCH requires a pattern".into()));
     }

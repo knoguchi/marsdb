@@ -22,18 +22,23 @@
 //! exactly one `Return` type for the entire tree walk, not a per-rule
 //! type. Grows a variant per AST node kind as later increments need it.
 
-use crate::ast::{Literal, NodePattern, Pattern, RelDirection, RelPattern};
+use crate::ast::{Literal, NodePattern, Pattern, QueryPart, RelDirection, RelPattern};
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
     BoolLitContext, BoolLitContextAttrs, CharLitContext, CharLitContextAttrs, LiteralContext,
-    LiteralContextAttrs, NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs,
-    NumLitContext, NumLitContextAttrs, PatternElemChainContextAttrs, PatternElemContext,
-    PatternElemContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
-    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
-    StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
+    LiteralContextAttrs, MatchStContext, MatchStContextAttrs, NodeLabelsContextAttrs,
+    NodePatternContext, NodePatternContextAttrs, NumLitContext, NumLitContextAttrs,
+    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    PatternPartContextAttrs, PatternWhereContextAttrs, RelationDetailContext,
+    RelationDetailContextAttrs, RelationshipPatternContext, RelationshipPatternContextAttrs,
+    RelationshipTypesContextAttrs, StringLitContext, StringLitContextAttrs, SymbolContextAll,
+    SymbolContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
-use crate::parser::{parse_int_literal, parse_rel_range, unescape_string};
+use crate::parser::{
+    group_into_linear_patterns, parse_int_literal, parse_rel_range, unescape_string,
+    validate_named_path_pattern,
+};
 use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat};
 
 #[derive(Debug, Default)]
@@ -44,6 +49,7 @@ pub(crate) enum AstNode {
     NodePattern(NodePattern),
     RelPattern(RelPattern),
     Pattern(Pattern),
+    QueryParts(Vec<QueryPart>),
     Err(QueryError),
 }
 
@@ -64,6 +70,7 @@ impl AstNode {
     ast_node_into!(into_node_pattern, NodePattern, NodePattern);
     ast_node_into!(into_rel_pattern, RelPattern, RelPattern);
     ast_node_into!(into_pattern, Pattern, Pattern);
+    ast_node_into!(into_query_parts, QueryParts, Vec<QueryPart>);
 }
 
 pub(crate) struct AstBuilder {
@@ -201,6 +208,13 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             Err(e) => AstNode::Err(e),
         }
     }
+
+    fn visit_matchSt(&mut self, ctx: &MatchStContext<'input>) -> Self::Return {
+        match self.build_match_st(ctx) {
+            Ok(parts) => AstNode::QueryParts(parts),
+            Err(e) => AstNode::Err(e),
+        }
+    }
 }
 
 fn symbol_text(ctx: &SymbolContextAll) -> String {
@@ -310,6 +324,76 @@ impl AstBuilder {
         }
         Ok(Pattern { start, hops })
     }
+
+    /// Mirrors `parser.rs`'s `parse_match_part` -- comma-separated pattern
+    /// parts splice into linear chains (shared-node merging) or split into
+    /// separate `QueryPart`s (disjoint cross join) via
+    /// `group_into_linear_patterns`, reused as-is.
+    fn build_match_st(&mut self, ctx: &MatchStContext) -> Result<Vec<QueryPart>, QueryError> {
+        let optional = ctx.OPTIONAL().is_some();
+        let pw = ctx
+            .patternWhere()
+            .expect("matchSt always has a patternWhere");
+        if pw.where_().is_some() {
+            return Err(QueryError::Syntax(
+                "WHERE isn't supported by the ANTLR parser yet".into(),
+            ));
+        }
+        let pattern_ctx = pw.pattern().expect("patternWhere always has a pattern");
+
+        let mut path_var = None;
+        let mut patterns = Vec::new();
+        for part in pattern_ctx.patternPart_all() {
+            let elem_ctx = part
+                .patternElem()
+                .expect("patternPart always has a patternElem");
+            patterns.push(self.visit(&*elem_ctx).into_pattern()?);
+            if part.ASSIGN().is_some() {
+                if path_var.is_some() {
+                    return Err(QueryError::Syntax(
+                        "at most one comma-separated pattern part can have a named-path variable"
+                            .into(),
+                    ));
+                }
+                let symbol_ctx = part
+                    .symbol()
+                    .expect("patternPart with ASSIGN always has a symbol");
+                path_var = Some(symbol_text(&symbol_ctx));
+            }
+        }
+
+        let groups = group_into_linear_patterns(patterns)?;
+        if groups.len() > 1 && path_var.is_some() {
+            return Err(QueryError::Syntax(
+                "a named path can't span a comma-separated cross join".into(),
+            ));
+        }
+        if path_var.is_some() {
+            validate_named_path_pattern(&groups[0])?;
+        }
+
+        // `where_clause`/`with` are unconditionally `None` here -- WHERE
+        // already errors out above (before `groups` even exists), and
+        // this grammar's `matchSt` has no trailing WITH of its own (that's
+        // a separate clause in the statement's clause list). Once WHERE
+        // support lands, only the *last* group should carry it, same as
+        // `parser.rs`'s `parse_match_part`.
+        Ok(groups
+            .into_iter()
+            .enumerate()
+            .map(|(i, pattern)| QueryPart {
+                optional,
+                path_var: if i == 0 { path_var.clone() } else { None },
+                // shortestPath()/allShortestPaths() aren't implemented by
+                // the vendored grammar (antlr/grammars-v4/cypher) at all
+                // -- a real gap, not deferred-for-now like WHERE/props.
+                shortest_path: false,
+                pattern,
+                where_clause: None,
+                with: None,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +424,17 @@ mod tests {
             .patternElem()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `patternElem`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_pattern()
+    }
+
+    fn parse_match(input: &str) -> Result<Vec<QueryPart>, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .matchSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `matchSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_query_parts()
     }
 
     #[test]
@@ -512,5 +607,58 @@ mod tests {
     #[test]
     fn properties_not_yet_supported() {
         assert!(parse_pattern("(a {name: 'x'})").is_err());
+    }
+
+    #[test]
+    fn simple_match() {
+        let parts = parse_match("MATCH (a:Person)-[:KNOWS]->(b)").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(!parts[0].optional);
+        assert_eq!(parts[0].path_var, None);
+        assert_eq!(parts[0].pattern.start.var.as_deref(), Some("a"));
+        assert_eq!(parts[0].pattern.hops.len(), 1);
+    }
+
+    #[test]
+    fn optional_match() {
+        let parts = parse_match("OPTIONAL MATCH (a)").unwrap();
+        assert!(parts[0].optional);
+    }
+
+    #[test]
+    fn named_path() {
+        let parts = parse_match("MATCH p = (a)-->(b)").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn comma_pattern_shared_node_merges_into_one_linear_chain() {
+        // `(a)-->(b), (b)-->(c)` shares `b` -- one QueryPart, three-node
+        // chain, not two disjoint ones. Exercises group_into_linear_patterns.
+        let parts = parse_match("MATCH (a)-->(b), (b)-->(c)").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].pattern.hops.len(), 2);
+    }
+
+    #[test]
+    fn comma_pattern_disjoint_becomes_multiple_query_parts() {
+        let parts = parse_match("MATCH (a), (b)").unwrap();
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn named_path_over_disjoint_cross_join_errors() {
+        assert!(parse_match("MATCH p = (a), (b)").is_err());
+    }
+
+    #[test]
+    fn named_path_over_variable_length_errors() {
+        assert!(parse_match("MATCH p = (a)-[*1..3]->(b)").is_err());
+    }
+
+    #[test]
+    fn where_not_yet_supported() {
+        assert!(parse_match("MATCH (a) WHERE a.x = 1").is_err());
     }
 }
