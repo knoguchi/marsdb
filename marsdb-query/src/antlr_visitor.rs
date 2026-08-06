@@ -42,15 +42,16 @@ use crate::generated::cypherparser::{
     ListLitContextAttrs, LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs,
     MapPairContextAttrs, MatchStContext, MatchStContextAttrs, MergeActionContextAll,
     MergeActionContextAttrs, MergeStContext, MergeStContextAttrs, MultDivExpressionContext,
-    NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs, NotExpressionContext,
-    NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext, NumLitContextAll,
-    NumLitContextAttrs, OrderItemContextAttrs, OrderStContext, OrderStContextAttrs,
-    ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
-    ParenthesizedExpressionContextAttrs, PatternContextAttrs, PatternElemChainContextAttrs,
-    PatternElemContext, PatternElemContextAttrs, PatternPartContextAttrs, PatternWhereContextAttrs,
-    PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
-    ProjectionBodyContextAttrs, ProjectionItemContextAttrs, ProjectionItemsContextAttrs,
-    PropertyExpressionContext, PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
+    MultiPartQContext, MultiPartQContextAttrs, NodeLabelsContextAttrs, NodePatternContext,
+    NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
+    NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
+    OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
+    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
+    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
+    PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
+    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertyExpressionContext,
+    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
     PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
     ReadingStatementContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
     RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
@@ -69,7 +70,10 @@ use crate::parser::{
     group_into_linear_patterns, parse_int_literal, parse_rel_range, unescape_string,
     validate_named_path_pattern,
 };
+use antlr4rust::parser_rule_context::ParserRuleContext;
+use antlr4rust::token::Token;
 use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat, Tree};
+use std::rc::Rc;
 
 #[derive(Debug, Default)]
 pub(crate) enum AstNode {
@@ -548,6 +552,13 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
 
     fn visit_singlePartQ(&mut self, ctx: &SinglePartQContext<'input>) -> Self::Return {
         match self.build_single_part_q(ctx) {
+            Ok(s) => AstNode::Statement(s),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_multiPartQ(&mut self, ctx: &MultiPartQContext<'input>) -> Self::Return {
+        match self.build_multi_part_q(ctx) {
             Ok(s) => AstNode::Statement(s),
             Err(e) => AstNode::Err(e),
         }
@@ -1793,6 +1804,102 @@ impl AstBuilder {
             limit,
         })
     }
+
+    /// `multiPartQ : readingStatement* ((readingStatement | updatingStatement)*
+    /// withSt)+ singlePartQ` -- one or more WITH boundaries, each preceded by
+    /// zero or more reading/updating statements, followed by a final
+    /// `singlePartQ` (itself another `readingStatement*` run plus the
+    /// statement's real tail). The grammar's typed accessors
+    /// (`readingStatement_all`/`updatingStatement_all`/`withSt_all`) each
+    /// flatten across every group, losing which items came before which
+    /// `withSt` -- recovered by sorting all three by source position
+    /// (`start().get_token_index()`) instead of walking raw children (which
+    /// would need runtime downcasting to tell a `readingStatement` from an
+    /// `updatingStatement` from a `withSt`).
+    ///
+    /// A `withSt` attaches to the immediately preceding MATCH/UNWIND/MERGE
+    /// clause's own `with` field (only the *last* one, for a comma
+    /// cross-join `matchSt`) -- same as `parser.rs`'s `parse_match_part`/
+    /// `parse_merge_clause`/`parse_unwind_clause`. If nothing attachable
+    /// immediately precedes it (statement-leading, or right after a
+    /// SET/DELETE/REMOVE/CREATE -- none of which have a `with` field on
+    /// their `QueryClause` variant -- or right after another `withSt`), it
+    /// becomes its own standalone `QueryClause::With` entry, mirroring
+    /// pest's `clause = { ... | with_clause | ... }` alternative.
+    fn build_multi_part_q(&mut self, ctx: &MultiPartQContext) -> Result<Statement, QueryError> {
+        enum Item<'i> {
+            Reading(Rc<ReadingStatementContextAll<'i>>),
+            Updating(Rc<UpdatingStatementContextAll<'i>>),
+            With(Rc<WithStContext<'i>>),
+        }
+        let mut items: Vec<(isize, Item)> = Vec::new();
+        for rs in ctx.readingStatement_all() {
+            let idx = rs.start().get_token_index();
+            items.push((idx, Item::Reading(rs)));
+        }
+        for us in ctx.updatingStatement_all() {
+            let idx = us.start().get_token_index();
+            items.push((idx, Item::Updating(us)));
+        }
+        for w in ctx.withSt_all() {
+            let idx = w.start().get_token_index();
+            items.push((idx, Item::With(w)));
+        }
+        items.sort_by_key(|(idx, _)| *idx);
+
+        let mut clauses: Vec<QueryClause> = Vec::new();
+        let mut attach_target: Option<usize> = None;
+        for (_, item) in items {
+            match item {
+                Item::Reading(rs) => {
+                    self.append_reading_statement(&rs, &mut clauses)?;
+                    attach_target = Some(clauses.len() - 1);
+                }
+                Item::Updating(us) => {
+                    let clause = self.build_updating_statement_as_clause(&us)?;
+                    let can_attach = matches!(clause, QueryClause::Merge(_));
+                    clauses.push(clause);
+                    attach_target = can_attach.then_some(clauses.len() - 1);
+                }
+                Item::With(w) => {
+                    let with = self.visit(&*w).into_with_clause()?;
+                    match attach_target.take() {
+                        Some(i) => match &mut clauses[i] {
+                            QueryClause::Match(part) => part.with = Some(with),
+                            QueryClause::Unwind(u) => u.with = Some(with),
+                            QueryClause::Merge(m) => m.with = Some(with),
+                            _ => unreachable!(
+                                "attach_target is only ever set right after pushing a Match/Unwind/Merge clause"
+                            ),
+                        },
+                        None => clauses.push(QueryClause::With(with)),
+                    }
+                }
+            }
+        }
+
+        let sp_ctx = ctx
+            .singlePartQ()
+            .expect("multiPartQ always ends in a singlePartQ");
+        let Statement::Match {
+            clauses: tail_clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        } = self.build_single_part_q(&sp_ctx)?
+        else {
+            unreachable!("build_single_part_q always returns Statement::Match");
+        };
+        clauses.extend(tail_clauses);
+        Ok(Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        })
+    }
 }
 
 /// `where`'s grammar reuses the same `expression` rule as everywhere else
@@ -2046,6 +2153,17 @@ mod tests {
         let ctx = parser
             .singlePartQ()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `singlePartQ`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_statement()
+    }
+
+    fn parse_multi_part_statement(input: &str) -> Result<Statement, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .multiPartQ()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `multiPartQ`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_statement()
     }
 
@@ -3132,5 +3250,90 @@ mod tests {
             panic!("expected Statement::Match");
         };
         assert!(matches!(tail, Some(Tail::Remove(_, None))));
+    }
+
+    #[test]
+    fn multi_part_with_attaches_to_preceding_match() {
+        let s = parse_multi_part_statement("MATCH (a:A) WITH a MATCH (b:B) RETURN a, b").unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 2);
+        let QueryClause::Match(first) = &clauses[0] else {
+            panic!("expected first clause to be Match");
+        };
+        assert!(first.with.is_some());
+        assert!(matches!(clauses[1], QueryClause::Match(_)));
+        assert!(matches!(tail, Some(Tail::Return(_, false))));
+    }
+
+    #[test]
+    fn multi_part_chained_with_second_one_standalone() {
+        // TCK's chained `WITH x AS y WITH y % 3 AS y` shape: the first WITH
+        // attaches to the preceding MATCH, the second has nothing
+        // attachable immediately before it (another WITH, not a fresh
+        // clause) so it becomes its own standalone `QueryClause::With`.
+        let s = parse_multi_part_statement("MATCH (a:A) WITH a.num AS x WITH x % 3 AS x RETURN x")
+            .unwrap();
+        let Statement::Match { clauses, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 2);
+        let QueryClause::Match(first) = &clauses[0] else {
+            panic!("expected first clause to be Match");
+        };
+        assert!(first.with.is_some());
+        assert!(matches!(clauses[1], QueryClause::With(_)));
+    }
+
+    #[test]
+    fn multi_part_set_then_with_stays_separate_entries() {
+        // SET has no `with` field on its `QueryClause` variant -- a
+        // following WITH always becomes its own standalone entry, never
+        // folded into the SET.
+        let s = parse_multi_part_statement(
+            "MATCH (n:N) WITH n, n.num AS num DELETE n WITH num WHERE num % 2 = 0 RETURN num",
+        )
+        .unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 3);
+        assert!(matches!(clauses[0], QueryClause::Match(_)));
+        assert!(matches!(clauses[1], QueryClause::Delete { .. }));
+        assert!(matches!(clauses[2], QueryClause::With(_)));
+        assert!(matches!(tail, Some(Tail::Return(_, false))));
+    }
+
+    #[test]
+    fn multi_part_create_with_star_create_create_tail() {
+        let s =
+            parse_multi_part_statement("CREATE (a) WITH a WITH * CREATE (b) CREATE (a)<-[:T]-(b)")
+                .unwrap();
+        let Statement::Match { clauses, tail, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        // Create(a), With(a) folded away into... no: Create has no `with`
+        // field, so the first WITH is standalone; the second WITH (WITH *)
+        // is likewise standalone (nothing attachable precedes it either).
+        assert_eq!(clauses.len(), 4);
+        assert!(matches!(clauses[0], QueryClause::Create(_)));
+        assert!(matches!(clauses[1], QueryClause::With(_)));
+        assert!(matches!(clauses[2], QueryClause::With(_)));
+        assert!(matches!(clauses[3], QueryClause::Create(_)));
+        assert!(matches!(tail, Some(Tail::Create(_, None))));
+    }
+
+    #[test]
+    fn multi_part_merge_with_attaches() {
+        let s = parse_multi_part_statement("MERGE (a:A) WITH a MATCH (b:B) RETURN a, b").unwrap();
+        let Statement::Match { clauses, .. } = s else {
+            panic!("expected Statement::Match");
+        };
+        assert_eq!(clauses.len(), 2);
+        let QueryClause::Merge(m) = &clauses[0] else {
+            panic!("expected first clause to be Merge");
+        };
+        assert!(m.with.is_some());
     }
 }
