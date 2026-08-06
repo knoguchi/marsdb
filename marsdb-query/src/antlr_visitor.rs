@@ -24,7 +24,7 @@
 
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Literal, NodePattern, Pattern, PropAccess, QueryPart,
-    RelDirection, RelPattern, ReturnExpr,
+    RelDirection, RelPattern, ReturnExpr, ReturnItem, SortDir, Tail,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -35,21 +35,25 @@ use crate::generated::cypherparser::{
     ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext,
     ExpressionChainContextAttrs, ExpressionContext, ExpressionContextAttrs,
     FunctionInvocationContext, FunctionInvocationContextAttrs, InvocationNameContextAll,
-    InvocationNameContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs,
-    LiteralContext, LiteralContextAttrs, MatchStContext, MatchStContextAttrs,
-    MultDivExpressionContext, NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs,
-    NotExpressionContext, NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext,
-    NumLitContextAll, NumLitContextAttrs, ParameterContext, ParameterContextAttrs,
-    ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs, PatternContextAttrs,
-    PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
+    InvocationNameContextAttrs, LimitStContextAttrs, ListExpressionContextAll,
+    ListExpressionContextAttrs, LiteralContext, LiteralContextAttrs, MatchStContext,
+    MatchStContextAttrs, MultDivExpressionContext, NodeLabelsContextAttrs, NodePatternContext,
+    NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
+    NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
+    OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
+    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
+    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
     PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
-    PowerExpressionContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
-    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs, RelationDetailContext,
-    RelationDetailContextAttrs, RelationshipPatternContext, RelationshipPatternContextAttrs,
-    RelationshipTypesContextAttrs, StringExpPrefixContextAll, StringExpPrefixContextAttrs,
-    StringExpressionContextAll, StringExpressionContextAttrs, StringLitContext,
-    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
-    UnaryAddSubExpressionContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
+    PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
+    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertyExpressionContext,
+    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
+    PropertyOrLabelExpressionContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
+    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
+    ReturnStContext, ReturnStContextAttrs, SkipStContextAttrs, StringExpPrefixContextAll,
+    StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
+    StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
+    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, XorExpressionContext,
+    XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
@@ -68,7 +72,22 @@ pub(crate) enum AstNode {
     Pattern(Pattern),
     QueryParts(Vec<QueryPart>),
     ReturnExpr(ReturnExpr),
+    ReturnClause(ParsedReturnClause),
     Err(QueryError),
+}
+
+/// `returnSt`'s/`withSt`'s shared `projectionBody` bundles the item list,
+/// `DISTINCT`, `ORDER BY`, `SKIP`, and `LIMIT` together, but `Tail`
+/// (items + distinct) and `order_by`/`skip`/`limit` live at different
+/// levels of `ast::Statement::Match` (the latter three are statement-wide,
+/// not per-`Tail`) -- this carries all four out of the visitor together
+/// so the caller building `Statement::Match` can split them apart.
+#[derive(Debug)]
+pub(crate) struct ParsedReturnClause {
+    pub tail: Tail,
+    pub order_by: Option<Vec<(ReturnExpr, SortDir)>>,
+    pub skip: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 macro_rules! ast_node_into {
@@ -90,6 +109,7 @@ impl AstNode {
     ast_node_into!(into_pattern, Pattern, Pattern);
     ast_node_into!(into_query_parts, QueryParts, Vec<QueryPart>);
     ast_node_into!(into_return_expr, ReturnExpr, ReturnExpr);
+    ast_node_into!(into_return_clause, ReturnClause, ParsedReturnClause);
 }
 
 pub(crate) struct AstBuilder {
@@ -416,6 +436,16 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
 
     fn visit_countAll(&mut self, _ctx: &CountAllContext<'input>) -> Self::Return {
         AstNode::ReturnExpr(ReturnExpr::CountStar)
+    }
+
+    fn visit_returnSt(&mut self, ctx: &ReturnStContext<'input>) -> Self::Return {
+        let body_ctx = ctx
+            .projectionBody()
+            .expect("returnSt always has a projectionBody");
+        match self.build_projection_body(&body_ctx) {
+            Ok(c) => AstNode::ReturnClause(c),
+            Err(e) => AstNode::Err(e),
+        }
     }
 }
 
@@ -1065,6 +1095,99 @@ impl AstBuilder {
         };
         Ok(ReturnExpr::Lit(Literal::Param(name)))
     }
+
+    fn build_projection_body(
+        &mut self,
+        ctx: &ProjectionBodyContext,
+    ) -> Result<ParsedReturnClause, QueryError> {
+        let distinct = ctx.DISTINCT().is_some();
+        let items_ctx = ctx
+            .projectionItems()
+            .expect("projectionBody always has projectionItems");
+        let tail = if items_ctx.MULT().is_some() {
+            Tail::ReturnStar(distinct)
+        } else {
+            let mut items = Vec::new();
+            for item_ctx in items_ctx.projectionItem_all() {
+                let expr_ctx = item_ctx
+                    .expression()
+                    .expect("projectionItem always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                let alias = item_ctx.symbol().map(|s| symbol_text(&s));
+                items.push(ReturnItem { expr, alias });
+            }
+            Tail::Return(items, distinct)
+        };
+
+        let order_by = match ctx.orderSt() {
+            Some(order_ctx) => Some(self.build_order_by(&order_ctx)?),
+            None => None,
+        };
+        let skip = match ctx.skipSt() {
+            Some(skip_ctx) => {
+                let expr_ctx = skip_ctx
+                    .expression()
+                    .expect("skipSt always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(literal_non_negative_int(expr, "SKIP")?)
+            }
+            None => None,
+        };
+        let limit = match ctx.limitSt() {
+            Some(limit_ctx) => {
+                let expr_ctx = limit_ctx
+                    .expression()
+                    .expect("limitSt always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(literal_non_negative_int(expr, "LIMIT")?)
+            }
+            None => None,
+        };
+
+        Ok(ParsedReturnClause {
+            tail,
+            order_by,
+            skip,
+            limit,
+        })
+    }
+
+    fn build_order_by(
+        &mut self,
+        ctx: &OrderStContext,
+    ) -> Result<Vec<(ReturnExpr, SortDir)>, QueryError> {
+        let mut items = Vec::new();
+        for item_ctx in ctx.orderItem_all() {
+            let expr_ctx = item_ctx
+                .expression()
+                .expect("orderItem always has an expression");
+            let expr = self.visit(&*expr_ctx).into_return_expr()?;
+            let dir = if item_ctx.DESC().is_some() || item_ctx.DESCENDING().is_some() {
+                SortDir::Desc
+            } else {
+                SortDir::Asc
+            };
+            items.push((expr, dir));
+        }
+        Ok(items)
+    }
+}
+
+/// `skipSt`/`limitSt` grammar-allow any `expression` (`SKIP_W expression`),
+/// wider than pest's grammar, which structurally requires a bare
+/// `int_literal` there. Matching pest's existing behavior rather than
+/// silently accepting something it can't (`SKIP $n`, `LIMIT 1 + 1`) --
+/// restrict to a literal non-negative integer here too.
+fn literal_non_negative_int(expr: ReturnExpr, clause: &str) -> Result<i64, QueryError> {
+    let ReturnExpr::Lit(Literal::Int(n)) = expr else {
+        return Err(QueryError::Syntax(format!(
+            "{clause} must be a literal non-negative integer"
+        )));
+    };
+    if n < 0 {
+        return Err(QueryError::Syntax(format!("{clause} can't be negative")));
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1117,6 +1240,17 @@ mod tests {
             .expression()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `expression`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_return_expr()
+    }
+
+    fn parse_return(input: &str) -> Result<ParsedReturnClause, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .returnSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `returnSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_return_clause()
     }
 
     #[test]
@@ -1695,5 +1829,69 @@ mod tests {
                 Box::new(ReturnExpr::Lit(Literal::Int(3))),
             )
         );
+    }
+
+    #[test]
+    fn return_simple_items() {
+        let c = parse_return("RETURN a, b.name AS name").unwrap();
+        let Tail::Return(items, distinct) = c.tail else {
+            panic!("expected Tail::Return");
+        };
+        assert!(!distinct);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].expr, ReturnExpr::Var("a".to_string()));
+        assert_eq!(items[0].alias, None);
+        assert_eq!(
+            items[1].expr,
+            ReturnExpr::Prop(PropAccess {
+                var: "b".to_string(),
+                prop: "name".to_string(),
+            })
+        );
+        assert_eq!(items[1].alias.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn return_distinct() {
+        let c = parse_return("RETURN DISTINCT a").unwrap();
+        let Tail::Return(_, distinct) = c.tail else {
+            panic!("expected Tail::Return");
+        };
+        assert!(distinct);
+    }
+
+    #[test]
+    fn return_star() {
+        let c = parse_return("RETURN *").unwrap();
+        assert!(matches!(c.tail, Tail::ReturnStar(false)));
+    }
+
+    #[test]
+    fn return_order_by_skip_limit() {
+        let c = parse_return("RETURN a ORDER BY a DESC SKIP 5 LIMIT 10").unwrap();
+        let order_by = c.order_by.unwrap();
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].0, ReturnExpr::Var("a".to_string()));
+        assert_eq!(order_by[0].1, SortDir::Desc);
+        assert_eq!(c.skip, Some(5));
+        assert_eq!(c.limit, Some(10));
+    }
+
+    #[test]
+    fn order_by_default_ascending() {
+        let c = parse_return("RETURN a ORDER BY a").unwrap();
+        assert_eq!(c.order_by.unwrap()[0].1, SortDir::Asc);
+    }
+
+    #[test]
+    fn limit_negative_errors() {
+        // skipSt/limitSt grammar-allow any expression; restricted to a
+        // literal non-negative integer to match pest's existing behavior.
+        assert!(parse_return("RETURN a LIMIT -1").is_err());
+    }
+
+    #[test]
+    fn limit_non_literal_errors() {
+        assert!(parse_return("RETURN a LIMIT 1 + 1").is_err());
     }
 }
