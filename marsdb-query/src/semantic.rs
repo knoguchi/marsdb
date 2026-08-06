@@ -137,25 +137,50 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
                 for (expr, _) in order_by {
                     if tail_aggregates {
                         // An ORDER BY item that repeats a RETURN item's
-                        // expression verbatim (`RETURN sum(x) AS s ORDER
-                        // BY sum(x)`) refers to that already-aggregated
-                        // item, not a fresh expression -- its kind is
-                        // already known from `output_scope`, and
-                        // re-running `infer_expr` on it would need
-                        // pre-aggregation bindings (like `x`'s row) that
-                        // no longer exist post-grouping (TCK's
-                        // WithOrderBy4 [11]/`ReturnOrderBy3`). Only an
-                        // aggregate that *doesn't* match any RETURN item
-                        // is rejected here.
-                        if tail_items.unwrap().iter().any(|item| item.expr == *expr) {
+                        // expression *or own alias* (`RETURN sum(x) AS s
+                        // ORDER BY sum(x)` / `ORDER BY s`, TCK's
+                        // WithOrderBy4 [11]/`ReturnOrderBy3`/
+                        // `WithSkipLimit1 [2]`) refers to that
+                        // already-aggregated item, not a fresh expression
+                        // -- its kind is already known from
+                        // `output_scope`, and re-running `infer_expr` on
+                        // it would need pre-aggregation bindings (like
+                        // `x`'s row) that no longer exist post-grouping.
+                        // Unlike `validate_composed_expr`'s own *nested*-
+                        // leaf check just below, this whole-expression
+                        // match doesn't exclude aggregating items -- an
+                        // aggregate's own alias referenced *directly* (not
+                        // buried inside a larger expression) is exactly
+                        // "reuse this item's already-finished value",
+                        // which `materialize_aggregating_return_with_
+                        // order`'s matching top-level lookup (executor.rs)
+                        // handles the same way.
+                        if tail_items
+                            .unwrap()
+                            .iter()
+                            .enumerate()
+                            .any(|(i, item)| crate::executor::item_matches_leaf(expr, i, item))
+                        {
                             continue;
                         }
-                        if crate::executor::contains_aggregate(expr) {
-                            return Err(semantic(
-                                "ORDER BY aggregate does not match any RETURN item",
-                            ));
-                        }
-                    } else if crate::executor::contains_aggregate(expr) {
+                        // Not a verbatim match -- may still be a *composed*
+                        // expression (an aggregate combined with other
+                        // values, or a plain non-aggregate expression
+                        // referencing a pre-aggregation variable, TCK's
+                        // ReturnOrderBy6) that `resolve_grouped_rows`/
+                        // `rewrite_composed_item` (executor.rs) can
+                        // evaluate the same way a composed RETURN item
+                        // would -- validated the same way, by the same
+                        // function, rather than `infer_expr` against a
+                        // scope that structurally can't have pre-
+                        // aggregation bindings in it anymore.
+                        crate::executor::validate_order_by_composed_expr(
+                            expr,
+                            tail_items.unwrap(),
+                        )?;
+                        continue;
+                    }
+                    if crate::executor::contains_aggregate(expr) {
                         return Err(semantic(
                             "ORDER BY cannot use an aggregate function unless RETURN itself \
                              is aggregating",
@@ -455,28 +480,43 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
             merged
         };
         for (expr, _) in order_by {
-            // Repeating a WITH item's expression verbatim (see the
-            // matching comment on the RETURN side) -- WithOrderBy4 [11].
-            // Applies to `DISTINCT` too, not just aggregation: both
-            // collapse many pre-WITH rows into one output row (that's
-            // exactly why `order_scope` above is `projected`-only for
-            // either), so a `DISTINCT`-only `WITH`'s `ORDER BY` needs the
-            // same shortcut to see its own item's alias instead of
-            // failing to resolve a pre-WITH variable it doesn't have
-            // access to (TCK's WithOrderBy2 [24] -- previously this
-            // shortcut only fired `if with_aggregates`, a real gap: a
+            // Repeating a WITH item's expression *or own alias* verbatim
+            // (see the matching comment on the RETURN side) -- WithOrderBy4
+            // [11]/WithSkipLimit1 [2]. Applies to `DISTINCT` too, not just
+            // aggregation: both collapse many pre-WITH rows into one
+            // output row (that's exactly why `order_scope` above is
+            // `projected`-only for either), so a `DISTINCT`-only `WITH`'s
+            // `ORDER BY` needs the same shortcut to see its own item's
+            // alias instead of failing to resolve a pre-WITH variable it
+            // doesn't have access to (TCK's WithOrderBy2 [24] -- previously
+            // this shortcut only fired `if with_aggregates`, a real gap: a
             // non-aggregating `DISTINCT` WITH's `order_scope` was *also*
             // narrowed to `projected`-only above, just without this
             // matching escape hatch).
             if (with_aggregates || with.distinct)
-                && with.items.iter().any(|item| item.expr == *expr)
+                && with
+                    .items
+                    .iter()
+                    .enumerate()
+                    .any(|(i, item)| crate::executor::item_matches_leaf(expr, i, item))
             {
                 continue;
             }
+            if with_aggregates {
+                // Not a verbatim match -- may still be a *composed*
+                // expression `resolve_grouped_rows`/`rewrite_composed_
+                // item` (executor.rs) can evaluate the same way a
+                // composed WITH item would, same reasoning as the
+                // matching RETURN-side check above (TCK's WithOrderBy4
+                // [16]-[18]). A `DISTINCT`-only (non-aggregating) WITH has
+                // no such per-group evaluator to fall back to, so that
+                // case still just falls through to `infer_expr` below,
+                // which correctly fails on anything past its own
+                // `projected`-only scope.
+                crate::executor::validate_order_by_composed_expr(expr, &with.items)?;
+                continue;
+            }
             if crate::executor::contains_aggregate(expr) {
-                if with_aggregates {
-                    return Err(semantic("ORDER BY aggregate does not match any WITH item"));
-                }
                 return Err(semantic(
                     "ORDER BY cannot use an aggregate function unless WITH itself is \
                      aggregating",

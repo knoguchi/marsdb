@@ -1257,6 +1257,56 @@ fn order_by_aggregate_not_matching_any_aggregating_item_is_an_error() {
     assert!(err.to_string().to_lowercase().contains("aggregat"));
 }
 
+/// TCK ReturnOrderBy6 [2]/[3]: an aggregating RETURN's own ORDER BY key
+/// can be *composed* (an aggregate combined with other values), as long
+/// as every non-aggregate leaf is an explicit grouping key -- either the
+/// item's own expression verbatim, or (unlike a plain composed RETURN
+/// item) its output *alias*, and every aggregate call in it matches some
+/// existing item (`age + count(you.age)` and `me.age + count(you.age)`
+/// both use `count(you.age)`, item1's own expression verbatim).
+#[test]
+fn return_order_by_composed_aggregate_expression_sorts_by_the_computed_value() {
+    // me.age=100 has 1 outgoing KNOWS (combined value 101); me.age=1 has
+    // 3 (combined value 4) -- DESC order by the combined value puts
+    // age=100 first, even though age alone would sort the other way.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:P {age: 100})-[:KNOWS]->(:F), \
+                (b:P {age: 1})-[:KNOWS]->(:F), \
+                (b)-[:KNOWS]->(:F), \
+                (b)-[:KNOWS]->(:F)",
+    );
+    let result = run(
+        &store,
+        "MATCH (me:P)-[:KNOWS]->(you:F) RETURN me.age AS age, count(you) AS cnt \
+         ORDER BY age + count(you) DESC",
+    );
+    let ages: Vec<i64> = result.rows.iter().map(|row| int(&row[0])).collect();
+    assert_eq!(ages, vec![100, 1]);
+}
+
+/// TCK WithOrderBy4 [16]: a WITH's own composed ORDER BY key mixing a
+/// constant/parameter with an aggregate that repeats a WITH item's
+/// expression verbatim.
+#[test]
+fn with_order_by_composed_expression_mixing_constant_and_aggregate() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({age: 10})");
+    run(&store, "CREATE ({age: 20})");
+    let result = run(
+        &store,
+        "MATCH (person) WITH avg(person.age) AS avgAge \
+         ORDER BY 1000 + avg(person.age) - 1000 RETURN avgAge",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => {
+            assert!((*f - 15.0).abs() < 1e-9, "expected 15.0, got {f}")
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
 /// `LIMIT 0` combined with `ORDER BY` is valid Cypher and must return
 /// nothing, not error or return everything -- an edge case `top_k_by`'s
 /// partial-select path needs to special-case explicitly (`select_nth_

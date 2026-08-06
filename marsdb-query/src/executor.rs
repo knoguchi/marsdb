@@ -1202,8 +1202,6 @@ impl<'a> Executor<'a> {
                 rows: vec![],
             },
             Some(Tail::Return(items, distinct)) => {
-                let projected =
-                    self.materialize_return(txn, items, &current_rows, *distinct, guard)?;
                 if let Some(ob) = order_by {
                     // DISTINCT (like aggregation) can drop rows, breaking
                     // the 1:1 correspondence `apply_order_by_with_scope`
@@ -1212,6 +1210,8 @@ impl<'a> Executor<'a> {
                     // post-projection, post-dedup result, same as the
                     // aggregating case just below.
                     if !has_aggregate(items) && !distinct {
+                        let projected =
+                            self.materialize_return(txn, items, &current_rows, *distinct, guard)?;
                         order_by_pre_applied = true;
                         self.apply_order_by_with_scope(
                             txn,
@@ -1221,11 +1221,21 @@ impl<'a> Executor<'a> {
                             skip,
                             limit,
                         )?
+                    } else if !distinct {
+                        order_by_pre_applied = true;
+                        self.materialize_aggregating_return_with_order(
+                            txn,
+                            items,
+                            &current_rows,
+                            ob,
+                            (skip, limit),
+                            guard,
+                        )?
                     } else {
-                        projected
+                        self.materialize_return(txn, items, &current_rows, *distinct, guard)?
                     }
                 } else {
-                    projected
+                    self.materialize_return(txn, items, &current_rows, *distinct, guard)?
                 }
             }
             Some(Tail::ReturnStar(distinct)) => {
@@ -1355,35 +1365,57 @@ impl<'a> Executor<'a> {
         } else {
             with
         };
-        // Only cloned when actually needed below (ORDER BY on a
-        // non-aggregating, non-`DISTINCT` WITH) -- avoids the copy on
-        // every other WITH shape.
-        let pre_with_rows =
-            (with.order_by.is_some() && !has_aggregate(&with.items) && !with.distinct)
-                .then(|| rows.clone());
-        let mut rows = self.materialize_with(txn, with, &rows, guard)?;
-        if let Some(with_order_by) = &with.order_by {
-            // Only a non-aggregating, non-`DISTINCT` WITH keeps a 1:1 row
-            // correspondence with its pre-WITH input -- see
-            // `apply_order_by_bindings`'s own docs on why that's exactly
-            // when ORDER BY can also see the pre-WITH scope.
-            rows = self.apply_order_by_bindings(
+        let rows = if let Some(with_order_by) = with
+            .order_by
+            .as_ref()
+            .filter(|_| has_aggregate(&with.items))
+        {
+            // `materialize_aggregating_with_with_order` folds its own
+            // extra composed ORDER BY keys through the same grouping pass
+            // as `with.items` -- also covers `with.distinct` correctly
+            // without any extra handling here, since grouping already
+            // makes every output row unique by its own grouping-key
+            // columns (see that function's `RETURN`-side twin's own docs
+            // on why that makes `DISTINCT` a no-op downstream of
+            // aggregation).
+            self.materialize_aggregating_with_with_order(
                 txn,
-                rows,
-                pre_with_rows.as_deref(),
                 &with.items,
+                &rows,
                 with_order_by,
                 (with.skip, with.limit),
-            )?;
+                guard,
+            )?
         } else {
-            let skip_n = with.skip.unwrap_or(0).max(0) as usize;
-            if skip_n > 0 {
-                rows.drain(0..skip_n.min(rows.len()));
+            // Only cloned when actually needed below (ORDER BY on a
+            // non-aggregating, non-`DISTINCT` WITH) -- avoids the copy on
+            // every other WITH shape.
+            let pre_with_rows = (with.order_by.is_some() && !with.distinct).then(|| rows.clone());
+            let mut rows = self.materialize_with(txn, with, &rows, guard)?;
+            if let Some(with_order_by) = &with.order_by {
+                // Only a non-aggregating, non-`DISTINCT` WITH keeps a 1:1
+                // row correspondence with its pre-WITH input -- see
+                // `apply_order_by_bindings`'s own docs on why that's
+                // exactly when ORDER BY can also see the pre-WITH scope.
+                rows = self.apply_order_by_bindings(
+                    txn,
+                    rows,
+                    pre_with_rows.as_deref(),
+                    &with.items,
+                    with_order_by,
+                    (with.skip, with.limit),
+                )?;
+            } else {
+                let skip_n = with.skip.unwrap_or(0).max(0) as usize;
+                if skip_n > 0 {
+                    rows.drain(0..skip_n.min(rows.len()));
+                }
+                if let Some(with_limit) = with.limit {
+                    rows.truncate(with_limit.max(0) as usize);
+                }
             }
-            if let Some(with_limit) = with.limit {
-                rows.truncate(with_limit.max(0) as usize);
-            }
-        }
+            rows
+        };
         *carried_vars = with
             .items
             .iter()
@@ -1652,6 +1684,89 @@ impl<'a> Executor<'a> {
             out = filtered;
         }
         Ok(out)
+    }
+
+    /// `materialize_aggregating_return_with_order`'s `WITH`-side twin --
+    /// same "fold extra composed ORDER BY keys through the same grouping
+    /// pass as `with_items` themselves" approach (TCK's WithOrderBy4
+    /// `[16]`-`[18]`), just producing `Vec<BindingRow>` (preserving graph
+    /// identity for whatever clause comes after this `WITH`) instead of a
+    /// final `QueryResult` -- the extra keys' own values are only ever
+    /// used for sorting here, never carried into the output rows.
+    fn materialize_aggregating_with_with_order(
+        &self,
+        txn: Txn,
+        with_items: &[ReturnItem],
+        rows: &[BindingRow],
+        order_by: &[(ReturnExpr, SortDir)],
+        skip_limit: (Option<i64>, Option<i64>),
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let (skip, limit) = skip_limit;
+        enum OrderKeySource {
+            RealColumn(usize),
+            Extra(usize),
+        }
+        let mut extra_exprs: Vec<ReturnExpr> = Vec::new();
+        let order_by_source: Vec<OrderKeySource> = order_by
+            .iter()
+            .map(|(expr, _)| {
+                match with_items
+                    .iter()
+                    .enumerate()
+                    .position(|(i, it)| item_matches_leaf(expr, i, it))
+                {
+                    Some(i) => OrderKeySource::RealColumn(i),
+                    None => {
+                        let idx = extra_exprs.len();
+                        extra_exprs.push(expr.clone());
+                        OrderKeySource::Extra(idx)
+                    }
+                }
+            })
+            .collect();
+        let extended_items: Vec<ReturnItem> = with_items
+            .iter()
+            .cloned()
+            .chain(
+                extra_exprs
+                    .into_iter()
+                    .map(|expr| ReturnItem { expr, alias: None }),
+            )
+            .collect();
+        validate_return_items(&extended_items)?;
+        let grouped = self.resolve_grouped_rows(txn, &extended_items, rows, guard)?;
+        let real_len = with_items.len();
+        let mut keyed: Vec<(Vec<Value>, BindingRow)> = Vec::with_capacity(grouped.len());
+        for bindings in grouped {
+            let (real, extra) = bindings.split_at(real_len);
+            let real_values: Vec<Value> = real
+                .iter()
+                .map(|b| self.binding_to_value(txn, b))
+                .collect::<Result<Vec<_>, _>>()?;
+            let extra_values: Vec<Value> = extra
+                .iter()
+                .map(|b| self.binding_to_value(txn, b))
+                .collect::<Result<Vec<_>, _>>()?;
+            let keys: Vec<Value> = order_by_source
+                .iter()
+                .map(|src| match src {
+                    OrderKeySource::RealColumn(i) => real_values[*i].clone(),
+                    OrderKeySource::Extra(k) => extra_values[*k].clone(),
+                })
+                .collect();
+            let real_row: BindingRow = with_items
+                .iter()
+                .enumerate()
+                .zip(real)
+                .map(|((i, item), binding)| (with_item_output_name((i, item)), binding.clone()))
+                .collect();
+            keyed.push((keys, real_row));
+        }
+        Ok(top_k_by(keyed, order_by, skip, limit)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
     }
 
     /// The `Binding` one WITH/RETURN item evaluates to for one input row. A
@@ -2093,7 +2208,8 @@ impl<'a> Executor<'a> {
             let j = ctx
                 .items
                 .iter()
-                .position(|it| it.expr == *expr && !contains_aggregate(&it.expr))
+                .enumerate()
+                .position(|(i, it)| item_matches_leaf(expr, i, it) && !contains_aggregate(&it.expr))
                 .expect(
                     "validate_return_items already checked this leaf matches a grouping-key item",
                 );
@@ -3074,6 +3190,105 @@ impl<'a> Executor<'a> {
             columns,
             rows: out_rows,
         })
+    }
+
+    /// An aggregating `RETURN`'s own `ORDER BY`, when at least one key
+    /// doesn't verbatim/alias-match any item -- `RETURN me.age AS age,
+    /// count(you.age) AS cnt ORDER BY age + count(you.age)` (TCK's
+    /// ReturnOrderBy6). Folds those extra keys through the *same*
+    /// grouping pass as `items` themselves, as synthetic unreturned extra
+    /// items (reusing `resolve_grouped_rows`/`rewrite_composed_item`
+    /// exactly as a composed RETURN item would, including an aggregate
+    /// call that appears *only* in the ORDER BY key, nowhere in `items`
+    /// -- real Cypher allows that too, it just needs to fold consistently
+    /// with `items`' own implicit grouping, not literally reuse one of
+    /// their accumulators), then uses their per-group values as
+    /// additional sort keys before stripping them back off. Degrades to
+    /// exactly the ordinary "sort by already-computed columns" behavior
+    /// when every key does verbatim/alias-match (`extra_exprs` empty) --
+    /// callers can route every aggregating-`RETURN`-with-`ORDER-BY` case
+    /// through this one function rather than branching on whether extras
+    /// are actually needed.
+    ///
+    /// `DISTINCT` isn't handled here -- deliberately: grouping already
+    /// makes every output row unique by its own grouping-key columns (two
+    /// groups can't have the same grouping key and still be different
+    /// groups), so `RETURN DISTINCT` combined with aggregation is
+    /// provably always a no-op downstream of this function regardless.
+    fn materialize_aggregating_return_with_order(
+        &self,
+        txn: Txn,
+        items: &[ReturnItem],
+        rows: &[BindingRow],
+        order_by: &[(ReturnExpr, SortDir)],
+        skip_limit: (Option<i64>, Option<i64>),
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        let (skip, limit) = skip_limit;
+        enum OrderKeySource {
+            RealColumn(usize),
+            Extra(usize),
+        }
+        let mut extra_exprs: Vec<ReturnExpr> = Vec::new();
+        let order_by_source: Vec<OrderKeySource> = order_by
+            .iter()
+            .map(|(expr, _)| {
+                match items
+                    .iter()
+                    .enumerate()
+                    .position(|(i, it)| item_matches_leaf(expr, i, it))
+                {
+                    Some(i) => OrderKeySource::RealColumn(i),
+                    None => {
+                        let idx = extra_exprs.len();
+                        extra_exprs.push(expr.clone());
+                        OrderKeySource::Extra(idx)
+                    }
+                }
+            })
+            .collect();
+        let extended_items: Vec<ReturnItem> = items
+            .iter()
+            .cloned()
+            .chain(
+                extra_exprs
+                    .into_iter()
+                    .map(|expr| ReturnItem { expr, alias: None }),
+            )
+            .collect();
+        validate_return_items(&extended_items)?;
+        let grouped = self.resolve_grouped_rows(txn, &extended_items, rows, guard)?;
+        let columns: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| default_column_name(&item.expr, i))
+            })
+            .collect();
+        let real_len = items.len();
+        let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(grouped.len());
+        for bindings in grouped {
+            let values: Vec<Value> = bindings
+                .iter()
+                .map(|b| self.binding_to_value(txn, b))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (real, extra) = values.split_at(real_len);
+            let keys: Vec<Value> = order_by_source
+                .iter()
+                .map(|src| match src {
+                    OrderKeySource::RealColumn(i) => real[*i].clone(),
+                    OrderKeySource::Extra(k) => extra[*k].clone(),
+                })
+                .collect();
+            keyed.push((keys, real.to_vec()));
+        }
+        let rows = top_k_by(keyed, order_by, skip, limit)
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        Ok(QueryResult { columns, rows })
     }
 
     fn eval_return_expr(
@@ -4381,7 +4596,25 @@ pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryErr
     Ok(())
 }
 
-fn validate_composed_expr(expr: &ReturnExpr, items: &[ReturnItem]) -> Result<(), QueryError> {
+/// Whether `expr` (a leaf found inside some *other* composed expression)
+/// refers to `item` -- either structurally (`item.expr == *expr`) or, for
+/// a bare `Var`, by `item`'s own output *alias* (`RETURN me.age AS age
+/// ... ORDER BY age + count(...)`, TCK's ReturnOrderBy6 `[2]`: `age`
+/// alone doesn't structurally equal `me.age`, but it's still exactly
+/// item `age`'s value). Shared by `validate_composed_expr`'s compile-time
+/// check and `Executor::rewrite_composed_item`'s matching runtime lookup
+/// -- both need to agree on what counts as "the same grouping key,"
+/// including this by-alias case, or one would accept what the other
+/// can't actually evaluate.
+pub(crate) fn item_matches_leaf(expr: &ReturnExpr, index: usize, item: &ReturnItem) -> bool {
+    item.expr == *expr
+        || matches!(expr, ReturnExpr::Var(name) if *name == with_item_output_name((index, item)))
+}
+
+pub(crate) fn validate_composed_expr(
+    expr: &ReturnExpr,
+    items: &[ReturnItem],
+) -> Result<(), QueryError> {
     if matches!(expr, ReturnExpr::CountStar) {
         return Ok(());
     }
@@ -4426,7 +4659,8 @@ fn validate_composed_expr(expr: &ReturnExpr, items: &[ReturnItem]) -> Result<(),
     if matches!(expr, ReturnExpr::Var(_) | ReturnExpr::Prop(_)) {
         let is_grouping_key = items
             .iter()
-            .any(|it| it.expr == *expr && !contains_aggregate(&it.expr));
+            .enumerate()
+            .any(|(i, it)| item_matches_leaf(expr, i, it) && !contains_aggregate(&it.expr));
         return if is_grouping_key {
             Ok(())
         } else {
@@ -4544,6 +4778,39 @@ fn validate_composed_expr(expr: &ReturnExpr, items: &[ReturnItem]) -> Result<(),
         | ReturnExpr::PatternPredicate(..)
         | ReturnExpr::PatternComprehension { .. }
         | ReturnExpr::ExistsPattern { .. } => {}
+    }
+    Ok(())
+}
+
+/// Same rules as `validate_composed_expr` (reused directly, first), plus
+/// one more real Cypher only enforces for an ORDER BY key specifically,
+/// not for a RETURN/WITH item's own composed expression: every
+/// aggregate-bearing subexpression found anywhere in it must itself
+/// verbatim/alias-match some existing RETURN/WITH item (TCK's
+/// WithOrderBy4 `[14]`, "Fail on sorting by a non-projected aggregation
+/// on an expression" -- `ORDER BY sum(x)` when the WITH only computes
+/// `min(x)`, a *different* aggregate over the same argument, is a real
+/// compile-time error, not "just fold it separately"). A RETURN/WITH
+/// item's own composed expression has no such restriction -- `RETURN a,
+/// count(a) + sum(b)` folds both `count(a)` and `sum(b)` fresh as part of
+/// evaluating that one item, with nothing else either needs to match.
+pub(crate) fn validate_order_by_composed_expr(
+    expr: &ReturnExpr,
+    items: &[ReturnItem],
+) -> Result<(), QueryError> {
+    validate_composed_expr(expr, items)?;
+    let mut agg_nodes = Vec::new();
+    collect_agg_nodes(expr, &mut agg_nodes);
+    for node in agg_nodes {
+        let matches_item = items
+            .iter()
+            .enumerate()
+            .any(|(i, it)| item_matches_leaf(node, i, it));
+        if !matches_item {
+            return Err(QueryError::Semantic(
+                "ORDER BY aggregate does not match any RETURN/WITH item".into(),
+            ));
+        }
     }
     Ok(())
 }
