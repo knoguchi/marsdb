@@ -8025,3 +8025,35 @@ fn chained_property_access_on_a_nested_map_literal() {
         other => panic!("expected a string, got {other:?}"),
     }
 }
+
+/// `n['name']` -- dynamic property access on a node/relationship, with a
+/// computed key expression, not just a literal string. TCK's Graph7
+/// [1]-[3].
+#[test]
+fn dynamic_property_access_on_a_node() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({name: 'Apa'})");
+    let result = run(
+        &store,
+        "MATCH (n {name: 'Apa'}) RETURN n['nam' + 'e'] AS value",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "Apa"),
+        other => panic!("expected a string, got {other:?}"),
+    }
+}
+
+/// `type(null)` -- a null-valued argument to a graph-object builtin
+/// (`type`/`nodes`/`relationships`/`length`) is `null`, not a compile-time
+/// type error. TCK's Graph4 [3], Path1 [1], Path2 [3].
+#[test]
+fn graph_builtins_on_null_argument_are_null_not_an_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN type(null), nodes(null), relationships(null), length(null)",
+    );
+    for cell in &result.rows[0] {
+        assert!(matches!(cell, Value::Null), "expected null, got {cell:?}");
+    }
+}

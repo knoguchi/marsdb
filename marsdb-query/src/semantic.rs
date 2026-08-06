@@ -871,19 +871,19 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     | "datetime.realtime" => Kind::Scalar,
                     "length" => {
                         if let Some(kind) = arg_kinds.first() {
-                            require_compatible_kind(kind, &Kind::Path, "length() argument")?;
+                            require_path_or_null(kind, "length() argument")?;
                         }
                         Kind::Scalar
                     }
                     "nodes" => {
                         if let Some(kind) = arg_kinds.first() {
-                            require_compatible_kind(kind, &Kind::Path, "nodes() argument")?;
+                            require_path_or_null(kind, "nodes() argument")?;
                         }
                         Kind::List(Box::new(Kind::Node))
                     }
                     "relationships" => {
                         if let Some(kind) = arg_kinds.first() {
-                            require_compatible_kind(kind, &Kind::Path, "relationships() argument")?;
+                            require_path_or_null(kind, "relationships() argument")?;
                         }
                         Kind::List(Box::new(Kind::Edge))
                     }
@@ -897,8 +897,18 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                     // one a zero-row match would silently skip (TCK's
                     // Graph4 [7]).
                     "type" => {
+                        // `Scalar` tolerated too, not just `Unknown` -- a
+                        // `null`-valued argument types as `Scalar` in this
+                        // imprecise `Kind` system, and `type(null)` is
+                        // `null` at runtime (`call_builtin`'s own early
+                        // null check), not an error (TCK's Graph4 `[3]`).
                         if let Some(kind) = arg_kinds.first() {
-                            require_compatible_kind(kind, &Kind::Edge, "type() argument")?;
+                            if !matches!(kind, Kind::Edge | Kind::Scalar | Kind::Unknown) {
+                                return Err(semantic(format!(
+                                    "type() argument requires a relationship, but found {}",
+                                    kind_name(kind)
+                                )));
+                            }
                         }
                         Kind::Scalar
                     }
@@ -1016,6 +1026,11 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                 // every other `Kind::Scalar` case in this module already
                 // gives.
                 Kind::Unknown | Kind::Scalar => Kind::Unknown,
+                // `n['name']` -- dynamic property access on a node/
+                // relationship, same as `n.name`'s static form (TCK's
+                // Graph7 `[1]`-`[3]`); `apply_index`'s own runtime already
+                // supports this via `property_of_value`.
+                Kind::Node | Kind::Edge => Kind::Scalar,
                 other => {
                     return Err(semantic(format!(
                         "index base is {}, not a list or map",
@@ -1215,6 +1230,22 @@ fn require_compatible_kind(
     Err(semantic(format!(
         "{context} requires {}, but found {}",
         kind_name(expected),
+        kind_name(actual)
+    )))
+}
+
+/// `length()`/`nodes()`/`relationships()`'s shared argument check --
+/// `Kind::Path`, or `Scalar` (a `null`-valued argument types as `Scalar`
+/// in this imprecise `Kind` system, and all three are `null` at runtime
+/// for a `null` argument -- `call_builtin`'s own early null check, not an
+/// error, TCK's Path1 `[1]`/Path2 `[3]`), or `Unknown`.
+fn require_path_or_null(actual: &Kind, context: &str) -> Result<(), QueryError> {
+    if matches!(actual, Kind::Path | Kind::Scalar | Kind::Unknown) {
+        return Ok(());
+    }
+    Err(semantic(format!(
+        "{context} requires {}, but found {}",
+        kind_name(&Kind::Path),
         kind_name(actual)
     )))
 }

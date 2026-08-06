@@ -6105,6 +6105,19 @@ fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryError> {
         };
         return Ok(entries.get(key).cloned().unwrap_or(Value::Null));
     }
+    // `n['name']` -- dynamic property access on a node/relationship/
+    // temporal value, same as `n.name`'s static form but with a computed
+    // key (TCK's Graph7 `[1]`-`[3]`). Reuses `property_of_value` exactly
+    // -- the only actual difference from `.prop` is where the key string
+    // comes from.
+    if matches!(list, Value::Node(_) | Value::Edge(_) | Value::Property(_)) {
+        let Some(key) = as_arith_str(index) else {
+            return Err(QueryError::Type(format!(
+                "a property index must be a string, got {index:?}"
+            )));
+        };
+        return property_of_value(list, key);
+    }
     let Value::List(items) = list else {
         return Err(QueryError::Type(format!(
             "[] indexing needs a list or map, got {list:?}"
