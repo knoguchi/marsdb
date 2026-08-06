@@ -111,6 +111,7 @@ NOT        : 'NOT';
 OR         : 'OR';
 STARTS     : 'STARTS';
 XOR        : 'XOR';
+SHORTEST_PATH : 'shortestPath';
 FALSE      : 'FALSE';
 TRUE       : 'TRUE';
 NULL_W     : 'NULL';

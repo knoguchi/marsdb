@@ -110,7 +110,7 @@ each one, not assumed.
 
 ## Local extensions (not from upstream, not real openCypher)
 
-Unlike the fixes above, these two additions aren't upstream-worthy — they
+Unlike the fixes above, these additions aren't upstream-worthy — they
 have no basis in `openCypher.bnf` at all, mirroring `cypher.pest`'s own
 identically-scoped mars-specific extensions (not sent to
 `antlr/grammars-v4`, which tracks real Cypher, not this):
@@ -129,6 +129,23 @@ Both needed two new lexer tokens (`EXPLAIN`, `INDEX`) added to
 `reservedWord` too, so `name` (label/property positions) can still absorb
 them — only `symbol` (bound-variable positions) excludes reserved words,
 matching every other keyword already in that list.
+
+A third, same class (real Neo4j Cypher syntax, but absent from
+`openCypher.bnf`/the TCK — confirmed by grep, not assumed — so treated as
+a local extension here too, mirroring `cypher.pest`'s own
+`shortest_path_wrapper`):
+
+- `patternPart : (symbol ASSIGN)? (shortestPathWrapper | patternElem)`,
+  `shortestPathWrapper : SHORTEST_PATH LPAREN patternElem RPAREN` —
+  `shortestPath((a)-[*..5]-(b))`. Only the single-path form, not
+  `allShortestPaths(...)` (pest doesn't have that either). Grammar-
+  permissive — `patternPart` is shared by MATCH/CREATE/MERGE, so this adds
+  a new lexer token, `SHORTEST_PATH` (also added to `reservedWord`), and
+  syntactically-legal-but-visitor-rejected positions (CREATE, MERGE, any
+  comma position but the first) rather than threading a MATCH-only rule
+  through three call sites — same "grammar permissive, visitor enforces
+  the exact constraint" split already used for `(symbol ASSIGN)?` on the
+  same rule.
 
 ## Why this toolchain
 

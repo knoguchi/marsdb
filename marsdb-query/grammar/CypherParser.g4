@@ -298,8 +298,22 @@ propertyExpression
     : atom (DOT name)*
     ;
 
+// `shortestPathWrapper` is grammar-permissive here (usable at any
+// comma-separated position, in CREATE/MERGE's own `patternPart` too, not
+// just MATCH's first pattern) -- the visitor enforces the real restriction
+// (MATCH only, first comma position only), same "grammar permissive,
+// visitor enforces the exact constraint" split already used for
+// `(symbol ASSIGN)?` named-path capture right below.
 patternPart
-    : (symbol ASSIGN)? patternElem
+    : (symbol ASSIGN)? (shortestPathWrapper | patternElem)
+    ;
+
+// mars-specific extension, same as `explainSt`/`createIndexSt` (see
+// `grammar/README.md`) -- real Cypher's `shortestPath(...)`/
+// `allShortestPaths(...)`, though only the single-path form is
+// implemented, matching `cypher.pest`'s own `shortest_path_wrapper`.
+shortestPathWrapper
+    : SHORTEST_PATH LPAREN patternElem RPAREN
     ;
 
 patternElem
@@ -526,6 +540,7 @@ reservedWord
     | OR
     | STARTS
     | XOR
+    | SHORTEST_PATH
     | FALSE
     | TRUE
     | NULL_W

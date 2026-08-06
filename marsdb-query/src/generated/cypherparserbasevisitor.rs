@@ -288,6 +288,11 @@ pub trait CypherParserBaseVisitor<'input>:
         self.visit_children(ctx)
     }
 
+    // Visit a parse tree produced by CypherParser#shortestPathWrapper.
+    fn visit_shortestpathwrapper(&mut self, ctx: &ShortestPathWrapperContext<'input>) {
+        self.visit_children(ctx)
+    }
+
     // Visit a parse tree produced by CypherParser#patternElem.
     fn visit_patternelem(&mut self, ctx: &PatternElemContext<'input>) {
         self.visit_children(ctx)

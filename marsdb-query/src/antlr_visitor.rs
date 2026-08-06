@@ -59,18 +59,19 @@ use crate::generated::cypherparser::{
     RelationshipPatternContextAttrs, RelationshipTypesContextAttrs, RemoveItemContextAll,
     RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
     ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
-    SinglePartQContext, SinglePartQContextAttrs, SkipStContextAttrs, StandaloneCallContext,
-    StringExpPrefixContextAll, StringExpPrefixContextAttrs, StringExpressionContextAll,
-    StringExpressionContextAttrs, StringLitContext, StringLitContextAttrs, SymbolContextAll,
-    SymbolContextAttrs, UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs,
-    UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
+    ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
+    SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
+    StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
+    StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
+    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, UnionStContextAttrs,
+    UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
     UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
     XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
     group_into_linear_patterns, parse_int_literal, parse_rel_range, unescape_string,
-    validate_named_path_pattern,
+    validate_named_path_pattern, validate_shortest_path_pattern,
 };
 use antlr4rust::parser_rule_context::ParserRuleContext;
 use antlr4rust::token::Token;
@@ -871,12 +872,36 @@ impl AstBuilder {
         let pattern_ctx = pw.pattern().expect("patternWhere always has a pattern");
 
         let mut path_var = None;
+        let mut shortest_path = false;
         let mut patterns = Vec::new();
-        for part in pattern_ctx.patternPart_all() {
-            let elem_ctx = part
-                .patternElem()
-                .expect("patternPart always has a patternElem");
-            patterns.push(self.visit(&*elem_ctx).into_pattern()?);
+        for (i, part) in pattern_ctx.patternPart_all().into_iter().enumerate() {
+            // `shortestPathWrapper` is grammar-permissive (any
+            // comma-separated position) -- restricted here to the first
+            // position only, same as `parser.rs`'s `parse_path_pattern`
+            // (real Cypher: naming/shortestPath only make sense on a
+            // single linear pattern, never a cross join).
+            let pattern = match part.shortestPathWrapper() {
+                Some(sp_ctx) => {
+                    if i != 0 {
+                        return Err(QueryError::Syntax(
+                            "shortestPath() must be the first (and only) comma-separated pattern"
+                                .into(),
+                        ));
+                    }
+                    shortest_path = true;
+                    let elem_ctx = sp_ctx
+                        .patternElem()
+                        .expect("shortestPathWrapper always has a patternElem");
+                    self.visit(&*elem_ctx).into_pattern()?
+                }
+                None => {
+                    let elem_ctx = part.patternElem().expect(
+                        "patternPart always has a patternElem when shortestPathWrapper is absent",
+                    );
+                    self.visit(&*elem_ctx).into_pattern()?
+                }
+            };
+            patterns.push(pattern);
             if part.ASSIGN().is_some() {
                 if path_var.is_some() {
                     return Err(QueryError::Syntax(
@@ -892,12 +917,14 @@ impl AstBuilder {
         }
 
         let groups = group_into_linear_patterns(patterns)?;
-        if groups.len() > 1 && path_var.is_some() {
+        if groups.len() > 1 && (shortest_path || path_var.is_some()) {
             return Err(QueryError::Syntax(
-                "a named path can't span a comma-separated cross join".into(),
+                "a named path/shortestPath() can't span a comma-separated cross join".into(),
             ));
         }
-        if path_var.is_some() {
+        if shortest_path {
+            validate_shortest_path_pattern(&groups[0])?;
+        } else if path_var.is_some() {
             validate_named_path_pattern(&groups[0])?;
         }
 
@@ -915,10 +942,7 @@ impl AstBuilder {
             .map(|(i, pattern)| QueryPart {
                 optional,
                 path_var: if i == 0 { path_var.clone() } else { None },
-                // shortestPath()/allShortestPaths() aren't implemented by
-                // the vendored grammar (antlr/grammars-v4/cypher) at all
-                // -- a real gap, not deferred-for-now like WHERE/props.
-                shortest_path: false,
+                shortest_path: i == 0 && shortest_path,
                 pattern,
                 where_clause: if i == last {
                     where_clause.clone()
@@ -1582,9 +1606,14 @@ impl AstBuilder {
                         "named-path capture (`p = ...`) isn't supported on CREATE".into(),
                     ));
                 }
-                let elem_ctx = part_ctx
-                    .patternElem()
-                    .expect("patternPart always has a patternElem");
+                if part_ctx.shortestPathWrapper().is_some() {
+                    return Err(QueryError::Syntax(
+                        "shortestPath() isn't valid in CREATE".into(),
+                    ));
+                }
+                let elem_ctx = part_ctx.patternElem().expect(
+                    "patternPart always has a patternElem when shortestPathWrapper is absent",
+                );
                 self.visit(&*elem_ctx).into_pattern()
             })
             .collect()
@@ -1605,9 +1634,14 @@ impl AstBuilder {
                 "named-path capture (`p = ...`) isn't supported on MERGE".into(),
             ));
         }
+        if part_ctx.shortestPathWrapper().is_some() {
+            return Err(QueryError::Syntax(
+                "shortestPath() isn't valid in MERGE".into(),
+            ));
+        }
         let elem_ctx = part_ctx
             .patternElem()
-            .expect("patternPart always has a patternElem");
+            .expect("patternPart always has a patternElem when shortestPathWrapper is absent");
         let pattern = self.visit(&*elem_ctx).into_pattern()?;
         if pattern.hops.len() > 1 {
             return Err(QueryError::Syntax(
@@ -2567,6 +2601,46 @@ mod tests {
     #[test]
     fn named_path_over_disjoint_cross_join_errors() {
         assert!(parse_match("MATCH p = (a), (b)").is_err());
+    }
+
+    #[test]
+    fn shortest_path() {
+        let parts = parse_match("MATCH shortestPath((a)-[*1..3]->(b))").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].shortest_path);
+        assert_eq!(parts[0].pattern.hops.len(), 1);
+    }
+
+    #[test]
+    fn shortest_path_with_named_path_capture() {
+        let parts = parse_match("MATCH p = shortestPath((a)-[*1..3]->(b))").unwrap();
+        assert_eq!(parts[0].path_var.as_deref(), Some("p"));
+        assert!(parts[0].shortest_path);
+    }
+
+    #[test]
+    fn shortest_path_requires_variable_length_hop() {
+        assert!(parse_match("MATCH shortestPath((a)-->(b))").is_err());
+    }
+
+    #[test]
+    fn shortest_path_not_first_in_cross_join_errors() {
+        assert!(parse_match("MATCH (c), shortestPath((a)-[*1..3]->(b))").is_err());
+    }
+
+    #[test]
+    fn shortest_path_over_disjoint_cross_join_errors() {
+        assert!(parse_match("MATCH shortestPath((a)-[*1..3]->(b)), (c)").is_err());
+    }
+
+    #[test]
+    fn shortest_path_not_valid_in_create() {
+        assert!(parse_statement("CREATE shortestPath((a)-[*1..3]->(b))").is_err());
+    }
+
+    #[test]
+    fn shortest_path_not_valid_in_merge() {
+        assert!(parse_merge("MERGE shortestPath((a)-[*1..3]->(b))").is_err());
     }
 
     #[test]

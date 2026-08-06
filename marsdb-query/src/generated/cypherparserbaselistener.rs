@@ -629,6 +629,17 @@ pub trait CypherParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_shortestpathwrapper(&mut self, _ctx: &ShortestPathWrapperContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_shortestpathwrapper(&mut self, _ctx: &ShortestPathWrapperContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_patternelem(&mut self, _ctx: &PatternElemContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.

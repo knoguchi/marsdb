@@ -457,6 +457,14 @@ pub trait CypherParserVisitor<'input>: ParseTreeVisitor<'input, CypherParserCont
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#shortestPathWrapper}.
+     * @param ctx the parse tree
+     */
+    fn visit_shortestPathWrapper(&mut self, ctx: &ShortestPathWrapperContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#patternElem}.
      * @param ctx the parse tree
      */
@@ -1228,6 +1236,17 @@ pub trait CypherParserVisitorCompat<'input>:
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#shortestPathWrapper}.
+     * @param ctx the parse tree
+     */
+    fn visit_shortestPathWrapper(
+        &mut self,
+        ctx: &ShortestPathWrapperContext<'input>,
+    ) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#patternElem}.
      * @param ctx the parse tree
      */
@@ -1829,6 +1848,11 @@ where
 
     fn visit_patternPart(&mut self, ctx: &PatternPartContext<'input>) {
         let result = <Self as CypherParserVisitorCompat>::visit_patternPart(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_shortestPathWrapper(&mut self, ctx: &ShortestPathWrapperContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_shortestPathWrapper(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
     }
 

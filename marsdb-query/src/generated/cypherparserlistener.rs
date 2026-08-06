@@ -566,6 +566,16 @@ pub trait CypherParserListener<'input>: ParseTreeListener<'input, CypherParserCo
      */
     fn exit_patternPart(&mut self, _ctx: &PatternPartContext<'input>) {}
     /**
+     * Enter a parse tree produced by {@link CypherParser#shortestPathWrapper}.
+     * @param ctx the parse tree
+     */
+    fn enter_shortestPathWrapper(&mut self, _ctx: &ShortestPathWrapperContext<'input>) {}
+    /**
+     * Exit a parse tree produced by {@link CypherParser#shortestPathWrapper}.
+     * @param ctx the parse tree
+     */
+    fn exit_shortestPathWrapper(&mut self, _ctx: &ShortestPathWrapperContext<'input>) {}
+    /**
      * Enter a parse tree produced by {@link CypherParser#patternElem}.
      * @param ctx the parse tree
      */
