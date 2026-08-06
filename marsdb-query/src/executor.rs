@@ -305,6 +305,13 @@ struct IndexSeekSpec<'a> {
     value: &'a PropertyValue,
 }
 
+/// Read-only context `Executor::rewrite_composed_item` needs to resolve a
+/// composed aggregate item's non-aggregate leaves -- see its own docs.
+struct GroupFinishCtx<'a> {
+    items: &'a [ReturnItem],
+    key_bindings: &'a [Option<Binding>],
+}
+
 /// `ORDER BY`/`SKIP`/`LIMIT` bundled into one argument for
 /// `execute_match` (clippy's `too_many_arguments`, capped at 7) --
 /// mirrors `Statement::Match`'s own trailing fields, always applied in
@@ -1113,33 +1120,7 @@ impl<'a> Executor<'a> {
                 // itself calls.
                 QueryClause::Delete { items, detach } => {
                     let write_txn = require_write_txn(txn);
-                    let mut deleted_nodes = HashSet::new();
-                    let mut deleted_edges = HashSet::new();
-                    for row in &current_rows {
-                        for target in items {
-                            if let ReturnExpr::Var(name) = target {
-                                let binding = row
-                                    .get(name)
-                                    .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
-                                delete_binding(
-                                    write_txn,
-                                    binding,
-                                    *detach,
-                                    &mut deleted_nodes,
-                                    &mut deleted_edges,
-                                )?;
-                            } else {
-                                let value = self.eval_return_expr(txn, target, row, guard)?;
-                                delete_value(
-                                    write_txn,
-                                    &value,
-                                    *detach,
-                                    &mut deleted_nodes,
-                                    &mut deleted_edges,
-                                )?;
-                            }
-                        }
-                    }
+                    self.delete_targets(txn, write_txn, items, &current_rows, *detach, guard)?;
                 }
                 // `REMOVE ... WITH ...` -- same passthrough reasoning as
                 // `QueryClause::Set` above (see `remove_as_clause`'s
@@ -1880,13 +1861,29 @@ impl<'a> Executor<'a> {
     }
 
     /// Folds `rows` into groups keyed by every non-aggregate item's per-row
-    /// `Binding` (via `item_binding`), then finishes each aggregate item's
-    /// accumulator per group. Returns one `Vec<Binding>` per output group,
-    /// column-aligned with `items`. Shared by `materialize_with` and
-    /// `materialize_return` — both already take the same `rows: &[BindingRow]`
-    /// input type, so the grouping core stays in `Binding`-space (preserving
-    /// graph identity for bare-var grouping keys) and each caller does its
-    /// own thin final conversion.
+    /// `Binding` (via `item_binding`), then finishes each aggregating
+    /// item's accumulator(s) per group. Returns one `Vec<Binding>` per
+    /// output group, column-aligned with `items`. Shared by
+    /// `materialize_with` and `materialize_return` — both already take the
+    /// same `rows: &[BindingRow]` input type, so the grouping core stays
+    /// in `Binding`-space (preserving graph identity for bare-var grouping
+    /// keys) and each caller does its own thin final conversion.
+    ///
+    /// An item "aggregates" (`contains_aggregate`) in one of two shapes:
+    /// purely (`count(a)`, `count(*)`, the only shape this used to
+    /// support) or composed with other expressions (`count(a) + 3`, `a,
+    /// count(a)` isn't this -- `a` is its own separate, non-aggregating
+    /// item). Either way, `Group.accs[i]` holds one `AggAcc` per
+    /// aggregate-bearing subexpression found in that item's tree
+    /// (`collect_agg_nodes`'s order — empty for a non-aggregating item,
+    /// exactly one for the purely-aggregating shape), and finishing a
+    /// composed item evaluates its whole expression tree via
+    /// `rewrite_composed_item` rather than just unwrapping a single
+    /// accumulator. `validate_return_items` (which callers must run
+    /// first) already guarantees every non-aggregate leaf inside a
+    /// composed item's tree matches some *other* item's own top-level
+    /// expression verbatim, so this function trusts that invariant rather
+    /// than re-checking it.
     ///
     /// Grouping-key lookup is a hash-map lookup (`group_index`, keyed by
     /// `binding_hash_key`'s output — `Binding`/`PropertyValue` don't
@@ -1896,10 +1893,6 @@ impl<'a> Executor<'a> {
     /// no ORDER BY. O(1) average per row, not the O(rows × groups) linear
     /// scan this used to be — see BENCHMARKS.md for the measured
     /// before/after.
-    ///
-    /// Callers must call `validate_return_items` first — this function
-    /// assumes every aggregate `Call` item has already been checked to
-    /// have exactly one argument.
     fn resolve_grouped_rows(
         &self,
         txn: Txn,
@@ -1908,25 +1901,45 @@ impl<'a> Executor<'a> {
         guard: &ExecutionGuard<'_>,
     ) -> Result<Vec<Vec<Binding>>, QueryError> {
         struct Group {
-            // Aligned to `items`: `Some` at a non-aggregate item's index,
-            // `None` at an aggregate item's index (both vecs below are
-            // index-aligned to `items` the same way, so exactly one of
-            // `key_bindings[i]`/`accs[i]` is populated per `i`).
+            // Aligned to `items`: `Some` at a non-aggregating item's
+            // index, `None` at an aggregating one's (whether purely
+            // aggregating or composed) -- exactly one of
+            // `key_bindings[i]`/`!accs[i].is_empty()` holds per `i`.
             key_bindings: Vec<Option<Binding>>,
-            accs: Vec<Option<AggAcc>>,
+            accs: Vec<Vec<AggAcc>>,
             row_count: i64,
         }
-        fn fresh_accs(items: &[ReturnItem]) -> Vec<Option<AggAcc>> {
+        fn fresh_accs(items: &[ReturnItem]) -> Vec<Vec<AggAcc>> {
             items
                 .iter()
-                .map(|item| match &item.expr {
-                    ReturnExpr::Call { name, distinct, .. } if is_aggregate_name(name) => {
-                        Some(AggAcc::identity(name, *distinct))
-                    }
-                    _ => None,
+                .map(|item| {
+                    let mut nodes = Vec::new();
+                    collect_agg_nodes(&item.expr, &mut nodes);
+                    nodes
+                        .into_iter()
+                        .map(|node| match node {
+                            ReturnExpr::CountStar => AggAcc::identity("count", false),
+                            ReturnExpr::Call { name, distinct, .. } => {
+                                AggAcc::identity(name, *distinct)
+                            }
+                            _ => unreachable!(
+                                "collect_agg_nodes only ever collects CountStar/aggregate Call nodes"
+                            ),
+                        })
+                        .collect()
                 })
                 .collect()
         }
+        // Computed once, not per row -- `item_agg_nodes[i][k]` is exactly
+        // the node `group.accs[i][k]` accumulates for, every row.
+        let item_agg_nodes: Vec<Vec<&ReturnExpr>> = items
+            .iter()
+            .map(|item| {
+                let mut nodes = Vec::new();
+                collect_agg_nodes(&item.expr, &mut nodes);
+                nodes
+            })
+            .collect();
 
         // Groups live in `groups` (insertion order, for stable output when
         // there's no ORDER BY) with `group_index` as a hash-based lookup
@@ -1940,7 +1953,7 @@ impl<'a> Executor<'a> {
         for row in rows {
             let mut key_bindings = Vec::with_capacity(items.len());
             for item in items {
-                key_bindings.push(if is_top_level_aggregate(&item.expr) {
+                key_bindings.push(if contains_aggregate(&item.expr) {
                     None
                 } else {
                     Some(self.item_binding(txn, &item.expr, row, guard)?)
@@ -1960,36 +1973,44 @@ impl<'a> Executor<'a> {
             });
             let group = &mut groups[group_idx];
             group.row_count += 1;
-            for (i, item) in items.iter().enumerate() {
-                let ReturnExpr::Call { name, args, .. } = &item.expr else {
-                    continue;
-                };
-                if !is_top_level_aggregate(&item.expr) {
-                    continue;
-                }
-                // Standard Cypher null-skipping: a null argument (e.g. an
-                // unmatched OPTIONAL MATCH variable) contributes to
-                // neither the accumulator nor its DISTINCT dedup set —
-                // this is what makes `count(x)` exclude a null-padded row
-                // while `count(*)` (tracked via `row_count`, not an
-                // accumulator at all) includes it.
-                let value = self.eval_return_expr(txn, &args[0], row, guard)?;
-                if is_percentile_name(name) {
-                    // percentileCont/percentileDisc's second argument (the
-                    // percentile) is evaluated per row too -- in practice
-                    // always a constant across the group, but nothing
-                    // structurally requires that, so it's just evaluated
-                    // fresh every row like any other expression rather than
-                    // memoized once.
-                    let percentile = self.eval_return_expr(txn, &args[1], row, guard)?;
-                    if !matches!(value, Value::Null) {
-                        if let Some(acc) = &mut group.accs[i] {
-                            acc.fold_percentile(&value, &percentile)?;
+            for (i, nodes) in item_agg_nodes.iter().enumerate() {
+                for (k, node) in nodes.iter().enumerate() {
+                    match node {
+                        // `count(*)` counts rows, not values -- folded
+                        // unconditionally (no null-skip: there's no
+                        // per-row expression to be null) via a dummy
+                        // always-non-null argument, reusing `AggAcc::
+                        // Count`'s existing fold logic instead of a
+                        // separate no-accumulator path (see `fresh_accs`).
+                        ReturnExpr::CountStar => {
+                            group.accs[i][k].fold(&Value::Literal(Literal::Bool(true)))?;
                         }
-                    }
-                } else if !matches!(value, Value::Null) {
-                    if let Some(acc) = &mut group.accs[i] {
-                        acc.fold(&value)?;
+                        ReturnExpr::Call { name, args, .. } => {
+                            // Standard Cypher null-skipping: a null
+                            // argument (e.g. an unmatched OPTIONAL MATCH
+                            // variable) contributes to neither the
+                            // accumulator nor its DISTINCT dedup set.
+                            let value = self.eval_return_expr(txn, &args[0], row, guard)?;
+                            if is_percentile_name(name) {
+                                // percentileCont/percentileDisc's second
+                                // argument (the percentile) is evaluated
+                                // per row too -- in practice always a
+                                // constant across the group, but nothing
+                                // structurally requires that, so it's just
+                                // evaluated fresh every row like any other
+                                // expression rather than memoized once.
+                                let percentile =
+                                    self.eval_return_expr(txn, &args[1], row, guard)?;
+                                if !matches!(value, Value::Null) {
+                                    group.accs[i][k].fold_percentile(&value, &percentile)?;
+                                }
+                            } else if !matches!(value, Value::Null) {
+                                group.accs[i][k].fold(&value)?;
+                            }
+                        }
+                        _ => unreachable!(
+                            "collect_agg_nodes only ever collects CountStar/aggregate Call nodes"
+                        ),
                     }
                 }
             }
@@ -2001,7 +2022,7 @@ impl<'a> Executor<'a> {
         // `avg`/`min`/`max` -> Null, `collect` -> [] — via the same
         // fresh-accumulator `finish()` path a normal empty-contribution
         // group already uses below, not a separate code path.
-        let no_key_items = items.iter().all(|item| is_top_level_aggregate(&item.expr));
+        let no_key_items = items.iter().all(|item| contains_aggregate(&item.expr));
         if groups.is_empty() && no_key_items {
             groups.push(Group {
                 key_bindings: vec![None; items.len()],
@@ -2012,26 +2033,226 @@ impl<'a> Executor<'a> {
 
         let mut out = Vec::with_capacity(groups.len());
         for mut group in groups {
+            let ctx = GroupFinishCtx {
+                items,
+                key_bindings: &group.key_bindings,
+            };
             let mut row_out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                let binding = if matches!(item.expr, ReturnExpr::CountStar) {
-                    Binding::Value(PropertyValue::Int(group.row_count))
-                } else if is_top_level_aggregate(&item.expr) {
-                    let value = group.accs[i]
-                        .take()
-                        .expect("aggregate item must have an accumulator")
-                        .finish();
-                    value_to_binding(value)
-                } else {
-                    group.key_bindings[i]
-                        .clone()
-                        .expect("non-aggregate item must have a key binding")
+                let binding = match &group.key_bindings[i] {
+                    Some(b) => b.clone(),
+                    None => {
+                        let mut accs = std::mem::take(&mut group.accs[i]).into_iter();
+                        let mut subst = HashMap::new();
+                        let rewritten = self
+                            .rewrite_composed_item(txn, &item.expr, &ctx, &mut accs, &mut subst)?;
+                        value_to_binding(eval_projected_expr(&rewritten, &subst)?)
+                    }
                 };
                 row_out.push(binding);
             }
             out.push(row_out);
         }
         Ok(out)
+    }
+
+    /// Finishing half of a composed aggregate item (`count(a) + 3`):
+    /// rewrites `expr`'s tree into an equivalent one `eval_projected_expr`
+    /// can evaluate without any further graph access, replacing every
+    /// aggregate-bearing subexpression with a synthetic `Var` referencing
+    /// its now-finished accumulator's value in `subst` (consumed from
+    /// `accs` in `collect_agg_nodes`'s order, the same order `fresh_accs`/
+    /// the per-row fold loop in `resolve_grouped_rows` built them in), and
+    /// every non-aggregate `Var`/`Prop` leaf with a synthetic `Var`
+    /// referencing whichever *other* item's own grouping-key `Binding` it
+    /// structurally matches (`validate_return_items` already guarantees
+    /// exactly one such match exists — never reached otherwise). Each
+    /// substituted value gets its own fresh, guaranteed-unique slot name
+    /// (`subst.len()` at insertion time), so nothing here can collide with
+    /// a real Cypher identifier the user wrote.
+    fn rewrite_composed_item(
+        &self,
+        txn: Txn,
+        expr: &ReturnExpr,
+        ctx: &GroupFinishCtx<'_>,
+        accs: &mut std::vec::IntoIter<AggAcc>,
+        subst: &mut HashMap<String, Value>,
+    ) -> Result<ReturnExpr, QueryError> {
+        if matches!(expr, ReturnExpr::CountStar)
+            || matches!(expr, ReturnExpr::Call { name, .. } if is_aggregate_name(name))
+        {
+            let value = accs
+                .next()
+                .expect("accs is aligned with this same expr's collect_agg_nodes traversal order")
+                .finish();
+            let slot = format!("__slot{}", subst.len());
+            subst.insert(slot.clone(), value);
+            return Ok(ReturnExpr::Var(slot));
+        }
+        if matches!(expr, ReturnExpr::Var(_) | ReturnExpr::Prop(_)) {
+            let j = ctx
+                .items
+                .iter()
+                .position(|it| it.expr == *expr && !contains_aggregate(&it.expr))
+                .expect(
+                    "validate_return_items already checked this leaf matches a grouping-key item",
+                );
+            let binding = ctx.key_bindings[j]
+                .clone()
+                .expect("a non-aggregating item always has a key binding");
+            let value = self.binding_to_value(txn, &binding)?;
+            let slot = format!("__slot{}", subst.len());
+            subst.insert(slot.clone(), value);
+            return Ok(ReturnExpr::Var(slot));
+        }
+        Ok(match expr {
+            ReturnExpr::Lit(lit) => ReturnExpr::Lit(lit.clone()),
+            ReturnExpr::Call {
+                name,
+                args,
+                distinct,
+            } => ReturnExpr::Call {
+                name: name.clone(),
+                distinct: *distinct,
+                args: args
+                    .iter()
+                    .map(|a| self.rewrite_composed_item(txn, a, ctx, accs, subst))
+                    .collect::<Result<_, _>>()?,
+            },
+            ReturnExpr::Case { test, whens, else_ } => ReturnExpr::Case {
+                test: test
+                    .as_deref()
+                    .map(|t| self.rewrite_composed_item(txn, t, ctx, accs, subst))
+                    .transpose()?
+                    .map(Box::new),
+                whens: whens
+                    .iter()
+                    .map(|(w, t)| {
+                        Ok::<_, QueryError>((
+                            self.rewrite_composed_item(txn, w, ctx, accs, subst)?,
+                            self.rewrite_composed_item(txn, t, ctx, accs, subst)?,
+                        ))
+                    })
+                    .collect::<Result<_, _>>()?,
+                else_: else_
+                    .as_deref()
+                    .map(|e| self.rewrite_composed_item(txn, e, ctx, accs, subst))
+                    .transpose()?
+                    .map(Box::new),
+            },
+            ReturnExpr::Arith(l, op, r) => ReturnExpr::Arith(
+                Box::new(self.rewrite_composed_item(txn, l, ctx, accs, subst)?),
+                *op,
+                Box::new(self.rewrite_composed_item(txn, r, ctx, accs, subst)?),
+            ),
+            ReturnExpr::Neg(e) => ReturnExpr::Neg(Box::new(
+                self.rewrite_composed_item(txn, e, ctx, accs, subst)?,
+            )),
+            ReturnExpr::ListLit(list_items) => ReturnExpr::ListLit(
+                list_items
+                    .iter()
+                    .map(|i| self.rewrite_composed_item(txn, i, ctx, accs, subst))
+                    .collect::<Result<_, _>>()?,
+            ),
+            ReturnExpr::Index(base, index) => ReturnExpr::Index(
+                Box::new(self.rewrite_composed_item(txn, base, ctx, accs, subst)?),
+                Box::new(self.rewrite_composed_item(txn, index, ctx, accs, subst)?),
+            ),
+            ReturnExpr::Slice(base, start, end) => ReturnExpr::Slice(
+                Box::new(self.rewrite_composed_item(txn, base, ctx, accs, subst)?),
+                start
+                    .as_deref()
+                    .map(|s| self.rewrite_composed_item(txn, s, ctx, accs, subst))
+                    .transpose()?
+                    .map(Box::new),
+                end.as_deref()
+                    .map(|e| self.rewrite_composed_item(txn, e, ctx, accs, subst))
+                    .transpose()?
+                    .map(Box::new),
+            ),
+            // `where_clause`/`project` are deliberately left untouched
+            // (cloned verbatim), not recursed into -- they run once per
+            // *element* of `source`'s own already-rewritten result, in a
+            // scope `eval_projected_expr`'s own `ListComp`/`Quantifier`
+            // handling builds itself (the outer `subst` map plus a fresh
+            // binding for `var`, per element). Rewriting a `Var`/`Prop`
+            // leaf in here the same way `source` gets rewritten would
+            // wrongly try to resolve the comprehension's own *local* loop
+            // variable (`x`/`ok`) as if it had to be some other item's
+            // grouping key -- there's no such item, since it's not an
+            // outer reference at all (found via TCK's List11 [3]: `ALL(ok
+            // IN collect(...) WHERE ok)` panicked trying to resolve `ok`
+            // this way). `validate_composed_expr`'s own `ListComp` arm
+            // already guarantees `project` has no aggregate to substitute
+            // in the first place; `where_clause` is the same documented
+            // scope gap `contains_aggregate` has everywhere else.
+            ReturnExpr::ListComp {
+                var,
+                source,
+                where_clause,
+                project,
+            } => ReturnExpr::ListComp {
+                var: var.clone(),
+                source: Box::new(self.rewrite_composed_item(txn, source, ctx, accs, subst)?),
+                where_clause: where_clause.clone(),
+                project: project.clone(),
+            },
+            ReturnExpr::Quantifier {
+                kind,
+                var,
+                source,
+                where_clause,
+            } => ReturnExpr::Quantifier {
+                kind: *kind,
+                var: var.clone(),
+                source: Box::new(self.rewrite_composed_item(txn, source, ctx, accs, subst)?),
+                where_clause: where_clause.clone(),
+            },
+            ReturnExpr::MapLit(entries) => ReturnExpr::MapLit(
+                entries
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok::<_, QueryError>((
+                            k.clone(),
+                            self.rewrite_composed_item(txn, v, ctx, accs, subst)?,
+                        ))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            ReturnExpr::And(l, r) => ReturnExpr::And(
+                Box::new(self.rewrite_composed_item(txn, l, ctx, accs, subst)?),
+                Box::new(self.rewrite_composed_item(txn, r, ctx, accs, subst)?),
+            ),
+            ReturnExpr::Or(l, r) => ReturnExpr::Or(
+                Box::new(self.rewrite_composed_item(txn, l, ctx, accs, subst)?),
+                Box::new(self.rewrite_composed_item(txn, r, ctx, accs, subst)?),
+            ),
+            ReturnExpr::Xor(l, r) => ReturnExpr::Xor(
+                Box::new(self.rewrite_composed_item(txn, l, ctx, accs, subst)?),
+                Box::new(self.rewrite_composed_item(txn, r, ctx, accs, subst)?),
+            ),
+            ReturnExpr::Not(e) => ReturnExpr::Not(Box::new(
+                self.rewrite_composed_item(txn, e, ctx, accs, subst)?,
+            )),
+            ReturnExpr::Compare(l, op, r) => ReturnExpr::Compare(
+                Box::new(self.rewrite_composed_item(txn, l, ctx, accs, subst)?),
+                *op,
+                Box::new(self.rewrite_composed_item(txn, r, ctx, accs, subst)?),
+            ),
+            ReturnExpr::IsNull(e) => ReturnExpr::IsNull(Box::new(
+                self.rewrite_composed_item(txn, e, ctx, accs, subst)?,
+            )),
+            ReturnExpr::In(needle, haystack) => ReturnExpr::In(
+                Box::new(self.rewrite_composed_item(txn, needle, ctx, accs, subst)?),
+                Box::new(self.rewrite_composed_item(txn, haystack, ctx, accs, subst)?),
+            ),
+            ReturnExpr::HasLabel(v, l) => ReturnExpr::HasLabel(v.clone(), l.clone()),
+            ReturnExpr::PatternPredicate(p) => ReturnExpr::PatternPredicate(p.clone()),
+            ReturnExpr::PatternComprehension { .. } => expr.clone(),
+            ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {
+                unreachable!("handled above, before this match")
+            }
+        })
     }
 
     /// WITH's HAVING-equivalent — evaluated against the already-projected/
@@ -3160,6 +3381,67 @@ impl<'a> Executor<'a> {
         value_to_bool3(&self.eval_return_expr(txn, expr, row, guard)?)
     }
 
+    /// Deletes every `targets` expression's value, across every row --
+    /// shared by `materialize_delete` (`DELETE`/`DETACH DELETE` as a
+    /// statement tail) and `execute_match`'s own `QueryClause::Delete`
+    /// (`DELETE ... WITH ...` mid-pattern). Edges are deleted immediately
+    /// (no ordering constraint), but nodes are only *collected* into
+    /// `pending_nodes` and deleted in a second pass, after every target
+    /// across every row has contributed its own edges -- not deleted
+    /// inline the way `delete_binding`/`delete_value` used to. A single
+    /// non-`DETACH` `DELETE` naming *several* targets that collectively
+    /// cover all of a node's edges (e.g. `DELETE pathColls.key[0],
+    /// pathColls.key[1]`, two paths sharing a node, each contributing one
+    /// of its two incident edges) must succeed -- deleting inline would
+    /// try to delete the first path's node while the second path's edge
+    /// (not yet processed) was still attached, a real bug found via TCK's
+    /// Delete5 `[7]` once `{key: collect(p)}`-shaped composed expressions
+    /// could reach this code path at all (previously rejected outright at
+    /// compile time, before general aggregate composition was supported).
+    fn delete_targets(
+        &self,
+        txn: Txn,
+        write_txn: &WriteTransaction,
+        targets: &[ReturnExpr],
+        rows: &[BindingRow],
+        detach: bool,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<(), QueryError> {
+        let mut deleted_edges = HashSet::new();
+        let mut pending_nodes = HashSet::new();
+        for row in rows {
+            for target in targets {
+                // A bare variable (`DELETE r, a, b`, by far the common
+                // case) deletes by the raw id already sitting in the row's
+                // `Binding` -- no existence check, no property fetch.
+                // That's what lets `DELETE r, a, b` work when two rows of
+                // the same undirected match both reference the same `a`/
+                // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
+                // row's own dedup lookup must succeed even though the
+                // first row already deleted them. Anything else (`list[0]`,
+                // `map.key`, a whole path variable's *elements* accessed
+                // computedly, ...) has no such raw shortcut and goes
+                // through real evaluation instead -- which correctly does
+                // still error via `deleted_entity_access` if it tries to
+                // read a property off something already gone, since that's
+                // a genuine access, not just a re-statement of identity.
+                if let ReturnExpr::Var(name) = target {
+                    let binding = row
+                        .get(name)
+                        .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                    delete_binding(binding, write_txn, &mut deleted_edges, &mut pending_nodes)?;
+                } else {
+                    let value = self.eval_return_expr(txn, target, row, guard)?;
+                    delete_value(&value, write_txn, &mut deleted_edges, &mut pending_nodes)?;
+                }
+            }
+        }
+        for id in pending_nodes {
+            GraphStore::delete_node_in_txn(write_txn, id, detach)?;
+        }
+        Ok(())
+    }
+
     /// `ret`, when present, is evaluated *after* the physical delete runs,
     /// not before — real Cypher's own DELETE+RETURN TCK scenarios agree on
     /// this ordering: `MATCH (n) DELETE n RETURN n.num` must raise a
@@ -3182,47 +3464,7 @@ impl<'a> Executor<'a> {
         guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         let write_txn = require_write_txn(txn);
-        let mut deleted_nodes = HashSet::new();
-        let mut deleted_edges = HashSet::new();
-        for row in rows {
-            for target in targets {
-                // A bare variable (`DELETE r, a, b`, by far the common
-                // case) deletes by the raw id already sitting in the row's
-                // `Binding` -- no existence check, no property fetch.
-                // That's what lets `DELETE r, a, b` work when two rows of
-                // the same undirected match both reference the same `a`/
-                // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
-                // row's own dedup lookup must succeed even though the
-                // first row already deleted them. Anything else (`list[0]`,
-                // `map.key`, a whole path variable's *elements* accessed
-                // computedly, ...) has no such raw shortcut and goes
-                // through real evaluation instead -- which correctly does
-                // still error via `deleted_entity_access` if it tries to
-                // read a property off something already gone, since that's
-                // a genuine access, not just a re-statement of identity.
-                if let ReturnExpr::Var(name) = target {
-                    let binding = row
-                        .get(name)
-                        .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
-                    delete_binding(
-                        write_txn,
-                        binding,
-                        detach,
-                        &mut deleted_nodes,
-                        &mut deleted_edges,
-                    )?;
-                } else {
-                    let value = self.eval_return_expr(txn, target, row, guard)?;
-                    delete_value(
-                        write_txn,
-                        &value,
-                        detach,
-                        &mut deleted_nodes,
-                        &mut deleted_edges,
-                    )?;
-                }
-            }
-        }
+        self.delete_targets(txn, write_txn, targets, rows, detach, guard)?;
         let result = match ret {
             Some(rt) => self.materialize_return(txn, &rt.items, rows, rt.distinct, guard)?,
             None => QueryResult {
@@ -3561,17 +3803,14 @@ impl<'a> Executor<'a> {
 /// `PathBinding` (raw ids) instead of `Value`/`PathElem` (fully
 /// materialized records).
 fn delete_binding(
-    write_txn: &WriteTransaction,
     binding: &Binding,
-    detach: bool,
-    deleted_nodes: &mut HashSet<NodeId>,
+    write_txn: &WriteTransaction,
     deleted_edges: &mut HashSet<EdgeId>,
+    pending_nodes: &mut HashSet<NodeId>,
 ) -> Result<(), QueryError> {
     match binding {
         Binding::Node(id) => {
-            if deleted_nodes.insert(*id) {
-                GraphStore::delete_node_in_txn(write_txn, *id, detach)?;
-            }
+            pending_nodes.insert(*id);
         }
         Binding::Edge(id) => {
             if deleted_edges.insert(*id) {
@@ -3588,9 +3827,7 @@ fn delete_binding(
             }
             for elem in elems {
                 if let PathBinding::Node(id) = elem {
-                    if deleted_nodes.insert(*id) {
-                        GraphStore::delete_node_in_txn(write_txn, *id, detach)?;
-                    }
+                    pending_nodes.insert(*id);
                 }
             }
         }
@@ -3608,27 +3845,24 @@ fn delete_binding(
 }
 
 /// Deletes whatever `value` evaluated to -- a node, a relationship, every
-/// node/edge in a path (edges first, then nodes, so a plain non-`detach`
-/// `DELETE` of a path succeeds as long as the path's *own* edges are all
-/// part of the same delete — an edge outside the path still correctly
-/// blocks it, matching real Cypher), or nothing at all for `null` (a
-/// documented no-op: an `OPTIONAL MATCH` that didn't match pads its
-/// variables with null, and deleting that is specified as silent, not an
-/// error). Anything else (a list, a map, a bare scalar, ...) is a real
-/// `QueryError::Type` -- `DELETE`'s target must resolve to a graph
-/// element, unlike `SET`'s RHS.
+/// node/edge in a path, or nothing at all for `null` (a documented no-op:
+/// an `OPTIONAL MATCH` that didn't match pads its variables with null, and
+/// deleting that is specified as silent, not an error). Anything else (a
+/// list, a map, a bare scalar, ...) is a real `QueryError::Type` --
+/// `DELETE`'s target must resolve to a graph element, unlike `SET`'s RHS.
+/// Edges are deleted immediately; nodes are only collected into
+/// `pending_nodes` -- `delete_targets` (the only caller) deletes them in
+/// its own second pass, after every target across every row has had a
+/// chance to delete its own edges first (see its own docs for why).
 fn delete_value(
-    write_txn: &WriteTransaction,
     value: &Value,
-    detach: bool,
-    deleted_nodes: &mut HashSet<NodeId>,
+    write_txn: &WriteTransaction,
     deleted_edges: &mut HashSet<EdgeId>,
+    pending_nodes: &mut HashSet<NodeId>,
 ) -> Result<(), QueryError> {
     match value {
         Value::Node(n) => {
-            if deleted_nodes.insert(n.id) {
-                GraphStore::delete_node_in_txn(write_txn, n.id, detach)?;
-            }
+            pending_nodes.insert(n.id);
         }
         Value::Edge(e) => {
             if deleted_edges.insert(e.id) {
@@ -3645,9 +3879,7 @@ fn delete_value(
             }
             for elem in elems {
                 if let PathElem::Node(n) = elem {
-                    if deleted_nodes.insert(n.id) {
-                        GraphStore::delete_node_in_txn(write_txn, n.id, detach)?;
-                    }
+                    pending_nodes.insert(n.id);
                 }
             }
         }
@@ -3831,22 +4063,108 @@ pub(crate) fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
         .unwrap_or_else(|| default_column_name(&item.expr, i))
 }
 
-/// True iff `expr` is itself an aggregate call — `count(*)`, or a `Call`
-/// whose name is in `is_aggregate_name`'s fixed set. Does NOT look inside
-/// `expr` for a nested aggregate — see `contains_aggregate` for that.
-fn is_top_level_aggregate(expr: &ReturnExpr) -> bool {
-    match expr {
-        ReturnExpr::CountStar => true,
-        ReturnExpr::Call { name, .. } => is_aggregate_name(name),
-        _ => false,
-    }
-}
-
 /// True iff `expr` contains an aggregate call anywhere inside it, at any
 /// depth — used to reject an aggregate nested inside another aggregate's
 /// argument, or inside a non-aggregate expression's `CASE`/`Call`
 /// arguments (an aggregate must be a return item's *entire* top-level
 /// expression — see `validate_return_items`).
+/// Collects every aggregate-bearing subexpression in `expr` (a `CountStar`
+/// or an aggregate-named `Call`), in a fixed pre-order -- the same
+/// traversal `contains_aggregate` uses, just gathering references instead
+/// of stopping at the first `true`. Doesn't recurse *into* a found node's
+/// own arguments (an aggregate's argument is folded per-row as a whole,
+/// not decomposed further -- see `resolve_grouped_rows`). The resulting
+/// order is what makes a composed item's per-row folding
+/// (`resolve_grouped_rows`) and its per-group finishing
+/// (`Executor::rewrite_composed_item`) agree on which accumulator is
+/// which, without needing to name or otherwise identify individual
+/// aggregate calls within one item's expression tree.
+fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
+    match expr {
+        ReturnExpr::CountStar => out.push(expr),
+        ReturnExpr::Call { name, args, .. } => {
+            if is_aggregate_name(name) {
+                out.push(expr);
+            } else {
+                for arg in args {
+                    collect_agg_nodes(arg, out);
+                }
+            }
+        }
+        ReturnExpr::Case { test, whens, else_ } => {
+            if let Some(t) = test.as_deref() {
+                collect_agg_nodes(t, out);
+            }
+            for (w, t) in whens {
+                collect_agg_nodes(w, out);
+                collect_agg_nodes(t, out);
+            }
+            if let Some(e) = else_.as_deref() {
+                collect_agg_nodes(e, out);
+            }
+        }
+        ReturnExpr::Arith(l, _, r) => {
+            collect_agg_nodes(l, out);
+            collect_agg_nodes(r, out);
+        }
+        ReturnExpr::Neg(e) => collect_agg_nodes(e, out),
+        ReturnExpr::ListLit(items) => {
+            for item in items {
+                collect_agg_nodes(item, out);
+            }
+        }
+        ReturnExpr::Index(base, index) => {
+            collect_agg_nodes(base, out);
+            collect_agg_nodes(index, out);
+        }
+        ReturnExpr::Slice(base, start, end) => {
+            collect_agg_nodes(base, out);
+            if let Some(s) = start.as_deref() {
+                collect_agg_nodes(s, out);
+            }
+            if let Some(e) = end.as_deref() {
+                collect_agg_nodes(e, out);
+            }
+        }
+        // Same `where_clause`-not-checked scope limitation as
+        // `contains_aggregate`'s matching arm.
+        ReturnExpr::ListComp {
+            source, project, ..
+        } => {
+            collect_agg_nodes(source, out);
+            if let Some(p) = project.as_deref() {
+                collect_agg_nodes(p, out);
+            }
+        }
+        ReturnExpr::Quantifier { source, .. } => collect_agg_nodes(source, out),
+        ReturnExpr::MapLit(entries) => {
+            for (_, v) in entries {
+                collect_agg_nodes(v, out);
+            }
+        }
+        ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
+            collect_agg_nodes(l, out);
+            collect_agg_nodes(r, out);
+        }
+        ReturnExpr::Not(e) => collect_agg_nodes(e, out),
+        ReturnExpr::Compare(l, _, r) => {
+            collect_agg_nodes(l, out);
+            collect_agg_nodes(r, out);
+        }
+        ReturnExpr::IsNull(e) => collect_agg_nodes(e, out),
+        ReturnExpr::In(needle, haystack) => {
+            collect_agg_nodes(needle, out);
+            collect_agg_nodes(haystack, out);
+        }
+        ReturnExpr::Var(_)
+        | ReturnExpr::Prop(_)
+        | ReturnExpr::Lit(_)
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..)
+        | ReturnExpr::PatternComprehension { .. } => {}
+    }
+}
+
 pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
     match expr {
         ReturnExpr::CountStar => true,
@@ -3908,15 +4226,16 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
 /// completely unchanged (zero perf/behavior impact on non-aggregating
 /// queries).
 pub(crate) fn has_aggregate(items: &[ReturnItem]) -> bool {
-    // `contains_aggregate`, not `is_top_level_aggregate` -- an aggregate
-    // nested inside a wrapping expression (`1 + count(x)`, now parseable
-    // since ReturnExpr::Arith exists) still needs to route to the
-    // grouping path so `validate_return_items` gets a chance to reject it
-    // with a clear error. With the narrower top-level-only check, such a
-    // query silently took the ordinary per-row path instead (iterating
-    // `rows` directly, which is empty for an empty MATCH) and produced
-    // the wrong row count instead of erroring -- a real bug this exact
-    // widening fixed, not just future-proofing.
+    // `contains_aggregate`, not a narrower "is the item's whole top-level
+    // expression itself an aggregate call" check -- an aggregate nested
+    // inside a wrapping expression (`1 + count(x)`, real Cypher composition
+    // -- see `resolve_grouped_rows`) still needs to route to the grouping
+    // path, both to actually compute it and so `validate_return_items` gets
+    // a chance to reject an invalid composition with a clear error. A
+    // narrower top-level-only check here would let such a query silently
+    // take the ordinary per-row path instead (iterating `rows` directly,
+    // which is empty for an empty MATCH), producing the wrong row count
+    // instead of the right (or correctly rejected) one.
     items.iter().any(|item| contains_aggregate(&item.expr))
 }
 
@@ -4004,67 +4323,197 @@ pub(crate) fn return_star_items(
         .collect())
 }
 
-/// Validates a RETURN/WITH item list before any row is processed: every
-/// aggregate call has exactly one argument (`count(*)`, the zero-argument
-/// form, is `CountStar`, a separate variant — never reaches the `Call`
-/// arm here), no aggregate's own argument contains a nested aggregate
-/// call, and no non-aggregate item's expression contains an aggregate
-/// call anywhere inside it (aggregates must be a return item's entire
-/// top-level expression — justified by there being no arithmetic
-/// operators anywhere in this engine yet, so `count(n) * 2`-style
-/// composition is already impossible, and nothing in the target query set
-/// needs an aggregate nested inside a `CASE` branch).
+/// Validates a RETURN/WITH item list before any row is processed. Two
+/// checks, both real Cypher compile-time errors:
+///
+/// - Every aggregate call (found anywhere -- not just a return item's
+///   whole top-level expression, since `RETURN a, count(a) + 3`-style
+///   composition is real Cypher, TCK's Return6 `[2]` etc) has the right
+///   number of arguments, doesn't nest another aggregate inside its own
+///   argument (`NestedAggregation`), and isn't given a non-deterministic
+///   argument like `rand()` (`NonConstantExpression`).
+/// - Once *any* item aggregates, every other item's own non-aggregate
+///   leaf (a bare `Var`/`Prop` used outside any aggregate call) must
+///   match some *other* item's whole top-level expression verbatim
+///   (`AmbiguousAggregationExpression`, TCK's Return6 `[20]`/`[21]`) --
+///   real Cypher's rule that a value used alongside an aggregate must
+///   itself be an explicit grouping key, not just something that happens
+///   to be in scope. A literal/param is always fine (same value on every
+///   row, nothing to group by). This is checked by recursing into every
+///   item whose expression contains an aggregate anywhere, stopping at
+///   each aggregate-bearing subexpression itself (its own argument
+///   doesn't need to be grouping-key-safe -- it's folded per row).
 pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
     for item in items {
-        match &item.expr {
-            ReturnExpr::CountStar => {}
-            ReturnExpr::Call { name, args, .. } if is_aggregate_name(name) => {
-                // `percentileCont`/`percentileDisc` take a second argument
-                // (the percentile) alongside the value being aggregated —
-                // every other aggregate takes exactly one.
-                let expected_args = if is_percentile_name(name) { 2 } else { 1 };
-                if args.len() != expected_args {
-                    return Err(QueryError::Semantic(if expected_args == 2 {
-                        format!(
-                            "{name}() takes exactly two arguments (the value, then the percentile)"
-                        )
-                    } else {
-                        format!(
-                            "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
-                        )
-                    }));
+        if contains_aggregate(&item.expr) {
+            validate_composed_expr(&item.expr, items)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_composed_expr(expr: &ReturnExpr, items: &[ReturnItem]) -> Result<(), QueryError> {
+    if matches!(expr, ReturnExpr::CountStar) {
+        return Ok(());
+    }
+    if let ReturnExpr::Call { name, args, .. } = expr {
+        if is_aggregate_name(name) {
+            // `percentileCont`/`percentileDisc` take a second argument
+            // (the percentile) alongside the value being aggregated —
+            // every other aggregate takes exactly one.
+            let expected_args = if is_percentile_name(name) { 2 } else { 1 };
+            if args.len() != expected_args {
+                return Err(QueryError::Semantic(if expected_args == 2 {
+                    format!("{name}() takes exactly two arguments (the value, then the percentile)")
+                } else {
+                    format!(
+                        "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
+                    )
+                }));
+            }
+            for arg in args {
+                if contains_aggregate(arg) {
+                    return Err(QueryError::Semantic(format!(
+                        "aggregate function '{name}' can't take another aggregate as an argument"
+                    )));
                 }
-                for arg in args {
-                    if contains_aggregate(arg) {
-                        return Err(QueryError::Semantic(format!(
-                            "aggregate function '{name}' can't take another aggregate as an argument"
-                        )));
-                    }
-                    // `count(rand())` etc -- an aggregate's argument must be
-                    // deterministic per row for grouping/re-execution to have
-                    // well-defined semantics, which `rand()` (a fresh value on
-                    // every call, see its own docs) fundamentally breaks. Real
-                    // Cypher rejects this at compile time (TCK's Return6
-                    // [15], `NonConstantExpression`), not just "whatever value
-                    // it happens to produce."
-                    if contains_rand_call(arg) {
-                        return Err(QueryError::Semantic(format!(
-                            "aggregate function '{name}' can't take a non-deterministic expression \
-                             (e.g. rand()) as an argument"
-                        )));
-                    }
+                // `count(rand())` etc -- an aggregate's argument must be
+                // deterministic per row for grouping/re-execution to have
+                // well-defined semantics, which `rand()` (a fresh value on
+                // every call, see its own docs) fundamentally breaks. Real
+                // Cypher rejects this at compile time (TCK's Return6
+                // [15], `NonConstantExpression`), not just "whatever value
+                // it happens to produce."
+                if contains_rand_call(arg) {
+                    return Err(QueryError::Semantic(format!(
+                        "aggregate function '{name}' can't take a non-deterministic expression \
+                         (e.g. rand()) as an argument"
+                    )));
                 }
             }
-            other => {
-                if contains_aggregate(other) {
-                    return Err(QueryError::Semantic(
-                        "an aggregate function must be a return item's entire expression, not nested inside \
-                         another expression"
-                            .into(),
-                    ));
-                }
+            return Ok(());
+        }
+    }
+    if matches!(expr, ReturnExpr::Var(_) | ReturnExpr::Prop(_)) {
+        let is_grouping_key = items
+            .iter()
+            .any(|it| it.expr == *expr && !contains_aggregate(&it.expr));
+        return if is_grouping_key {
+            Ok(())
+        } else {
+            Err(QueryError::Semantic(format!(
+                "{expr:?} is used alongside an aggregate function but isn't itself one of this \
+                 RETURN/WITH's own items -- once any item aggregates, every other value used \
+                 with it must be listed as its own explicit grouping key"
+            )))
+        };
+    }
+    // `Lit`/`HasLabel`/`PatternPredicate`/`PatternComprehension` need no
+    // check here: a literal is the same value on every row (nothing to
+    // group by), and the other three are opaque leaves for this same
+    // reason `contains_aggregate`/`collect_agg_nodes` treat them that way
+    // (see their own docs) -- not reachable with real content to check
+    // since none can themselves contain an aggregate.
+    match expr {
+        ReturnExpr::Case { test, whens, else_ } => {
+            if let Some(t) = test.as_deref() {
+                validate_composed_expr(t, items)?;
+            }
+            for (w, t) in whens {
+                validate_composed_expr(w, items)?;
+                validate_composed_expr(t, items)?;
+            }
+            if let Some(e) = else_.as_deref() {
+                validate_composed_expr(e, items)?;
             }
         }
+        ReturnExpr::Call { args, .. } => {
+            for arg in args {
+                validate_composed_expr(arg, items)?;
+            }
+        }
+        ReturnExpr::Arith(l, _, r) => {
+            validate_composed_expr(l, items)?;
+            validate_composed_expr(r, items)?;
+        }
+        ReturnExpr::Neg(e) => validate_composed_expr(e, items)?,
+        ReturnExpr::ListLit(list_items) => {
+            for item in list_items {
+                validate_composed_expr(item, items)?;
+            }
+        }
+        ReturnExpr::Index(base, index) => {
+            validate_composed_expr(base, items)?;
+            validate_composed_expr(index, items)?;
+        }
+        ReturnExpr::Slice(base, start, end) => {
+            validate_composed_expr(base, items)?;
+            if let Some(s) = start.as_deref() {
+                validate_composed_expr(s, items)?;
+            }
+            if let Some(e) = end.as_deref() {
+                validate_composed_expr(e, items)?;
+            }
+        }
+        // `source` may itself be a (possibly composed) aggregate --
+        // `[x IN collect(p) | head(nodes(x))]` aggregates once per group
+        // to build the list, then the comprehension iterates its result
+        // normally (TCK's List12 [4]/[5], real and required) -- recursed
+        // into below via the generic `Call`/`Arith`/etc. machinery, same
+        // as any other composed leaf. `project`, in contrast, runs once
+        // *per element* of that already-built list -- an aggregate
+        // there has no defined semantics at all (real Cypher flatly
+        // rejects it, TCK's List12 [7], "Fail when using aggregation in
+        // list comprehension") and `resolve_grouped_rows` has no
+        // "fold once per group, then run per element" fold shape for it
+        // anyway, so it's checked directly here rather than falling
+        // through to the generic recursion below, which would otherwise
+        // validate (and `rewrite_composed_item` would then evaluate) a
+        // nested aggregate as if it were an ordinary composed leaf.
+        ReturnExpr::ListComp {
+            source,
+            project,
+            where_clause,
+            ..
+        } => {
+            if project.as_deref().is_some_and(contains_aggregate) {
+                return Err(QueryError::Semantic(
+                    "an aggregate function can't be used inside a list comprehension's projection"
+                        .into(),
+                ));
+            }
+            validate_composed_expr(source, items)?;
+            // `where_clause` isn't checked -- same scope limitation as
+            // `contains_aggregate`'s own matching arm.
+            let _ = where_clause;
+        }
+        ReturnExpr::Quantifier { source, .. } => validate_composed_expr(source, items)?,
+        ReturnExpr::MapLit(entries) => {
+            for (_, v) in entries {
+                validate_composed_expr(v, items)?;
+            }
+        }
+        ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
+            validate_composed_expr(l, items)?;
+            validate_composed_expr(r, items)?;
+        }
+        ReturnExpr::Not(e) => validate_composed_expr(e, items)?,
+        ReturnExpr::Compare(l, _, r) => {
+            validate_composed_expr(l, items)?;
+            validate_composed_expr(r, items)?;
+        }
+        ReturnExpr::IsNull(e) => validate_composed_expr(e, items)?,
+        ReturnExpr::In(needle, haystack) => {
+            validate_composed_expr(needle, items)?;
+            validate_composed_expr(haystack, items)?;
+        }
+        ReturnExpr::CountStar
+        | ReturnExpr::Var(_)
+        | ReturnExpr::Prop(_)
+        | ReturnExpr::Lit(_)
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..)
+        | ReturnExpr::PatternComprehension { .. } => {}
     }
     Ok(())
 }

@@ -1501,14 +1501,67 @@ fn match_create_binds_created_relationship_for_return() {
 /// -- see `has_aggregate`'s own doc comment for the real scenario this
 /// caught.
 #[test]
-fn nested_aggregate_inside_arithmetic_is_rejected_not_silently_wrong() {
+fn aggregate_composed_with_arithmetic_computes_per_group() {
+    // TCK clauses/return Return6 [2]/[9]: an aggregate doesn't need to be
+    // a return item's *entire* top-level expression -- `count(n) + 3`,
+    // `count(*) * 10` etc are real Cypher, evaluated once per group with
+    // the aggregate's finished value substituted in.
     let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()");
+
+    fn int_at(result: &marsdb_query::QueryResult) -> i64 {
+        match &result.rows[0][0] {
+            Value::Property(marsdb_graph::PropertyValue::Int(n)) => *n,
+            other => panic!("unexpected value {other:?}"),
+        }
+    }
+
     let stmt = marsdb_query::parse("MATCH (n) RETURN 1 + count(n)").unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int_at(&result), 2);
+
+    let stmt = marsdb_query::parse("MATCH () RETURN count(*) * 10 AS c").unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int_at(&result), 10);
+}
+
+#[test]
+fn nested_aggregate_inside_another_aggregates_argument_is_rejected() {
+    // TCK Return6 [14]: `count(count(*))` -- an aggregate's own argument
+    // can't itself contain another aggregate (NestedAggregation), even
+    // though composing an aggregate with *non*-aggregate arithmetic
+    // (the test above) is fine.
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = marsdb_query::parse("RETURN count(count(*))").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(
-        err.to_string().contains("entire expression"),
+        err.to_string().contains("another aggregate"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn aggregate_composed_expression_requires_leaf_to_be_an_explicit_grouping_key() {
+    // TCK Return6 [20]/[21]: once any item aggregates, a non-aggregate
+    // leaf used alongside it must itself be listed as its own item --
+    // just being in scope isn't enough (AmbiguousAggregationExpression).
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Person)-[:X]->(:Person)");
+    let stmt =
+        marsdb_query::parse("MATCH (me:Person)--(you:Person) RETURN me.age + count(you.age)")
+            .unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("grouping key"),
+        "unexpected error: {err}"
+    );
+
+    // Same leaf, but now also listed as its own item -- legal.
+    let stmt = marsdb_query::parse(
+        "MATCH (me:Person)--(you:Person) RETURN me.age, me.age + count(you.age)",
+    )
+    .unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_ok());
 }
 
 #[test]
@@ -7593,4 +7646,26 @@ fn delete_multiple_bare_variables_across_two_rows_of_the_same_edge() {
     assert_eq!(int_value(&result.rows[0][0]), 2);
     let count = run(&store, "MATCH (n) RETURN count(n)");
     assert_eq!(int_value(&count.rows[0][0]), 0);
+}
+
+#[test]
+fn delete_multiple_path_targets_deletes_all_edges_before_any_node() {
+    // TCK Delete5 [7]: two DELETE targets in one (non-DETACH) clause can
+    // each hold one of a shared node's two edges -- deleting the first
+    // target's node inline (before the second target's edge is gone)
+    // would wrongly fail with "node has incident edges", even though the
+    // whole DELETE, taken together, removes every edge that node had.
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:User), (b:User) CREATE (a)-[:R]->(b), (b)-[:R]->(a)",
+    );
+    run(
+        &store,
+        "MATCH p = (:User)-[r]->(:User) \
+         WITH {key: collect(p)} AS pathColls \
+         DELETE pathColls.key[0], pathColls.key[1]",
+    );
+    let nodes = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int_value(&nodes.rows[0][0]), 0);
 }
