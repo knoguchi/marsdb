@@ -1,109 +1,160 @@
 // Not wired into a public entry point yet -- only this file's own tests
-// use these functions until later Phase 2 increments call them from a
-// higher grammar rule. Remove once that happens.
+// exercise `Visitor::visit` until later Phase 2 increments need more of
+// `AstNode`. Remove once that happens.
 #![allow(dead_code)]
 
 //! ANTLR-based AST builder (Phase 2, mars-nog) -- replaces `parser.rs`'s
 //! pest-tree-walk once complete, built incrementally clause by clause.
 //! Not wired into `parse`/`parse_many` yet.
 //!
-//! ANTLR4's Rust target only supports one shared `Return` type across an
-//! entire `Visitor` implementation (`ParseTreeVisitorCompat::Return`),
-//! which doesn't fit a heterogeneous AST (`Literal` vs `Expr` vs
-//! `Statement` ...) without an enum wrapping every possible node type and
-//! unwrapping it at every call site. Walking the generated `XContextAttrs`
-//! accessors directly (this file's approach) mirrors `parser.rs`'s
-//! existing one-fn-per-rule style and avoids that -- swap pest's
-//! `Pair<Rule>` for ANTLR's generated `XContextAll`, keep the shape.
+//! Implements the generated `CypherParserVisitorCompat` trait rather than
+//! manually walking context accessors: ANTLR's own `accept()`/`visit()`
+//! double-dispatch already routes to the right `visit_X` method for
+//! whichever grammar alternative is actually present, so alternation
+//! (`literal : boolLit | numLit | NULL_W | stringLit | charLit | listLit
+//! | mapLit`) doesn't need a hand-written `if let Some(x) = ctx.boolLit()
+//! ... else if ...` chain -- only `visit_literal` needs a one-line manual
+//! check, for the bare `NULL_W` terminal alternative specifically (a
+//! terminal has no grammar-rule `visit_X` hook of its own to override).
+//!
+//! `Return` (via [`AstNode`]) is one shared enum across the whole
+//! visitor -- required by `ParseTreeVisitorCompat`, which supports
+//! exactly one `Return` type for the entire tree walk, not a per-rule
+//! type. Grows a variant per AST node kind as later increments need it.
 
 use crate::ast::Literal;
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
-    BoolLitContextAll, BoolLitContextAttrs, CharLitContextAll, CharLitContextAttrs,
-    LiteralContextAll, LiteralContextAttrs, NumLitContextAll, NumLitContextAttrs,
-    StringLitContextAll, StringLitContextAttrs,
+    BoolLitContext, BoolLitContextAttrs, CharLitContext, CharLitContextAttrs, LiteralContext,
+    LiteralContextAttrs, NumLitContext, NumLitContextAttrs, StringLitContext,
+    StringLitContextAttrs,
 };
+use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{parse_int_literal, unescape_string};
-use antlr4rust::tree::ParseTree;
+use antlr4rust::tree::{ParseTree, ParseTreeVisitorCompat};
 
-pub(crate) fn build_literal(ctx: &LiteralContextAll) -> Result<Literal, QueryError> {
-    if let Some(b) = ctx.boolLit() {
-        return Ok(build_bool_lit(&b));
-    }
-    if let Some(n) = ctx.numLit() {
-        return build_num_lit(&n);
-    }
-    if ctx.NULL_W().is_some() {
-        return Ok(Literal::Null);
-    }
-    if let Some(s) = ctx.stringLit() {
-        return build_string_lit(&s);
-    }
-    if let Some(c) = ctx.charLit() {
-        return build_char_lit(&c);
-    }
-    // listLit/mapLit are handled at the `Expr` level (`Expr::List`/
-    // `Expr::Map`), not here -- `literal`'s other two alternatives.
-    unreachable!("literal context has no boolLit/numLit/NULL_W/stringLit/charLit child")
+#[derive(Debug, Default)]
+pub(crate) enum AstNode {
+    #[default]
+    None,
+    Literal(Literal),
+    Err(QueryError),
 }
 
-fn build_bool_lit(ctx: &BoolLitContextAll) -> Literal {
-    Literal::Bool(ctx.TRUE().is_some())
-}
-
-/// The lexer's `DIGIT` token covers hex/octal/decimal integers *and*
-/// floats in one token (`DIGIT : HexDigits | OctalDigits | Digits |
-/// FLOAT;`), unlike pest's grammar which split `int_literal`/
-/// `float_literal` into separate rules -- so int-vs-float has to be
-/// decided from the raw text here instead of from which sub-rule matched.
-/// Hex/octal integers can't contain `.`/exponent/`f`/`d` at all (the
-/// lexer wouldn't have matched `DIGIT` as those alternatives if they
-/// did), so checking for those unconditionally is safe and doesn't
-/// misfire on e.g. `0xE` (a hex digit `E`, not a float exponent).
-fn build_num_lit(ctx: &NumLitContextAll) -> Result<Literal, QueryError> {
-    let text = ctx
-        .DIGIT()
-        .expect("numLit context always has a DIGIT token")
-        .get_text();
-    let is_float = text.contains('.')
-        || text.ends_with(['f', 'F', 'd', 'D'])
-        || text
-            .rfind(['e', 'E'])
-            .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-'));
-    if is_float {
-        let f: f64 = text
-            .parse()
-            .map_err(|_| QueryError::Syntax(format!("invalid float literal '{text}'")))?;
-        // `str::parse::<f64>()` silently returns `f64::INFINITY` for a
-        // magnitude beyond f64's representable range instead of erroring
-        // (`"1e999".parse::<f64>()` is `Ok(inf)`) -- real Cypher requires
-        // this to be a compile-time error (TCK Literals5 [27],
-        // `FloatingPointOverflow`).
-        if f.is_infinite() {
-            return Err(QueryError::Syntax(format!(
-                "float literal '{text}' is too large to represent"
-            )));
+impl AstNode {
+    fn into_literal(self) -> Result<Literal, QueryError> {
+        match self {
+            AstNode::Literal(l) => Ok(l),
+            AstNode::Err(e) => Err(e),
+            other => unreachable!("expected AstNode::Literal, got {other:?}"),
         }
-        Ok(Literal::Float(f))
-    } else {
-        Ok(Literal::Int(parse_int_literal(&text)?))
     }
 }
 
-fn build_string_lit(ctx: &StringLitContextAll) -> Result<Literal, QueryError> {
-    let text = ctx
-        .STRING_LITERAL()
-        .expect("stringLit context always has a STRING_LITERAL token")
-        .get_text();
-    Ok(Literal::String(unescape_string(&text[1..text.len() - 1])?))
+pub(crate) struct AstBuilder {
+    result: AstNode,
 }
 
-fn build_char_lit(ctx: &CharLitContextAll) -> Result<Literal, QueryError> {
-    let text = ctx
-        .CHAR_LITERAL()
-        .expect("charLit context always has a CHAR_LITERAL token")
-        .get_text();
-    Ok(Literal::String(unescape_string(&text[1..text.len() - 1])?))
+impl AstBuilder {
+    pub(crate) fn new() -> Self {
+        AstBuilder {
+            result: AstNode::default(),
+        }
+    }
+}
+
+impl<'input> ParseTreeVisitorCompat<'input> for AstBuilder {
+    type Node = crate::generated::cypherparser::CypherParserContextType;
+    type Return = AstNode;
+
+    fn temp_result(&mut self) -> &mut Self::Return {
+        &mut self.result
+    }
+}
+
+impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
+    fn visit_literal(&mut self, ctx: &LiteralContext<'input>) -> Self::Return {
+        // The only alternative that's a bare terminal, not a sub-rule --
+        // no `visit_X` grammar-rule hook exists to override for it, so it
+        // needs the one manual check `visit_children`'s default dispatch
+        // can't cover on its own.
+        if ctx.NULL_W().is_some() {
+            return AstNode::Literal(Literal::Null);
+        }
+        self.visit_children(ctx)
+    }
+
+    fn visit_boolLit(&mut self, ctx: &BoolLitContext<'input>) -> Self::Return {
+        AstNode::Literal(Literal::Bool(ctx.TRUE().is_some()))
+    }
+
+    /// The lexer's `DIGIT` token covers hex/octal/decimal integers *and*
+    /// floats in one token (`DIGIT : HexDigits | OctalDigits | Digits |
+    /// FLOAT;`), unlike pest's grammar which split `int_literal`/
+    /// `float_literal` into separate rules -- so int-vs-float is decided
+    /// from the raw text here instead of from which sub-rule matched.
+    /// Hex/octal integers can't contain `.`/exponent/`f`/`d` at all (the
+    /// lexer wouldn't have matched `DIGIT` as those alternatives if they
+    /// did), so checking for those unconditionally is safe and doesn't
+    /// misfire on e.g. `0xE` (a hex digit `E`, not a float exponent).
+    fn visit_numLit(&mut self, ctx: &NumLitContext<'input>) -> Self::Return {
+        let text = ctx
+            .DIGIT()
+            .expect("numLit context always has a DIGIT token")
+            .get_text();
+        let is_float = text.contains('.')
+            || text.ends_with(['f', 'F', 'd', 'D'])
+            || text
+                .rfind(['e', 'E'])
+                .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-'));
+        let result = if is_float {
+            text.parse::<f64>()
+                .map_err(|_| QueryError::Syntax(format!("invalid float literal '{text}'")))
+                .and_then(|f| {
+                    // `str::parse::<f64>()` silently returns `f64::INFINITY`
+                    // for a magnitude beyond f64's representable range
+                    // instead of erroring (`"1e999".parse::<f64>()` is
+                    // `Ok(inf)`) -- real Cypher requires this to be a
+                    // compile-time error (TCK Literals5 [27],
+                    // `FloatingPointOverflow`).
+                    if f.is_infinite() {
+                        Err(QueryError::Syntax(format!(
+                            "float literal '{text}' is too large to represent"
+                        )))
+                    } else {
+                        Ok(Literal::Float(f))
+                    }
+                })
+        } else {
+            parse_int_literal(&text).map(Literal::Int)
+        };
+        match result {
+            Ok(lit) => AstNode::Literal(lit),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_stringLit(&mut self, ctx: &StringLitContext<'input>) -> Self::Return {
+        let text = ctx
+            .STRING_LITERAL()
+            .expect("stringLit context always has a STRING_LITERAL token")
+            .get_text();
+        match unescape_string(&text[1..text.len() - 1]) {
+            Ok(s) => AstNode::Literal(Literal::String(s)),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_charLit(&mut self, ctx: &CharLitContext<'input>) -> Self::Return {
+        let text = ctx
+            .CHAR_LITERAL()
+            .expect("charLit context always has a CHAR_LITERAL token")
+            .get_text();
+        match unescape_string(&text[1..text.len() - 1]) {
+            Ok(s) => AstNode::Literal(Literal::String(s)),
+            Err(e) => AstNode::Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +173,7 @@ mod tests {
         let ctx = parser
             .literal()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `literal`: {e:?}"));
-        build_literal(&ctx)
+        AstBuilder::new().visit(&*ctx).into_literal()
     }
 
     #[test]
