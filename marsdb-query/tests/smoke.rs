@@ -7870,3 +7870,81 @@ fn delete_multiple_path_targets_deletes_all_edges_before_any_node() {
     let nodes = run(&store, "MATCH (n) RETURN count(n)");
     assert_eq!(int_value(&nodes.rows[0][0]), 0);
 }
+
+/// `<expr>.prop` where `<expr>` isn't a bare variable -- `startNode(r).id`
+/// (a function-call result). TCK's Merge5 [11].
+#[test]
+fn property_access_on_a_function_calls_result() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a {id: 2}), (b {id: 1})");
+    let result = run(
+        &store,
+        "MATCH (a {id: 2}), (b {id: 1}) MERGE (a)-[r:KNOWS]-(b) \
+         RETURN startNode(r).id AS s, endNode(r).id AS e",
+    );
+    assert_eq!(int(&result.rows[0][0]), 2);
+    assert_eq!(int(&result.rows[0][1]), 1);
+}
+
+/// `(list[1]).prop` -- property access on a node/map produced by indexing
+/// into a list, not a bare variable. TCK's Map1 [3], Graph6 [4]/[8].
+/// Missing properties read back as `null`, same as `var.missing` already
+/// does for a bound variable.
+#[test]
+fn property_access_on_an_indexed_list_element() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({existing: 42, missing: null})");
+    let result = run(
+        &store,
+        "MATCH (n) WITH [123, n] AS list \
+         RETURN (list[1]).missing, (list[1]).missingToo, (list[1]).existing",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert_eq!(int(&result.rows[0][2]), 42);
+
+    let result = run(
+        &store,
+        "WITH [123, {existing: 42, notMissing: null}] AS list \
+         RETURN (list[1]).missing, (list[1]).notMissing, (list[1]).existing",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+    assert!(matches!(result.rows[0][1], Value::Null));
+    assert_eq!(int(&result.rows[0][2]), 42);
+}
+
+/// `MERGE p = ...` -- named-path capture on MERGE itself, both when the
+/// pattern is created fresh and when it's found by an ordinary match.
+/// TCK's Merge1 [13], Merge5 [10].
+#[test]
+fn merge_named_path_capture_on_create_and_on_match() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "MERGE p = (a {num: 1}) RETURN p");
+    match &result.rows[0][0] {
+        Value::Path(elems) => assert_eq!(elems.len(), 1),
+        other => panic!("expected a Path, got {other:?}"),
+    }
+
+    run(&store, "MERGE (a {num: 1}) MERGE (b {num: 2})");
+    let result = run(
+        &store,
+        "MATCH (a {num: 1}), (b {num: 2}) MERGE p = (a)-[:R]->(b) RETURN p",
+    );
+    match &result.rows[0][0] {
+        Value::Path(elems) => assert_eq!(elems.len(), 3),
+        other => panic!("expected a Path, got {other:?}"),
+    }
+    // Re-running the same MERGE finds the just-created relationship
+    // instead of creating a second one -- the found branch must also
+    // capture the path, not just the create branch.
+    let again = run(
+        &store,
+        "MATCH (a {num: 1}), (b {num: 2}) MERGE p = (a)-[:R]->(b) RETURN p",
+    );
+    match &again.rows[0][0] {
+        Value::Path(elems) => assert_eq!(elems.len(), 3),
+        other => panic!("expected a Path, got {other:?}"),
+    }
+    let count = run(&store, "MATCH ()-[r:R]->() RETURN count(r)");
+    assert_eq!(int(&count.rows[0][0]), 1);
+}

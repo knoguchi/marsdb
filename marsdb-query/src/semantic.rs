@@ -281,6 +281,9 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
         }
     }
     bind_match_pattern(pattern, scope)?;
+    if let Some(path_var) = &clause.path_var {
+        bind_kind(scope, path_var, Kind::Path, "path variable")?;
+    }
     for item in clause.on_create.iter().chain(&clause.on_match) {
         validate_set_item(item, scope)?;
     }
@@ -791,6 +794,16 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_property_owner(scope, &access.var)?;
             Kind::Scalar
         }
+        // `<expr>.prop` where `<expr>` isn't a bare variable -- same
+        // permissive stance as `Prop` above (the real node/relationship/
+        // map/temporal-value-or-error check is a runtime one, see
+        // `executor::property_of_value`); only checks that the base
+        // expression itself is well-formed (e.g. no unbound variable
+        // inside it).
+        ReturnExpr::PropOf(base, _) => {
+            infer_expr(base, scope)?;
+            Kind::Scalar
+        }
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => Kind::Scalar,
         ReturnExpr::Call { name, args, .. } => {
             let arg_kinds = args
@@ -874,6 +887,20 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                             require_compatible_kind(kind, &Kind::Edge, "type() argument")?;
                         }
                         Kind::Scalar
+                    }
+                    // Same compile-time-checkable-input-kind reasoning as
+                    // `type()` just above -- both only ever accept a
+                    // relationship, and return the node at its
+                    // start/end.
+                    "startnode" | "endnode" => {
+                        if let Some(kind) = arg_kinds.first() {
+                            require_compatible_kind(
+                                kind,
+                                &Kind::Edge,
+                                "startNode()/endNode() argument",
+                            )?;
+                        }
+                        Kind::Node
                     }
                     // `keys`/`labels`/`properties`/`id`/`size`/`exists`
                     // accept a node, relationship, or (for keys/

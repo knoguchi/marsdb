@@ -1343,17 +1343,16 @@ impl AstBuilder {
         Ok(ReturnExpr::HasLabel(var, labels))
     }
 
-    /// `propertyExpression : atom (DOT name)*`. Mars's `ReturnExpr::Prop`
-    /// is a flat `{var, prop}` pair, not a recursive/chainable node --
-    /// matching pest's own `prop_access` rule, which is likewise a
-    /// dedicated single-level `identifier DOT identifier` production, not
-    /// a generic postfix chain over any atom. So a bare atom (no `.name`
-    /// suffix) passes through unchanged, exactly one suffix on a bare
-    /// variable becomes `Prop`, and anything wider (a chain, or a suffix
-    /// on a non-variable base like a function call's result) errors
-    /// clearly rather than silently mishandling -- neither pest nor this
-    /// parser can represent `duration.between(a, b).days` directly today
-    /// (real queries route it through a bound variable first instead,
+    /// `propertyExpression : atom (DOT name)*`. A bare atom (no `.name`
+    /// suffix) passes through unchanged; exactly one suffix on a bare
+    /// variable becomes the flat `Prop` shape (`{var, prop}`); exactly one
+    /// suffix on anything else (a function call's result, a map literal,
+    /// an indexed list element, ...) becomes `PropOf` instead -- evaluated
+    /// by evaluating the base expression first, then looking the property
+    /// up on whatever `Value` it produced (TCK's Graph6 [4]/[8], Map1
+    /// [3], Merge5 [11]). A *chain* of two or more suffixes still errors
+    /// -- neither pest nor this parser represents that (`duration.
+    /// between(a, b).days` routes through a bound variable first instead,
     /// confirmed against the TCK's own Temporal10 fixtures).
     fn build_property_expression(
         &mut self,
@@ -1364,18 +1363,13 @@ impl AstBuilder {
         let names = ctx.name_all();
         match names.len() {
             0 => Ok(base),
-            1 => {
-                let ReturnExpr::Var(var) = base else {
-                    return Err(QueryError::Syntax(
-                        "property access (`x.prop`) is only supported on a bare variable, not a computed expression"
-                            .into(),
-                    ));
-                };
-                Ok(ReturnExpr::Prop(PropAccess {
+            1 => Ok(match base {
+                ReturnExpr::Var(var) => ReturnExpr::Prop(PropAccess {
                     var,
                     prop: name_text(&names[0]),
-                }))
-            }
+                }),
+                other => ReturnExpr::PropOf(Box::new(other), name_text(&names[0])),
+            }),
             _ => Err(QueryError::Syntax(
                 "chained property access (`a.b.c`) isn't supported yet".into(),
             )),
@@ -2016,15 +2010,23 @@ impl AstBuilder {
     /// other pattern context uses), and real Cypher rejects more than one
     /// `ON CREATE`/`ON MATCH` on the same MERGE (also grammar-permissive,
     /// `mergeAction*` allows any order/count) -- same "grammar permissive,
-    /// builder enforces the exact constraint" split used there. No
-    /// named-path capture either, same reasoning as `build_create_st`.
+    /// builder enforces the exact constraint" split used there.
+    /// `p = ...` named-path capture (unlike `build_create_st`, which still
+    /// rejects it) is supported here -- MERGE's own pattern is simple
+    /// enough (at most one hop, no `shortestPath()`, no variable-length
+    /// hop) that `executor::merge_one_row` can just reuse ordinary MATCH's
+    /// own `name_pattern_for_path`/`assemble_path` machinery directly, no
+    /// bespoke path-assembly logic needed.
     fn build_merge_st(&mut self, ctx: &MergeStContext) -> Result<MergeClause, QueryError> {
         let part_ctx = ctx.patternPart().expect("mergeSt always has a patternPart");
-        if part_ctx.ASSIGN().is_some() {
-            return Err(QueryError::Syntax(
-                "named-path capture (`p = ...`) isn't supported on MERGE".into(),
-            ));
-        }
+        let path_var = if part_ctx.ASSIGN().is_some() {
+            let symbol_ctx = part_ctx
+                .symbol()
+                .expect("patternPart with ASSIGN always has a symbol");
+            Some(symbol_text(&symbol_ctx))
+        } else {
+            None
+        };
         if part_ctx.shortestPathWrapper().is_some() {
             return Err(QueryError::Syntax(
                 "shortestPath() isn't valid in MERGE".into(),
@@ -2065,6 +2067,7 @@ impl AstBuilder {
 
         Ok(MergeClause {
             pattern,
+            path_var,
             on_create,
             on_match,
             with: None,
@@ -3753,8 +3756,22 @@ mod tests {
     }
 
     #[test]
-    fn property_access_on_computed_expr_not_supported() {
-        assert!(parse_expr("duration.between(a, b).days").is_err());
+    fn property_access_on_computed_expr_becomes_prop_of() {
+        // `<expr>.prop` where `<expr>` isn't a bare variable -- `ReturnExpr::
+        // PropOf`, evaluated by evaluating the base first, then looking the
+        // property up on whatever `Value` it produced (TCK's Graph6 [4]/
+        // [8], Map1 [3], Merge5 [11]).
+        let expr = parse_expr("duration.between(a, b).days").unwrap();
+        let ReturnExpr::PropOf(base, prop) = expr else {
+            panic!("expected PropOf, got {expr:?}");
+        };
+        assert_eq!(prop, "days");
+        assert!(matches!(*base, ReturnExpr::Call { .. }));
+    }
+
+    #[test]
+    fn chained_property_access_still_errors() {
+        assert!(parse_expr("a.b.c").is_err());
     }
 
     #[test]
@@ -4134,8 +4151,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_named_path_errors() {
-        assert!(parse_merge("MERGE p = (a)-->(b)").is_err());
+    fn merge_named_path_capture() {
+        let m = parse_merge("MERGE p = (a)-->(b)").unwrap();
+        assert_eq!(m.path_var.as_deref(), Some("p"));
     }
 
     #[test]

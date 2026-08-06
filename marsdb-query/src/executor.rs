@@ -863,6 +863,22 @@ impl<'a> Executor<'a> {
                 ));
             }
         }
+        // `MERGE p = ...` -- give every anonymous token in the pattern a
+        // synthetic name first (same convention ordinary MATCH's own
+        // named-path capture uses, see `execute_match`'s `QueryClause::
+        // Match` arm), so `assemble_path` below has a real row binding to
+        // read at every position regardless of whether the user wrote one
+        // -- then strip those synthetic keys back out before this row
+        // becomes visible to the rest of the query. A no-`path_var` MERGE
+        // clones `clause.pattern` once here rather than working with it
+        // by reference throughout, so this function has exactly one
+        // pattern to work from either way.
+        let (pattern, synthesized) = if clause.path_var.is_some() {
+            name_pattern_for_path(&clause.pattern)
+        } else {
+            (clause.pattern.clone(), HashSet::new())
+        };
+        let pattern = &pattern;
         // A MERGE pattern's own inline `{...}` property evaluating to
         // null can never be searched-or-created consistently: a null
         // property is never equal to anything (so the search half can
@@ -894,7 +910,7 @@ impl<'a> Executor<'a> {
         // free by reusing this instead of inventing bespoke search logic.
         let carried_vars: HashSet<String> = row.keys().cloned().collect();
         let plan = apply_index_seeks(
-            build_match_plan(&clause.pattern, &None, &carried_vars)?,
+            build_match_plan(pattern, &None, &carried_vars)?,
             Txn::Write(write_txn),
         )?;
         let found = self.eval_plan(
@@ -906,7 +922,16 @@ impl<'a> Executor<'a> {
         if !found.is_empty() {
             return Ok(found
                 .into_iter()
-                .map(|r| tag_merge_created(r, false))
+                .map(|mut r| {
+                    if let Some(path_var) = &clause.path_var {
+                        let path_binding = assemble_path(pattern, &r);
+                        for key in &synthesized {
+                            r.remove(key);
+                        }
+                        r.insert(path_var.clone(), path_binding);
+                    }
+                    tag_merge_created(r, false)
+                })
                 .collect());
         }
 
@@ -915,15 +940,14 @@ impl<'a> Executor<'a> {
         // already bound in the row, else create fresh" logic
         // Tail::Create/materialize_create already use.
         let mut new_row = row.clone();
-        let start_id =
-            self.resolve_or_create_node(write_txn, &clause.pattern.start, &new_row, guard)?;
-        if let Some(var) = &clause.pattern.start.var {
+        let start_id = self.resolve_or_create_node(write_txn, &pattern.start, &new_row, guard)?;
+        if let Some(var) = &pattern.start.var {
             new_row.insert(var.clone(), Binding::Node(start_id));
         }
         // At most one hop (enforced at parse time) -- a plain `if let`,
         // not a loop, so there's no dangling "previous node" state to
         // thread once a 2nd+ hop is ever supported.
-        if let Some((rel, node)) = clause.pattern.hops.first() {
+        if let Some((rel, node)) = pattern.hops.first() {
             let node_id = self.resolve_or_create_node(write_txn, node, &new_row, guard)?;
             if let Some(var) = &node.var {
                 new_row.insert(var.clone(), Binding::Node(node_id));
@@ -933,19 +957,26 @@ impl<'a> Executor<'a> {
             );
             let rel_props =
                 self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row, guard)?;
+            // An undirected pattern (`-[r]-`) with nothing to match
+            // defaults to an outgoing relationship when creating -- real
+            // Cypher's own rule (TCK's Merge5 [11], "Use outgoing
+            // direction when unspecified").
             let (src, dst) = match rel.direction {
-                RelDirection::Right => (start_id, node_id),
+                RelDirection::Right | RelDirection::Either => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
-                RelDirection::Either => return Err(QueryError::Semantic(
-                    "MERGE requires a directed relationship (-> or <-), not an undirected pattern"
-                        .into(),
-                )),
             };
             let edge_id =
                 GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
             if let Some(var) = &rel.var {
                 new_row.insert(var.clone(), Binding::Edge(edge_id));
             }
+        }
+        if let Some(path_var) = &clause.path_var {
+            let path_binding = assemble_path(pattern, &new_row);
+            for key in &synthesized {
+                new_row.remove(key);
+            }
+            new_row.insert(path_var.clone(), path_binding);
         }
         Ok(vec![tag_merge_created(new_row, true)])
     }
@@ -1095,11 +1126,15 @@ impl<'a> Executor<'a> {
                     // guaranteed to be `Txn::Write` here.
                     let write_txn = require_write_txn(txn);
                     current_rows = self.eval_merge(write_txn, m, &current_rows, guard)?;
+                    let mut new_vars = pattern_all_vars(&m.pattern);
+                    if let Some(path_var) = &m.path_var {
+                        new_vars.insert(path_var.clone());
+                    }
                     current_rows = self.apply_with_or_carry(
                         txn,
                         &m.with,
                         current_rows,
-                        pattern_all_vars(&m.pattern),
+                        new_vars,
                         &mut carried_vars,
                         guard,
                     )?;
@@ -1977,6 +2012,32 @@ impl<'a> Executor<'a> {
         })
     }
 
+    /// `startNode(r)`/`endNode(r)` — unlike every other builtin function
+    /// (`labels()`, `type()`, ...), which reads straight off the already-
+    /// materialized `Value::Node`/`Edge` it's given, this needs a *second*
+    /// `GraphStore` lookup: `Edge.src`/`.dst` are bare `NodeId`s, not full
+    /// records. `call_builtin` (the free function every other builtin
+    /// dispatches through) has no `Txn` to do that lookup with, so these
+    /// two are special-cased here instead, before ever reaching it.
+    fn start_or_end_node(
+        &self,
+        txn: Txn,
+        which: &str,
+        arg: Option<&Value>,
+    ) -> Result<Value, QueryError> {
+        match arg {
+            None | Some(Value::Null) => Ok(Value::Null),
+            Some(Value::Edge(e)) => {
+                let id = if which == "startnode" { e.src } else { e.dst };
+                let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, id)?)?;
+                Ok(Value::Node(node))
+            }
+            Some(other) => Err(QueryError::Type(format!(
+                "{which}() expects a relationship, got {other:?}"
+            ))),
+        }
+    }
+
     /// `binding_to_value`'s per-element helper for `Binding::Path` — fetches
     /// each element's full current record, same "keep just the id in the
     /// row, resolve to a full record only when materializing for display"
@@ -2299,6 +2360,10 @@ impl<'a> Executor<'a> {
             ReturnExpr::Index(base, index) => ReturnExpr::Index(
                 Box::new(self.rewrite_composed_item(txn, base, ctx, accs, subst)?),
                 Box::new(self.rewrite_composed_item(txn, index, ctx, accs, subst)?),
+            ),
+            ReturnExpr::PropOf(base, prop) => ReturnExpr::PropOf(
+                Box::new(self.rewrite_composed_item(txn, base, ctx, accs, subst)?),
+                prop.clone(),
             ),
             ReturnExpr::Slice(base, start, end) => ReturnExpr::Slice(
                 Box::new(self.rewrite_composed_item(txn, base, ctx, accs, subst)?),
@@ -3365,6 +3430,10 @@ impl<'a> Executor<'a> {
                 self.binding_to_value(txn, binding)
             }
             ReturnExpr::Prop(pa) => self.lookup_prop_value(txn, pa, row),
+            ReturnExpr::PropOf(base, prop) => {
+                let v = self.eval_return_expr(txn, base, row, guard)?;
+                property_of_value(&v, prop)
+            }
             ReturnExpr::Lit(lit) => Ok(match lit {
                 Literal::Null => Value::Null,
                 other => Value::Literal(other.clone()),
@@ -3386,6 +3455,10 @@ impl<'a> Executor<'a> {
                     .iter()
                     .map(|a| self.eval_return_expr(txn, a, row, guard))
                     .collect::<Result<Vec<_>, _>>()?;
+                let lower = name.to_ascii_lowercase();
+                if lower == "startnode" || lower == "endnode" {
+                    return self.start_or_end_node(txn, &lower, arg_values.first());
+                }
                 call_builtin(name, &arg_values, self.now_snapshot())
             }
             ReturnExpr::CountStar => Err(QueryError::Semantic(
@@ -4337,6 +4410,7 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         ReturnExpr::Arith(..) | ReturnExpr::Neg(..) => format!("col{idx}"),
         ReturnExpr::ListLit(..)
         | ReturnExpr::Index(..)
+        | ReturnExpr::PropOf(..)
         | ReturnExpr::Slice(..)
         | ReturnExpr::ListComp { .. }
         | ReturnExpr::Quantifier { .. }
@@ -4419,6 +4493,7 @@ fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
             collect_agg_nodes(base, out);
             collect_agg_nodes(index, out);
         }
+        ReturnExpr::PropOf(base, _) => collect_agg_nodes(base, out),
         ReturnExpr::Slice(base, start, end) => {
             collect_agg_nodes(base, out);
             if let Some(s) = start.as_deref() {
@@ -4485,6 +4560,7 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::Neg(e) => contains_aggregate(e),
         ReturnExpr::ListLit(items) => items.iter().any(contains_aggregate),
         ReturnExpr::Index(base, index) => contains_aggregate(base) || contains_aggregate(index),
+        ReturnExpr::PropOf(base, _) => contains_aggregate(base),
         ReturnExpr::Slice(base, start, end) => {
             contains_aggregate(base)
                 || start.as_deref().is_some_and(contains_aggregate)
@@ -4564,6 +4640,7 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         ReturnExpr::Neg(e) => contains_rand_call(e),
         ReturnExpr::ListLit(items) => items.iter().any(contains_rand_call),
         ReturnExpr::Index(base, index) => contains_rand_call(base) || contains_rand_call(index),
+        ReturnExpr::PropOf(base, _) => contains_rand_call(base),
         ReturnExpr::Slice(base, start, end) => {
             contains_rand_call(base)
                 || start.as_deref().is_some_and(contains_rand_call)
@@ -4770,6 +4847,7 @@ pub(crate) fn validate_composed_expr(
             validate_composed_expr(base, items)?;
             validate_composed_expr(index, items)?;
         }
+        ReturnExpr::PropOf(base, _) => validate_composed_expr(base, items)?,
         ReturnExpr::Slice(base, start, end) => {
             validate_composed_expr(base, items)?;
             if let Some(s) = start.as_deref() {
@@ -8353,6 +8431,50 @@ fn is_temporal_property_value(pv: &PropertyValue) -> bool {
     )
 }
 
+/// `<expr>.prop` where `<expr>` isn't a bare row variable (`ReturnExpr::
+/// PropOf`, e.g. `startNode(r).id`, `head(nodes(p)).name`, `{a: 1}.a`) --
+/// unlike `lookup_prop_value`'s `Prop(PropAccess)` arm, there's no row/txn
+/// lookup to do here, `v` already *is* the fully-evaluated base value, so
+/// this reads straight off it. Same node/edge/map/temporal-value-or-error
+/// shape as `lookup_prop_value`, minus the "unbound variable" case (there's
+/// no variable name to report -- a `PropOf` base that evaluates to
+/// `Value::Null` propagates `Null` here the same way a bound-but-null row
+/// variable's own `.prop` access already does).
+fn property_of_value(v: &Value, prop: &str) -> Result<Value, QueryError> {
+    match v {
+        Value::Node(n) => Ok(n
+            .props
+            .get(prop)
+            .cloned()
+            .map(property_value_to_value)
+            .unwrap_or(Value::Null)),
+        Value::Edge(e) => Ok(e
+            .props
+            .get(prop)
+            .cloned()
+            .map(property_value_to_value)
+            .unwrap_or(Value::Null)),
+        Value::Map(m) => Ok(m.get(prop).cloned().unwrap_or(Value::Null)),
+        Value::Null => Ok(Value::Null),
+        Value::Property(PropertyValue::Null) => Ok(Value::Null),
+        Value::Property(pv) => match temporal_component(pv, prop) {
+            Some(component) => Ok(Value::Property(component)),
+            None if is_temporal_property_value(pv) => Ok(Value::Null),
+            None => Err(QueryError::Type(
+                "property access requires a node, relationship, map, or temporal value".into(),
+            )),
+        },
+        Value::List(_) | Value::Path(_) => Err(QueryError::Type(
+            "property access requires a node, relationship, map, or temporal value, not a list \
+             or path"
+                .into(),
+        )),
+        Value::Literal(_) => Err(QueryError::Type(
+            "property access requires a node, relationship, map, or temporal value".into(),
+        )),
+    }
+}
+
 fn temporal_component(pv: &PropertyValue, prop: &str) -> Option<PropertyValue> {
     match pv {
         PropertyValue::Date(d) => temporal::date_component(*d, prop).map(PropertyValue::Int),
@@ -8548,6 +8670,10 @@ fn eval_projected_expr(
                 }),
                 _ => Ok(Value::Null),
             }
+        }
+        ReturnExpr::PropOf(base, prop) => {
+            let v = eval_projected_expr(base, row)?;
+            property_of_value(&v, prop)
         }
         ReturnExpr::Lit(lit) => Ok(match lit {
             Literal::Null => Value::Null,

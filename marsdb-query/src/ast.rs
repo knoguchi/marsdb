@@ -125,6 +125,12 @@ pub enum Expr {
 pub enum ReturnExpr {
     Var(String),
     Prop(PropAccess),
+    /// `<expr>.prop` where `<expr>` is anything other than a bare variable
+    /// (`startNode(r).id`, `head(nodes(p)).name`, `{a: 1}.a`) — `Prop`
+    /// only covers the flat `var.prop` case (matching pest's own
+    /// `prop_access` rule, a dedicated `identifier DOT identifier`
+    /// production). TCK's Graph6 [4]/[8], Map1 [3], Merge5 [11].
+    PropOf(Box<ReturnExpr>, String),
     Lit(Literal),
     Call {
         name: String,
@@ -662,6 +668,17 @@ pub struct UnwindSource(pub ReturnExpr);
 #[derive(Debug, Clone)]
 pub struct MergeClause {
     pub pattern: Pattern,
+    /// `MERGE p = (a)-[:R]->(b)` -- captures the whole matched-or-created
+    /// pattern as a path, same as ordinary `MATCH`'s own named-path
+    /// capture (`Pattern::path_var`) but on `MergeClause` directly, since
+    /// `Pattern` itself has no notion of a MERGE-vs-MATCH distinction.
+    /// `MergeClause::pattern` caps at one relationship hop (see this
+    /// struct's own construction site), so assembling the path is just
+    /// "the start node, plus the one hop's edge and node if present" --
+    /// no BFS/parent-pointer tracking needed the way a general
+    /// variable-length pattern's path capture would (TCK's Merge1 [13],
+    /// Merge5 [10]).
+    pub path_var: Option<String>,
     pub on_create: Vec<SetItem>,
     pub on_match: Vec<SetItem>,
     pub with: Option<WithClause>,

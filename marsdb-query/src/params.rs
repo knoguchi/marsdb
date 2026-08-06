@@ -364,6 +364,7 @@ fn substitute_return_expr(
             substitute_return_expr(base, params)?;
             substitute_return_expr(index, params)?;
         }
+        ReturnExpr::PropOf(base, _) => substitute_return_expr(base, params)?,
         ReturnExpr::Slice(base, start, end) => {
             substitute_return_expr(base, params)?;
             if let Some(s) = start {
