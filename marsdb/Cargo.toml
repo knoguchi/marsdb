@@ -13,9 +13,9 @@ name = "marsdb"
 path = "src/lib.rs"
 
 [dependencies]
-marsdb-storage = { path = "../marsdb-storage", version = "0.5.0" }
-marsdb-graph = { path = "../marsdb-graph", version = "0.5.0" }
-marsdb-query = { path = "../marsdb-query", version = "0.5.0" }
+marsdb-storage = { path = "../marsdb-storage", version = "0.6.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.6.0" }
+marsdb-query = { path = "../marsdb-query", version = "0.6.0" }
 thiserror.workspace = true
 
 [dev-dependencies]
