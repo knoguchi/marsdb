@@ -1,0 +1,14 @@
+[book]
+title = "MarsDB"
+description = "An embeddable property-graph database with an openCypher query subset"
+authors = ["Kenji Noguchi"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/knoguchi/marsdb"
+edit-url-template = "https://github.com/knoguchi/marsdb/edit/main/book/{path}"
+site-url = "/marsdb/"
+
+[output.html.search]
+enable = true
