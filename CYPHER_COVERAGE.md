@@ -44,7 +44,7 @@ scope.
 | expressions/boolean | 150 | 150 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/comparison | 72 | 72 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/existentialSubqueries | 10 | 5 | 0 | 0 | 5 | 0 | 50.0% |
+| expressions/existentialSubqueries | 10 | 10 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/graph | 61 | 61 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/list | 185 | 185 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/literals | 131 | 131 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3832** | **0** | **3** | **45** | **0** | **98.8%** |
+| **TOTAL** | **3880** | **3837** | **0** | **3** | **40** | **0** | **98.9%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -149,10 +149,12 @@ between these two specific nodes," not "does `n` have any outgoing edge
 at all"), pattern comprehension (`[(n)-[:T]->(b) | b.name]`/
 `[p = (n)-->() | p]` — unlike a pattern predicate, can introduce brand-new
 node/relationship variables, and enumerates every match instead of just
-checking existence), `exists { (n)-->(m) WHERE ... }` (the "simple" form
-only — a pattern with an optional inline `WHERE`; the "full" form,
-`exists { MATCH ... RETURN ... }`, a real nested subquery, isn't
-supported yet), any number of chained `WITH` boundaries per statement
+checking existence), `exists { (n)-->(m) WHERE ... }` (the "simple"
+form — a pattern with an optional inline `WHERE`) and `exists { MATCH
+... RETURN ... }` (the "full" form — an arbitrary read-only nested
+statement, its own aggregation/`WITH`/nested `exists {}` all allowed,
+run correlated against the enclosing row; an updating clause inside it
+is a compile-time error), any number of chained `WITH` boundaries per statement
 (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER BY`/`LIMIT`,
 and `WITH *` — every currently-bound variable carries forward unchanged,
 optionally alongside more items), `RETURN`/`RETURN *`/`DELETE`/

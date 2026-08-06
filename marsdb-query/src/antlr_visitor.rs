@@ -1473,25 +1473,31 @@ impl AstBuilder {
     }
 
     /// `subqueryExist : EXISTS LBRACE (regularQuery | patternWhere)
-    /// RBRACE` -- only the `patternWhere` alternative (TCK's
-    /// ExistentialSubquery1, the "simple" form: a pattern with an
-    /// optional inline `WHERE`, same grammar rule `MATCH` itself uses)
-    /// is supported. The `regularQuery` alternative (TCK's
-    /// ExistentialSubquery2, a full nested `MATCH ... RETURN ...`
-    /// subquery, arbitrarily many clauses) needs running an arbitrary
-    /// nested `Statement` correlated against the current row -- a bigger
-    /// change, not attempted here.
+    /// RBRACE` -- `patternWhere` (TCK's ExistentialSubquery1, the "simple"
+    /// form: a pattern with an optional inline `WHERE`, same grammar rule
+    /// `MATCH` itself uses) builds a `ReturnExpr::ExistsPattern`;
+    /// `regularQuery` (TCK's ExistentialSubquery2/3, a full nested `MATCH
+    /// ... RETURN ...` subquery, arbitrarily many clauses, possibly itself
+    /// containing a nested `exists {}`) reuses `build_regular_query`
+    /// verbatim -- the exact same builder a top-level statement goes
+    /// through -- and wraps the result in `ReturnExpr::ExistsSubquery`.
+    /// Real Cypher restricts `exists {}`'s body to read-only clauses;
+    /// `semantic::validate_statement`/`validate_match_clauses` reject a
+    /// mutating clause or non-`Statement::Match` shape at compile time
+    /// (TCK's ExistentialSubquery2 `[3]`), not here -- this stays a
+    /// structural build step, same division of labor as every other
+    /// pattern this visitor builds.
     fn build_subquery_exist(
         &mut self,
         ctx: &SubqueryExistContext,
     ) -> Result<ReturnExpr, QueryError> {
-        let Some(pw_ctx) = ctx.patternWhere() else {
-            return Err(QueryError::Syntax(
-                "exists { MATCH ... RETURN ... } (a full nested subquery, as opposed to \
-                 exists { (pattern) WHERE ... }) isn't supported yet"
-                    .into(),
-            ));
-        };
+        if let Some(rq_ctx) = ctx.regularQuery() {
+            let stmt = self.build_regular_query(&rq_ctx)?;
+            return Ok(ReturnExpr::ExistsSubquery(Box::new(stmt)));
+        }
+        let pw_ctx = ctx
+            .patternWhere()
+            .expect("subqueryExist always has a regularQuery or patternWhere");
         let pattern_ctx = pw_ctx.pattern().expect("patternWhere always has a pattern");
         let mut parts = pattern_ctx.patternPart_all().into_iter();
         let part = parts
@@ -2721,6 +2727,7 @@ fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
             pattern,
             where_clause,
         },
+        ReturnExpr::ExistsSubquery(stmt) => Expr::ExistsSubquery(stmt),
         other => Expr::GeneralBare(other),
     })
 }
