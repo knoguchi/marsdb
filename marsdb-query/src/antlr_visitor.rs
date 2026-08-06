@@ -53,15 +53,16 @@ use crate::generated::cypherparser::{
     ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertyExpressionContext,
     PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
     PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
-    ReadingStatementContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
-    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
-    RemoveItemContextAll, RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs,
-    ReturnStContext, ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext,
-    SetStContextAttrs, SinglePartQContext, SinglePartQContextAttrs, SkipStContextAttrs,
+    ReadingStatementContextAttrs, RegularQueryContext, RegularQueryContextAttrs,
+    RelationDetailContext, RelationDetailContextAttrs, RelationshipPatternContext,
+    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs, RemoveItemContextAll,
+    RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
+    ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
+    SinglePartQContext, SinglePartQContextAttrs, SkipStContextAttrs, StandaloneCallContext,
     StringExpPrefixContextAll, StringExpPrefixContextAttrs, StringExpressionContextAll,
     StringExpressionContextAttrs, StringLitContext, StringLitContextAttrs, SymbolContextAll,
     SymbolContextAttrs, UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs,
-    UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
+    UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
     UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
     XorExpressionContext, XorExpressionContextAttrs,
 };
@@ -562,6 +563,27 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             Ok(s) => AstNode::Statement(s),
             Err(e) => AstNode::Err(e),
         }
+    }
+
+    fn visit_regularQuery(&mut self, ctx: &RegularQueryContext<'input>) -> Self::Return {
+        match self.build_regular_query(ctx) {
+            Ok(s) => AstNode::Statement(s),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    // `query : regularQuery | standaloneCall` -- `regularQuery` needs no
+    // override of its own here (default `visit_children` dispatch already
+    // routes to `visit_regularQuery` above), but `standaloneCall` (a bare
+    // `CALL proc(...) YIELD ...` with no MATCH at all) has no `Statement`
+    // representation yet (same CALL gap as `queryCallSt`, tracked
+    // separately as mars-82w) -- overridden so reaching it errors cleanly
+    // instead of default-recursing into its inner symbol/expression nodes
+    // and silently producing a wrong-shaped `AstNode`.
+    fn visit_standaloneCall(&mut self, _ctx: &StandaloneCallContext<'input>) -> Self::Return {
+        AstNode::Err(QueryError::Syntax(
+            "CALL isn't supported by the ANTLR parser yet".into(),
+        ))
     }
 
     fn visit_listLit(&mut self, ctx: &ListLitContext<'input>) -> Self::Return {
@@ -1900,6 +1922,113 @@ impl AstBuilder {
             limit,
         })
     }
+
+    /// `regularQuery : singleQuery unionSt*`. No `unionSt` at all just
+    /// passes the single `Statement` straight through -- `singleQuery`
+    /// itself (`singlePartQ | multiPartQ`) needs no override, default
+    /// dispatch already routes to whichever of those two produced the
+    /// `Statement`. Otherwise mirrors `parser.rs`'s `parse_union_stmt`:
+    /// every `unionSt`'s `ALL` presence must agree (real Cypher rejects
+    /// mixing bare `UNION` and `UNION ALL` in one statement), checked here
+    /// rather than in the grammar since it's only knowable once every
+    /// occurrence is in hand.
+    fn build_regular_query(&mut self, ctx: &RegularQueryContext) -> Result<Statement, QueryError> {
+        let sq_ctx = ctx
+            .singleQuery()
+            .expect("regularQuery always has a singleQuery");
+        let first = self.visit(&*sq_ctx).into_statement()?;
+        let unions = ctx.unionSt_all();
+        if unions.is_empty() {
+            return Ok(first);
+        }
+        let mut parts = vec![first];
+        let mut all: Option<bool> = None;
+        for u_ctx in unions {
+            let this_all = u_ctx.ALL().is_some();
+            match all {
+                None => all = Some(this_all),
+                Some(prev) if prev != this_all => {
+                    return Err(QueryError::Syntax(
+                        "can't mix UNION and UNION ALL in the same statement".into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+            let part_sq = u_ctx
+                .singleQuery()
+                .expect("unionSt always has a singleQuery");
+            parts.push(self.visit(&*part_sq).into_statement()?);
+        }
+        Ok(Statement::Union {
+            parts,
+            all: all.unwrap_or(false),
+        })
+    }
+}
+
+/// Parallel entry point alongside `parser::parse` -- not wired into
+/// `lib.rs`'s public `parse`/`parse_many` yet (that's Phase 3's cutover,
+/// gated on this whole file's remaining gaps: CALL, EXPLAIN, CREATE INDEX,
+/// none of which this vendored grammar (antlr/grammars-v4/cypher) supports
+/// at all yet -- the last two would need a grammar patch, not just visitor
+/// work). Exercised directly by this file's own tests and, later, a
+/// filtered TCK run comparing against `parser::parse`'s output.
+#[cfg(test)]
+pub(crate) fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
+    use crate::generated::cypherlexer::CypherLexer;
+    use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
+    use antlr4rust::common_token_stream::CommonTokenStream;
+    use antlr4rust::error_listener::ErrorListener;
+    use antlr4rust::recognizer::Recognizer;
+    use antlr4rust::token_factory::TokenFactory;
+    use antlr4rust::InputStream;
+    use antlr4rust::Parser as _;
+    use std::cell::RefCell;
+
+    struct CollectErrors(Rc<RefCell<Vec<String>>>);
+    impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectErrors {
+        fn syntax_error(
+            &self,
+            _recognizer: &T,
+            _offending_symbol: Option<&<T::TF as TokenFactory<'a>>::Inner>,
+            line: isize,
+            column: isize,
+            msg: &str,
+            _e: Option<&antlr4rust::errors::ANTLRError>,
+        ) {
+            self.0
+                .borrow_mut()
+                .push(format!("line {line}:{column} {msg}"));
+        }
+    }
+
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let stream = InputStream::new(input);
+    let mut lexer = CypherLexer::new(stream);
+    lexer.remove_error_listeners();
+    lexer.add_error_listener(Box::new(CollectErrors(errors.clone())));
+    let tokens = CommonTokenStream::new(lexer);
+    let mut parser = CypherParser::new(tokens);
+    parser.remove_error_listeners();
+    parser.add_error_listener(Box::new(CollectErrors(errors.clone())));
+    let ctx = parser
+        .script()
+        .map_err(|e| QueryError::Syntax(e.to_string()))?;
+    if let Some(msg) = errors.borrow().first() {
+        return Err(QueryError::Syntax(format!("syntax error: {msg}")));
+    }
+    // `script : query SEMI? EOF` -- visiting the whole tree would run
+    // straight into the default `aggregate_results`' unconditional
+    // "last child wins" rule (not "last *non-default*", despite this
+    // file's other alternation rules getting away with relying on that
+    // distinction -- see this function's own docs): the trailing `EOF`
+    // terminal has no `visit_X` hook of its own, so it'd overwrite
+    // `query`'s real result with `AstNode::None`. Visiting `query`
+    // directly sidesteps it -- `script`'s own job (rejecting trailing
+    // garbage after a valid query) is already done by the `parser.script()`
+    // call above succeeding.
+    let query_ctx = ctx.query().expect("script always has a query");
+    AstBuilder::new().visit(&*query_ctx).into_statement()
 }
 
 /// `where`'s grammar reuses the same `expression` rule as everywhere else
@@ -3335,5 +3464,61 @@ mod tests {
             panic!("expected first clause to be Merge");
         };
         assert!(m.with.is_some());
+    }
+
+    #[test]
+    fn parse_antlr_no_union_passes_through() {
+        let s = parse_antlr("MATCH (a) RETURN a;").unwrap();
+        assert!(matches!(s, Statement::Match { .. }));
+    }
+
+    #[test]
+    fn parse_antlr_union() {
+        let s = parse_antlr("MATCH (a) RETURN a UNION MATCH (b) RETURN b;").unwrap();
+        let Statement::Union { parts, all } = s else {
+            panic!("expected Statement::Union");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(!all);
+    }
+
+    #[test]
+    fn parse_antlr_union_all() {
+        let s = parse_antlr("MATCH (a) RETURN a UNION ALL MATCH (b) RETURN b;").unwrap();
+        let Statement::Union { parts, all } = s else {
+            panic!("expected Statement::Union");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(all);
+    }
+
+    #[test]
+    fn parse_antlr_union_three_parts() {
+        let s =
+            parse_antlr("MATCH (a) RETURN a UNION MATCH (b) RETURN b UNION MATCH (c) RETURN c;")
+                .unwrap();
+        let Statement::Union { parts, .. } = s else {
+            panic!("expected Statement::Union");
+        };
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn parse_antlr_mixed_union_and_union_all_errors() {
+        let err = parse_antlr(
+            "MATCH (a) RETURN a UNION MATCH (b) RETURN b UNION ALL MATCH (c) RETURN c;",
+        )
+        .unwrap_err();
+        assert!(matches!(err, QueryError::Syntax(_)));
+    }
+
+    #[test]
+    fn parse_antlr_standalone_call_not_supported() {
+        assert!(parse_antlr("CALL db.labels() YIELD label;").is_err());
+    }
+
+    #[test]
+    fn parse_antlr_syntax_error() {
+        assert!(parse_antlr("MATCH (a RETURN a;").is_err());
     }
 }
