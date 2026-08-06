@@ -3,6 +3,11 @@ mod ast;
 mod error;
 mod executor;
 mod explain;
+// ANTLR-generated Cypher lexer/parser (see grammar/README.md) -- not wired
+// into `parse`/`parse_many` yet, kept separate until the visitor-based AST
+// builder (replacing `parser` below) is complete.
+mod generated;
+pub use generated::antlr_accepts;
 mod ir;
 mod params;
 mod parser;

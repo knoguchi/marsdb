@@ -37,16 +37,26 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // Phase 1 diagnostic only (mars-0mn): compares the vendored ANTLR
+    // grammar's parse-acceptance rate against pest's on the real TCK corpus,
+    // before investing in Phase 2's clause-by-clause rewrite. Doesn't touch
+    // the normal report() path below.
+    if std::env::var("ANTLR_SPIKE").is_ok() {
+        antlr_spike_report(&features_dir);
+        return;
+    }
+
+    let filter = std::env::var("TCK_FILTER").ok();
     let mut reports = Vec::new();
 
     for entry in walk_feature_files(&features_dir) {
-        let category = entry
-            .strip_prefix(&features_dir)
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let rel_path = entry.strip_prefix(&features_dir).unwrap();
+        if let Some(filter) = &filter {
+            if !rel_path.to_string_lossy().contains(filter.as_str()) {
+                continue;
+            }
+        }
+        let category = rel_path.parent().unwrap().to_string_lossy().to_string();
         let content =
             std::fs::read_to_string(&entry).unwrap_or_else(|e| panic!("read {entry:?}: {e}"));
         for scenario_result in gherkin::parse_feature(&content) {
@@ -75,6 +85,77 @@ fn main() {
     }
 
     report(&reports);
+}
+
+/// Phase 1 diagnostic only (mars-0mn, see `main`'s `ANTLR_SPIKE` check) --
+/// walks every TCK scenario's query text through both grammars in
+/// parse-only mode (no execution) and reports accept/reject counts side by
+/// side, plus scenarios where they disagree. Delete once Phase 2's
+/// visitor-based parser replaces `marsdb_query::antlr_accepts`.
+fn antlr_spike_report(features_dir: &Path) {
+    let mut antlr_accept = 0usize;
+    let mut antlr_reject = 0usize;
+    let mut pest_accept = 0usize;
+    let mut disagreements: Vec<(String, String, bool, bool)> = Vec::new();
+    let mut disagreement_count = 0usize;
+    let filter = std::env::var("TCK_FILTER").ok();
+
+    for entry in walk_feature_files(features_dir) {
+        if let Some(filter) = &filter {
+            let rel_path = entry.strip_prefix(features_dir).unwrap();
+            if !rel_path.to_string_lossy().contains(filter.as_str()) {
+                continue;
+            }
+        }
+        let content =
+            std::fs::read_to_string(&entry).unwrap_or_else(|e| panic!("read {entry:?}: {e}"));
+        for scenario_result in gherkin::parse_feature(&content) {
+            let Ok(scenario) = scenario_result else {
+                continue;
+            };
+            let antlr_ok = marsdb_query::antlr_accepts(&scenario.query);
+            let pest_ok = marsdb_query::parse(&scenario.query).is_ok();
+            if antlr_ok {
+                antlr_accept += 1;
+            } else {
+                antlr_reject += 1;
+            }
+            if pest_ok {
+                pest_accept += 1;
+            }
+            if antlr_ok != pest_ok {
+                disagreement_count += 1;
+                disagreements.push((
+                    scenario.feature_name.clone(),
+                    scenario.query.clone(),
+                    antlr_ok,
+                    pest_ok,
+                ));
+            }
+        }
+    }
+
+    let total = antlr_accept + antlr_reject;
+    println!(
+        "pest:  {pest_accept:>5}/{total} accepted ({:.1}%)",
+        100.0 * pest_accept as f64 / total as f64
+    );
+    println!(
+        "antlr: {antlr_accept:>5}/{total} accepted ({:.1}%)",
+        100.0 * antlr_accept as f64 / total as f64
+    );
+    println!("\n{disagreement_count} disagreements -- written to /tmp/antlr_spike_disagreements.txt");
+    let mut out = String::new();
+    for (feature, query, antlr_ok, pest_ok) in &disagreements {
+        out.push_str(&format!(
+            "[{feature}] antlr={} pest={} :: {}\n",
+            antlr_ok,
+            pest_ok,
+            query.replace('\n', " ")
+        ));
+    }
+    std::fs::write("/tmp/antlr_spike_disagreements.txt", out)
+        .expect("write /tmp/antlr_spike_disagreements.txt");
 }
 
 fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {

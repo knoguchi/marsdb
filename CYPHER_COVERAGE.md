@@ -9,6 +9,13 @@ Real, measured numbers from the vendored openCypher TCK (`marsdb-tck/`,
 cargo run -p marsdb-tck --release
 ```
 
+For fast iteration, restrict to a category/feature via `TCK_FILTER` (substring
+match against each scenario's path relative to `openCypher/tck/features/`):
+
+```
+TCK_FILTER="clauses/create" cargo run -p marsdb-tck --release
+```
+
 Results + coarse error-checking only (a scenario expecting an error passes
 iff MarsDB errored *at all*, not the *right kind* of error; no side-effect
 assertions) — see `marsdb-tck/src/main.rs`'s own doc comments for the full
