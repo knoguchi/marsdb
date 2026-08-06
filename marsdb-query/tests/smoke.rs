@@ -8277,3 +8277,28 @@ fn variable_length_relationship_binds_a_list_of_edges() {
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("already-bound"));
 }
+
+/// `WITH null AS a OPTIONAL MATCH p = (a)-[r]->()` -- reusing an
+/// already-bound-to-`null` variable as a node/relationship pattern token
+/// is legal (matches nothing, same as any other `OPTIONAL MATCH` miss),
+/// unlike reusing a variable bound to a real, wrong-typed value (`WITH 1
+/// AS x MATCH (x)-->()`, still a real compile-time type error). TCK's
+/// Path1 [1], Path2 [3].
+#[test]
+fn null_bound_variable_reused_as_pattern_token_is_legal() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH null AS a \
+         OPTIONAL MATCH p = (a)-[r]->() \
+         RETURN type(r), nodes(p), relationships(p), length(p)",
+    );
+    for cell in &result.rows[0] {
+        assert!(matches!(cell, Value::Null), "expected null, got {cell:?}");
+    }
+
+    // A real, non-null, wrong-typed reused variable must still error.
+    let stmt = parse("WITH 1 AS x MATCH (x)-[:R]->(n) RETURN n").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("node"));
+}
