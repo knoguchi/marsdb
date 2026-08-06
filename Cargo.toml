@@ -14,6 +14,14 @@ members = [
 # marsdb-python builds as a PyO3 extension-module (no libpython link, no
 # runnable test binary) via maturin, not plain `cargo build`/`cargo test` —
 # kept out of the workspace so it doesn't affect `cargo test --workspace`.
+# `cargo build`/`test` fail here at the *link* step regardless of whether
+# the code is correct (extension-module deliberately skips linking
+# libpython; maturin patches that in) -- but `cargo check --manifest-path
+# marsdb-python/Cargo.toml` stops before linking and *does* catch real
+# type errors (e.g. a PropertyValue match missing a new variant, which
+# broke CI silently for a while since nothing local exercised this crate
+# — see rust.yml's own `quality` job, which now runs this too). Run it
+# yourself after any shared-type change (PropertyValue, Value, ...).
 exclude = ["marsdb-python"]
 
 [workspace.package]

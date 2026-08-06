@@ -165,6 +165,17 @@ fn property_to_py<'py>(
             }
             list.into_any()
         }
+        // Only ever reached for a `$parameter` echoed back into a result
+        // (e.g. `RETURN $mapParam`) -- never a real stored node/edge
+        // property (`PropertyValue::Map`'s own doc comment). Converts to
+        // a Python dict, recursing per-value the same as `List` above.
+        marsdb_graph::PropertyValue::Map(entries) => {
+            let dict = PyDict::new(py);
+            for (key, value) in entries {
+                dict.set_item(key, property_to_py(py, value)?)?;
+            }
+            dict.into_any()
+        }
     })
 }
 
