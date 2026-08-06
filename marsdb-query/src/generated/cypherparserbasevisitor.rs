@@ -18,6 +18,16 @@ pub trait CypherParserBaseVisitor<'input>:
         self.visit_children(ctx)
     }
 
+    // Visit a parse tree produced by CypherParser#explainSt.
+    fn visit_explainst(&mut self, ctx: &ExplainStContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    // Visit a parse tree produced by CypherParser#createIndexSt.
+    fn visit_createindexst(&mut self, ctx: &CreateIndexStContext<'input>) {
+        self.visit_children(ctx)
+    }
+
     // Visit a parse tree produced by CypherParser#regularQuery.
     fn visit_regularquery(&mut self, ctx: &RegularQueryContext<'input>) {
         self.visit_children(ctx)

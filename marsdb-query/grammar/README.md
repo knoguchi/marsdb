@@ -108,6 +108,28 @@ grammar bugs to zero — all 22 remaining rejects are scenarios the TCK
 itself expects to fail (`Expected::AnyError`), confirmed by cross-checking
 each one, not assumed.
 
+## Local extensions (not from upstream, not real openCypher)
+
+Unlike the fixes above, these two additions aren't upstream-worthy — they
+have no basis in `openCypher.bnf` at all, mirroring `cypher.pest`'s own
+identically-scoped mars-specific extensions (not sent to
+`antlr/grammars-v4`, which tracks real Cypher, not this):
+
+- `explainSt : EXPLAIN (createIndexSt | regularQuery)` — `EXPLAIN
+  <statement>` (describe the plan without running it). Never wraps another
+  `explainSt` or `standaloneCall` (CALL has no `Statement` representation
+  in this grammar's visitor yet regardless — see mars-82w).
+- `createIndexSt : CREATE INDEX ON COLON name LPAREN name RPAREN UNIQUE?`
+  — `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE`. Deliberately the
+  older, simpler single-property syntax, not real openCypher's newer
+  `CREATE INDEX FOR (n:Label) ON (n.prop)` / `CREATE CONSTRAINT ... IS
+  UNIQUE`.
+
+Both needed two new lexer tokens (`EXPLAIN`, `INDEX`) added to
+`reservedWord` too, so `name` (label/property positions) can still absorb
+them — only `symbol` (bound-variable positions) excludes reserved words,
+matching every other keyword already in that list.
+
 ## Why this toolchain
 
 ANTLR4's Rust code-generation target is not in mainline ANTLR4 (never merged

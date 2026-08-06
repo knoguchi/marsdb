@@ -34,6 +34,28 @@ pub trait CypherParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_explainst(&mut self, _ctx: &ExplainStContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_explainst(&mut self, _ctx: &ExplainStContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn enter_createindexst(&mut self, _ctx: &CreateIndexStContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_createindexst(&mut self, _ctx: &CreateIndexStContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_regularquery(&mut self, _ctx: &RegularQueryContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.

@@ -41,8 +41,27 @@ script
 
 // statements
 query
-    : regularQuery
+    : explainSt
+    | regularQuery
     | standaloneCall
+    | createIndexSt
+    ;
+
+// `EXPLAIN <statement>` -- mars-specific, not real openCypher syntax (no
+// equivalent in `openCypher.bnf`). Never wraps another `explainSt` (real
+// `EXPLAIN EXPLAIN ...` isn't valid either) or `standaloneCall` (CALL isn't
+// implemented by this grammar's visitor yet regardless).
+explainSt
+    : EXPLAIN (createIndexSt | regularQuery)
+    ;
+
+// `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE` -- mars-specific,
+// deliberately the older, simpler single-property syntax, not real
+// openCypher's newer `CREATE INDEX FOR (n:Label) ON (n.prop)` /
+// `CREATE CONSTRAINT ... IS UNIQUE`. Mirrors `cypher.pest`'s
+// `create_index_stmt` exactly.
+createIndexSt
+    : CREATE INDEX ON COLON name LPAREN name RPAREN UNIQUE?
     ;
 
 regularQuery
@@ -480,6 +499,7 @@ reservedWord
     | DESCENDING
     | DETACH
     | EXISTS
+    | EXPLAIN
     | LIMIT
     | MATCH
     | MERGE
@@ -500,6 +520,7 @@ reservedWord
     | DISTINCT
     | ENDS
     | IN
+    | INDEX
     | IS
     | NOT
     | OR

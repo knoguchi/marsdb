@@ -25,6 +25,22 @@ pub trait CypherParserVisitor<'input>: ParseTreeVisitor<'input, CypherParserCont
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#explainSt}.
+     * @param ctx the parse tree
+     */
+    fn visit_explainSt(&mut self, ctx: &ExplainStContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#createIndexSt}.
+     * @param ctx the parse tree
+     */
+    fn visit_createIndexSt(&mut self, ctx: &CreateIndexStContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#regularQuery}.
      * @param ctx the parse tree
      */
@@ -761,6 +777,22 @@ pub trait CypherParserVisitorCompat<'input>:
      * @param ctx the parse tree
      */
     fn visit_query(&mut self, ctx: &QueryContext<'input>) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#explainSt}.
+     * @param ctx the parse tree
+     */
+    fn visit_explainSt(&mut self, ctx: &ExplainStContext<'input>) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#createIndexSt}.
+     * @param ctx the parse tree
+     */
+    fn visit_createIndexSt(&mut self, ctx: &CreateIndexStContext<'input>) -> Self::Return {
         self.visit_children(ctx)
     }
 
@@ -1526,6 +1558,16 @@ where
 
     fn visit_query(&mut self, ctx: &QueryContext<'input>) {
         let result = <Self as CypherParserVisitorCompat>::visit_query(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_explainSt(&mut self, ctx: &ExplainStContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_explainSt(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_createIndexSt(&mut self, ctx: &CreateIndexStContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_createIndexSt(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
     }
 

@@ -25,6 +25,26 @@ pub trait CypherParserListener<'input>: ParseTreeListener<'input, CypherParserCo
      */
     fn exit_query(&mut self, _ctx: &QueryContext<'input>) {}
     /**
+     * Enter a parse tree produced by {@link CypherParser#explainSt}.
+     * @param ctx the parse tree
+     */
+    fn enter_explainSt(&mut self, _ctx: &ExplainStContext<'input>) {}
+    /**
+     * Exit a parse tree produced by {@link CypherParser#explainSt}.
+     * @param ctx the parse tree
+     */
+    fn exit_explainSt(&mut self, _ctx: &ExplainStContext<'input>) {}
+    /**
+     * Enter a parse tree produced by {@link CypherParser#createIndexSt}.
+     * @param ctx the parse tree
+     */
+    fn enter_createIndexSt(&mut self, _ctx: &CreateIndexStContext<'input>) {}
+    /**
+     * Exit a parse tree produced by {@link CypherParser#createIndexSt}.
+     * @param ctx the parse tree
+     */
+    fn exit_createIndexSt(&mut self, _ctx: &CreateIndexStContext<'input>) {}
+    /**
      * Enter a parse tree produced by {@link CypherParser#regularQuery}.
      * @param ctx the parse tree
      */

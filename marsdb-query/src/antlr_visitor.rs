@@ -34,8 +34,9 @@ use crate::generated::cypherparser::{
     AtomContextAttrs, AtomicExpressionContext, AtomicExpressionContextAll,
     AtomicExpressionContextAttrs, BoolLitContext, BoolLitContextAttrs, CharLitContext,
     CharLitContextAttrs, ComparisonExpressionContext, ComparisonExpressionContextAttrs,
-    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext, CreateStContext,
-    CreateStContextAttrs, DeleteStContext, DeleteStContextAttrs, ExpressionChainContextAttrs,
+    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext, CreateIndexStContext,
+    CreateIndexStContextAttrs, CreateStContext, CreateStContextAttrs, DeleteStContext,
+    DeleteStContextAttrs, ExplainStContext, ExplainStContextAttrs, ExpressionChainContextAttrs,
     ExpressionContext, ExpressionContextAttrs, FunctionInvocationContext,
     FunctionInvocationContextAttrs, InvocationNameContextAll, InvocationNameContextAttrs,
     LimitStContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs, ListLitContext,
@@ -572,9 +573,10 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
         }
     }
 
-    // `query : regularQuery | standaloneCall` -- `regularQuery` needs no
-    // override of its own here (default `visit_children` dispatch already
-    // routes to `visit_regularQuery` above), but `standaloneCall` (a bare
+    // `query : explainSt | regularQuery | standaloneCall | createIndexSt`
+    // -- `regularQuery`/`explainSt`/`createIndexSt` need no override of
+    // their own *here* (default `visit_children` dispatch already routes
+    // to each rule's own override below), but `standaloneCall` (a bare
     // `CALL proc(...) YIELD ...` with no MATCH at all) has no `Statement`
     // representation yet (same CALL gap as `queryCallSt`, tracked
     // separately as mars-82w) -- overridden so reaching it errors cleanly
@@ -584,6 +586,20 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
         AstNode::Err(QueryError::Syntax(
             "CALL isn't supported by the ANTLR parser yet".into(),
         ))
+    }
+
+    fn visit_explainSt(&mut self, ctx: &ExplainStContext<'input>) -> Self::Return {
+        match self.build_explain_st(ctx) {
+            Ok(s) => AstNode::Statement(s),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_createIndexSt(&mut self, ctx: &CreateIndexStContext<'input>) -> Self::Return {
+        match self.build_create_index_st(ctx) {
+            Ok(s) => AstNode::Statement(s),
+            Err(e) => AstNode::Err(e),
+        }
     }
 
     fn visit_listLit(&mut self, ctx: &ListLitContext<'input>) -> Self::Return {
@@ -1920,6 +1936,48 @@ impl AstBuilder {
             order_by,
             skip,
             limit,
+        })
+    }
+
+    /// `explainSt : EXPLAIN (createIndexSt | regularQuery)` -- mars-specific
+    /// grammar extension (this file's own local addition, not from
+    /// upstream `antlr/grammars-v4/cypher`; see `grammar/README.md`), no
+    /// real openCypher equivalent. Mirrors `parser.rs`'s `parse_explain_stmt`.
+    fn build_explain_st(&mut self, ctx: &ExplainStContext) -> Result<Statement, QueryError> {
+        let inner = match ctx.createIndexSt() {
+            Some(ci_ctx) => self.build_create_index_st(&ci_ctx)?,
+            None => {
+                let rq_ctx = ctx
+                    .regularQuery()
+                    .expect("explainSt always has a createIndexSt or regularQuery");
+                self.visit(&*rq_ctx).into_statement()?
+            }
+        };
+        Ok(Statement::Explain(Box::new(inner)))
+    }
+
+    /// `createIndexSt : CREATE INDEX ON COLON name LPAREN name RPAREN
+    /// UNIQUE?` -- same mars-specific-extension caveat as `build_explain_st`
+    /// above. Mirrors `parser.rs`'s `parse_create_index_stmt`; `name_all()`
+    /// returns the label then the property name in source order (the only
+    /// two `name` children this rule ever has).
+    fn build_create_index_st(
+        &mut self,
+        ctx: &CreateIndexStContext,
+    ) -> Result<Statement, QueryError> {
+        let names = ctx.name_all();
+        let label = names
+            .first()
+            .expect("createIndexSt always has a label name")
+            .get_text();
+        let prop = names
+            .get(1)
+            .expect("createIndexSt always has a property name")
+            .get_text();
+        Ok(Statement::CreateIndex {
+            label,
+            prop,
+            unique: ctx.UNIQUE().is_some(),
         })
     }
 
@@ -3520,5 +3578,58 @@ mod tests {
     #[test]
     fn parse_antlr_syntax_error() {
         assert!(parse_antlr("MATCH (a RETURN a;").is_err());
+    }
+
+    #[test]
+    fn parse_antlr_create_index() {
+        let s = parse_antlr("CREATE INDEX ON :Person(name);").unwrap();
+        let Statement::CreateIndex {
+            label,
+            prop,
+            unique,
+        } = s
+        else {
+            panic!("expected Statement::CreateIndex");
+        };
+        assert_eq!(label, "Person");
+        assert_eq!(prop, "name");
+        assert!(!unique);
+    }
+
+    #[test]
+    fn parse_antlr_create_index_unique() {
+        let s = parse_antlr("CREATE INDEX ON :Person(name) UNIQUE;").unwrap();
+        let Statement::CreateIndex { unique, .. } = s else {
+            panic!("expected Statement::CreateIndex");
+        };
+        assert!(unique);
+    }
+
+    #[test]
+    fn parse_antlr_explain_match() {
+        let s = parse_antlr("EXPLAIN MATCH (a) RETURN a;").unwrap();
+        let Statement::Explain(inner) = s else {
+            panic!("expected Statement::Explain");
+        };
+        assert!(matches!(*inner, Statement::Match { .. }));
+    }
+
+    #[test]
+    fn parse_antlr_explain_create_index() {
+        let s = parse_antlr("EXPLAIN CREATE INDEX ON :Person(name);").unwrap();
+        let Statement::Explain(inner) = s else {
+            panic!("expected Statement::Explain");
+        };
+        assert!(matches!(*inner, Statement::CreateIndex { .. }));
+    }
+
+    #[test]
+    fn parse_antlr_index_still_usable_as_property_name() {
+        // `INDEX`/`EXPLAIN` becoming real keyword tokens (needed for
+        // `createIndexSt`/`explainSt`) must not break their use as
+        // ordinary property/label names elsewhere -- `name : symbol |
+        // reservedWord` still absorbs them there.
+        let s = parse_antlr("MATCH (a) RETURN a.index;").unwrap();
+        assert!(matches!(s, Statement::Match { .. }));
     }
 }
