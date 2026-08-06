@@ -8121,3 +8121,104 @@ fn size_on_a_path_is_a_compile_time_error() {
         "unexpected error: {err}"
     );
 }
+
+/// `duration.between(...)`'s own component accessors must read the
+/// stored `seconds`/`nanos` fields directly, not recombine them into one
+/// signed total and re-split (which would silently reintroduce a
+/// negative `nanos`, breaking the "nanos always non-negative, sign
+/// lives in seconds" storage invariant). TCK's Temporal10 [1].
+#[test]
+fn duration_component_accessors_read_raw_fields_not_a_resplit_total() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH duration.between(localdatetime('2018-01-02T10:00:00.1'), \
+         localdatetime('2018-01-01T10:00:00.2')) AS dur \
+         RETURN dur, dur.days, dur.seconds, dur.nanosecondsOfSecond",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT-23H-59M-59.9S");
+    assert_eq!(int(&result.rows[0][1]), 0);
+    assert_eq!(int(&result.rows[0][2]), -86400);
+    assert_eq!(int(&result.rows[0][3]), 100_000_000);
+}
+
+/// `duration('P2012-02-02T14:37:21.545')` -- ISO-8601's alternate
+/// "combined date-time" duration representation (date/time formatted
+/// like a calendar date/time-of-day, each field meaning "this many
+/// years/months/days/hours/minutes/seconds"), not the more common
+/// `PnYnMnD` form. TCK's Temporal2 [7].
+#[test]
+fn duration_parses_the_combined_date_time_alternate_form() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "RETURN duration('P2012-02-02T14:37:21.545') AS d");
+    assert_eq!(temporal_str(&result.rows[0][0]), "P2012Y2M2DT14H37M21.545S");
+}
+
+/// `datetime.fromepoch(seconds, nanos)`/`datetime.fromepochmillis(millis)`.
+/// TCK's Temporal1 [11].
+#[test]
+fn datetime_from_epoch_and_epoch_millis() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN datetime.fromepoch(416779, 999999999) AS d1, \
+         datetime.fromepochmillis(237821673987) AS d2",
+    );
+    assert_eq!(
+        temporal_str(&result.rows[0][0]),
+        "1970-01-05T19:46:19.999999999Z"
+    );
+    assert_eq!(temporal_str(&result.rows[0][1]), "1977-07-15T13:34:33.987Z");
+}
+
+/// `MATCH p = (n)-->(x) WHERE length(p) = 1` -- a named path's own
+/// inline WHERE can reference the path variable itself, which isn't in
+/// the row until after path assembly, unlike an ordinary pattern's
+/// WHERE. TCK's MatchWhere1 [12]/[13].
+#[test]
+fn named_path_where_references_the_path_variable_itself() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:A {name: 'A'})-[:KNOWS]->(b:B {name: 'B'})",
+    );
+    let result = run(&store, "MATCH p = (n)-->(x) WHERE length(p) = 1 RETURN x");
+    assert_eq!(result.rows.len(), 1);
+
+    let result = run(&store, "MATCH p = (n)-->(x) WHERE length(p) = 10 RETURN x");
+    assert_eq!(result.rows.len(), 0);
+}
+
+/// `MATCH (a) WHERE count(a) > 10` -- an aggregate function is never
+/// legal inside a pattern-level WHERE, a real compile-time error (not
+/// something a zero-row MATCH could silently skip checking). TCK's
+/// MatchWhere1 [15].
+#[test]
+fn aggregate_in_pattern_where_is_a_compile_time_error() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("MATCH (a) WHERE count(a) > 10 RETURN a").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("aggregate"));
+}
+
+/// `MATCH ()-[r]->() DELETE r RETURN type(r)` -- a relationship's type
+/// never changes, so real Cypher still allows reading it after the
+/// relationship itself is deleted earlier in the same statement, unlike
+/// labels()/property access (real DeletedEntityAccess errors). TCK's
+/// Return2 [14].
+#[test]
+fn type_of_a_deleted_relationship_still_works() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()-[:T]->()");
+    let result = run(&store, "MATCH ()-[r]->() DELETE r RETURN type(r)");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "T"),
+        other => panic!("expected a string, got {other:?}"),
+    }
+
+    // Properties of a deleted relationship still correctly error.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()-[:T {num: 0}]->()");
+    let stmt = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
+    assert!(Executor::new(&store).execute(&stmt).is_err());
+}
