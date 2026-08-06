@@ -9,6 +9,7 @@ mod ir;
 mod params;
 mod parse_helpers;
 mod planner;
+mod procedure;
 mod result;
 mod semantic;
 pub mod temporal;
@@ -22,6 +23,7 @@ pub use executor::{
     ExecutionOutcome, Executor,
 };
 pub use params::substitute_params;
+pub use procedure::{ProcedureProvider, ProcedureSignature, Procedures};
 pub use result::QueryResult;
 pub use semantic::validate_statement;
 pub use value::{PathElem, Value};

@@ -743,6 +743,50 @@ pub struct MergeClause {
     pub with: Option<WithClause>,
 }
 
+/// `CALL proc.name(args) [YIELD ...]` -- both the in-query reading-clause
+/// form (`QueryClause::Call`, `args` always `Some` per the grammar's own
+/// `queryCallSt : CALL invocationName parenExpressionChain (YIELD
+/// yieldItems)?`, parens mandatory) and the standalone top-level form
+/// (`Statement::StandaloneCall`, whose `standaloneCall` rule's own
+/// `parenExpressionChain?` is optional -- `args: None` is that implicit-
+/// argument shape, `CALL proc` with no parens at all, where each declared
+/// input instead resolves from a same-named `$param`, TCK's Call1
+/// `[2]`/`[11]`, Call2 `[3]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallClause {
+    pub name: String,
+    pub args: Option<Vec<ReturnExpr>>,
+    /// A trailing `WITH` (TCK's Call6 `[1]`: `CALL ... YIELD label WITH
+    /// count(*) AS c CALL ... YIELD label RETURN *`) -- same "glued onto
+    /// the preceding reading clause while walking `multiPartQ`'s children"
+    /// mechanism `QueryPart`/`UnwindClause`/`MergeClause` already use for
+    /// their own trailing `with`. Always `None` on a `Statement::
+    /// StandaloneCall` (never read there -- a standalone call is always
+    /// the whole statement, nothing can follow it).
+    pub with: Option<WithClause>,
+    /// `None` -- no `YIELD` written at all. For the in-query form this
+    /// means every output is discarded, nothing bound into scope (TCK's
+    /// Call1 `[12]`: referencing an un-yielded output afterward is
+    /// `UndefinedVariable`); for the standalone form it instead means
+    /// "auto-yield every output," same as `Some(CallYield::Star)` would,
+    /// since a standalone `CALL` *is* the whole query (TCK's Call1 `[5]`,
+    /// Call2 `[2]`) -- `executor::eval_standalone_call` is what actually
+    /// applies that standalone-only distinction; this AST shape alone
+    /// can't tell the two apart.
+    pub yield_items: Option<CallYield>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallYield {
+    /// `YIELD *` -- every declared output, bound under its own name.
+    Star,
+    /// `YIELD a, b AS c, ...` -- explicit output name (optionally
+    /// renamed), plus `yieldItems`' own optional trailing `WHERE` (only
+    /// this variant's grammar production carries one -- `YIELD *` has no
+    /// `where?` of its own).
+    Items(Vec<(String, Option<String>)>, Option<Box<Expr>>),
+}
+
 /// One reading clause in a `MATCH`/`UNWIND`/`MERGE` sequence. `Match` is
 /// today's `MATCH`/`OPTIONAL MATCH ... [WHERE] [WITH]` segment; `Unwind`
 /// fans out a list; `Merge` matches-or-creates. All three can optionally
@@ -789,6 +833,10 @@ pub enum QueryClause {
     /// extends `carried_vars` with every pattern's own vars, same as
     /// `Merge`'s own binding-changing clause already does.
     Create(Vec<Pattern>),
+    /// `CALL proc.name(args) [YIELD ...]` used as a reading clause --
+    /// `CallClause::args` is always `Some` here (the grammar's own
+    /// `queryCallSt` requires parens), see `CallClause`'s own docs.
+    Call(CallClause),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -852,4 +900,13 @@ pub enum Statement {
         parts: Vec<Statement>,
         all: bool,
     },
+    /// A bare `CALL proc.name(args) [YIELD ...]` with nothing else in the
+    /// statement (the grammar's own `standaloneCall`, a top-level
+    /// alternative alongside `regularQuery` -- never wrapped in
+    /// `Statement::Match`, since there's no pattern to match at all). See
+    /// `CallClause`'s own docs for why `args`/`yield_items` mean something
+    /// subtly different here than in `QueryClause::Call`. Boxed (clippy's
+    /// `large_enum_variant`) -- `CallClause` is far bigger than
+    /// `Statement`'s other variants just for this rarely-taken one.
+    StandaloneCall(Box<CallClause>),
 }

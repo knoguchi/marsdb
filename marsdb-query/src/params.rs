@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use marsdb_graph::PropertyValue;
 
 use crate::ast::{
-    Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause, QueryPart, ReturnExpr,
-    ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause, WithExpr,
+    CallClause, CallYield, Expr, Literal, MergeClause, NodePattern, Pattern, QueryClause,
+    QueryPart, ReturnExpr, ReturnTail, SetItem, Statement, Tail, UnwindClause, WithClause,
+    WithExpr,
 };
 use crate::error::QueryError;
 
@@ -56,6 +57,27 @@ pub fn substitute_params(
                 substitute_params(part, params)?;
             }
         }
+        Statement::StandaloneCall(call) => substitute_call_clause(call, params)?,
+    }
+    Ok(())
+}
+
+/// `CallClause::args: None` (the implicit-argument form, `CALL proc` with
+/// no parens) has nothing to substitute here -- each declared input
+/// resolves from a same-named `$param` at execution time instead (see
+/// `ExecutionOptions::params`'s own docs for why that can't happen this
+/// early, before the procedure's signature is even known).
+fn substitute_call_clause(
+    call: &mut CallClause,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<(), QueryError> {
+    if let Some(args) = &mut call.args {
+        for arg in args {
+            substitute_return_expr(arg, params)?;
+        }
+    }
+    if let Some(CallYield::Items(_, Some(where_expr))) = &mut call.yield_items {
+        substitute_expr(where_expr, params)?;
     }
     Ok(())
 }
@@ -90,6 +112,7 @@ fn substitute_query_clause(
             }
             Ok(())
         }
+        QueryClause::Call(call) => substitute_call_clause(call, params),
     }
 }
 

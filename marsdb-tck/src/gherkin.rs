@@ -42,6 +42,9 @@ pub struct Scenario {
     pub setup_cypher: Vec<String>,
     /// Raw TCK literal text per parameter, parsed by the caller.
     pub params: Vec<(String, String)>,
+    /// One per `And there exists a procedure ...` step -- see
+    /// `ProcedureFixture`'s own docs.
+    pub procedures: Vec<ProcedureFixture>,
     pub query: String,
     pub expected: Expected,
     /// The raw `Then a <Kind>Error should be raised...` line, when
@@ -50,6 +53,33 @@ pub struct Scenario {
     /// to distinguish `SyntaxError` from other kinds (`TypeError`,
     /// `ArgumentError`, etc), not for normal scenario running.
     pub expected_error_line: Option<String>,
+}
+
+/// `And there exists a procedure NAME(in1 :: TYPE1, ...) :: (out1 ::
+/// TYPE1, ...):` plus its own `| in1 | ... | out1 | ... |` mock-result
+/// table (TCK's own convention: the header always lists every declared
+/// input name followed by every declared output name, in declared order
+/// -- confirmed by grepping every vendored `clauses/call/*.feature`
+/// signature+table pair). `header`/`rows` are kept as raw cell text,
+/// parsed by the caller (`procedure::TckProcedureProvider`) the same way
+/// an expected-result cell is (`tck_value::parse_cell`) -- this module
+/// only extracts structure, never interprets values.
+#[derive(Debug, Clone)]
+pub struct ProcedureFixture {
+    pub name: String,
+    pub input_names: Vec<String>,
+    /// Each input's declared type text (`INTEGER?`, `NUMBER?`, ...), same
+    /// order as `input_names` -- passed through to `ProcedureSignature::
+    /// input_types` for `Executor`'s own coarse argument-type check (TCK's
+    /// Call2 `[5]`/`[6]`).
+    pub input_types: Vec<String>,
+    pub output_names: Vec<String>,
+    /// Column names, in table order (not necessarily `input_names ++
+    /// output_names`, even though every vendored fixture happens to write
+    /// it that way -- looked up by name, not position, to stay correct
+    /// either way).
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }
 
 pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
@@ -268,6 +298,7 @@ fn parse_scenario(
     let mut initial_graph = None;
     let mut setup_cypher = Vec::new();
     let mut params = Vec::new();
+    let mut procedures = Vec::new();
     let mut query = None;
     let mut expected = None;
     let mut expected_error_line = None;
@@ -323,14 +354,7 @@ fn parse_scenario(
                 }
             }
         } else if line.starts_with("And there exists a procedure") {
-            // MarsDB has no CALL/procedure support at all -- the query
-            // itself will fail to parse regardless (ParseRejected), so
-            // this step's own mock-procedure signature/table is
-            // structurally consumed and otherwise irrelevant.
-            cursor.pos += 1;
-            if cursor.peek_trimmed().is_some_and(|l| l.starts_with('|')) {
-                cursor.read_table();
-            }
+            procedures.push(parse_procedure_fixture(line, cursor)?);
         } else if line.starts_with("When executing query:")
             || line.starts_with("When executing control query:")
         {
@@ -408,11 +432,84 @@ fn parse_scenario(
         initial_graph,
         setup_cypher,
         params,
+        procedures,
         query,
         expected,
         expected_error_line,
     };
     Ok((scenario, examples))
+}
+
+/// `And there exists a procedure NAME(in1 :: TYPE1, ...) :: (out1 ::
+/// TYPE1, ...):` -- `line` is the signature line itself (cursor still
+/// positioned there); an optional `| ... |` table immediately follows.
+fn parse_procedure_fixture(line: &str, cursor: &mut Cursor) -> Result<ProcedureFixture, String> {
+    cursor.pos += 1;
+    let rest = line
+        .trim_start_matches("And there exists a procedure")
+        .trim()
+        .trim_end_matches(':')
+        .trim();
+    // `name(inputs) :: (outputs)` -- the inputs list can itself contain
+    // `::` (once per parameter, `name :: STRING?, in :: INTEGER?`), so the
+    // split point is the first `::` *after* the inputs list's own closing
+    // `)`, not the first `::` anywhere in the line (which would land
+    // inside the first parameter's own type instead). No signature this
+    // grammar needs to parse nests parens within a parameter's type
+    // (`INTEGER?`/`STRING?`/`NUMBER?`/`FLOAT?` only), so a plain `find`
+    // for the matching `)` (not a depth-counting scan) is enough.
+    let open = rest
+        .find('(')
+        .ok_or_else(|| format!("procedure signature missing '(': {line:?}"))?;
+    let name = rest[..open].trim().to_string();
+    let close = rest[open..]
+        .find(')')
+        .map(|i| open + i)
+        .ok_or_else(|| format!("procedure signature missing ')': {line:?}"))?;
+    let inputs_text = rest[open + 1..close].trim();
+    let after = rest[close + 1..]
+        .trim()
+        .strip_prefix("::")
+        .ok_or_else(|| format!("procedure signature missing '::' after inputs: {line:?}"))?
+        .trim();
+    let outputs_text = after.trim_start_matches('(').trim_end_matches(')').trim();
+    let (input_names, input_types) = parse_procedure_params(inputs_text)?;
+    let (output_names, _output_types) = parse_procedure_params(outputs_text)?;
+    let mut header = Vec::new();
+    let mut rows = Vec::new();
+    if cursor.peek_trimmed().is_some_and(|l| l.starts_with('|')) {
+        let mut table = cursor.read_table();
+        if !table.is_empty() {
+            header = table.remove(0);
+            rows = table;
+        }
+    }
+    Ok(ProcedureFixture {
+        name,
+        input_names,
+        input_types,
+        output_names,
+        header,
+        rows,
+    })
+}
+
+/// `name1 :: TYPE1, name2 :: TYPE2, ...` (either the input or the output
+/// half of a procedure signature) -- empty for `()`.
+fn parse_procedure_params(text: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    if text.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    for part in text.split(',') {
+        let (name, ty) = part.split_once("::").ok_or_else(|| {
+            format!("expected 'name :: TYPE' in procedure signature, got {part:?}")
+        })?;
+        names.push(name.trim().to_string());
+        types.push(ty.trim().to_string());
+    }
+    Ok((names, types))
 }
 
 /// Expands a `Scenario Outline:` template into one real `Scenario` per
@@ -459,6 +556,12 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
                     .iter()
                     .map(|(k, v)| (k.clone(), subst(v)))
                     .collect(),
+                // No vendored outline scenario references a `<col>` token
+                // inside its own procedure fixture text, so a plain clone
+                // (not `subst`) is correct today -- if a future one did,
+                // this would need to change to match `setup_cypher`/
+                // `params`'s own substitution above.
+                procedures: template.procedures.clone(),
                 query: subst(&template.query),
                 expected,
                 expected_error_line: template.expected_error_line.clone(),

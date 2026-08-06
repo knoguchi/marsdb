@@ -13,15 +13,16 @@ use marsdb_graph::{
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, is_percentile_name, ArithOp, CompareOp, Expr, Literal, MergeClause,
-    NodePattern, Pattern, PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection,
-    RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail,
-    UnwindClause, WithClause, WithExpr,
+    is_aggregate_name, is_percentile_name, ArithOp, CallClause, CallYield, CompareOp, Expr,
+    Literal, MergeClause, NodePattern, Pattern, PropAccess, QuantifierKind, QueryClause, QueryPart,
+    RelDirection, RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement,
+    Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
 use crate::parse_helpers::validate_named_path_pattern;
 use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars};
+use crate::procedure::{ProcedureProvider, ProcedureSignature};
 use crate::result::QueryResult;
 use crate::temporal;
 use crate::value::{PathElem, Value};
@@ -138,6 +139,22 @@ pub struct ExecutionOptions {
     pub timeout: Option<Duration>,
     pub cancellation_token: Option<CancellationToken>,
     pub observer: Option<ExecutionObserver>,
+    /// `None` (the default) means `CALL` always fails with "procedure not
+    /// found" -- MarsDB ships no built-in procedures itself, see
+    /// `procedure::ProcedureProvider`'s own docs.
+    pub procedures: Option<crate::procedure::Procedures>,
+    /// The statement's own `$name` parameters, verbatim -- every other
+    /// `$param` position is already resolved to a concrete `Literal`
+    /// before `Executor` ever sees the statement (`substitute_params`,
+    /// run during `marsdb::prepare_statement`, well before this point),
+    /// but a *standalone* `CALL proc` written with no parens at all (TCK's
+    /// Call1 `[2]`/`[11]`, Call2 `[3]`) resolves each declared input from
+    /// a same-named `$param` -- which declared names even exist isn't
+    /// knowable until the procedure's signature is looked up here, at
+    /// execution time (the registry itself, `procedures` above, isn't
+    /// available any earlier either), so this is the one place `Executor`
+    /// still needs the raw map instead of already-substituted AST nodes.
+    pub params: HashMap<String, PropertyValue>,
 }
 
 struct ExecutionGuard<'a> {
@@ -177,6 +194,10 @@ impl<'a> ExecutionGuard<'a> {
 
     fn deleted_edge_type(&self, id: EdgeId) -> Option<String> {
         self.deleted_edge_types.borrow().get(&id).cloned()
+    }
+
+    fn procedure_provider(&self) -> Option<&dyn ProcedureProvider> {
+        self.options.procedures.as_ref().map(|p| p.0.as_ref())
     }
 
     fn checkpoint(&self) -> Result<(), QueryError> {
@@ -648,7 +669,186 @@ impl<'a> Executor<'a> {
             Statement::Union { parts, all } => {
                 self.materialize_union(Txn::Write(write_txn), parts, *all, guard)
             }
+            Statement::StandaloneCall(call) => {
+                self.eval_standalone_call(Txn::Write(write_txn), call, guard)
+            }
         }
+    }
+
+    /// `CALL proc(args) [YIELD ...]` with nothing else in the statement
+    /// (TCK's Call1 `[1]`/`[2]`/`[5]`, Call2 `[2]`/`[3]`) -- unlike the
+    /// in-query form, this *is* the whole query: no outer rows to run the
+    /// call once per, and no YIELD at all means "auto-yield every output"
+    /// (`CallYield::Star`) rather than "discard everything."
+    /// `QueryClause::Call`'s own in-query handling -- calls the procedure
+    /// once per input row (TCK's Call1 `[3]`/`[4]`: even a `WHERE`-less,
+    /// output-less call still runs once per already-matched row, same as
+    /// any other reading clause). `None` (no `YIELD` at all) discards
+    /// every output and keeps `row` unchanged -- see `CallClause::
+    /// yield_items`'s own docs for why that's not the same as `Star`
+    /// (which never actually reaches here, `queryCallSt`'s grammar has no
+    /// `YIELD *` alternative). `Items` fans each input row out into one
+    /// output row per matching procedure result row (same cross-join
+    /// shape `eval_unwind` already gives its own per-row fan-out), each
+    /// carrying `row`'s own bindings forward plus the newly yielded ones,
+    /// filtered by `yieldItems`' own optional trailing `WHERE`.
+    fn eval_call_clause(
+        &self,
+        txn: Txn,
+        call: &CallClause,
+        current_rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        let mut out = Vec::new();
+        for row in current_rows {
+            guard.checkpoint()?;
+            let (sig, proc_rows) = self.call_procedure(txn, call, row, guard)?;
+            let Some(yield_items) = &call.yield_items else {
+                out.push(row.clone());
+                continue;
+            };
+            let names: Vec<String> = match yield_items {
+                CallYield::Star => sig.outputs.clone(),
+                CallYield::Items(items, _) => items
+                    .iter()
+                    .map(|(name, alias)| alias.clone().unwrap_or_else(|| name.clone()))
+                    .collect(),
+            };
+            for proc_row in &proc_rows {
+                let projected = project_call_row(&sig, proc_row, yield_items)?;
+                let mut new_row = row.clone();
+                for (name, value) in names.iter().zip(&projected) {
+                    new_row.insert(name.clone(), value_to_binding_restore(value));
+                }
+                if let CallYield::Items(_, Some(where_expr)) = yield_items {
+                    if self.eval_expr(txn, where_expr, &new_row, guard)? != Some(true) {
+                        continue;
+                    }
+                }
+                out.push(new_row);
+                guard.check_intermediate_rows(out.len())?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn eval_standalone_call(
+        &self,
+        txn: Txn,
+        call: &CallClause,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<QueryResult, QueryError> {
+        let empty_row = BindingRow::new();
+        let (sig, proc_rows) = self.call_procedure(txn, call, &empty_row, guard)?;
+        let yield_items = call.yield_items.clone().unwrap_or(CallYield::Star);
+        let columns: Vec<String> = match &yield_items {
+            CallYield::Star => sig.outputs.clone(),
+            CallYield::Items(items, _) => items
+                .iter()
+                .map(|(name, alias)| alias.clone().unwrap_or_else(|| name.clone()))
+                .collect(),
+        };
+        let mut rows = Vec::with_capacity(proc_rows.len());
+        for proc_row in &proc_rows {
+            rows.push(project_call_row(&sig, proc_row, &yield_items)?);
+        }
+        if let CallYield::Items(_, Some(where_expr)) = &yield_items {
+            let mut filtered = Vec::with_capacity(rows.len());
+            for row_values in &rows {
+                let mut binding_row = BindingRow::new();
+                for (col, v) in columns.iter().zip(row_values) {
+                    binding_row.insert(col.clone(), value_to_binding_restore(v));
+                }
+                if self.eval_expr(txn, where_expr, &binding_row, guard)? == Some(true) {
+                    filtered.push(row_values.clone());
+                }
+            }
+            rows = filtered;
+        }
+        Ok(QueryResult { columns, rows })
+    }
+
+    /// Shared by `eval_standalone_call` and `QueryClause::Call`'s own
+    /// in-query handling -- looks up `call.name`'s signature, resolves and
+    /// type-checks its arguments against `row`'s already-bound variables
+    /// (explicit args) or `guard.options.params` (the implicit-argument
+    /// form, `call.args: None`), then invokes the provider. Returns the
+    /// signature alongside the raw output rows since both callers need it
+    /// again afterward (`sig.outputs`' names, for `YIELD *`/column
+    /// naming).
+    fn call_procedure(
+        &self,
+        txn: Txn,
+        call: &CallClause,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<(ProcedureSignature, Vec<Vec<Value>>), QueryError> {
+        let provider = guard.procedure_provider().ok_or_else(|| {
+            QueryError::Semantic(format!(
+                "procedure '{}' not found -- no procedure provider is configured",
+                call.name
+            ))
+        })?;
+        let sig = provider
+            .signature(&call.name)
+            .ok_or_else(|| QueryError::Semantic(format!("procedure '{}' not found", call.name)))?;
+        let args = self.eval_call_args(txn, call, &sig, row, guard)?;
+        let rows = provider.call(&call.name, &args)?;
+        Ok((sig, rows))
+    }
+
+    fn eval_call_args(
+        &self,
+        txn: Txn,
+        call: &CallClause,
+        sig: &ProcedureSignature,
+        row: &BindingRow,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Vec<Value>, QueryError> {
+        let values: Vec<Value> = match &call.args {
+            Some(args) => {
+                if args.len() != sig.inputs.len() {
+                    return Err(QueryError::Semantic(format!(
+                        "'{}' expects {} argument(s), got {}",
+                        call.name,
+                        sig.inputs.len(),
+                        args.len()
+                    )));
+                }
+                args.iter()
+                    .map(|a| self.eval_return_expr(txn, a, row, guard))
+                    .collect::<Result<_, _>>()?
+            }
+            // The implicit-argument form (`CALL proc`, no parens) --
+            // each declared input resolves from a same-named `$param`
+            // (TCK's Call1 `[11]`, Call2 `[3]`); missing is a
+            // `MissingParam`, same error real Cypher's own
+            // `ParameterMissing`/`MissingParameter` reports.
+            None => sig
+                .inputs
+                .iter()
+                .map(|input_name| {
+                    guard
+                        .options
+                        .params
+                        .get(input_name)
+                        .cloned()
+                        .map(property_value_to_value)
+                        .ok_or_else(|| QueryError::MissingParam(input_name.clone()))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        for (value, (input_name, declared_type)) in
+            values.iter().zip(sig.inputs.iter().zip(&sig.input_types))
+        {
+            if !value_matches_declared_type(value, declared_type) {
+                return Err(QueryError::Type(format!(
+                    "'{}' argument '{input_name}' expects {declared_type}, got {value:?}",
+                    call.name
+                )));
+            }
+        }
+        Ok(values)
     }
 
     fn execute_create(
@@ -1223,6 +1423,27 @@ impl<'a> Executor<'a> {
                         &u.with,
                         current_rows,
                         HashSet::from([u.var.clone()]),
+                        &mut carried_vars,
+                        guard,
+                    )?;
+                }
+                QueryClause::Call(call) => {
+                    current_rows = self.eval_call_clause(txn, call, &current_rows, guard)?;
+                    let new_vars: HashSet<String> = match &call.yield_items {
+                        Some(CallYield::Items(items, _)) => items
+                            .iter()
+                            .map(|(name, alias)| alias.clone().unwrap_or_else(|| name.clone()))
+                            .collect(),
+                        // `Star` never reaches here (`queryCallSt`'s own
+                        // grammar has no `YIELD *` alternative) and `None`
+                        // binds nothing new.
+                        Some(CallYield::Star) | None => HashSet::new(),
+                    };
+                    current_rows = self.apply_with_or_carry(
+                        txn,
+                        &call.with,
+                        current_rows,
+                        new_vars,
                         &mut carried_vars,
                         guard,
                     )?;
@@ -4878,6 +5099,13 @@ pub fn is_read_only(stmt: &Statement) -> bool {
                 | QueryClause::Delete { .. }
                 | QueryClause::Remove(_)
                 | QueryClause::Create(_)
+                // A procedure is opaque to MarsDB -- it might write, so
+                // any statement calling one is conservatively treated as
+                // non-read-only too, same reasoning `Statement::
+                // StandaloneCall` already gets for free (it isn't a
+                // `Statement::Match` at all, so it never matches this
+                // function's own read-only pattern above).
+                | QueryClause::Call(_)
         )
     })
 }
@@ -5521,6 +5749,74 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     })
+}
+
+/// Projects one of `ProcedureProvider::call`'s raw output rows (positional,
+/// `sig.outputs.len()` values in that order) down to whatever `yield_items`
+/// actually asked for -- `YIELD *` keeps every output under its own name;
+/// an explicit item list picks out just those (by the procedure's own
+/// declared name, not any rename yet) and pairs each with its `AS` alias
+/// if it had one, same output order the `YIELD` itself was written in
+/// (TCK's Call5 `[3]`: order is irrelevant to the *result*, but this still
+/// preserves whatever order was written, which `materialize_return`-style
+/// column ordering downstream expects to already be correct).
+fn project_call_row(
+    sig: &ProcedureSignature,
+    proc_row: &[Value],
+    yield_items: &CallYield,
+) -> Result<Vec<Value>, QueryError> {
+    match yield_items {
+        CallYield::Star => Ok(proc_row.to_vec()),
+        CallYield::Items(items, _) => items
+            .iter()
+            .map(|(name, _)| {
+                let idx = sig.outputs.iter().position(|o| o == name).ok_or_else(|| {
+                    QueryError::Semantic(format!(
+                        "'{name}' isn't a declared output of this procedure"
+                    ))
+                })?;
+                Ok(proc_row[idx].clone())
+            })
+            .collect(),
+    }
+}
+
+/// Coarse compile-time-shaped argument-type check (TCK's Call2
+/// `[5]`/`[6]`: passing a `BOOLEAN` where `INTEGER` is declared must
+/// error, even against an empty mock table that would otherwise just
+/// silently return zero rows). `Value::Null` always matches regardless of
+/// declared type -- every signature this codebase's own callers declare
+/// is nullable (`INTEGER?` etc, TCK's Call4), and there's no dedicated
+/// non-null marker to check against anyway. An unrecognized type name is
+/// tolerated (accepts anything) rather than rejected -- this is a coarse
+/// sanity check for the handful of type names TCK's own procedures
+/// actually declare (`INTEGER`/`FLOAT`/`NUMBER`/`STRING`/`BOOLEAN`), not a
+/// full type system.
+fn value_matches_declared_type(value: &Value, declared: &str) -> bool {
+    if matches!(value, Value::Null) {
+        return true;
+    }
+    let is_int = matches!(
+        value,
+        Value::Literal(Literal::Int(_)) | Value::Property(PropertyValue::Int(_))
+    );
+    let is_float = matches!(
+        value,
+        Value::Literal(Literal::Float(_)) | Value::Property(PropertyValue::Float(_))
+    );
+    match declared.trim_end_matches('?').to_ascii_uppercase().as_str() {
+        "INTEGER" => is_int,
+        "FLOAT" | "NUMBER" => is_int || is_float,
+        "STRING" => matches!(
+            value,
+            Value::Literal(Literal::String(_)) | Value::Property(PropertyValue::String(_))
+        ),
+        "BOOLEAN" => matches!(
+            value,
+            Value::Literal(Literal::Bool(_)) | Value::Property(PropertyValue::Bool(_))
+        ),
+        _ => true,
+    }
 }
 
 /// Converts a finished `AggAcc::finish()` result to the `Binding` it's

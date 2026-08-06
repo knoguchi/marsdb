@@ -1,12 +1,14 @@
 mod gherkin;
+mod procedure;
 mod tck_value;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use gherkin::{Expected, InitialGraph, Scenario};
-use marsdb::{Database, PropertyValue};
+use marsdb::{Database, ExecutionOptions, Procedures, PropertyValue};
 use marsdb_query::QueryError;
+use procedure::TckProcedureProvider;
 use tck_value::{tck_eq, value_to_tck, TckScalar, TckValue};
 
 const BINARY_TREE_1: &str = include_str!("../graphs/binary-tree-1.cypher");
@@ -162,7 +164,15 @@ fn run_scenario(scenario: &Scenario) -> (Outcome, Option<String>) {
         Err(reason) => return (Outcome::RunnerUnsupported, Some(reason)),
     };
 
-    let result = db.execute_with_params(&scenario.query, &params);
+    let options = ExecutionOptions {
+        procedures: (!scenario.procedures.is_empty()).then(|| {
+            Procedures(std::sync::Arc::new(TckProcedureProvider::new(
+                scenario.procedures.clone(),
+            )))
+        }),
+        ..Default::default()
+    };
+    let result = db.execute_with_params_and_options(&scenario.query, &params, &options);
 
     match &scenario.expected {
         Expected::AnyError => match result {

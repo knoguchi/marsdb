@@ -23,7 +23,7 @@ scope.
 
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
-| clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
+| clauses/call | 52 | 52 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/match | 381 | 381 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3842** | **0** | **2** | **36** | **0** | **99.0%** |
+| **TOTAL** | **3880** | **3878** | **0** | **2** | **0** | **0** | **99.9%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -220,7 +220,14 @@ all. Named-path capture (`MATCH p = (a)-[:KNOWS]->(b) RETURN p`,
 fixed-hop patterns only) and `shortestPath((a)-[:TYPE*..N]-(b))` (real
 shortest-path search via BFS, not just the first path found — both
 endpoints must already be matched by a preceding clause), plus
-`length(p)` to measure one.
+`length(p)` to measure one. `CALL proc(args) [YIELD ...]` (standalone,
+`CALL proc(args)`/implicit-argument `CALL proc`, or in-query as a reading
+clause, optionally chaining into a trailing `WITH`) resolves against a
+caller-supplied `marsdb_query::ProcedureProvider` — MarsDB itself ships no
+built-in procedures; an embedder (or `marsdb-tck`'s own fixture-driven
+mock provider, used to exercise this against the TCK's inline-defined
+test procedures) provides the actual behavior via `ExecutionOptions::
+procedures`.
 
 ## Expressions
 
