@@ -25,18 +25,18 @@ scope.
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 76 | 0 | 0 | 2 | 0 | 97.4% |
-| clauses/delete | 41 | 38 | 0 | 0 | 3 | 0 | 92.7% |
+| clauses/delete | 41 | 40 | 0 | 0 | 1 | 0 | 97.6% |
 | clauses/match | 381 | 357 | 0 | 0 | 24 | 0 | 93.7% |
 | clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
 | clauses/merge | 75 | 72 | 0 | 0 | 3 | 0 | 96.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/return | 63 | 49 | 0 | 1 | 13 | 0 | 77.8% |
-| clauses/return-orderby | 35 | 30 | 0 | 0 | 5 | 0 | 85.7% |
+| clauses/return | 63 | 60 | 0 | 1 | 2 | 0 | 95.2% |
+| clauses/return-orderby | 35 | 31 | 0 | 0 | 4 | 0 | 88.6% |
 | clauses/return-skip-limit | 31 | 27 | 0 | 0 | 4 | 0 | 87.1% |
 | clauses/set | 53 | 53 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/union | 12 | 12 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/unwind | 14 | 12 | 0 | 0 | 0 | 2 | 85.7% |
-| clauses/with | 29 | 23 | 0 | 0 | 6 | 0 | 79.3% |
+| clauses/with | 29 | 27 | 0 | 0 | 2 | 0 | 93.1% |
 | clauses/with-orderBy | 292 | 285 | 0 | 0 | 7 | 0 | 97.6% |
 | clauses/with-skip-limit | 9 | 8 | 0 | 0 | 1 | 0 | 88.9% |
 | clauses/with-where | 19 | 17 | 0 | 0 | 2 | 0 | 89.5% |
@@ -44,15 +44,15 @@ scope.
 | expressions/boolean | 150 | 150 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/comparison | 72 | 72 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/conditional | 13 | 13 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/existentialSubqueries | 10 | 1 | 0 | 0 | 9 | 0 | 10.0% |
+| expressions/existentialSubqueries | 10 | 5 | 0 | 0 | 5 | 0 | 50.0% |
 | expressions/graph | 61 | 55 | 0 | 0 | 6 | 0 | 90.2% |
-| expressions/list | 185 | 170 | 0 | 0 | 8 | 7 | 91.9% |
+| expressions/list | 185 | 184 | 0 | 0 | 0 | 1 | 99.5% |
 | expressions/literals | 131 | 131 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/map | 44 | 38 | 0 | 0 | 1 | 5 | 86.4% |
 | expressions/mathematical | 6 | 6 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/null | 44 | 38 | 0 | 0 | 0 | 6 | 86.4% |
+| expressions/null | 44 | 44 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/path | 7 | 2 | 0 | 0 | 5 | 0 | 28.6% |
-| expressions/pattern | 50 | 39 | 0 | 0 | 11 | 0 | 78.0% |
+| expressions/pattern | 50 | 49 | 0 | 0 | 1 | 0 | 98.0% |
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/quantifier | 604 | 596 | 0 | 0 | 8 | 0 | 98.7% |
 | expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3697** | **1** | **7** | **155** | **20** | **95.3%** |
+| **TOTAL** | **3880** | **3749** | **1** | **7** | **115** | **8** | **96.6%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -151,7 +151,13 @@ real error — and a pattern predicate used as a boolean expression,
 correlated against whatever's already bound: `WHERE (n)-[]->(m)` with
 both `n`/`m` already bound by an outer `MATCH` means "is there a real edge
 between these two specific nodes," not "does `n` have any outgoing edge
-at all"), any number of chained `WITH` boundaries per statement
+at all"), pattern comprehension (`[(n)-[:T]->(b) | b.name]`/
+`[p = (n)-->() | p]` — unlike a pattern predicate, can introduce brand-new
+node/relationship variables, and enumerates every match instead of just
+checking existence), `exists { (n)-->(m) WHERE ... }` (the "simple" form
+only — a pattern with an optional inline `WHERE`; the "full" form,
+`exists { MATCH ... RETURN ... }`, a real nested subquery, isn't
+supported yet), any number of chained `WITH` boundaries per statement
 (projection/rename, its own `WHERE`/`WITH...WHERE`/`ORDER BY`/`LIMIT`,
 and `WITH *` — every currently-bound variable carries forward unchanged,
 optionally alongside more items), `RETURN`/`RETURN *`/`DELETE`/
@@ -189,8 +195,10 @@ string character count), `length()` (path edge count), `nodes()`/
 `relationships()` (a path's elements), `head()`/`tail()`/`last()`/
 `range(start, end[, step])` (list construction/slicing — `range` is
 both-ends-inclusive, matching real Cypher, not Rust's exclusive-end
-convention), `exists()` (property presence — the pattern-existence form,
-`exists((n)-->())`, isn't supported), string functions `toUpper()`/
+convention), `exists()` (property presence only — pest's own bare
+`exists((n)-->())`-as-a-function-call form was never real Cypher syntax,
+removed rather than preserved; real Cypher's own pattern-existence form
+is `exists { (n)-->() }`, see below), string functions `toUpper()`/
 `toLower()`/`trim()`/`ltrim()`/`rtrim()`/`reverse()`/`replace()`/
 `split()`/`substring()`/`left()`/`right()`, and math functions `abs()`/
 `ceil()`/`floor()`/`round()`/`sqrt()`/`sign()`. `date()`/`duration()`
@@ -202,12 +210,14 @@ Two independent `MATCH` parts across one `WITH` boundary
 `UNWIND <list> AS x` (fans a list out into one row per element,
 cross-joined against existing rows; its own `WHERE` works without needing
 a second `WITH`) — `<list>` is an inline Cypher-text list literal
-(`[1, 2, 'a', $p]`) or a variable bound by a preceding
-`WITH ... collect(...)`/a list-valued node or relationship property;
-`UNWIND $param` where `$param` itself names a list isn't supported yet
-(no list-valued *parameters* — every `$param` is a single scalar; a
-list-valued *property* is a different, already-supported thing, see
-below). `MERGE <pattern> [ON CREATE SET ...] [ON MATCH SET ...]`
+(`[1, 2, 'a', $p]`), a variable bound by a preceding
+`WITH ... collect(...)`/a list-valued node or relationship property, or
+`$param` itself naming a list (including nested lists) directly. A
+map/node/relationship-*valued* `$param`, though, still isn't supported —
+the public parameter type (`PropertyValue`, marsdb-graph) has no
+Map/Node/Edge variant at all, unlike a list-valued property (a
+different, already-supported thing, see below). `MERGE <pattern> [ON
+CREATE SET ...] [ON MATCH SET ...]`
 (match-or-create: tries the pattern as an ordinary MATCH first, creates
 exactly one new instance if nothing matched) — capped at one relationship
 hop (`MERGE (n:Label {props})` or `MERGE (a)-[:TYPE]->(b)`); a completely
@@ -233,9 +243,18 @@ comparison form map/date comparisons already use, see below) — `+` also
 concatenates two strings, or appends/prepends/concatenates when either
 side is a list (`[1,2] + 3` is `[1,2,3]`, `[1,2] + [3]` is `[1,2,3]`);
 `^` always produces a float, even for two integer operands, matching real
-Cypher's own rule. An aggregate can't be nested inside a wrapping
-arithmetic expression (`1 + count(x)` is rejected, not silently wrong —
-`count(x)` alone as a whole return item is fine).
+Cypher's own rule. An aggregate can be composed with other expressions
+(`RETURN a, count(a) + 3`, `RETURN count(*) * 10 AS c`) as long as every
+non-aggregate value used alongside it is itself an explicit grouping key
+— another `RETURN`/`WITH` item's own top-level expression, verbatim, not
+just something that happens to be in scope (`RETURN me.age, me.age +
+count(you.age)` is fine; `RETURN me.age + count(you.age)` alone is a
+compile-time error, real Cypher's `AmbiguousAggregationExpression`).
+Composing an aggregate inside a list comprehension/quantifier's
+*projection* is a flat rejection regardless (no defined "aggregate once
+per list element" semantics) — its *source* can still be an aggregate
+(`[x IN collect(p) | head(nodes(x))]`), evaluated once per group same as
+anywhere else.
 
 List literals (`[1, 2, 3+1]`), indexing (`list[0]`, negative indices count
 from the end, out-of-bounds is `null`), and slicing (`list[1..3]`,
