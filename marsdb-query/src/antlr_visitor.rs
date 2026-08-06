@@ -37,37 +37,38 @@ use crate::error::QueryError;
 use crate::generated::cypherparser::{
     AddSubExpressionContext, AndExpressionContext, AndExpressionContextAttrs, AtomContext,
     AtomContextAttrs, AtomicExpressionContext, AtomicExpressionContextAll,
-    AtomicExpressionContextAttrs, BoolLitContext, BoolLitContextAttrs, CharLitContext,
-    CharLitContextAttrs, ComparisonExpressionContext, ComparisonExpressionContextAttrs,
-    ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext, CreateIndexStContext,
-    CreateIndexStContextAttrs, CreateStContext, CreateStContextAttrs, DeleteStContext,
-    DeleteStContextAttrs, ExplainStContext, ExplainStContextAttrs, ExpressionChainContextAttrs,
-    ExpressionContext, ExpressionContextAttrs, FilterExpressionContext,
-    FilterExpressionContextAttrs, FilterWithContext, FilterWithContextAttrs,
-    FunctionInvocationContext, FunctionInvocationContextAttrs, InvocationNameContextAll,
-    InvocationNameContextAttrs, LimitStContextAttrs, ListComprehensionContext,
-    ListComprehensionContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs,
-    ListLitContext, ListLitContextAttrs, LiteralContext, LiteralContextAttrs, MapLitContext,
-    MapLitContextAttrs, MapPairContextAttrs, MatchStContext, MatchStContextAttrs,
-    MergeActionContextAll, MergeActionContextAttrs, MergeStContext, MergeStContextAttrs,
-    MultDivExpressionContext, MultiPartQContext, MultiPartQContextAttrs, NodeLabelsContextAttrs,
-    NodePatternContext, NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
-    NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
-    OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
-    ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
-    PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
-    PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
-    PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
-    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertiesContextAll,
-    PropertiesContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
-    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs,
-    ReadingStatementContextAll, ReadingStatementContextAttrs, RegularQueryContext,
-    RegularQueryContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
-    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
-    RemoveItemContextAll, RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs,
-    ReturnStContext, ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext,
-    SetStContextAttrs, ShortestPathWrapperContextAttrs, SinglePartQContext,
-    SinglePartQContextAttrs, SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
+    AtomicExpressionContextAttrs, BoolLitContext, BoolLitContextAttrs, CaseExpressionContext,
+    CharLitContext, CharLitContextAttrs, ComparisonExpressionContext,
+    ComparisonExpressionContextAttrs, ComparisonSignsContextAll, ComparisonSignsContextAttrs,
+    CountAllContext, CreateIndexStContext, CreateIndexStContextAttrs, CreateStContext,
+    CreateStContextAttrs, DeleteStContext, DeleteStContextAttrs, ExplainStContext,
+    ExplainStContextAttrs, ExpressionChainContextAttrs, ExpressionContext, ExpressionContextAttrs,
+    FilterExpressionContext, FilterExpressionContextAttrs, FilterWithContext,
+    FilterWithContextAttrs, FunctionInvocationContext, FunctionInvocationContextAttrs,
+    InvocationNameContextAll, InvocationNameContextAttrs, LimitStContextAttrs,
+    ListComprehensionContext, ListComprehensionContextAttrs, ListExpressionContextAll,
+    ListExpressionContextAttrs, ListLitContext, ListLitContextAttrs, LiteralContext,
+    LiteralContextAttrs, MapLitContext, MapLitContextAttrs, MapPairContextAttrs, MatchStContext,
+    MatchStContextAttrs, MergeActionContextAll, MergeActionContextAttrs, MergeStContext,
+    MergeStContextAttrs, MultDivExpressionContext, MultiPartQContext, MultiPartQContextAttrs,
+    NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs, NotExpressionContext,
+    NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext, NumLitContextAll,
+    NumLitContextAttrs, OrderItemContextAttrs, OrderStContext, OrderStContextAttrs,
+    ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
+    ParenthesizedExpressionContextAttrs, PatternContextAttrs, PatternElemChainContextAttrs,
+    PatternElemContext, PatternElemContextAttrs, PatternPartContextAttrs, PatternWhereContextAttrs,
+    PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
+    ProjectionBodyContextAttrs, ProjectionItemContextAttrs, ProjectionItemsContextAttrs,
+    PropertiesContextAll, PropertiesContextAttrs, PropertyExpressionContext,
+    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
+    PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
+    ReadingStatementContextAttrs, RegularQueryContext, RegularQueryContextAttrs,
+    RelationDetailContext, RelationDetailContextAttrs, RelationshipPatternContext,
+    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs, RemoveItemContextAll,
+    RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
+    ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
+    ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
+    SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
     StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
     StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
     UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, UnionStContextAttrs,
@@ -1293,9 +1294,65 @@ impl AstBuilder {
         if let Some(lc_ctx) = ctx.listComprehension() {
             return self.build_list_comprehension(&lc_ctx);
         }
+        if let Some(case_ctx) = ctx.caseExpression() {
+            return self.build_case_expression(&case_ctx);
+        }
         Err(QueryError::Syntax(
-            "this expression form (CASE/pattern comprehension/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
+            "this expression form (pattern comprehension/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
         ))
+    }
+
+    /// `caseExpression : CASE expression? (WHEN expression THEN
+    /// expression)+ (ELSE expression)? END`. No typed per-`WHEN`/`THEN`
+    /// accessor exists (`expression_all()` flattens every branch's exprs
+    /// together, `WHEN()`/`THEN()`/`ELSE()` only ever return the *first*
+    /// occurrence) -- walked via raw children instead, same "read raw
+    /// children in source order" approach `build_add_sub_expression` uses,
+    /// tracking position via each keyword *terminal*'s own text. Matched
+    /// case-insensitively (the lexer's `caseInsensitive = true` means
+    /// `get_text()` returns the source's own casing, e.g. `case`/`CASE`
+    /// both valid) -- safe against a same-named real expression, since
+    /// CASE/WHEN/THEN/ELSE/END are all in `reservedWord`, so none can
+    /// appear as a bare variable at this position.
+    fn build_case_expression(
+        &mut self,
+        ctx: &CaseExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        #[derive(PartialEq)]
+        enum Pos {
+            BeforeFirstWhen,
+            AfterWhen,
+            AfterThen,
+            AfterElse,
+        }
+        let mut pos = Pos::BeforeFirstWhen;
+        let mut test = None;
+        let mut whens: Vec<(ReturnExpr, ReturnExpr)> = Vec::new();
+        let mut pending_when: Option<ReturnExpr> = None;
+        let mut else_ = None;
+        for child in ctx.get_children() {
+            match child.get_text().to_ascii_uppercase().as_str() {
+                "CASE" | "END" => continue,
+                "WHEN" => pos = Pos::AfterWhen,
+                "THEN" => pos = Pos::AfterThen,
+                "ELSE" => pos = Pos::AfterElse,
+                _ => {
+                    let expr = self.visit(&*child).into_return_expr()?;
+                    match pos {
+                        Pos::BeforeFirstWhen => test = Some(Box::new(expr)),
+                        Pos::AfterWhen => pending_when = Some(expr),
+                        Pos::AfterThen => {
+                            let w = pending_when
+                                .take()
+                                .expect("a THEN expression always follows a WHEN expression");
+                            whens.push((w, expr));
+                        }
+                        Pos::AfterElse => else_ = Some(Box::new(expr)),
+                    }
+                }
+            }
+        }
+        Ok(ReturnExpr::Case { test, whens, else_ })
     }
 
     /// `filterExpression : symbol IN expression where?` -- shared by
@@ -3007,6 +3064,59 @@ mod tests {
                 Box::new(ReturnExpr::Var("x".to_string())),
                 Box::new(ReturnExpr::Var("y".to_string())),
             )
+        );
+    }
+
+    #[test]
+    fn case_searched_form() {
+        assert_eq!(
+            parse_expr("CASE WHEN x > 1 THEN 'big' WHEN x > 0 THEN 'small' ELSE 'none' END")
+                .unwrap(),
+            ReturnExpr::Case {
+                test: None,
+                whens: vec![
+                    (
+                        ReturnExpr::Compare(
+                            Box::new(ReturnExpr::Var("x".to_string())),
+                            CompareOp::Gt,
+                            Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                        ),
+                        ReturnExpr::Lit(Literal::String("big".to_string())),
+                    ),
+                    (
+                        ReturnExpr::Compare(
+                            Box::new(ReturnExpr::Var("x".to_string())),
+                            CompareOp::Gt,
+                            Box::new(ReturnExpr::Lit(Literal::Int(0))),
+                        ),
+                        ReturnExpr::Lit(Literal::String("small".to_string())),
+                    ),
+                ],
+                else_: Some(Box::new(ReturnExpr::Lit(Literal::String(
+                    "none".to_string()
+                )))),
+            }
+        );
+    }
+
+    #[test]
+    fn case_simple_form_with_test_no_else() {
+        assert_eq!(
+            parse_expr("CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' END").unwrap(),
+            ReturnExpr::Case {
+                test: Some(Box::new(ReturnExpr::Var("x".to_string()))),
+                whens: vec![
+                    (
+                        ReturnExpr::Lit(Literal::Int(1)),
+                        ReturnExpr::Lit(Literal::String("one".to_string())),
+                    ),
+                    (
+                        ReturnExpr::Lit(Literal::Int(2)),
+                        ReturnExpr::Lit(Literal::String("two".to_string())),
+                    ),
+                ],
+                else_: None,
+            }
         );
     }
 
