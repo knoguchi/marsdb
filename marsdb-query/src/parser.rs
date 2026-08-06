@@ -1498,7 +1498,7 @@ fn parse_rel_pattern(pair: Pair<Rule>) -> Result<RelPattern, QueryError> {
 /// directly rather than via sub-rules, since the `..` literal produces no
 /// child `Pair` to structurally distinguish "*N" (exact) from "*N.." (N or
 /// more).
-fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
+pub(crate) fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
     let rest = &text[1..]; // strip leading '*'
                            // Real Cypher's default minimum is 1, not 0 -- a variable-length
                            // pattern always requires at least one real relationship unless a
