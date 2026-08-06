@@ -77,6 +77,37 @@ This raised acceptance from 96.4% to 98.5% and eliminated the entire
 scenarios chain several `UNWIND`/`WITH` pairs, which simply couldn't
 parse under the old rule.
 
+Four more, back in `CypherLexer.g4`/`CypherParser.g4` (the diagnostic was
+also extended at this point to cross-check each reject against the TCK
+scenario's own expected outcome — `Expected::AnyError` cases are supposed
+to reject, so only mismatches count as real bugs):
+
+- `DIGIT`'s hex alternative referenced `HexDigit` (singular — a bare
+  `[0-9a-f]` single-char fragment) instead of `HexDigits` (plural — the
+  actual `0x`-prefixed fragment, defined but never used). `0x1` etc
+  couldn't tokenize as a hex literal at all.
+- No `0o`-prefixed octal support existed at all (the old `OctalDigit` was
+  `'0' Digits`, a bare-leading-zero form with no basis in
+  `openCypher.bnf`, which defines `<unsigned octal integer>` as requiring
+  an explicit `0o` prefix). Added a proper `OctalDigits` fragment.
+- `notExpression: NOT? comparisonExpression;` allowed at most one `NOT`,
+  so `NOT NOT true` (ordinary double negation) couldn't parse. Fixed to
+  `NOT*`.
+- `DIGIT`'s leading `SUB?` let the lexer's maximal-munch rule greedily
+  swallow a *binary* minus into the next operand's token: tokenizing
+  `5-1` starting at position 1, `-1` (2 chars, matches `SUB? Digits`)
+  beats `-` alone (1 char, `SUB`) under longest-match, leaving two
+  adjacent `DIGIT` tokens with no operator between them — a parse error
+  on ordinary subtraction with no surrounding whitespace. The parser
+  already has correct unary-minus handling at the right precedence level
+  (`unaryAddSubExpression: (PLUS | SUB)? atomicExpression`), so `DIGIT`
+  embedding its own sign was both redundant and actively wrong. Removed.
+
+These raised acceptance from 98.5% to 99.4% (3858/3880) and brought real
+grammar bugs to zero — all 22 remaining rejects are scenarios the TCK
+itself expects to fail (`Expected::AnyError`), confirmed by cross-checking
+each one, not assumed.
+
 ## Why this toolchain
 
 ANTLR4's Rust code-generation target is not in mainline ANTLR4 (never merged

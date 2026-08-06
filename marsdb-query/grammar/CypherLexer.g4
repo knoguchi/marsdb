@@ -151,7 +151,24 @@ ESC_LITERAL    : '`' .*? '`';
 CHAR_LITERAL   : '\'' (~['\\\r\n] | EscapeSequence)* '\'';
 STRING_LITERAL : '"' (~["\\\r\n] | EscapeSequence)* '"';
 
-DIGIT : SUB? (HexDigit | OctalDigit | Digits | FLOAT);
+// Upstream referenced `HexDigit` (singular -- a bare [0-9a-f] single-char
+// fragment) here instead of `HexDigits` (plural -- the actual '0x'-prefixed
+// hex-literal fragment defined below), so `HexDigits` was dead code and
+// `0x1` etc couldn't tokenize as a hex literal at all; a bare single hex
+// digit character could accidentally satisfy DIGIT on its own instead.
+// `OctalDigit` was `'0' Digits` (bare-leading-zero-means-octal, C-style) --
+// openCypher.bnf has no such form; octal needs an explicit `0o` prefix
+// (<unsigned octal integer> ::= 0o {[_]<octal digit>}...), which didn't
+// exist in this grammar at all. Added `OctalDigits` below to match spec.
+// Upstream's leading `SUB?` let the lexer's maximal-munch rule greedily
+// swallow a *binary* minus into the next operand's token: tokenizing
+// `5-1` starting at position 1, `-1` (2 chars, DIGIT via `SUB? Digits`)
+// beats `-` alone (1 char, SUB) under longest-match, leaving two adjacent
+// DIGIT tokens with no operator token between them -- a parse error. The
+// parser already has correct unary-minus handling at the right precedence
+// level (`unaryAddSubExpression: (PLUS | SUB)? atomicExpression`), so
+// DIGIT embedding its own sign was both redundant and actively wrong.
+DIGIT : HexDigits | OctalDigits | Digits | FLOAT;
 FLOAT : (Digits '.' Digits | '.' Digits) ExponentPart? [fd]? | Digits (ExponentPart [fd]? | [fd]);
 
 WS           : [ \t\r\n\u000C]+ -> channel(HIDDEN);
@@ -172,9 +189,10 @@ fragment EscapeSequence:
 
 fragment ExponentPart: [e] [+-]? Digits;
 
-fragment HexDigits  : '0x' HexDigit ((HexDigit | '_')* HexDigit)?;
-fragment HexDigit   : [0-9a-f];
-fragment OctalDigit : '0' Digits;
+fragment HexDigits    : '0x' HexDigit ((HexDigit | '_')* HexDigit)?;
+fragment HexDigit     : [0-9a-f];
+fragment OctalDigits  : '0o' OctalDigit ((OctalDigit | '_')* OctalDigit)?;
+fragment OctalDigit   : [0-7];
 // Upstream required the first digit to be 1-9 (no leading zero), but
 // openCypher.bnf's <unsigned decimal integer> ::= <digit> [{[_]<digit>}...]
 // has no such restriction -- e.g. `007` couldn't tokenize as DIGIT at all

@@ -98,7 +98,7 @@ fn antlr_spike_report(features_dir: &Path) {
     let mut pest_accept = 0usize;
     let mut disagreements: Vec<(String, String, bool, bool)> = Vec::new();
     let mut disagreement_count = 0usize;
-    let mut antlr_rejects: Vec<(String, String)> = Vec::new();
+    let mut antlr_rejects: Vec<(String, String, bool)> = Vec::new();
     let filter = std::env::var("TCK_FILTER").ok();
 
     for entry in walk_feature_files(features_dir) {
@@ -116,11 +116,16 @@ fn antlr_spike_report(features_dir: &Path) {
             };
             let antlr_ok = marsdb_query::antlr_accepts(&scenario.query);
             let pest_ok = marsdb_query::parse(&scenario.query).is_ok();
+            let expects_error = matches!(scenario.expected, Expected::AnyError);
             if antlr_ok {
                 antlr_accept += 1;
             } else {
                 antlr_reject += 1;
-                antlr_rejects.push((scenario.feature_name.clone(), scenario.query.clone()));
+                antlr_rejects.push((
+                    scenario.feature_name.clone(),
+                    scenario.query.clone(),
+                    expects_error,
+                ));
             }
             if pest_ok {
                 pest_accept += 1;
@@ -161,13 +166,23 @@ fn antlr_spike_report(features_dir: &Path) {
     std::fs::write("/tmp/antlr_spike_disagreements.txt", out)
         .expect("write /tmp/antlr_spike_disagreements.txt");
 
+    let wrongly_rejected = antlr_rejects
+        .iter()
+        .filter(|(_, _, expects_error)| !expects_error)
+        .count();
     println!(
-        "{} total antlr rejects -- written to /tmp/antlr_all_rejects.txt",
-        antlr_rejects.len()
+        "{} total antlr rejects ({} correctly reject invalid syntax, {} are real bugs) -- written to /tmp/antlr_all_rejects.txt",
+        antlr_rejects.len(),
+        antlr_rejects.len() - wrongly_rejected,
+        wrongly_rejected,
     );
     let mut out = String::new();
-    for (feature, query) in &antlr_rejects {
-        out.push_str(&format!("[{feature}] :: {}\n", query.replace('\n', " ")));
+    for (feature, query, expects_error) in &antlr_rejects {
+        let tag = if *expects_error { "expected" } else { "BUG" };
+        out.push_str(&format!(
+            "[{tag}] [{feature}] :: {}\n",
+            query.replace('\n', " ")
+        ));
     }
     std::fs::write("/tmp/antlr_all_rejects.txt", out).expect("write /tmp/antlr_all_rejects.txt");
 }

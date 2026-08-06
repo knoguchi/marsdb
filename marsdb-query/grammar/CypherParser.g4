@@ -212,8 +212,11 @@ andExpression
     : notExpression (AND notExpression)*
     ;
 
+// Upstream had `NOT?` -- at most one negation, so `NOT NOT true` (double
+// negation, ordinary Cypher) couldn't parse. Fixed to `NOT*` to allow
+// chained negation.
 notExpression
-    : NOT? comparisonExpression
+    : NOT* comparisonExpression
     ;
 
 comparisonExpression
