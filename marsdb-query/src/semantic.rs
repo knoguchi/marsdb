@@ -209,7 +209,7 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
     if pattern.hops.is_empty() {
         if let Some(var) = &pattern.start.var {
             if pattern.start.labels.is_empty()
-                && pattern.start.props.is_empty()
+                && !pattern.start.has_explicit_props
                 && scope.contains_key(var)
             {
                 return Err(semantic(format!(
@@ -218,6 +218,16 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
                 )));
             }
         }
+    }
+    // Same reasoning as CREATE's own node check -- MERGE might need to
+    // *create* any node its pattern names, so an already-bound node can't
+    // also carry a new label/property predicate (TCK's Merge5 [22]). The
+    // hopless-and-predicate-free case just above has its own, more
+    // specific message; this covers every other node token, start and hop
+    // ends alike.
+    check_no_new_predicates_on_bound_node(&pattern.start, scope, "MERGE")?;
+    for (_, node) in &pattern.hops {
+        check_no_new_predicates_on_bound_node(node, scope, "MERGE")?;
     }
     // Unlike a node endpoint (which can legitimately reference an
     // already-bound node to search/create from), MERGE never reuses an
@@ -318,15 +328,39 @@ fn check_create_node_not_already_bound(
     if !scope.contains_key(var) {
         return Ok(());
     }
-    if is_bare && node.labels.is_empty() && node.props.is_empty() {
+    if is_bare && node.labels.is_empty() && !node.has_explicit_props {
         return Err(semantic(format!(
             "'{var}' is already bound — CREATE ({var}) with no relationship and no new \
              labels/properties doesn't create or connect anything"
         )));
     }
-    if !node.labels.is_empty() || !node.props.is_empty() {
+    check_no_new_predicates_on_bound_node(node, scope, "CREATE")
+}
+
+/// Shared by CREATE (via `check_create_node_not_already_bound` above) and
+/// MERGE (`bind_merge`, for each of its own node endpoints) -- both might
+/// need to *create* a node the pattern names, so a variable already bound
+/// to an *existing* node can't also carry a new label/property predicate
+/// (would silently drop it on match, or ambiguously decide whether it
+/// applies on create) (TCK's Create1 `[19]`/Merge5 `[22]`). Unlike
+/// `check_create_node_not_already_bound`, this alone doesn't also cover
+/// the "no relationship and no predicates at all" case -- CREATE and
+/// MERGE phrase that differently (MERGE's own bare-node check lives in
+/// `bind_merge`, keyed off `pattern.hops.is_empty()` the same way).
+fn check_no_new_predicates_on_bound_node(
+    node: &NodePattern,
+    scope: &Scope,
+    verb: &str,
+) -> Result<(), QueryError> {
+    let Some(var) = &node.var else {
+        return Ok(());
+    };
+    if !scope.contains_key(var) {
+        return Ok(());
+    }
+    if !node.labels.is_empty() || node.has_explicit_props {
         return Err(semantic(format!(
-            "'{var}' is already bound — CREATE can't add labels/properties to an existing node"
+            "'{var}' is already bound — {verb} can't add labels/properties to an existing node"
         )));
     }
     Ok(())

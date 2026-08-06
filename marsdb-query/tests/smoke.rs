@@ -2902,6 +2902,39 @@ fn already_bound_rejection_fires_even_on_a_zero_row_match() {
     }
 }
 
+/// TCK Create1 [19]: `(n {})` -- an *explicit but empty* inline map --
+/// still counts as "imposing a new predicate" on an already-bound node,
+/// same as a non-empty one. A real bug found via the TCK: `NodePattern`'s
+/// `props` alone can't tell `(n {})` apart from `(n)` (both give an empty
+/// `Vec`), so the already-bound check silently passed until
+/// `has_explicit_props` was added specifically to preserve that
+/// syntactic distinction.
+#[test]
+fn create_rejects_empty_explicit_prop_map_on_already_bound_node() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (n:Foo) CREATE (n {})-[:OWNS]->(:Dog)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
+}
+
+/// TCK Merge5 [22]: MERGE's node endpoints share CREATE's "might need to
+/// create this node" reasoning -- an already-bound variable can't carry a
+/// new label/property predicate there either, even when it's a different
+/// endpoint of the same relationship than the one that's actually bound.
+#[test]
+fn merge_rejects_new_label_predicate_on_already_bound_node() {
+    let store = GraphStore::open_memory().unwrap();
+    let stmt = parse("CREATE (a:Foo) MERGE (a)-[r:KNOWS]->(a:Bar)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("already bound"),
+        "expected an already-bound error, got: {err}"
+    );
+}
+
 #[test]
 fn match_create_rejects_variable_length_pattern() {
     let store = GraphStore::open_memory().unwrap();

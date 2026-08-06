@@ -336,6 +336,15 @@ pub struct NodePattern {
     /// `Executor::eval_props_to_values`, which evaluates each one against
     /// the row already bound so far in the same CREATE.
     pub props: Vec<(String, ReturnExpr)>,
+    /// Whether an inline `{...}` map token was actually written, even an
+    /// empty one (`(n {})`) -- `props` alone can't distinguish that from
+    /// no map token at all (`(n)`), both giving an empty `Vec`, but real
+    /// Cypher's `VariableAlreadyBound` check cares about the distinction:
+    /// `MATCH (n) CREATE (n {})` is still "imposing a new predicate" on
+    /// an already-bound node even though the map is empty (TCK's Create1
+    /// `[19]`), while `MATCH (n) CREATE (n)-->()` (no map token at all)
+    /// is fine.
+    pub has_explicit_props: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

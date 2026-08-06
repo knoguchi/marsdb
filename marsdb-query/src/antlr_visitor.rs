@@ -834,8 +834,14 @@ impl AstBuilder {
             .nodeLabels()
             .map(|nl| nl.name_all().iter().map(|n| name_text(n)).collect())
             .unwrap_or_default();
+        let has_explicit_props = ctx.properties().is_some();
         let props = self.build_properties(ctx.properties())?;
-        Ok(NodePattern { var, labels, props })
+        Ok(NodePattern {
+            var,
+            labels,
+            props,
+            has_explicit_props,
+        })
     }
 
     fn build_rel_detail(&mut self, ctx: &RelationDetailContext) -> Result<RelPattern, QueryError> {
