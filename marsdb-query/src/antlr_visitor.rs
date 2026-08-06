@@ -868,6 +868,7 @@ impl AstBuilder {
             direction: RelDirection::Either,
             hop_range,
             capture_path_segment: false,
+            rel_list_var: None,
         })
     }
 
@@ -884,6 +885,7 @@ impl AstBuilder {
                 direction: RelDirection::Either,
                 hop_range: None,
                 capture_path_segment: false,
+                rel_list_var: None,
             },
         };
         // Both LT and GT present (`<-[...]->`) is *not* "left wins" --

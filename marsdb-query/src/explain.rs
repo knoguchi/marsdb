@@ -390,6 +390,26 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             ));
             format_plan(input, depth + 1, out);
         }
+        LogicalPlan::MatchRelList {
+            input,
+            from_var,
+            to_var,
+            rel_list_var,
+            rel_labels,
+            direction,
+            min_hops,
+            max_hops,
+        } => {
+            let hops = match max_hops {
+                Some(max) => format!("*{min_hops}..{max}"),
+                None => format!("*{min_hops}.."),
+            };
+            out.push(format!(
+                "{pad}MatchRelList({from_var}){}({to_var}) using {rel_list_var}",
+                rel_arrow_var(*direction, rel_labels, &hops)
+            ));
+            format_plan(input, depth + 1, out);
+        }
         LogicalPlan::Filter { input, predicate } => {
             out.push(format!("{pad}Filter {}", format_expr(predicate)));
             format_plan(input, depth + 1, out);

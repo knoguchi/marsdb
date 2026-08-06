@@ -136,22 +136,6 @@ pub fn build_match_plan(
             }
         }
         let rel_is_repeat = rel.var.as_ref().is_some_and(|v| carried_vars.contains(v));
-        if rel.hop_range.is_some() && !rel.capture_path_segment && rel_is_repeat {
-            // `MATCH (a)-[rs*]->(b)` where `rs` is *already* bound (e.g.
-            // `WITH [r1, r2] AS rs`) means "match a path whose edge
-            // sequence equals `rs`" in real Cypher -- a genuinely
-            // different feature (constraining the BFS against an
-            // existing value) from the fresh-traversal-then-bind
-            // `rel_list_var` implements below, which would otherwise
-            // silently overwrite the carried binding with whatever this
-            // traversal happens to find (TCK's Match4 `[8]`: a real,
-            // silently-wrong-count bug, not just a coverage gap).
-            return Err(QueryError::Semantic(
-                "matching a variable-length relationship pattern against an already-bound list \
-                 variable isn't supported"
-                    .into(),
-            ));
-        }
         // A fixed-hop relationship is always bound to an internal name, even
         // when the user didn't write one -- needed both to filter inline
         // properties (`-[:KNOWS {name: 'x'}]->`) and to enforce edge
@@ -185,6 +169,26 @@ pub fn build_match_plan(
                 rel_labels: rel.rel_types.clone(),
                 direction,
             },
+            // `MATCH (a)-[rs*]->(b)` where `rs` is *already* bound (e.g.
+            // `WITH [r1, r2] AS rs`) -- see `LogicalPlan::MatchRelList`'s
+            // own docs for why this is a distinct, deterministic
+            // "verify the chain" plan node rather than `VarExpand`'s
+            // fresh BFS (TCK's Match4 `[8]`, Match9 `[6]`/`[7]`).
+            Some((min_hops, max_hops)) if rel_is_repeat && !rel.capture_path_segment => {
+                LogicalPlan::MatchRelList {
+                    input: Box::new(plan),
+                    from_var: from_var.clone(),
+                    to_var: to_var.clone(),
+                    rel_list_var: rel
+                        .var
+                        .clone()
+                        .expect("rel_is_repeat implies rel.var is Some"),
+                    rel_labels: rel.rel_types.clone(),
+                    direction,
+                    min_hops,
+                    max_hops,
+                }
+            }
             Some((min_hops, max_hops)) => {
                 // Always synthesized, regardless of whether this hop's
                 // own path/list capture was requested -- see
@@ -208,12 +212,19 @@ pub fn build_match_plan(
                             .expect("name_pattern_for_path always sets rel.var alongside capture_path_segment")
                     }),
                     // The user's own `[r:TYPE*1..3]` -- a real Cypher
-                    // relationship-list binding (TCK's Match4 `[1]`/`[6]`),
-                    // distinct from `capture_path_segment`'s internal,
-                    // synthesized-name bookkeeping for named-path capture.
-                    rel_list_var: (!rel.capture_path_segment)
-                        .then(|| rel.var.clone())
-                        .flatten(),
+                    // relationship-list binding (TCK's Match4 `[1]`/`[6]`,
+                    // Match9 `[9]`). Not `rel.var` itself when
+                    // `capture_path_segment` is set -- that field holds
+                    // this hop's own internal path-segment bookkeeping
+                    // name in that case instead (see `RelPattern::
+                    // rel_list_var`'s own docs) -- but the two aren't
+                    // mutually exclusive: a hop can have both a named-path
+                    // capture *and* its own real rel-list variable at once.
+                    rel_list_var: if rel.capture_path_segment {
+                        rel.rel_list_var.clone()
+                    } else {
+                        rel.var.clone()
+                    },
                     rel_props: rel.props.clone(),
                 };
                 // Propagate forward -- a *later* hop (fixed, via a new
@@ -403,6 +414,13 @@ pub fn pattern_all_vars(pattern: &Pattern) -> HashSet<String> {
         if let Some(v) = &rel.var {
             vars.insert(v.clone());
         }
+        // A named-path-captured hop's own real rel-list variable, if it
+        // had one (`p = (a)-[r*]->(b)`) -- `rel.var` itself holds this
+        // hop's internal path-segment bookkeeping name in that case
+        // instead, see `RelPattern::rel_list_var`'s own docs.
+        if let Some(v) = &rel.rel_list_var {
+            vars.insert(v.clone());
+        }
         if let Some(v) = &node.var {
             vars.insert(v.clone());
         }
@@ -560,6 +578,25 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             path_segment_var,
             rel_list_var,
             rel_props,
+        },
+        LogicalPlan::MatchRelList {
+            input,
+            from_var,
+            to_var,
+            rel_list_var,
+            rel_labels,
+            direction,
+            min_hops,
+            max_hops,
+        } => LogicalPlan::MatchRelList {
+            input: Box::new(apply_index_seeks(*input, txn)?),
+            from_var,
+            to_var,
+            rel_list_var,
+            rel_labels,
+            direction,
+            min_hops,
+            max_hops,
         },
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }
