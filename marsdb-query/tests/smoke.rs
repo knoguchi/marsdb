@@ -3537,6 +3537,31 @@ fn with_order_by_sees_pre_with_scope() {
     assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
 }
 
+/// TCK's WithOrderBy2 [24]: a `DISTINCT` (non-aggregating) `WITH`'s own
+/// `ORDER BY` needs the same "verbatim item match" shortcut aggregation
+/// already had -- a real bug found via the TCK, `DISTINCT`'s own
+/// `order_scope` is narrowed to the projected names only (same reasoning
+/// as aggregation: both collapse many pre-WITH rows into one output row,
+/// so there's no single pre-WITH row to resolve `a.name` against), but
+/// the shortcut that lets `ORDER BY a.name` still resolve via its own
+/// `name` alias only checked `with_aggregates`, not `with.distinct` --
+/// `a.name` (a pre-WITH property access) failed to resolve at all.
+#[test]
+fn with_distinct_order_by_sees_its_own_item_verbatim() {
+    let store = GraphStore::open_memory().unwrap();
+    for name in ["A", "A", "B", "C", "C"] {
+        run(&store, &format!("CREATE ({{name: '{name}'}})"));
+    }
+    let result = run(
+        &store,
+        "MATCH (a) WITH DISTINCT a.name AS name ORDER BY a.name ASC LIMIT 1 RETURN *",
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "A"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
 /// `RETURN *` -- every currently-bound variable, alphabetically. Can't
 /// resolve to a concrete `Tail::Return` at parse time (no scope exists
 /// yet); resolved independently in both `semantic.rs` (compile-time

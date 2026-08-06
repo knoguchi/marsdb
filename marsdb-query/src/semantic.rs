@@ -455,17 +455,28 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
             merged
         };
         for (expr, _) in order_by {
-            if with_aggregates {
-                // Repeating a WITH item's expression verbatim (see the
-                // matching comment on the RETURN side) -- WithOrderBy4
-                // [11].
-                if with.items.iter().any(|item| item.expr == *expr) {
-                    continue;
-                }
-                if crate::executor::contains_aggregate(expr) {
+            // Repeating a WITH item's expression verbatim (see the
+            // matching comment on the RETURN side) -- WithOrderBy4 [11].
+            // Applies to `DISTINCT` too, not just aggregation: both
+            // collapse many pre-WITH rows into one output row (that's
+            // exactly why `order_scope` above is `projected`-only for
+            // either), so a `DISTINCT`-only `WITH`'s `ORDER BY` needs the
+            // same shortcut to see its own item's alias instead of
+            // failing to resolve a pre-WITH variable it doesn't have
+            // access to (TCK's WithOrderBy2 [24] -- previously this
+            // shortcut only fired `if with_aggregates`, a real gap: a
+            // non-aggregating `DISTINCT` WITH's `order_scope` was *also*
+            // narrowed to `projected`-only above, just without this
+            // matching escape hatch).
+            if (with_aggregates || with.distinct)
+                && with.items.iter().any(|item| item.expr == *expr)
+            {
+                continue;
+            }
+            if crate::executor::contains_aggregate(expr) {
+                if with_aggregates {
                     return Err(semantic("ORDER BY aggregate does not match any WITH item"));
                 }
-            } else if crate::executor::contains_aggregate(expr) {
                 return Err(semantic(
                     "ORDER BY cannot use an aggregate function unless WITH itself is \
                      aggregating",
