@@ -228,6 +228,16 @@ pub trait CypherParserBaseVisitor<'input>:
         self.visit_children(ctx)
     }
 
+    // Visit a parse tree produced by CypherParser#stringListNullExpression.
+    fn visit_stringlistnullexpression(&mut self, ctx: &StringListNullExpressionContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    // Visit a parse tree produced by CypherParser#inExpression.
+    fn visit_inexpression(&mut self, ctx: &InExpressionContext<'input>) {
+        self.visit_children(ctx)
+    }
+
     // Visit a parse tree produced by CypherParser#comparisonSigns.
     fn visit_comparisonsigns(&mut self, ctx: &ComparisonSignsContext<'input>) {
         self.visit_children(ctx)

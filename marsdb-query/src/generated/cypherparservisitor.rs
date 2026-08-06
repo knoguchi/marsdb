@@ -361,6 +361,22 @@ pub trait CypherParserVisitor<'input>: ParseTreeVisitor<'input, CypherParserCont
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#stringListNullExpression}.
+     * @param ctx the parse tree
+     */
+    fn visit_stringListNullExpression(&mut self, ctx: &StringListNullExpressionContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#inExpression}.
+     * @param ctx the parse tree
+     */
+    fn visit_inExpression(&mut self, ctx: &InExpressionContext<'input>) {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#comparisonSigns}.
      * @param ctx the parse tree
      */
@@ -1139,6 +1155,25 @@ pub trait CypherParserVisitorCompat<'input>:
     }
 
     /**
+     * Visit a parse tree produced by {@link CypherParser#stringListNullExpression}.
+     * @param ctx the parse tree
+     */
+    fn visit_stringListNullExpression(
+        &mut self,
+        ctx: &StringListNullExpressionContext<'input>,
+    ) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
+     * Visit a parse tree produced by {@link CypherParser#inExpression}.
+     * @param ctx the parse tree
+     */
+    fn visit_inExpression(&mut self, ctx: &InExpressionContext<'input>) -> Self::Return {
+        self.visit_children(ctx)
+    }
+
+    /**
      * Visit a parse tree produced by {@link CypherParser#comparisonSigns}.
      * @param ctx the parse tree
      */
@@ -1803,6 +1838,16 @@ where
 
     fn visit_comparisonExpression(&mut self, ctx: &ComparisonExpressionContext<'input>) {
         let result = <Self as CypherParserVisitorCompat>::visit_comparisonExpression(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_stringListNullExpression(&mut self, ctx: &StringListNullExpressionContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_stringListNullExpression(self, ctx);
+        *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
+    }
+
+    fn visit_inExpression(&mut self, ctx: &InExpressionContext<'input>) {
+        let result = <Self as CypherParserVisitorCompat>::visit_inExpression(self, ctx);
         *<Self as ParseTreeVisitorCompat>::temp_result(self) = result;
     }
 

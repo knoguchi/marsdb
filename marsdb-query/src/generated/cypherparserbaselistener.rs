@@ -496,6 +496,28 @@ pub trait CypherParserBaseListener<'input>:
      * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
      * @param ctx the parse tree
      */
+    fn enter_stringlistnullexpression(&mut self, _ctx: &StringListNullExpressionContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_stringlistnullexpression(&mut self, _ctx: &StringListNullExpressionContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn enter_inexpression(&mut self, _ctx: &InExpressionContext<'input>) {}
+    /**
+     * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
+    fn exit_inexpression(&mut self, _ctx: &InExpressionContext<'input>) {}
+
+    /**
+     * Enter a parse tree produced by \{@link CypherParserBaseParser#s}.
+     * @param ctx the parse tree
+     */
     fn enter_comparisonsigns(&mut self, _ctx: &ComparisonSignsContext<'input>) {}
     /**
      * Exit a parse tree produced by \{@link  CypherParserBaseParser#s}.

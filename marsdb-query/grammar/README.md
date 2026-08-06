@@ -108,6 +108,37 @@ grammar bugs to zero — all 22 remaining rejects are scenarios the TCK
 itself expects to fail (`Expected::AnyError`), confirmed by cross-checking
 each one, not assumed.
 
+One more, found later (Phase 2/3, mars-nog) by a *behavioral* dry-run
+(temporarily pointing this crate's real `parse`/`parse_many` at the new
+visitor and running the full `smoke.rs` suite) rather than the TCK
+parse-comparison spike above — parse-only comparison can't catch a
+precedence bug where both sides still merely "parse successfully", just
+into the wrong tree:
+
+- `IN`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`/`IS NULL` attached at
+  `atomicExpression`'s level — tighter than `+`/`-`/`*`/`/`/`^` — so
+  `n.val + 0 IS NULL` parsed as `n.val + (0 IS NULL)` instead of `(n.val
+  + 0) IS NULL`. Verified against `openCypher.bnf`'s own `<comparison
+  predicate>` chain (not assumed from `cypher.pest`, which has its own,
+  independently-derived precedence chain) — `<advanced comparison
+  predicate part 2>` (which is exactly these operators) takes `<advanced
+  comparison predicand> ::= <arithmetic value expression>` as its operand,
+  meaning they sit *above* arithmetic, below the simple comparison
+  operators (`=`/`<>`/`<`/`>`/`<=`/`>=`). Fixed by moving them off
+  `atomicExpression` into a new `stringListNullExpression` rule between
+  `comparisonExpression` and `addSubExpression` (`stringExpression`'s own
+  RHS widened from `propertyOrLabelExpression` to `addSubExpression` to
+  match); `atomicExpression` keeps only the real postfix forms (index/
+  slice), which — unlike these — spec (`<postfix expression> ::= ... |
+  <postfix expression> <postfix operator>`) and real usage (`list[0][1]`)
+  both expect to genuinely chain, so an existing "at most one suffix"
+  restriction was also removed as no longer necessary at that level (it
+  had been papering over the conflated precedence, not a real limit —
+  `3 IN [1,2,3][0..2]` needed both fixed together).
+
+Same class of bug as the ones above (a real, spec-verifiable defect, not
+a mars-specific choice) — sent upstream too.
+
 ## Local extensions (not from upstream, not real openCypher)
 
 Unlike the fixes above, these additions aren't upstream-worthy — they

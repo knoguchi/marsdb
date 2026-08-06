@@ -247,8 +247,31 @@ notExpression
     : NOT* comparisonExpression
     ;
 
+// Fixed precedence bug (found via a Phase 3 behavioral dry-run, not the
+// TCK -- see grammar/README.md): `IN`/`STARTS WITH`/`ENDS WITH`/
+// `CONTAINS`/`IS NULL` used to attach at `atomicExpression`'s level,
+// binding *tighter* than `+`/`-`/`*`/`/`/`^` (so `n.val + 0 IS NULL`
+// parsed as `n.val + (0 IS NULL)`). Per openCypher.bnf's `<comparison
+// predicate>` chain (`<simple comparison predicand> ::= <advanced
+// comparison predicand> [<advanced comparison predicate part 2>]`, where
+// `<advanced comparison predicand> ::= <arithmetic value expression>` and
+// `<advanced comparison predicate part 2>` is exactly these operators),
+// they belong here instead: above arithmetic, below `=`/`<>`/`</>/<=/>=`.
 comparisonExpression
-    : addSubExpression (comparisonSigns addSubExpression)*
+    : stringListNullExpression (comparisonSigns stringListNullExpression)*
+    ;
+
+// At most one suffix (spec's own `[...]` is a single optional, not
+// repeatable) -- `a IN b IN c` / `a IS NULL IS NULL` aren't valid Cypher
+// either way, so no "grammar permissive, visitor enforces" split is
+// needed here (unlike this same file's `(symbol ASSIGN)?` pattern) --
+// the grammar itself already matches the real constraint.
+stringListNullExpression
+    : addSubExpression (stringExpression | inExpression | nullExpression)?
+    ;
+
+inExpression
+    : IN addSubExpression
     ;
 
 comparisonSigns
@@ -276,17 +299,25 @@ unaryAddSubExpression
     : (PLUS | SUB)? atomicExpression
     ;
 
+// `IN`/`stringExpression`/`nullExpression` moved up to
+// `stringListNullExpression` (see its own docs) -- only the real postfix
+// forms (index/slice) stay here, tight/repeatable, matching
+// openCypher.bnf's own `<postfix expression> ::= ... | <postfix
+// expression> <postfix operator>` (`<dynamic element reference>`/
+// `<slicing>`).
 atomicExpression
-    : propertyOrLabelExpression (stringExpression | listExpression | nullExpression)*
+    : propertyOrLabelExpression (listExpression)*
     ;
 
 listExpression
-    : IN propertyOrLabelExpression
-    | LBRACK (expression? RANGE expression? | expression) RBRACK
+    : LBRACK (expression? RANGE expression? | expression) RBRACK
     ;
 
+// Operand widened from `propertyOrLabelExpression` to `addSubExpression`
+// (moved up a level, see `stringListNullExpression`) -- matches spec's
+// `<advanced comparison predicand> ::= <arithmetic value expression>`.
 stringExpression
-    : stringExpPrefix propertyOrLabelExpression
+    : stringExpPrefix addSubExpression
     ;
 
 stringExpPrefix

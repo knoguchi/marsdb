@@ -45,16 +45,16 @@ use crate::generated::cypherparser::{
     ExplainStContextAttrs, ExpressionChainContextAttrs, ExpressionContext, ExpressionContextAttrs,
     FilterExpressionContext, FilterExpressionContextAttrs, FilterWithContext,
     FilterWithContextAttrs, FunctionInvocationContext, FunctionInvocationContextAttrs,
-    InvocationNameContextAll, InvocationNameContextAttrs, LimitStContextAttrs,
-    ListComprehensionContext, ListComprehensionContextAttrs, ListExpressionContextAll,
-    ListExpressionContextAttrs, ListLitContext, ListLitContextAttrs, LiteralContext,
-    LiteralContextAttrs, MapLitContext, MapLitContextAttrs, MapPairContextAttrs, MatchStContext,
-    MatchStContextAttrs, MergeActionContextAll, MergeActionContextAttrs, MergeStContext,
-    MergeStContextAttrs, MultDivExpressionContext, MultiPartQContext, MultiPartQContextAttrs,
-    NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs, NotExpressionContext,
-    NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext, NumLitContextAll,
-    NumLitContextAttrs, OrderItemContextAttrs, OrderStContext, OrderStContextAttrs,
-    ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
+    InExpressionContextAttrs, InvocationNameContextAll, InvocationNameContextAttrs,
+    LimitStContextAttrs, ListComprehensionContext, ListComprehensionContextAttrs,
+    ListExpressionContextAll, ListExpressionContextAttrs, ListLitContext, ListLitContextAttrs,
+    LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs, MapPairContextAttrs,
+    MatchStContext, MatchStContextAttrs, MergeActionContextAll, MergeActionContextAttrs,
+    MergeStContext, MergeStContextAttrs, MultDivExpressionContext, MultiPartQContext,
+    MultiPartQContextAttrs, NodeLabelsContextAttrs, NodePatternContext, NodePatternContextAttrs,
+    NotExpressionContext, NotExpressionContextAttrs, NullExpressionContextAttrs, NumLitContext,
+    NumLitContextAll, NumLitContextAttrs, OrderItemContextAttrs, OrderStContext,
+    OrderStContextAttrs, ParameterContext, ParameterContextAttrs, ParenthesizedExpressionContext,
     ParenthesizedExpressionContextAttrs, PatternContextAttrs, PatternElemChainContextAttrs,
     PatternElemContext, PatternElemContextAttrs, PatternPartContextAttrs, PatternWhereContextAttrs,
     PowerExpressionContext, PowerExpressionContextAttrs, ProjectionBodyContext,
@@ -71,11 +71,11 @@ use crate::generated::cypherparser::{
     ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
     SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
     StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
-    StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
-    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, UnionStContextAttrs,
-    UnwindStContext, UnwindStContextAttrs, UpdatingStatementContextAll,
-    UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext, WithStContextAttrs,
-    XorExpressionContext, XorExpressionContextAttrs,
+    StringListNullExpressionContext, StringListNullExpressionContextAttrs, StringLitContext,
+    StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs, UnaryAddSubExpressionContext,
+    UnaryAddSubExpressionContextAttrs, UnionStContextAttrs, UnwindStContext, UnwindStContextAttrs,
+    UpdatingStatementContextAll, UpdatingStatementContextAttrs, WhereContextAttrs, WithStContext,
+    WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
@@ -388,6 +388,16 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
         }
     }
 
+    fn visit_stringListNullExpression(
+        &mut self,
+        ctx: &StringListNullExpressionContext<'input>,
+    ) -> Self::Return {
+        match self.build_string_list_null_expression(ctx) {
+            Ok(expr) => AstNode::ReturnExpr(expr),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
     fn visit_addSubExpression(&mut self, ctx: &AddSubExpressionContext<'input>) -> Self::Return {
         match self.build_add_sub_expression(ctx) {
             Ok(expr) => AstNode::ReturnExpr(expr),
@@ -658,11 +668,26 @@ fn symbol_text(ctx: &SymbolContextAll) -> String {
 /// function's docs for why a leading sign has to be handled there instead
 /// of in `DIGIT` itself.
 fn parse_num_lit_text(text: &str) -> Result<Literal, QueryError> {
-    let is_float = text.contains('.')
-        || text.ends_with(['f', 'F', 'd', 'D'])
-        || text
-            .rfind(['e', 'E'])
-            .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-'));
+    // A hex/octal literal's own digits can end in `f`/`F`/`d`/`D` (real hex
+    // digits, e.g. `0x7FFFFFFFFFFFFFFF`) or contain `e`/`E` (also a real
+    // hex digit) -- neither is real openCypher's `<approximate number
+    // suffix>` (`F`/`D`/`f`), which per spec only ever follows a decimal
+    // literal already in scientific or common (has a `.`) notation. Found
+    // via a Phase 3 dry-run behavioral test failure
+    // (`int_literal_accepts_hex_and_octal_forms`): a hex literal ending in
+    // a suffix-shaped digit was misdetected as float and failed to parse.
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let is_hex_or_octal = unsigned
+        .as_bytes()
+        .get(1)
+        .is_some_and(|b| matches!(b, b'x' | b'X' | b'o' | b'O'))
+        && unsigned.starts_with('0');
+    let is_float = !is_hex_or_octal
+        && (text.contains('.')
+            || text.ends_with(['f', 'F', 'd', 'D'])
+            || text
+                .rfind(['e', 'E'])
+                .is_some_and(|i| text[..i].chars().all(|c| c.is_ascii_digit() || c == '-')));
     if is_float {
         let f: f64 = text
             .parse()
@@ -724,13 +749,14 @@ fn invocation_name_text(ctx: &InvocationNameContextAll) -> String {
 /// no property/label/postfix suffixes at any level between it and the
 /// `numLit` itself. Used by `build_unary_add_sub_expression` to fold a
 /// leading `-` directly into the literal (see that function's docs).
+/// `stringExpression`/`nullExpression`/`inExpression` no longer live at
+/// this level at all (moved up to `stringListNullExpression`, see its own
+/// docs) -- only `listExpression` (postfix index/slice) can still appear
+/// here, so that's the only check left.
 fn bare_num_lit<'i>(
     ctx: &AtomicExpressionContextAll<'i>,
 ) -> Option<std::rc::Rc<NumLitContextAll<'i>>> {
-    if !ctx.stringExpression_all().is_empty()
-        || !ctx.listExpression_all().is_empty()
-        || !ctx.nullExpression_all().is_empty()
-    {
+    if !ctx.listExpression_all().is_empty() {
         return None;
     }
     let prop_or_label = ctx.propertyOrLabelExpression()?;
@@ -1007,13 +1033,16 @@ impl AstBuilder {
     /// Mirrors `parser.rs`'s `parse_compare_expr` -- a chain folds into
     /// nested `And`s of each *adjacent* pair (`a op0 b op1 c` -> `(a op0
     /// b) AND (b op1 c)`, real Cypher's own chained-comparison semantics),
-    /// not a separate AST shape.
+    /// not a separate AST shape. Operand type is `stringListNullExpression`
+    /// (not `addSubExpression` directly) since the precedence fix moved
+    /// `IN`/`STARTS WITH`/etc up to sit between this level and arithmetic
+    /// -- see `build_string_list_null_expression`'s docs.
     fn build_comparison_expression(
         &mut self,
         ctx: &ComparisonExpressionContext,
     ) -> Result<ReturnExpr, QueryError> {
         let mut operands = Vec::new();
-        for operand_ctx in ctx.addSubExpression_all() {
+        for operand_ctx in ctx.stringListNullExpression_all() {
             operands.push(self.visit(&*operand_ctx).into_return_expr()?);
         }
         let mut ops = Vec::new();
@@ -1024,7 +1053,7 @@ impl AstBuilder {
             return Ok(operands
                 .into_iter()
                 .next()
-                .expect("comparisonExpression has at least one addSubExpression"));
+                .expect("comparisonExpression has at least one stringListNullExpression"));
         }
         let mut pairs = operands.windows(2).zip(&ops).map(|(pair, op)| {
             ReturnExpr::Compare(Box::new(pair[0].clone()), *op, Box::new(pair[1].clone()))
@@ -1137,6 +1166,14 @@ impl AstBuilder {
         self.visit(&*atomic_ctx).into_return_expr()
     }
 
+    /// `atomicExpression : propertyOrLabelExpression (listExpression)*`
+    /// -- only postfix index/slice suffixes live here now (`IN`/
+    /// `stringExpression`/`nullExpression` moved up to
+    /// `stringListNullExpression`, see its own docs); genuinely
+    /// left-to-right chainable (`list[0][1]`, real postfix repetition per
+    /// openCypher.bnf's `<postfix expression> ::= ... | <postfix
+    /// expression> <postfix operator>`), so no "at most one" restriction
+    /// is needed here at all anymore.
     fn build_atomic_expression(
         &mut self,
         ctx: &AtomicExpressionContext,
@@ -1144,29 +1181,45 @@ impl AstBuilder {
         let base_ctx = ctx
             .propertyOrLabelExpression()
             .expect("atomicExpression always has a propertyOrLabelExpression");
+        let mut base = self.visit(&*base_ctx).into_return_expr()?;
+        for l in ctx.listExpression_all() {
+            base = self.build_list_expression(&l, base)?;
+        }
+        Ok(base)
+    }
+
+    /// `stringListNullExpression : addSubExpression (stringExpression |
+    /// inExpression | nullExpression)?` -- fixes a real precedence bug in
+    /// the vendored grammar (found via a Phase 3 behavioral dry-run, not
+    /// the TCK): `IN`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`/`IS NULL` used
+    /// to attach at `atomicExpression`'s level (tighter than `+`/`-`/`*`/
+    /// `/`/`^`), so `n.val + 0 IS NULL` parsed as `n.val + (0 IS NULL)`.
+    /// Per openCypher.bnf's `<comparison predicate>` chain, these operate
+    /// on a full `<arithmetic value expression>` (this file's
+    /// `addSubExpression`), sitting above arithmetic and below `=`/`<>`/
+    /// `<`/`>`/`<=`/`>=` (`comparisonExpression`, one level up) --
+    /// see `grammar/README.md` for the upstream PR this was also sent to.
+    fn build_string_list_null_expression(
+        &mut self,
+        ctx: &StringListNullExpressionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let base_ctx = ctx
+            .addSubExpression()
+            .expect("stringListNullExpression always has an addSubExpression");
         let base = self.visit(&*base_ctx).into_return_expr()?;
-        let string_suffixes = ctx.stringExpression_all();
-        let list_suffixes = ctx.listExpression_all();
-        let null_suffixes = ctx.nullExpression_all();
-        let total = string_suffixes.len() + list_suffixes.len() + null_suffixes.len();
-        if total == 0 {
-            return Ok(base);
-        }
-        if total > 1 {
-            return Err(QueryError::Syntax(
-                "chaining multiple STARTS WITH/ENDS WITH/CONTAINS/IN/[]/IS NULL suffixes on one expression isn't supported yet".into(),
-            ));
-        }
-        if let Some(s) = string_suffixes.into_iter().next() {
+        if let Some(s) = ctx.stringExpression() {
             return self.build_string_expression(&s, base);
         }
-        if let Some(l) = list_suffixes.into_iter().next() {
-            return self.build_list_expression(&l, base);
+        if let Some(i) = ctx.inExpression() {
+            let rhs_ctx = i
+                .addSubExpression()
+                .expect("inExpression always has an addSubExpression");
+            let rhs = self.visit(&*rhs_ctx).into_return_expr()?;
+            return Ok(ReturnExpr::In(Box::new(base), Box::new(rhs)));
         }
-        let n = null_suffixes
-            .into_iter()
-            .next()
-            .expect("total == 1 and string/list suffixes are empty");
+        let Some(n) = ctx.nullExpression() else {
+            return Ok(base);
+        };
         Ok(if n.NOT().is_some() {
             ReturnExpr::Not(Box::new(ReturnExpr::IsNull(Box::new(base))))
         } else {
@@ -1174,6 +1227,11 @@ impl AstBuilder {
         })
     }
 
+    /// Operand widened from `propertyOrLabelExpression` to
+    /// `addSubExpression` (moved up alongside `stringListNullExpression`,
+    /// see its own docs) -- `x STARTS WITH y + z` is now real, matching
+    /// spec's `<advanced comparison predicand> ::= <arithmetic value
+    /// expression>`.
     fn build_string_expression(
         &mut self,
         ctx: &StringExpressionContextAll,
@@ -1184,24 +1242,21 @@ impl AstBuilder {
             .expect("stringExpression always has a stringExpPrefix");
         let op = string_exp_op(&prefix_ctx);
         let rhs_ctx = ctx
-            .propertyOrLabelExpression()
-            .expect("stringExpression always has a propertyOrLabelExpression");
+            .addSubExpression()
+            .expect("stringExpression always has an addSubExpression");
         let rhs = self.visit(&*rhs_ctx).into_return_expr()?;
         Ok(ReturnExpr::Compare(Box::new(base), op, Box::new(rhs)))
     }
 
+    /// `listExpression` no longer has an `IN` alternative at all (moved to
+    /// the new `inExpression` rule, built directly in
+    /// `build_string_list_null_expression`) -- only the postfix index/
+    /// slice forms remain.
     fn build_list_expression(
         &mut self,
         ctx: &ListExpressionContextAll,
         base: ReturnExpr,
     ) -> Result<ReturnExpr, QueryError> {
-        if ctx.IN().is_some() {
-            let haystack_ctx = ctx
-                .propertyOrLabelExpression()
-                .expect("`IN` listExpression always has a propertyOrLabelExpression");
-            let haystack = self.visit(&*haystack_ctx).into_return_expr()?;
-            return Ok(ReturnExpr::In(Box::new(base), Box::new(haystack)));
-        }
         let exprs = ctx.expression_all();
         if ctx.RANGE().is_some() {
             // `list[start..end]` -- either bound can be omitted.
@@ -1234,7 +1289,7 @@ impl AstBuilder {
         let index_ctx = exprs
             .into_iter()
             .next()
-            .expect("non-slice, non-IN listExpression always has exactly one expression");
+            .expect("non-slice listExpression always has exactly one expression");
         let index = self.visit(&*index_ctx).into_return_expr()?;
         Ok(ReturnExpr::Index(Box::new(base), Box::new(index)))
     }
@@ -2045,6 +2100,23 @@ impl AstBuilder {
 
         let updating = ctx.updatingStatement_all();
         let return_ctx = ctx.returnSt();
+
+        // Bare `CREATE (...)` with nothing else at all (no leading MATCH/
+        // UNWIND, no trailing RETURN, no other updating clause) -- mirrors
+        // pest's `create_stmt_only` (`create_stmt ~ !(return_clause |
+        // chainable_clause_follows)`), producing a real `Statement::Create`
+        // directly instead of wrapping in `Statement::Match` with a
+        // `Tail::Create`. Found via a Phase 3 dry-run behavioral test
+        // failure (`explain_never_mutates_even_a_write_statement`):
+        // `explain.rs`'s "no query plan" output depends on this exact
+        // shape distinction, not just equivalent semantics.
+        if clauses.is_empty() && return_ctx.is_none() && updating.len() == 1 {
+            if let Some(create_ctx) = updating[0].createSt() {
+                let patterns = self.visit(&*create_ctx).into_create_patterns()?;
+                return Ok(Statement::Create(patterns));
+            }
+        }
+
         let mut tail = None;
         let mut order_by = None;
         let mut skip = None;
@@ -3193,6 +3265,80 @@ mod tests {
     }
 
     #[test]
+    fn is_null_binds_looser_than_arithmetic() {
+        // Precedence bug found via a Phase 3 behavioral dry-run: `IS
+        // NULL`/`IN`/`STARTS WITH` etc must bind above `+`/`-`/`*`/`/`/`^`
+        // (openCypher.bnf's <comparison predicate> chain), so `x + 0 IS
+        // NULL` is `(x + 0) IS NULL`, not `x + (0 IS NULL)`.
+        assert_eq!(
+            parse_expr("x + 0 IS NULL").unwrap(),
+            ReturnExpr::IsNull(Box::new(ReturnExpr::Arith(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                ArithOp::Add,
+                Box::new(ReturnExpr::Lit(Literal::Int(0))),
+            )))
+        );
+    }
+
+    #[test]
+    fn in_binds_looser_than_arithmetic_and_operand_can_be_sliced() {
+        assert_eq!(
+            parse_expr("3 IN [1, 2, 3][0..2]").unwrap(),
+            ReturnExpr::In(
+                Box::new(ReturnExpr::Lit(Literal::Int(3))),
+                Box::new(ReturnExpr::Slice(
+                    Box::new(ReturnExpr::ListLit(vec![
+                        ReturnExpr::Lit(Literal::Int(1)),
+                        ReturnExpr::Lit(Literal::Int(2)),
+                        ReturnExpr::Lit(Literal::Int(3)),
+                    ])),
+                    Some(Box::new(ReturnExpr::Lit(Literal::Int(0)))),
+                    Some(Box::new(ReturnExpr::Lit(Literal::Int(2)))),
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn starts_with_operand_can_be_an_arithmetic_expression() {
+        assert_eq!(
+            parse_expr("x STARTS WITH y + z").unwrap(),
+            ReturnExpr::Compare(
+                Box::new(ReturnExpr::Var("x".to_string())),
+                CompareOp::StartsWith,
+                Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Var("y".to_string())),
+                    ArithOp::Add,
+                    Box::new(ReturnExpr::Var("z".to_string())),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn chained_index_postfix_still_works() {
+        assert_eq!(
+            parse_expr("[[1, 2], [3, 4]][0][1]").unwrap(),
+            ReturnExpr::Index(
+                Box::new(ReturnExpr::Index(
+                    Box::new(ReturnExpr::ListLit(vec![
+                        ReturnExpr::ListLit(vec![
+                            ReturnExpr::Lit(Literal::Int(1)),
+                            ReturnExpr::Lit(Literal::Int(2)),
+                        ]),
+                        ReturnExpr::ListLit(vec![
+                            ReturnExpr::Lit(Literal::Int(3)),
+                            ReturnExpr::Lit(Literal::Int(4)),
+                        ]),
+                    ])),
+                    Box::new(ReturnExpr::Lit(Literal::Int(0))),
+                )),
+                Box::new(ReturnExpr::Lit(Literal::Int(1))),
+            )
+        );
+    }
+
+    #[test]
     fn case_searched_form() {
         assert_eq!(
             parse_expr("CASE WHEN x > 1 THEN 'big' WHEN x > 0 THEN 'small' ELSE 'none' END")
@@ -4007,6 +4153,17 @@ mod tests {
     }
 
     #[test]
+    fn statement_bare_create_is_not_wrapped_in_match() {
+        // `CREATE (...)` with nothing else at all mirrors pest's
+        // `create_stmt_only` -- a real `Statement::Create` directly, not
+        // `Statement::Match{tail: Some(Tail::Create(...))}`. Found via a
+        // Phase 3 dry-run: `explain.rs`'s "no query plan" output depends
+        // on this exact shape distinction.
+        let s = parse_antlr("CREATE (a);").unwrap();
+        assert!(matches!(s, Statement::Create(_)));
+    }
+
+    #[test]
     fn statement_remove_tail() {
         let s = parse_statement("MATCH (n) REMOVE n.x").unwrap();
         let Statement::Match { tail, .. } = s else {
@@ -4160,7 +4317,10 @@ mod tests {
     fn parse_antlr_many_basic() {
         let stmts = parse_antlr_many("CREATE (a); CREATE (b); MATCH (n) RETURN n").unwrap();
         assert_eq!(stmts.len(), 3);
-        assert!(matches!(stmts[0], Statement::Match { .. }));
+        // Bare `CREATE (...)` with nothing else is `Statement::Create`
+        // directly, not `Statement::Match` -- see `build_single_part_q`'s
+        // own docs.
+        assert!(matches!(stmts[0], Statement::Create(_)));
         assert!(matches!(stmts[2], Statement::Match { .. }));
     }
 
