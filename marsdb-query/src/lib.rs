@@ -7,7 +7,7 @@ mod explain;
 // into `parse`/`parse_many` yet, kept separate until the visitor-based AST
 // builder (replacing `parser` below) is complete.
 mod generated;
-pub use generated::antlr_accepts;
+pub use generated::{antlr_accepts, antlr_debug_tree_text};
 mod ir;
 mod params;
 mod parser;

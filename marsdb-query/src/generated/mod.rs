@@ -55,6 +55,23 @@ pub fn antlr_accepts(input: &str) -> bool {
     result.is_ok() && !had_error.get()
 }
 
+/// Debugging aid only, same caveats as [`antlr_accepts`] -- returns the
+/// parse tree's flattened text so a mis-tokenization (e.g. a swallowed
+/// character) can be seen directly instead of inferred from accept/reject.
+pub fn antlr_debug_tree_text(input: &str) -> Option<String> {
+    use antlr4rust::common_token_stream::CommonTokenStream;
+    use antlr4rust::tree::ParseTree;
+    use antlr4rust::InputStream;
+    use cypherlexer::CypherLexer;
+    use cypherparser::CypherParser;
+
+    let input = InputStream::new(input);
+    let lexer = CypherLexer::new(input);
+    let tokens = CommonTokenStream::new(lexer);
+    let mut parser = CypherParser::new(tokens);
+    parser.script().ok().map(|t| t.get_text())
+}
+
 #[cfg(test)]
 mod phase1_spike {
     // Phase 1 proof-of-toolchain only (see ../../grammar/README.md) -- not

@@ -95,8 +95,7 @@ FLOAT=94
 WS=95
 COMMENT=96
 LINE_COMMENT=97
-ERRCHAR=98
-Letter=99
+Letter=98
 '='=1
 '+='=2
 '<='=3

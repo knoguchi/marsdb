@@ -131,7 +131,13 @@ DROP       : 'DROP';
 ID: LetterOrDigit+;
 
 ESC_LITERAL    : '`' .*? '`';
-CHAR_LITERAL   : '\'' (~['\\\r\n] | EscapeSequence)? '\'';
+// Upstream (antlr/grammars-v4) had `?` here, capping single-quoted content
+// at 0-1 characters -- any real (2+ char) single-quoted Cypher string
+// silently failed to tokenize as this rule, and the orphaned quote/content
+// fell through to ERRCHAR below instead of erroring. Fixed to `*` to match
+// STRING_LITERAL's shape; Cypher treats '...' and "..." as equivalent
+// string literal forms, not distinct char-vs-string types.
+CHAR_LITERAL   : '\'' (~['\\\r\n] | EscapeSequence)* '\'';
 STRING_LITERAL : '"' (~["\\\r\n] | EscapeSequence)* '"';
 
 DIGIT : SUB? (HexDigit | OctalDigit | Digits | FLOAT);
@@ -140,7 +146,12 @@ FLOAT : (Digits '.' Digits | '.' Digits) ExponentPart? [fd]? | Digits (ExponentP
 WS           : [ \t\r\n\u000C]+ -> channel(HIDDEN);
 COMMENT      : '/*' .*? '*/'    -> channel(COMMENTS);
 LINE_COMMENT : '//' ~[\r\n]*    -> channel(COMMENTS);
-ERRCHAR      : .                -> channel(HIDDEN);
+// Upstream sent any unrecognized character to the HIDDEN channel instead of
+// erroring -- silently swallowing it rather than causing a syntax error,
+// which is how the CHAR_LITERAL bug above turned into silent mis-parses
+// instead of clean rejections. Removed: without a catch-all, ANTLR's
+// default lexer behavior raises a real syntax_error on unmatched input,
+// which is what we want.
 
 fragment EscapeSequence:
     '\\' [btnfr"'\\]
