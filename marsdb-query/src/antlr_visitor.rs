@@ -1,16 +1,15 @@
 // `AstBuilder`/`AstNode` internals stay unused-by-external-code from
-// rustc's perspective even though `parse_antlr` (this file's one real
-// public entry point) exercises them at runtime -- the visitor trait's
-// `visit_X` overrides are only ever called through dynamic dispatch
-// (`accept()`), which rustc's dead-code analysis can't see through.
+// rustc's perspective even though `parse_antlr` (this file's real public
+// entry point, re-exported as `lib.rs`'s `parse`/`parse_many`) exercises
+// them at runtime -- the visitor trait's `visit_X` overrides are only
+// ever called through dynamic dispatch (`accept()`), which rustc's
+// dead-code analysis can't see through.
 #![allow(dead_code)]
 
-//! ANTLR-based AST builder (Phase 2, mars-nog) -- replaces `parser.rs`'s
-//! pest-tree-walk once complete, built incrementally clause by clause.
-//! `parse_antlr` is exported for `marsdb-tck` to exercise against the real
-//! TCK corpus, but `parse`/`parse_many` (this crate's real public API)
-//! still call `parser::parse` exclusively -- that switch is Phase 3's
-//! cutover, not this file's job.
+//! ANTLR-based AST builder (`mars-nog`/`mars-cuk`) -- replaced the old
+//! pest-tree-walk (`parser.rs`/`cypher.pest`, deleted at cutover) as this
+//! crate's real Cypher parser. `parse_antlr`/`parse_antlr_many` are
+//! re-exported by `lib.rs` as `parse`/`parse_many`.
 //!
 //! Implements the generated `CypherParserVisitorCompat` trait rather than
 //! manually walking context accessors: ANTLR's own `accept()`/`visit()`
@@ -78,7 +77,7 @@ use crate::generated::cypherparser::{
     WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
-use crate::parser::{
+use crate::parse_helpers::{
     group_into_linear_patterns, parse_int_literal, parse_rel_range, unescape_string,
     validate_named_path_pattern, validate_shortest_path_pattern,
 };
@@ -2359,13 +2358,11 @@ impl AstBuilder {
     }
 }
 
-/// Parallel entry point alongside `parser::parse` -- not wired into
-/// `lib.rs`'s public `parse`/`parse_many` re-exports yet (that's Phase 3's
-/// cutover, gated on this file's one remaining real gap, CALL -- not a
-/// regression versus pest, which has no CALL support either; see mars-82w).
-/// Exported (not `#[cfg(test)]`) so `marsdb-tck` can run it against the
-/// real TCK corpus as Phase 3's pre-cutover gate, comparing its
-/// accept/reject/`Statement` shape against `parser::parse`'s.
+/// The real implementation behind `lib.rs`'s public `parse` (Phase 3
+/// cutover, mars-cuk/mars-nog) -- the pest-based `parser.rs`/`cypher.pest`
+/// this replaced are gone (see `grammar/README.md`). CALL is the one
+/// remaining gap versus the old parser, and it's not a regression: pest
+/// never supported it either (tracked separately as mars-82w).
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
@@ -2423,14 +2420,13 @@ pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     AstBuilder::new().visit(&*query_ctx).into_statement()
 }
 
-/// Parallel entry point alongside `parser::parse_many` -- parses a
-/// `;`-separated batch of one or more statements (`"CREATE (a); CREATE
-/// (b); MATCH (n) RETURN n"`). `queries : query (SEMI query)* EOF` is a
-/// mars-specific grammar extension (see `grammar/README.md`), mirroring
-/// `cypher.pest`'s own `queries` rule exactly, including stripping a
-/// single genuinely-trailing `;` in Rust before parsing (same reason
-/// `parser::parse_many` does: the grammar rule itself has no trailing
-/// `SEMI?`, to avoid the same ambiguity its own doc comment describes).
+/// The real implementation behind `lib.rs`'s public `parse_many` (Phase 3
+/// cutover) -- parses a `;`-separated batch of one or more statements
+/// (`"CREATE (a); CREATE (b); MATCH (n) RETURN n"`). `queries : query
+/// (SEMI query)* EOF` is a mars-specific grammar extension (see
+/// `grammar/README.md`), including stripping a single genuinely-trailing
+/// `;` in Rust before parsing -- the grammar rule itself has no trailing
+/// `SEMI?`, to avoid a `queries`/`script` prefix ambiguity.
 pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, QueriesContextAttrs};
