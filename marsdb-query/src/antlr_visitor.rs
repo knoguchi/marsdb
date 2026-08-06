@@ -1,11 +1,16 @@
-// Not wired into a public entry point yet -- only this file's own tests
-// exercise `Visitor::visit` until later Phase 2 increments need more of
-// `AstNode`. Remove once that happens.
+// `AstBuilder`/`AstNode` internals stay unused-by-external-code from
+// rustc's perspective even though `parse_antlr` (this file's one real
+// public entry point) exercises them at runtime -- the visitor trait's
+// `visit_X` overrides are only ever called through dynamic dispatch
+// (`accept()`), which rustc's dead-code analysis can't see through.
 #![allow(dead_code)]
 
 //! ANTLR-based AST builder (Phase 2, mars-nog) -- replaces `parser.rs`'s
 //! pest-tree-walk once complete, built incrementally clause by clause.
-//! Not wired into `parse`/`parse_many` yet.
+//! `parse_antlr` is exported for `marsdb-tck` to exercise against the real
+//! TCK corpus, but `parse`/`parse_many` (this crate's real public API)
+//! still call `parser::parse` exclusively -- that switch is Phase 3's
+//! cutover, not this file's job.
 //!
 //! Implements the generated `CypherParserVisitorCompat` trait rather than
 //! manually walking context accessors: ANTLR's own `accept()`/`visit()`
@@ -24,9 +29,9 @@
 
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
-    PropAccess, QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem, ReturnExpr,
-    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, UnwindSource,
-    WithClause, WithExpr,
+    PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection, RelPattern, RemoveItem,
+    ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause,
+    UnwindSource, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -37,30 +42,32 @@ use crate::generated::cypherparser::{
     ComparisonSignsContextAll, ComparisonSignsContextAttrs, CountAllContext, CreateIndexStContext,
     CreateIndexStContextAttrs, CreateStContext, CreateStContextAttrs, DeleteStContext,
     DeleteStContextAttrs, ExplainStContext, ExplainStContextAttrs, ExpressionChainContextAttrs,
-    ExpressionContext, ExpressionContextAttrs, FunctionInvocationContext,
-    FunctionInvocationContextAttrs, InvocationNameContextAll, InvocationNameContextAttrs,
-    LimitStContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs, ListLitContext,
-    ListLitContextAttrs, LiteralContext, LiteralContextAttrs, MapLitContext, MapLitContextAttrs,
-    MapPairContextAttrs, MatchStContext, MatchStContextAttrs, MergeActionContextAll,
-    MergeActionContextAttrs, MergeStContext, MergeStContextAttrs, MultDivExpressionContext,
-    MultiPartQContext, MultiPartQContextAttrs, NodeLabelsContextAttrs, NodePatternContext,
-    NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
+    ExpressionContext, ExpressionContextAttrs, FilterExpressionContext,
+    FilterExpressionContextAttrs, FilterWithContext, FilterWithContextAttrs,
+    FunctionInvocationContext, FunctionInvocationContextAttrs, InvocationNameContextAll,
+    InvocationNameContextAttrs, LimitStContextAttrs, ListComprehensionContext,
+    ListComprehensionContextAttrs, ListExpressionContextAll, ListExpressionContextAttrs,
+    ListLitContext, ListLitContextAttrs, LiteralContext, LiteralContextAttrs, MapLitContext,
+    MapLitContextAttrs, MapPairContextAttrs, MatchStContext, MatchStContextAttrs,
+    MergeActionContextAll, MergeActionContextAttrs, MergeStContext, MergeStContextAttrs,
+    MultDivExpressionContext, MultiPartQContext, MultiPartQContextAttrs, NodeLabelsContextAttrs,
+    NodePatternContext, NodePatternContextAttrs, NotExpressionContext, NotExpressionContextAttrs,
     NullExpressionContextAttrs, NumLitContext, NumLitContextAll, NumLitContextAttrs,
     OrderItemContextAttrs, OrderStContext, OrderStContextAttrs, ParameterContext,
     ParameterContextAttrs, ParenthesizedExpressionContext, ParenthesizedExpressionContextAttrs,
     PatternContextAttrs, PatternElemChainContextAttrs, PatternElemContext, PatternElemContextAttrs,
     PatternPartContextAttrs, PatternWhereContextAttrs, PowerExpressionContext,
     PowerExpressionContextAttrs, ProjectionBodyContext, ProjectionBodyContextAttrs,
-    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertyExpressionContext,
-    PropertyExpressionContextAttrs, PropertyOrLabelExpressionContext,
-    PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
-    ReadingStatementContextAttrs, RegularQueryContext, RegularQueryContextAttrs,
-    RelationDetailContext, RelationDetailContextAttrs, RelationshipPatternContext,
-    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs, RemoveItemContextAll,
-    RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
-    ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
-    ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
-    SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
+    ProjectionItemContextAttrs, ProjectionItemsContextAttrs, PropertiesContextAll,
+    PropertiesContextAttrs, PropertyExpressionContext, PropertyExpressionContextAttrs,
+    PropertyOrLabelExpressionContext, PropertyOrLabelExpressionContextAttrs,
+    ReadingStatementContextAll, ReadingStatementContextAttrs, RegularQueryContext,
+    RegularQueryContextAttrs, RelationDetailContext, RelationDetailContextAttrs,
+    RelationshipPatternContext, RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
+    RemoveItemContextAll, RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs,
+    ReturnStContext, ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext,
+    SetStContextAttrs, ShortestPathWrapperContextAttrs, SinglePartQContext,
+    SinglePartQContextAttrs, SkipStContextAttrs, StandaloneCallContext, StringExpPrefixContextAll,
     StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
     StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
     UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, UnionStContextAttrs,
@@ -675,19 +682,6 @@ fn parse_num_lit_text(text: &str) -> Result<Literal, QueryError> {
     }
 }
 
-fn no_properties_yet<T>(properties_present: bool) -> Result<Vec<(String, T)>, QueryError> {
-    if properties_present {
-        // Property values are arbitrary expressions (`{x: 1 + 2}`), not
-        // just literals -- deferred until the expression chain lands
-        // later in Phase 2, rather than silently dropping them.
-        Err(QueryError::Syntax(
-            "pattern properties aren't supported by the ANTLR parser yet".into(),
-        ))
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 fn compare_sign(ctx: &ComparisonSignsContextAll) -> CompareOp {
     if ctx.LE().is_some() {
         CompareOp::Le
@@ -767,13 +761,38 @@ fn list_expr_bound_is_before_range(ctx: &ListExpressionContextAll) -> bool {
 }
 
 impl AstBuilder {
+    /// `properties : mapLit | parameter`. Only the `mapLit` alternative
+    /// has a real `NodePattern`/`RelPattern::props` representation --
+    /// `Vec<(String, ReturnExpr)>` has no "the whole map comes from one
+    /// parameter" shape, and pest doesn't support that on a pattern's
+    /// inline properties either (only `map_expr`), so rejecting it here
+    /// isn't a regression, just parity.
+    fn build_properties(
+        &mut self,
+        ctx: Option<Rc<PropertiesContextAll>>,
+    ) -> Result<Vec<(String, ReturnExpr)>, QueryError> {
+        let Some(ctx) = ctx else {
+            return Ok(Vec::new());
+        };
+        let Some(map_ctx) = ctx.mapLit() else {
+            return Err(QueryError::Syntax(
+                "a parameter can't be used as a pattern's whole properties map".into(),
+            ));
+        };
+        let expr = self.visit(&*map_ctx).into_return_expr()?;
+        let ReturnExpr::MapLit(items) = expr else {
+            unreachable!("mapLit always builds a ReturnExpr::MapLit");
+        };
+        Ok(items)
+    }
+
     fn build_node_pattern(&mut self, ctx: &NodePatternContext) -> Result<NodePattern, QueryError> {
         let var = ctx.symbol().map(|s| symbol_text(&s));
         let labels = ctx
             .nodeLabels()
             .map(|nl| nl.name_all().iter().map(|n| n.get_text()).collect())
             .unwrap_or_default();
-        let props = no_properties_yet(ctx.properties().is_some())?;
+        let props = self.build_properties(ctx.properties())?;
         Ok(NodePattern { var, labels, props })
     }
 
@@ -783,7 +802,7 @@ impl AstBuilder {
             .relationshipTypes()
             .map(|rt| rt.name_all().iter().map(|n| n.get_text()).collect())
             .unwrap_or_default();
-        let props = no_properties_yet(ctx.properties().is_some())?;
+        let props = self.build_properties(ctx.properties())?;
         let hop_range = ctx
             .rangeLit()
             .map(|r| parse_rel_range(&r.get_text()))
@@ -1268,9 +1287,94 @@ impl AstBuilder {
         if let Some(sym_ctx) = ctx.symbol() {
             return Ok(ReturnExpr::Var(symbol_text(&sym_ctx)));
         }
+        if let Some(filter_ctx) = ctx.filterWith() {
+            return self.build_filter_with(&filter_ctx);
+        }
+        if let Some(lc_ctx) = ctx.listComprehension() {
+            return self.build_list_comprehension(&lc_ctx);
+        }
         Err(QueryError::Syntax(
-            "this expression form (CASE/list comprehension/pattern comprehension/filter/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
+            "this expression form (CASE/pattern comprehension/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
         ))
+    }
+
+    /// `filterExpression : symbol IN expression where?` -- shared by
+    /// `filterWith` (ALL/ANY/NONE/SINGLE quantifiers) and
+    /// `listComprehension`, both of which bind one variable over a source
+    /// list, optionally filtered.
+    fn build_filter_expression(
+        &mut self,
+        ctx: &FilterExpressionContext,
+    ) -> Result<(String, ReturnExpr, Option<Box<ReturnExpr>>), QueryError> {
+        let var_ctx = ctx.symbol().expect("filterExpression always has a symbol");
+        let var = symbol_text(&var_ctx);
+        let source_ctx = ctx
+            .expression()
+            .expect("filterExpression always has an expression");
+        let source = self.visit(&*source_ctx).into_return_expr()?;
+        let where_clause = match ctx.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                Some(Box::new(self.visit(&*expr_ctx).into_return_expr()?))
+            }
+            None => None,
+        };
+        Ok((var, source, where_clause))
+    }
+
+    /// `filterWith : (ALL | ANY | NONE | SINGLE) LPAREN filterExpression
+    /// RPAREN` -- `ReturnExpr::Quantifier`, always evaluates to a bool
+    /// (`where_clause` absent means "every element's own truthiness", same
+    /// convention `Quantifier::where_clause`'s own docs describe).
+    fn build_filter_with(&mut self, ctx: &FilterWithContext) -> Result<ReturnExpr, QueryError> {
+        let kind = if ctx.ALL().is_some() {
+            QuantifierKind::All
+        } else if ctx.ANY().is_some() {
+            QuantifierKind::Any
+        } else if ctx.NONE().is_some() {
+            QuantifierKind::None
+        } else {
+            ctx.SINGLE()
+                .expect("filterWith always has one of ALL/ANY/NONE/SINGLE");
+            QuantifierKind::Single
+        };
+        let fe_ctx = ctx
+            .filterExpression()
+            .expect("filterWith always has a filterExpression");
+        let (var, source, where_clause) = self.build_filter_expression(&fe_ctx)?;
+        Ok(ReturnExpr::Quantifier {
+            kind,
+            var,
+            source: Box::new(source),
+            where_clause,
+        })
+    }
+
+    /// `listComprehension : LBRACK filterExpression (STICK expression)?
+    /// RBRACK` -- `ctx.expression()` here is `listComprehension`'s own
+    /// direct child (the `STICK`-following projection), not
+    /// `filterExpression`'s nested one (a different context type, no
+    /// ambiguity).
+    fn build_list_comprehension(
+        &mut self,
+        ctx: &ListComprehensionContext,
+    ) -> Result<ReturnExpr, QueryError> {
+        let fe_ctx = ctx
+            .filterExpression()
+            .expect("listComprehension always has a filterExpression");
+        let (var, source, where_clause) = self.build_filter_expression(&fe_ctx)?;
+        let project = match ctx.expression() {
+            Some(expr_ctx) => Some(Box::new(self.visit(&*expr_ctx).into_return_expr()?)),
+            None => None,
+        };
+        Ok(ReturnExpr::ListComp {
+            var,
+            source: Box::new(source),
+            where_clause,
+            project,
+        })
     }
 
     fn build_function_invocation(
@@ -1758,28 +1862,46 @@ impl AstBuilder {
     /// it's last, per `Statement::Match`'s own "missing tail is only valid
     /// with a MERGE clause" rule) folds into a `Tail::X(_, Option
     /// <ReturnTail>)`, consuming an optional trailing `returnSt` as a
-    /// narrower `ReturnTail` (items + distinct only). Mirrors `parser.rs`'s
-    /// `parse_mutating_tail`: `RETURN *` and ORDER BY/SKIP/LIMIT aren't
-    /// supported in this specific position (`ReturnTail` has no fields for
-    /// either) even though this grammar's `returnSt` here is the exact
-    /// same full-featured rule used everywhere else, unlike pest's, which
-    /// has a dedicated narrower rule for just this position -- matching
-    /// pest's existing restriction rather than silently accepting
-    /// something it can't represent.
+    /// narrower `ReturnTail` (items + distinct only, matching pest's
+    /// `ReturnTail`, which has no other fields either). `RETURN *` isn't
+    /// supported in this position (`ReturnTail` has no star-resolution
+    /// site -- mirrors `parser.rs`'s `parse_mutating_tail`, same
+    /// real restriction there too, confirmed via the TCK). ORDER BY/SKIP/
+    /// LIMIT, though, are NOT restricted here (an earlier version of this
+    /// function wrongly rejected them, found via a full TCK parse-parity
+    /// run -- `MATCH (n) DELETE n RETURN 42 LIMIT 0` is real, TCK-tested
+    /// Cypher) -- returned to the caller instead, which places them on the
+    /// *statement's* own `order_by`/`skip`/`limit` fields, same as pest:
+    /// its `mutating_tail` rule has no order/skip/limit slot of its own at
+    /// all, they're siblings of `tail_clause` at `match_stmt`'s own level
+    /// (`clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~
+    /// limit_clause?`), applying regardless of which `Tail` variant is
+    /// active. This grammar just nests them inside `returnSt`'s own
+    /// `projectionBody` structurally instead of keeping them as separate
+    /// statement-level siblings -- same semantics, different grammar shape.
+    #[allow(clippy::type_complexity)]
     fn build_mutating_tail(
         &mut self,
         ctx: &UpdatingStatementContextAll,
         return_ctx: Option<&ReturnStContext>,
-    ) -> Result<Tail, QueryError> {
+    ) -> Result<
+        (
+            Tail,
+            Option<Vec<(ReturnExpr, SortDir)>>,
+            Option<i64>,
+            Option<i64>,
+        ),
+        QueryError,
+    > {
+        let mut order_by = None;
+        let mut skip = None;
+        let mut limit = None;
         let ret = match return_ctx {
             Some(return_ctx) => {
                 let c = self.visit(return_ctx).into_return_clause()?;
-                if c.order_by.is_some() || c.skip.is_some() || c.limit.is_some() {
-                    return Err(QueryError::Syntax(
-                        "ORDER BY/SKIP/LIMIT aren't supported on a mutating clause's own trailing RETURN"
-                            .into(),
-                    ));
-                }
+                order_by = c.order_by;
+                skip = c.skip;
+                limit = c.limit;
                 let Tail::Return(items, distinct) = c.tail else {
                     return Err(QueryError::Syntax(
                         "RETURN * isn't supported as a mutating clause's own trailing RETURN"
@@ -1790,27 +1912,24 @@ impl AstBuilder {
             }
             None => None,
         };
-        if let Some(create_ctx) = ctx.createSt() {
-            let patterns = self.visit(&*create_ctx).into_create_patterns()?;
-            return Ok(Tail::Create(patterns, ret));
-        }
-        if let Some(delete_ctx) = ctx.deleteSt() {
+        let tail = if let Some(create_ctx) = ctx.createSt() {
+            Tail::Create(self.visit(&*create_ctx).into_create_patterns()?, ret)
+        } else if let Some(delete_ctx) = ctx.deleteSt() {
             let d = self.visit(&*delete_ctx).into_delete_items()?;
-            return Ok(if d.detach {
+            if d.detach {
                 Tail::DetachDelete(d.items, ret)
             } else {
                 Tail::Delete(d.items, ret)
-            });
-        }
-        if let Some(set_ctx) = ctx.setSt() {
-            let items = self.visit(&*set_ctx).into_set_items()?;
-            return Ok(Tail::Set(items, ret));
-        }
-        let remove_ctx = ctx
-            .removeSt()
-            .expect("build_mutating_tail's caller already excluded mergeSt");
-        let items = self.visit(&*remove_ctx).into_remove_items()?;
-        Ok(Tail::Remove(items, ret))
+            }
+        } else if let Some(set_ctx) = ctx.setSt() {
+            Tail::Set(self.visit(&*set_ctx).into_set_items()?, ret)
+        } else {
+            let remove_ctx = ctx
+                .removeSt()
+                .expect("build_mutating_tail's caller already excluded mergeSt");
+            Tail::Remove(self.visit(&*remove_ctx).into_remove_items()?, ret)
+        };
+        Ok((tail, order_by, skip, limit))
     }
 
     /// `singlePartQ : readingStatement* (returnSt | updatingStatement+
@@ -1847,7 +1966,11 @@ impl AstBuilder {
             if last.mergeSt().is_some() {
                 clauses.push(self.build_updating_statement_as_clause(last)?);
             } else {
-                tail = Some(self.build_mutating_tail(last, return_ctx.as_deref())?);
+                let (t, ob, sk, lim) = self.build_mutating_tail(last, return_ctx.as_deref())?;
+                tail = Some(t);
+                order_by = ob;
+                skip = sk;
+                limit = lim;
                 consumed_return = return_ctx.is_some();
             }
         }
@@ -2059,14 +2182,13 @@ impl AstBuilder {
 }
 
 /// Parallel entry point alongside `parser::parse` -- not wired into
-/// `lib.rs`'s public `parse`/`parse_many` yet (that's Phase 3's cutover,
-/// gated on this whole file's remaining gaps: CALL, EXPLAIN, CREATE INDEX,
-/// none of which this vendored grammar (antlr/grammars-v4/cypher) supports
-/// at all yet -- the last two would need a grammar patch, not just visitor
-/// work). Exercised directly by this file's own tests and, later, a
-/// filtered TCK run comparing against `parser::parse`'s output.
-#[cfg(test)]
-pub(crate) fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
+/// `lib.rs`'s public `parse`/`parse_many` re-exports yet (that's Phase 3's
+/// cutover, gated on this file's one remaining real gap, CALL -- not a
+/// regression versus pest, which has no CALL support either; see mars-82w).
+/// Exported (not `#[cfg(test)]`) so `marsdb-tck` can run it against the
+/// real TCK corpus as Phase 3's pre-cutover gate, comparing its
+/// accept/reject/`Statement` shape against `parser::parse`'s.
+pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
     use antlr4rust::common_token_stream::CommonTokenStream;
@@ -2556,8 +2678,39 @@ mod tests {
     }
 
     #[test]
-    fn properties_not_yet_supported() {
-        assert!(parse_pattern("(a {name: 'x'})").is_err());
+    fn node_pattern_properties() {
+        let pattern = parse_pattern("(a {name: 'x', age: 1 + 1})").unwrap();
+        assert_eq!(
+            pattern.start.props,
+            vec![
+                (
+                    "name".to_string(),
+                    ReturnExpr::Lit(Literal::String("x".to_string()))
+                ),
+                (
+                    "age".to_string(),
+                    ReturnExpr::Arith(
+                        Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                        ArithOp::Add,
+                        Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                    )
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rel_pattern_properties() {
+        let pattern = parse_pattern("(a)-[:T {weight: 5}]->(b)").unwrap();
+        assert_eq!(
+            pattern.hops[0].0.props,
+            vec![("weight".to_string(), ReturnExpr::Lit(Literal::Int(5)))]
+        );
+    }
+
+    #[test]
+    fn pattern_properties_parameter_not_supported() {
+        assert!(parse_pattern("(a $props)").is_err());
     }
 
     #[test]
@@ -2854,6 +3007,102 @@ mod tests {
                 Box::new(ReturnExpr::Var("x".to_string())),
                 Box::new(ReturnExpr::Var("y".to_string())),
             )
+        );
+    }
+
+    #[test]
+    fn quantifier_none() {
+        assert_eq!(
+            parse_expr("none(x IN [1,2] WHERE x > 1)").unwrap(),
+            ReturnExpr::Quantifier {
+                kind: QuantifierKind::None,
+                var: "x".to_string(),
+                source: Box::new(ReturnExpr::ListLit(vec![
+                    ReturnExpr::Lit(Literal::Int(1)),
+                    ReturnExpr::Lit(Literal::Int(2)),
+                ])),
+                where_clause: Some(Box::new(ReturnExpr::Compare(
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                    CompareOp::Gt,
+                    Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                ))),
+            }
+        );
+    }
+
+    #[test]
+    fn quantifier_all_any_single_no_where() {
+        assert!(matches!(
+            parse_expr("all(x IN [1]) ").unwrap(),
+            ReturnExpr::Quantifier {
+                kind: QuantifierKind::All,
+                where_clause: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_expr("any(x IN [1])").unwrap(),
+            ReturnExpr::Quantifier {
+                kind: QuantifierKind::Any,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_expr("single(x IN [1])").unwrap(),
+            ReturnExpr::Quantifier {
+                kind: QuantifierKind::Single,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn list_comprehension_with_projection() {
+        assert_eq!(
+            parse_expr("[x IN [1,2] WHERE x > 1 | x * 2]").unwrap(),
+            ReturnExpr::ListComp {
+                var: "x".to_string(),
+                source: Box::new(ReturnExpr::ListLit(vec![
+                    ReturnExpr::Lit(Literal::Int(1)),
+                    ReturnExpr::Lit(Literal::Int(2)),
+                ])),
+                where_clause: Some(Box::new(ReturnExpr::Compare(
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                    CompareOp::Gt,
+                    Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                ))),
+                project: Some(Box::new(ReturnExpr::Arith(
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                    ArithOp::Mul,
+                    Box::new(ReturnExpr::Lit(Literal::Int(2))),
+                ))),
+            }
+        );
+    }
+
+    #[test]
+    fn list_comprehension_with_where_no_project() {
+        // Bare `[x IN list]` with neither WHERE nor `| project` is
+        // genuinely ambiguous with a one-element `listLit` containing the
+        // boolean `x IN list` membership test -- ANTLR resolves it as the
+        // latter (`literal` is `atom`'s first alternative), which is also
+        // a real, useful expression on its own. A WHERE (or `|`) is what
+        // actually distinguishes a list comprehension here.
+        assert_eq!(
+            parse_expr("[x IN [1,2] WHERE x > 1]").unwrap(),
+            ReturnExpr::ListComp {
+                var: "x".to_string(),
+                source: Box::new(ReturnExpr::ListLit(vec![
+                    ReturnExpr::Lit(Literal::Int(1)),
+                    ReturnExpr::Lit(Literal::Int(2)),
+                ])),
+                where_clause: Some(Box::new(ReturnExpr::Compare(
+                    Box::new(ReturnExpr::Var("x".to_string())),
+                    CompareOp::Gt,
+                    Box::new(ReturnExpr::Lit(Literal::Int(1))),
+                ))),
+                project: None,
+            }
         );
     }
 
@@ -3483,11 +3732,29 @@ mod tests {
     }
 
     #[test]
-    fn statement_mutating_tail_order_by_errors() {
-        // ReturnTail (SET/DELETE/REMOVE/CREATE's own trailing RETURN) has
-        // no room for ORDER BY/SKIP/LIMIT, even though this grammar's
-        // returnSt is the same full rule used everywhere else.
-        assert!(parse_statement("MATCH (n) SET n.x = 1 RETURN n ORDER BY n.x").is_err());
+    fn statement_mutating_tail_order_by_skip_limit_apply_at_statement_level() {
+        // ReturnTail itself (SET/DELETE/REMOVE/CREATE's own trailing
+        // RETURN) has no room for ORDER BY/SKIP/LIMIT -- but real Cypher
+        // still allows them here (TCK's Delete6/Remove3 "Persistence of
+        // .../remove clause side effects"), applying to the *statement*,
+        // same as pest's own grammar keeps them as siblings of tail_clause
+        // rather than nested inside the RETURN.
+        let s =
+            parse_statement("MATCH (n) SET n.x = 1 RETURN n ORDER BY n.x SKIP 1 LIMIT 2").unwrap();
+        let Statement::Match {
+            tail,
+            order_by,
+            skip,
+            limit,
+            ..
+        } = s
+        else {
+            panic!("expected Statement::Match");
+        };
+        assert!(matches!(tail, Some(Tail::Set(_, Some(_)))));
+        assert!(order_by.is_some());
+        assert_eq!(skip, Some(1));
+        assert_eq!(limit, Some(2));
     }
 
     #[test]
