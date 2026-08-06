@@ -1414,7 +1414,7 @@ impl<'a> Executor<'a> {
             // legitimately overlap with `carried_vars` (e.g. `MATCH (a)
             // MERGE (a)-[:R]->(b)` reuses the already-bound `a`), and a
             // raw chain would double it up into two identical columns.
-            let star_items = return_star_items(carried_vars.union(&new_vars).cloned())?;
+            let star_items = with_star_items(carried_vars.union(&new_vars).cloned());
             let mut owned = with.clone();
             let mut items = star_items;
             items.extend(owned.items);
@@ -4685,24 +4685,38 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
 /// pass before execution) needs no `&mut Statement` ripple through
 /// `Executor::execute`'s public signature. Real Cypher's own
 /// `NoVariablesInScope` compile-time error when nothing is bound at all
-/// (TCK's Return7 `[2]`, `MATCH () RETURN *`).
+/// (TCK's Return7 `[2]`, `MATCH () RETURN *`). `WITH *` doesn't share this
+/// restriction -- an empty `WITH *` is a legal, if useless, "carry forward
+/// nothing" no-op (TCK's Create3 `[2]`/`[3]`: `MATCH () CREATE () WITH *
+/// CREATE ()`, every token anonymous) -- see `with_star_items` below.
 pub(crate) fn return_star_items(
     names: impl Iterator<Item = String>,
 ) -> Result<Vec<ReturnItem>, QueryError> {
-    let mut names: Vec<String> = names.collect();
+    let names: Vec<String> = names.collect();
     if names.is_empty() {
         return Err(QueryError::Semantic(
             "RETURN * needs at least one variable in scope".into(),
         ));
     }
+    Ok(star_items(names))
+}
+
+/// `WITH *`'s own version of `return_star_items` -- same alphabetical
+/// `Var`-per-name expansion, but tolerates an empty name set instead of
+/// erroring (see that function's docs for why the two differ).
+pub(crate) fn with_star_items(names: impl Iterator<Item = String>) -> Vec<ReturnItem> {
+    star_items(names.collect())
+}
+
+fn star_items(mut names: Vec<String>) -> Vec<ReturnItem> {
     names.sort();
-    Ok(names
+    names
         .into_iter()
         .map(|name| ReturnItem {
             expr: ReturnExpr::Var(name),
             alias: None,
         })
-        .collect())
+        .collect()
 }
 
 /// Validates a RETURN/WITH item list before any row is processed. Two

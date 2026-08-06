@@ -24,7 +24,7 @@ scope.
 | category | total | pass | wrong | unexp | reject | unsup | pass % |
 |---|---|---|---|---|---|---|---|
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
-| clauses/create | 78 | 76 | 0 | 0 | 2 | 0 | 97.4% |
+| clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 40 | 0 | 0 | 1 | 0 | 97.6% |
 | clauses/match | 381 | 357 | 0 | 0 | 24 | 0 | 93.7% |
 | clauses/match-where | 34 | 31 | 0 | 3 | 0 | 0 | 91.2% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3770** | **1** | **7** | **94** | **8** | **97.2%** |
+| **TOTAL** | **3880** | **3772** | **1** | **7** | **92** | **8** | **97.2%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`

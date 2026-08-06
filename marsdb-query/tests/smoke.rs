@@ -4080,14 +4080,13 @@ fn with_star_carries_every_bound_variable() {
     assert_eq!(int(&result.rows[0][1]), 2);
     assert_eq!(int(&result.rows[0][2]), 3);
 
-    // Nothing bound yet -- must error, mirroring RETURN *'s own
-    // NoVariablesInScope rule.
+    // Nothing bound yet -- unlike `RETURN *` (real Cypher's own
+    // `NoVariablesInScope`), `WITH *` tolerates this: it's a legal, if
+    // useless, "carry forward nothing" no-op (TCK's Create3 [2]/[3]; see
+    // `with_star_tolerates_an_empty_scope`).
     let stmt = parse("WITH * RETURN 1").unwrap();
-    let err = Executor::new(&store).execute(&stmt).unwrap_err();
-    assert!(
-        err.to_string().contains("at least one variable"),
-        "expected a no-variables-in-scope error, got: {err}"
-    );
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    assert_eq!(int(&result.rows[0][0]), 1);
 }
 
 /// `[:A|B]`/`[:A|:B]` -- a relationship pattern matches if the edge's
@@ -7947,4 +7946,26 @@ fn merge_named_path_capture_on_create_and_on_match() {
     }
     let count = run(&store, "MATCH ()-[r:R]->() RETURN count(r)");
     assert_eq!(int(&count.rows[0][0]), 1);
+}
+
+/// `WITH *` with nothing bound at all -- a legal no-op, unlike `RETURN *`
+/// in the same situation (real Cypher's `NoVariablesInScope`, which only
+/// applies to `RETURN *`). TCK's Create3 [2]/[3]: every pattern token is
+/// anonymous, so there's genuinely nothing for `WITH *` to carry forward.
+#[test]
+fn with_star_tolerates_an_empty_scope() {
+    // TCK Create3 [2]: 2 pre-existing nodes, +4 from the query itself
+    // (MATCH matches both, each row creates 2 more) -- 6 total.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (), ()");
+    run(&store, "MATCH () CREATE () WITH * CREATE ()");
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int(&count.rows[0][0]), 6);
+
+    // TCK Create3 [3]: 2 pre-existing nodes, +10 -- 12 total.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (), ()");
+    run(&store, "MATCH () CREATE () WITH * MATCH () CREATE ()");
+    let count = run(&store, "MATCH (n) RETURN count(n)");
+    assert_eq!(int(&count.rows[0][0]), 12);
 }

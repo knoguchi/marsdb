@@ -416,7 +416,7 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
     // apply_with_or_carry`'s own `carried_vars`/`new_vars` split.
     let with_owned;
     let with: &WithClause = if with.star {
-        let star_items = crate::executor::return_star_items(input.keys().cloned())?;
+        let star_items = crate::executor::with_star_items(input.keys().cloned());
         let mut owned = with.clone();
         let mut items = star_items;
         items.extend(owned.items);
