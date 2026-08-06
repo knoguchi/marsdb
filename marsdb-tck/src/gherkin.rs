@@ -44,6 +44,12 @@ pub struct Scenario {
     pub params: Vec<(String, String)>,
     pub query: String,
     pub expected: Expected,
+    /// The raw `Then a <Kind>Error should be raised...` line, when
+    /// `expected` is `AnyError` -- kept alongside the deliberately-generic
+    /// `Expected::AnyError` (see its docs) purely for diagnostics that need
+    /// to distinguish `SyntaxError` from other kinds (`TypeError`,
+    /// `ArgumentError`, etc), not for normal scenario running.
+    pub expected_error_line: Option<String>,
 }
 
 pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
@@ -264,6 +270,7 @@ fn parse_scenario(
     let mut params = Vec::new();
     let mut query = None;
     let mut expected = None;
+    let mut expected_error_line = None;
     let mut examples: Option<Examples> = None;
     let mut seen_first_then = false;
 
@@ -359,9 +366,11 @@ fn parse_scenario(
             }
             seen_first_then = true;
         } else if line.starts_with("Then a") && line.contains("should be raised") {
+            let raw_line = line.to_string();
             cursor.pos += 1;
             if expected.is_none() {
                 expected = Some(Expected::AnyError);
+                expected_error_line = Some(raw_line);
             }
             seen_first_then = true;
         } else if line.starts_with("And no side effects")
@@ -401,6 +410,7 @@ fn parse_scenario(
         params,
         query,
         expected,
+        expected_error_line,
     };
     Ok((scenario, examples))
 }
@@ -451,6 +461,7 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
                     .collect(),
                 query: subst(&template.query),
                 expected,
+                expected_error_line: template.expected_error_line.clone(),
             })
         })
         .collect()

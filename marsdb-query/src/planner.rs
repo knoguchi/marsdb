@@ -522,7 +522,8 @@ mod tests {
     }
 
     fn part_from(cypher: &str) -> crate::ast::QueryPart {
-        let Statement::Match { clauses, .. } = crate::parser::parse(cypher).unwrap() else {
+        let Statement::Match { clauses, .. } = crate::antlr_visitor::parse_antlr(cypher).unwrap()
+        else {
             panic!("expected a Match statement");
         };
         let QueryClause::Match(part) = clauses.into_iter().next().unwrap() else {

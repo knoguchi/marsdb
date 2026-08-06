@@ -37,16 +37,17 @@ fn main() {
         );
         std::process::exit(1);
     }
+    let filter = std::env::var("TCK_FILTER").ok();
     let mut reports = Vec::new();
 
     for entry in walk_feature_files(&features_dir) {
-        let category = entry
-            .strip_prefix(&features_dir)
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let rel_path = entry.strip_prefix(&features_dir).unwrap();
+        if let Some(filter) = &filter {
+            if !rel_path.to_string_lossy().contains(filter.as_str()) {
+                continue;
+            }
+        }
+        let category = rel_path.parent().unwrap().to_string_lossy().to_string();
         let content =
             std::fs::read_to_string(&entry).unwrap_or_else(|e| panic!("read {entry:?}: {e}"));
         for scenario_result in gherkin::parse_feature(&content) {

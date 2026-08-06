@@ -2991,6 +2991,9 @@ impl<'a> Executor<'a> {
                     ))),
                 }
             }
+            ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
+                "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+            )),
         }
     }
 
@@ -3658,7 +3661,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Compare(..)
         | ReturnExpr::IsNull(..)
         | ReturnExpr::In(..)
-        | ReturnExpr::HasLabel(..) => format!("col{idx}"),
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => format!("col{idx}"),
     }
 }
 
@@ -3731,7 +3735,8 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::Var(_)
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
-        | ReturnExpr::HasLabel(..) => false,
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => false,
     }
 }
 
@@ -3797,7 +3802,8 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         | ReturnExpr::Var(_)
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
-        | ReturnExpr::HasLabel(..) => false,
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => false,
     }
 }
 
@@ -5059,36 +5065,44 @@ fn call_builtin(
             None => Ok(Value::Null),
         },
         "date" => date_builtin(args, now),
-        "date.transaction" | "date.statement" | "date.realtime" => {
-            Ok(Value::Property(PropertyValue::Date(now.epoch_day)))
-        }
+        "date.transaction" | "date.statement" | "date.realtime" => Ok(now_or_null(args, || {
+            Value::Property(PropertyValue::Date(now.epoch_day))
+        })),
         "duration" => duration_builtin(args),
         "localtime" => local_time_builtin(args, now),
         "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
-            Ok(Value::Property(PropertyValue::LocalTime(now.nanos_of_day)))
+            Ok(now_or_null(args, || {
+                Value::Property(PropertyValue::LocalTime(now.nanos_of_day))
+            }))
         }
         "time" => time_builtin(args, now),
         "time.transaction" | "time.statement" | "time.realtime" => {
             // No-arg time() defaults to UTC offset (real Cypher's statement default timezone)
-            Ok(Value::Property(PropertyValue::Time {
-                nanos_of_day: now.nanos_of_day,
-                offset_seconds: 0,
+            Ok(now_or_null(args, || {
+                Value::Property(PropertyValue::Time {
+                    nanos_of_day: now.nanos_of_day,
+                    offset_seconds: 0,
+                })
             }))
         }
         "localdatetime" => local_date_time_builtin(args, now),
         "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
-            Ok(Value::Property(PropertyValue::LocalDateTime {
-                epoch_seconds: now.epoch_seconds,
-                nanos: now.nanos,
+            Ok(now_or_null(args, || {
+                Value::Property(PropertyValue::LocalDateTime {
+                    epoch_seconds: now.epoch_seconds,
+                    nanos: now.nanos,
+                })
             }))
         }
         "datetime" => date_time_builtin(args, now),
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
             // No-arg datetime() defaults to UTC offset (real Cypher's statement default timezone)
-            Ok(Value::Property(PropertyValue::DateTime {
-                epoch_seconds: now.epoch_seconds,
-                nanos: now.nanos,
-                zone: GraphTzId::Offset(0),
+            Ok(now_or_null(args, || {
+                Value::Property(PropertyValue::DateTime {
+                    epoch_seconds: now.epoch_seconds,
+                    nanos: now.nanos,
+                    zone: GraphTzId::Offset(0),
+                })
             }))
         }
         "duration.between" => {
@@ -5849,6 +5863,23 @@ fn to_string_value(v: &Value) -> Result<Value, QueryError> {
 /// `date('2015-W30-2')`, ...) — a real, documented gap (see the README),
 /// not a silent wrong answer: both `parse_date` and `date_from_map`
 /// return a clear error/`None` for those rather than guessing.
+/// `date.transaction()`/`.statement()`/`.realtime()` and their siblings
+/// for the other 4 temporal types conceptually take no argument (they
+/// always return the current transaction/statement/realtime instant) --
+/// but real Cypher still requires them to propagate a `null` argument
+/// (TCK's Temporal4 [13] "Should propagate null"), same as every other
+/// temporal constructor. Found via the TCK: pest's own grammar couldn't
+/// parse these namespaced calls with an argument at all, so this always-
+/// ignore-args behavior was untested until ANTLR's grammar (which does
+/// support it) newly exposed it as a silent wrong answer instead of null.
+fn now_or_null(args: &[Value], now_value: impl FnOnce() -> Value) -> Value {
+    if matches!(args.first(), Some(Value::Null)) {
+        Value::Null
+    } else {
+        now_value()
+    }
+}
+
 fn date_builtin(args: &[Value], now: temporal::NowSnapshot) -> Result<Value, QueryError> {
     if args.len() > 1 {
         return Err(QueryError::Semantic(format!(
@@ -7720,6 +7751,9 @@ fn eval_projected_expr(
                 ))),
             }
         }
+        ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
+            "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+        )),
     }
 }
 

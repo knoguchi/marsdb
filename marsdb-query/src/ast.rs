@@ -246,6 +246,18 @@ pub enum ReturnExpr {
     /// `RETURN`/`WITH`/`WHERE` instead of only ever being synthesized by
     /// the planner for a multi-label pattern token).
     HasLabel(String, Vec<String>),
+    /// `(n)-[]->()` etc used directly as a boolean expression -- existential
+    /// pattern-predicate syntax, same shape as `Expr::Pattern` (the
+    /// pattern-level sibling this mirrors), but reachable from generic
+    /// expression position (parsed via the same `atom` alternative
+    /// anything else is). In practice only ever meaningful inside `WHERE`
+    /// -- `return_expr_to_expr` folds it into `Expr::Pattern` there before
+    /// it ever reaches `RETURN`/`WITH` position or the executor. Reaching
+    /// `RETURN (n)-->()`/a RETURN item/property value/etc directly (no
+    /// `Expr`-folding step in between) is a real error, not evaluated --
+    /// existence can't be checked without a bound row to check it against,
+    /// which only `WHERE`'s evaluation context has.
+    PatternPredicate(Pattern),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +316,7 @@ pub enum RelDirection {
     Either,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodePattern {
     pub var: Option<String>,
     pub labels: Vec<String>,
@@ -316,7 +328,7 @@ pub struct NodePattern {
     pub props: Vec<(String, ReturnExpr)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RelPattern {
     pub var: Option<String>,
     /// `[:A]` -- one element; `[:A|B]`/`[:A|:B]` (real Cypher accepts
@@ -333,7 +345,7 @@ pub struct RelPattern {
 }
 
 /// A linear chain: node, (rel, node)*.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub start: NodePattern,
     pub hops: Vec<(RelPattern, NodePattern)>,
