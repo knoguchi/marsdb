@@ -26,7 +26,7 @@ scope.
 | clauses/call | 52 | 16 | 0 | 0 | 36 | 0 | 30.8% |
 | clauses/create | 78 | 78 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/delete | 41 | 41 | 0 | 0 | 0 | 0 | 100.0% |
-| clauses/match | 381 | 362 | 0 | 0 | 19 | 0 | 95.0% |
+| clauses/match | 381 | 371 | 0 | 1 | 9 | 0 | 97.4% |
 | clauses/match-where | 34 | 34 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/merge | 75 | 75 | 0 | 0 | 0 | 0 | 100.0% |
 | clauses/remove | 33 | 33 | 0 | 0 | 0 | 0 | 100.0% |
@@ -60,7 +60,7 @@ scope.
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3808** | **0** | **3** | **61** | **8** | **98.1%** |
+| **TOTAL** | **3880** | **3817** | **0** | **3** | **52** | **8** | **98.4%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README for provenance/regen), replacing an earlier hand-rolled `pest`
@@ -106,21 +106,18 @@ database — real, DST-aware offset resolution, not a fixed lookup table
 offsets, e.g. Stockholm in 1818 resolves to `+00:53:28`). `Time` still
 only accepts a fixed offset — it carries no calendar date, so a named
 zone's DST-dependent offset has nothing to resolve against, a real
-structural limit of the type rather than a missing feature. The remaining
-temporal `unexp`/`reject` scenarios are narrow, specific gaps: dates
-outside `chrono`'s representable range (`'-999999999-01-01'`) and the
-alternate ISO-8601 combined date-time duration syntax
+structural limit of the type rather than a missing feature. The alternate
+ISO-8601 combined date-time duration syntax
 (`duration('P2012-02-02T14:37:21.545')`, as opposed to the plain
-`'P1Y2M3DT4H5M6S'` form, which is fully supported).
+`'P1Y2M3DT4H5M6S'` form) and `datetime.fromepoch`/`datetime.fromepochmillis`
+are both supported. The one remaining temporal gap: dates outside
+`chrono`'s representable range (`'-999999999-01-01'`) — see the `unexp`
+column's own docs above for why this one's deliberately left as-is.
 
-The remaining non-temporal `unexp` scenarios are each their own narrow,
-specific gap, not one common cause: `Return2 [14]` (returning the *type*
-of an already-deleted relationship — MarsDB's `DeletedEntityAccess` check
-fires eagerly on any access to a deleted entity, real Cypher's own `type()`
-apparently doesn't need the record itself so it's exempt), and
-`MatchWhere1 [12,13,15]` (a path-length predicate and an aggregate used
-directly inside pattern-level `WHERE`, both real Cypher restrictions this
-codebase doesn't enforce at compile time).
+The only other non-temporal `unexp` left, `Match9 [9]`, is inside TCK's
+own "deprecated scenarios" feature file (`Match9` — excluded from this
+project's conformance push by design, see git history for the reasoning),
+not a real gap in currently-supported syntax.
 
 ## Clauses
 
