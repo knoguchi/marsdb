@@ -965,6 +965,13 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_graph(scope, var, "(n:Label) target")?;
             Kind::Scalar
         }
+        // Real validation (undefined-variable checks etc) happens via
+        // `validate_pattern_predicate` once `return_expr_to_expr` folds
+        // this into `Expr::Pattern` -- reaching `infer_expr` at all means
+        // it's in a position `Expr`-folding never runs (RETURN/WITH item,
+        // function arg, ...), which is already a real error the executor
+        // raises when it tries to evaluate this variant directly.
+        ReturnExpr::PatternPredicate(_) => Kind::Scalar,
     })
 }
 

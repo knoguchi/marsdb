@@ -2991,6 +2991,9 @@ impl<'a> Executor<'a> {
                     ))),
                 }
             }
+            ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
+                "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+            )),
         }
     }
 
@@ -3658,7 +3661,8 @@ fn default_column_name(expr: &ReturnExpr, idx: usize) -> String {
         | ReturnExpr::Compare(..)
         | ReturnExpr::IsNull(..)
         | ReturnExpr::In(..)
-        | ReturnExpr::HasLabel(..) => format!("col{idx}"),
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => format!("col{idx}"),
     }
 }
 
@@ -3731,7 +3735,8 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         ReturnExpr::Var(_)
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
-        | ReturnExpr::HasLabel(..) => false,
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => false,
     }
 }
 
@@ -3797,7 +3802,8 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
         | ReturnExpr::Var(_)
         | ReturnExpr::Prop(_)
         | ReturnExpr::Lit(_)
-        | ReturnExpr::HasLabel(..) => false,
+        | ReturnExpr::HasLabel(..)
+        | ReturnExpr::PatternPredicate(..) => false,
     }
 }
 
@@ -7720,6 +7726,9 @@ fn eval_projected_expr(
                 ))),
             }
         }
+        ReturnExpr::PatternPredicate(_) => Err(QueryError::Semantic(
+            "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
+        )),
     }
 }
 

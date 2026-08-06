@@ -293,6 +293,7 @@ fn substitute_return_expr(
 ) -> Result<(), QueryError> {
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
+        ReturnExpr::PatternPredicate(pattern) => substitute_pattern(pattern, params)?,
         ReturnExpr::Lit(lit) => substitute_literal(lit, params)?,
         ReturnExpr::Call { args, .. } => {
             for arg in args {

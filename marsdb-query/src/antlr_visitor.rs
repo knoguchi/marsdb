@@ -64,7 +64,8 @@ use crate::generated::cypherparser::{
     PropertyOrLabelExpressionContextAttrs, ReadingStatementContextAll,
     ReadingStatementContextAttrs, RegularQueryContext, RegularQueryContextAttrs,
     RelationDetailContext, RelationDetailContextAttrs, RelationshipPatternContext,
-    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs, RemoveItemContextAll,
+    RelationshipPatternContextAttrs, RelationshipTypesContextAttrs,
+    RelationshipsChainPatternContext, RelationshipsChainPatternContextAttrs, RemoveItemContextAll,
     RemoveItemContextAttrs, RemoveStContext, RemoveStContextAttrs, ReturnStContext,
     ReturnStContextAttrs, SetItemContextAll, SetItemContextAttrs, SetStContext, SetStContextAttrs,
     ShortestPathWrapperContextAttrs, SinglePartQContext, SinglePartQContextAttrs,
@@ -870,6 +871,35 @@ impl AstBuilder {
         Ok(Pattern { start, hops })
     }
 
+    /// `relationshipsChainPattern : nodePattern patternElemChain+` -- an
+    /// `atom` alternative (`(n)-->()` used directly as a boolean
+    /// expression, TCK's Pattern1/2 "Pattern predicate"), same node+chain
+    /// shape `build_pattern_elem` already builds for real match patterns,
+    /// just requiring at least one hop (no bare-node pattern predicate,
+    /// matching the grammar's own `+` here vs `patternElem`'s `*`).
+    fn build_relationships_chain_pattern(
+        &mut self,
+        ctx: &RelationshipsChainPatternContext,
+    ) -> Result<Pattern, QueryError> {
+        let node_ctx = ctx
+            .nodePattern()
+            .expect("relationshipsChainPattern always has a nodePattern");
+        let start = self.visit(&*node_ctx).into_node_pattern()?;
+        let mut hops = Vec::new();
+        for chain in ctx.patternElemChain_all() {
+            let rel_ctx = chain
+                .relationshipPattern()
+                .expect("patternElemChain always has a relationshipPattern");
+            let node_ctx = chain
+                .nodePattern()
+                .expect("patternElemChain always has a nodePattern");
+            let rel = self.visit(&*rel_ctx).into_rel_pattern()?;
+            let node = self.visit(&*node_ctx).into_node_pattern()?;
+            hops.push((rel, node));
+        }
+        Ok(Pattern { start, hops })
+    }
+
     /// Mirrors `parser.rs`'s `parse_match_part` -- comma-separated pattern
     /// parts splice into linear chains (shared-node merging) or split into
     /// separate `QueryPart`s (disjoint cross join) via
@@ -1296,6 +1326,11 @@ impl AstBuilder {
         }
         if let Some(case_ctx) = ctx.caseExpression() {
             return self.build_case_expression(&case_ctx);
+        }
+        if let Some(rcp_ctx) = ctx.relationshipsChainPattern() {
+            return Ok(ReturnExpr::PatternPredicate(
+                self.build_relationships_chain_pattern(&rcp_ctx)?,
+            ));
         }
         Err(QueryError::Syntax(
             "this expression form (pattern comprehension/path-as-expression/EXISTS subquery) isn't supported by the ANTLR parser yet".into(),
@@ -2384,6 +2419,7 @@ fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
                 Expr::And(Box::new(acc), Box::new(Expr::HasLabel(var.clone(), label)))
             })
         }
+        ReturnExpr::PatternPredicate(pattern) => Expr::Pattern(pattern),
         other => Expr::GeneralBare(other),
     })
 }
@@ -2882,6 +2918,35 @@ mod tests {
     fn match_where_label_predicate() {
         let parts = parse_match("MATCH (a) WHERE a:A:B").unwrap();
         assert!(matches!(parts[0].where_clause, Some(Expr::And(_, _))));
+    }
+
+    #[test]
+    fn match_where_pattern_predicate() {
+        let parts = parse_match("MATCH (n) WHERE (n)-[]->() RETURN n")
+            .unwrap_or_else(|e| panic!("expected pattern predicate to parse, got {e:?}"));
+        let Some(Expr::Pattern(pattern)) = &parts[0].where_clause else {
+            panic!("expected Expr::Pattern");
+        };
+        assert_eq!(pattern.hops.len(), 1);
+    }
+
+    #[test]
+    fn match_where_pattern_predicate_combined_with_and() {
+        let parts = parse_match("MATCH (n) WHERE (n)-->() AND n.x = 1").unwrap();
+        let Some(Expr::And(l, r)) = &parts[0].where_clause else {
+            panic!("expected Expr::And");
+        };
+        assert!(matches!(**l, Expr::Pattern(_)));
+        assert!(matches!(**r, Expr::Compare(..)));
+    }
+
+    #[test]
+    fn pattern_predicate_outside_where_is_a_runtime_error_shape() {
+        // Grammatically legal anywhere an expression is (real Cypher
+        // restricts it to WHERE) -- parses fine as a ReturnExpr, the
+        // executor is what rejects it outside a WHERE-folded position.
+        let expr = parse_expr("(n)-->()").unwrap();
+        assert!(matches!(expr, ReturnExpr::PatternPredicate(_)));
     }
 
     #[test]
