@@ -24,7 +24,7 @@
 
 use crate::ast::{
     is_aggregate_name, ArithOp, CompareOp, Literal, NodePattern, Pattern, PropAccess, QueryPart,
-    RelDirection, RelPattern, ReturnExpr, ReturnItem, SortDir, Tail,
+    RelDirection, RelPattern, ReturnExpr, ReturnItem, SortDir, Tail, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::generated::cypherparser::{
@@ -52,8 +52,8 @@ use crate::generated::cypherparser::{
     ReturnStContext, ReturnStContextAttrs, SkipStContextAttrs, StringExpPrefixContextAll,
     StringExpPrefixContextAttrs, StringExpressionContextAll, StringExpressionContextAttrs,
     StringLitContext, StringLitContextAttrs, SymbolContextAll, SymbolContextAttrs,
-    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, XorExpressionContext,
-    XorExpressionContextAttrs,
+    UnaryAddSubExpressionContext, UnaryAddSubExpressionContextAttrs, WhereContextAttrs,
+    WithStContext, WithStContextAttrs, XorExpressionContext, XorExpressionContextAttrs,
 };
 use crate::generated::cypherparservisitor::CypherParserVisitorCompat;
 use crate::parser::{
@@ -73,6 +73,7 @@ pub(crate) enum AstNode {
     QueryParts(Vec<QueryPart>),
     ReturnExpr(ReturnExpr),
     ReturnClause(ParsedReturnClause),
+    WithClause(WithClause),
     Err(QueryError),
 }
 
@@ -110,6 +111,7 @@ impl AstNode {
     ast_node_into!(into_query_parts, QueryParts, Vec<QueryPart>);
     ast_node_into!(into_return_expr, ReturnExpr, ReturnExpr);
     ast_node_into!(into_return_clause, ReturnClause, ParsedReturnClause);
+    ast_node_into!(into_with_clause, WithClause, WithClause);
 }
 
 pub(crate) struct AstBuilder {
@@ -444,6 +446,13 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
             .expect("returnSt always has a projectionBody");
         match self.build_projection_body(&body_ctx) {
             Ok(c) => AstNode::ReturnClause(c),
+            Err(e) => AstNode::Err(e),
+        }
+    }
+
+    fn visit_withSt(&mut self, ctx: &WithStContext<'input>) -> Self::Return {
+        match self.build_with_clause(ctx) {
+            Ok(c) => AstNode::WithClause(c),
             Err(e) => AstNode::Err(e),
         }
     }
@@ -1105,6 +1114,18 @@ impl AstBuilder {
             .projectionItems()
             .expect("projectionBody always has projectionItems");
         let tail = if items_ctx.MULT().is_some() {
+            // `projectionItems : (MULT | projectionItem) (COMMA
+            // projectionItem)*` syntactically allows `RETURN *, x AS y`
+            // (MULT first, then a COMMA'd projectionItem) -- but
+            // `Tail::ReturnStar` has no field for extra items alongside
+            // the star (unlike `WithClause`, which has both `star` and
+            // `items`), so silently taking the star-only path here would
+            // drop `x AS y` on the floor. Error instead.
+            if !items_ctx.projectionItem_all().is_empty() {
+                return Err(QueryError::Syntax(
+                    "RETURN * can't be combined with additional items".into(),
+                ));
+            }
             Tail::ReturnStar(distinct)
         } else {
             let mut items = Vec::new();
@@ -1119,6 +1140,24 @@ impl AstBuilder {
             Tail::Return(items, distinct)
         };
 
+        let (order_by, skip, limit) = self.build_order_skip_limit(ctx)?;
+
+        Ok(ParsedReturnClause {
+            tail,
+            order_by,
+            skip,
+            limit,
+        })
+    }
+
+    /// Shared by `build_projection_body` (RETURN) and `build_with_clause`
+    /// (WITH) -- both grammar rules bundle `orderSt`/`skipSt`/`limitSt`
+    /// into the same `projectionBody`.
+    #[allow(clippy::type_complexity)]
+    fn build_order_skip_limit(
+        &mut self,
+        ctx: &ProjectionBodyContext,
+    ) -> Result<(Option<Vec<(ReturnExpr, SortDir)>>, Option<i64>, Option<i64>), QueryError> {
         let order_by = match ctx.orderSt() {
             Some(order_ctx) => Some(self.build_order_by(&order_ctx)?),
             None => None,
@@ -1143,13 +1182,7 @@ impl AstBuilder {
             }
             None => None,
         };
-
-        Ok(ParsedReturnClause {
-            tail,
-            order_by,
-            skip,
-            limit,
-        })
+        Ok((order_by, skip, limit))
     }
 
     fn build_order_by(
@@ -1170,6 +1203,72 @@ impl AstBuilder {
             items.push((expr, dir));
         }
         Ok(items)
+    }
+
+    fn build_with_clause(&mut self, ctx: &WithStContext) -> Result<WithClause, QueryError> {
+        let body_ctx = ctx
+            .projectionBody()
+            .expect("withSt always has a projectionBody");
+        let distinct = body_ctx.DISTINCT().is_some();
+        let items_ctx = body_ctx
+            .projectionItems()
+            .expect("projectionBody always has projectionItems");
+        let star = items_ctx.MULT().is_some();
+        let mut items = Vec::new();
+        for item_ctx in items_ctx.projectionItem_all() {
+            let expr_ctx = item_ctx
+                .expression()
+                .expect("projectionItem always has an expression");
+            let expr = self.visit(&*expr_ctx).into_return_expr()?;
+            let alias = item_ctx.symbol().map(|s| symbol_text(&s));
+            items.push(ReturnItem { expr, alias });
+        }
+        let (order_by, skip, limit) = self.build_order_skip_limit(&body_ctx)?;
+        let where_clause = match ctx.where_() {
+            Some(where_ctx) => {
+                let expr_ctx = where_ctx
+                    .expression()
+                    .expect("where always has an expression");
+                let expr = self.visit(&*expr_ctx).into_return_expr()?;
+                Some(return_expr_to_with_expr(expr))
+            }
+            None => None,
+        };
+        Ok(WithClause {
+            items,
+            star,
+            distinct,
+            where_clause,
+            order_by,
+            skip,
+            limit,
+        })
+    }
+}
+
+/// `where`'s grammar reuses the same `expression` rule as everywhere else
+/// (unlike pest, which has a separate, narrower `with_expr` grammar chain
+/// building `WithExpr` directly) -- so a full `ReturnExpr` has to be built
+/// first and then folded down into `WithExpr` here. Only the variants with
+/// an exact `WithExpr` counterpart (`And`/`Or`/`Not`/`Compare`/`IsNull`)
+/// unwrap recursively; everything else (including `Xor`, which `WithExpr`
+/// has no variant for at all) becomes `Bare` -- `WithExpr::Bare`'s own
+/// docs already cover "any boolean-valued expression used directly as a
+/// predicate", which this falls under regardless of its exact shape.
+fn return_expr_to_with_expr(expr: ReturnExpr) -> WithExpr {
+    match expr {
+        ReturnExpr::And(l, r) => WithExpr::And(
+            Box::new(return_expr_to_with_expr(*l)),
+            Box::new(return_expr_to_with_expr(*r)),
+        ),
+        ReturnExpr::Or(l, r) => WithExpr::Or(
+            Box::new(return_expr_to_with_expr(*l)),
+            Box::new(return_expr_to_with_expr(*r)),
+        ),
+        ReturnExpr::Not(inner) => WithExpr::Not(Box::new(return_expr_to_with_expr(*inner))),
+        ReturnExpr::Compare(l, op, r) => WithExpr::Compare(*l, op, *r),
+        ReturnExpr::IsNull(inner) => WithExpr::IsNull(*inner),
+        other => WithExpr::Bare(other),
     }
 }
 
@@ -1251,6 +1350,17 @@ mod tests {
             .returnSt()
             .unwrap_or_else(|e| panic!("failed to parse {input:?} as `returnSt`: {e:?}"));
         AstBuilder::new().visit(&*ctx).into_return_clause()
+    }
+
+    fn parse_with(input: &str) -> Result<WithClause, QueryError> {
+        let stream = InputStream::new(input);
+        let lexer = CypherLexer::new(stream);
+        let tokens = CommonTokenStream::new(lexer);
+        let mut parser = CypherParser::new(tokens);
+        let ctx = parser
+            .withSt()
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} as `withSt`: {e:?}"));
+        AstBuilder::new().visit(&*ctx).into_with_clause()
     }
 
     #[test]
@@ -1893,5 +2003,98 @@ mod tests {
     #[test]
     fn limit_non_literal_errors() {
         assert!(parse_return("RETURN a LIMIT 1 + 1").is_err());
+    }
+
+    #[test]
+    fn return_star_with_extra_items_errors() {
+        // projectionItems syntactically allows `* , x` (MULT then a
+        // COMMA'd projectionItem), but Tail::ReturnStar has no field to
+        // carry the extra item -- must error, not silently drop it.
+        assert!(parse_return("RETURN *, x AS y").is_err());
+    }
+
+    #[test]
+    fn with_items() {
+        let c = parse_with("WITH a, b.name AS name").unwrap();
+        assert!(!c.star);
+        assert!(!c.distinct);
+        assert_eq!(c.items.len(), 2);
+        assert_eq!(c.items[0].expr, ReturnExpr::Var("a".to_string()));
+        assert_eq!(c.items[1].alias.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn with_star() {
+        let c = parse_with("WITH *").unwrap();
+        assert!(c.star);
+        assert!(c.items.is_empty());
+    }
+
+    #[test]
+    fn with_star_and_items() {
+        // Unlike RETURN *, WithClause has both `star` and `items` fields
+        // -- real Cypher's `WITH *, x AS y` is fully representable.
+        let c = parse_with("WITH *, x AS y").unwrap();
+        assert!(c.star);
+        assert_eq!(c.items.len(), 1);
+        assert_eq!(c.items[0].alias.as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn with_distinct_order_skip_limit() {
+        let c = parse_with("WITH DISTINCT a ORDER BY a SKIP 1 LIMIT 2").unwrap();
+        assert!(c.distinct);
+        assert!(c.order_by.is_some());
+        assert_eq!(c.skip, Some(1));
+        assert_eq!(c.limit, Some(2));
+    }
+
+    #[test]
+    fn with_where_compare() {
+        let c = parse_with("WITH a WHERE a.x = 1").unwrap();
+        let WithExpr::Compare(lhs, op, rhs) = c.where_clause.unwrap() else {
+            panic!("expected WithExpr::Compare");
+        };
+        assert_eq!(
+            lhs,
+            ReturnExpr::Prop(PropAccess {
+                var: "a".to_string(),
+                prop: "x".to_string()
+            })
+        );
+        assert_eq!(op, CompareOp::Eq);
+        assert_eq!(rhs, ReturnExpr::Lit(Literal::Int(1)));
+    }
+
+    #[test]
+    fn with_where_and_or_not() {
+        let c = parse_with("WITH a WHERE NOT (a.x = 1 AND a.y = 2)").unwrap();
+        assert!(matches!(c.where_clause.unwrap(), WithExpr::Not(_)));
+
+        let c = parse_with("WITH a WHERE a.x = 1 OR a.y = 2").unwrap();
+        assert!(matches!(c.where_clause.unwrap(), WithExpr::Or(_, _)));
+    }
+
+    #[test]
+    fn with_where_is_null() {
+        let c = parse_with("WITH a WHERE a IS NULL").unwrap();
+        assert!(matches!(c.where_clause.unwrap(), WithExpr::IsNull(_)));
+    }
+
+    #[test]
+    fn with_where_bare_expression() {
+        // A boolean-valued expression with no comparison operator at all
+        // (here: a HasLabel check) -- no exact WithExpr variant, so it
+        // falls back to Bare rather than erroring.
+        let c = parse_with("WITH n WHERE n:Person").unwrap();
+        assert!(matches!(c.where_clause.unwrap(), WithExpr::Bare(_)));
+    }
+
+    #[test]
+    fn with_where_xor_becomes_bare() {
+        // WithExpr has no Xor variant at all -- confirmed falls back to
+        // Bare rather than silently dropping the XOR semantics.
+        let c = parse_with("WITH a WHERE a.x XOR a.y").unwrap();
+        assert!(matches!(c.where_clause.unwrap(), WithExpr::Bare(_)));
     }
 }
