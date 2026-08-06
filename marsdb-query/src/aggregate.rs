@@ -163,6 +163,23 @@ pub(crate) enum AggAcc {
         distinct: Option<HashSet<HashKey>>,
         items: Vec<Value>,
     },
+    /// Always emits a `Float` (real Cypher's documented behavior --
+    /// interpolating between two ranks can't stay an `Int` even when every
+    /// input was), unlike `PercentileDisc` below.
+    PercentileCont {
+        distinct: Option<HashSet<HashKey>>,
+        values: Vec<f64>,
+        percentile: Option<f64>,
+    },
+    /// Keeps each folded value's original `Value` (not just its numeric
+    /// magnitude) -- `percentileDisc` always returns one of its actual
+    /// inputs verbatim (an `Int` input stays an `Int`), unlike
+    /// `PercentileCont`'s interpolation.
+    PercentileDisc {
+        distinct: Option<HashSet<HashKey>>,
+        values: Vec<Value>,
+        percentile: Option<f64>,
+    },
 }
 
 enum Numeric {
@@ -222,6 +239,16 @@ impl AggAcc {
             "min" => AggAcc::Min { distinct: d(), best: None },
             "max" => AggAcc::Max { distinct: d(), best: None },
             "collect" => AggAcc::Collect { distinct: d(), items: Vec::new() },
+            "percentilecont" => AggAcc::PercentileCont {
+                distinct: d(),
+                values: Vec::new(),
+                percentile: None,
+            },
+            "percentiledisc" => AggAcc::PercentileDisc {
+                distinct: d(),
+                values: Vec::new(),
+                percentile: None,
+            },
             other => unreachable!(
                 "AggAcc::identity called with non-aggregate name {other:?} — is_aggregate_name should have rejected this earlier"
             ),
@@ -334,6 +361,85 @@ impl AggAcc {
                     items.push(v.clone());
                 }
             }
+            AggAcc::PercentileCont { .. } | AggAcc::PercentileDisc { .. } => unreachable!(
+                "percentileCont()/percentileDisc() take two arguments -- callers must use \
+                 fold_percentile, not fold"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Folds one row's (value, percentile) pair for `percentileCont()`/
+    /// `percentileDisc()` — the only two-argument aggregates, so they can't
+    /// share `fold`'s single-`Value` interface. Same null-skipping
+    /// convention as `fold`: callers must skip calling this when `value` is
+    /// `Value::Null`. The percentile is validated (numeric, `0.0..=1.0` —
+    /// TCK's Aggregation6 `[3]`/`[4]`) on every call rather than just the
+    /// first, since nothing here assumes it's constant across the group
+    /// even though real usage always writes it that way.
+    pub(crate) fn fold_percentile(
+        &mut self,
+        value: &Value,
+        percentile: &Value,
+    ) -> Result<(), QueryError> {
+        debug_assert!(
+            !matches!(value, Value::Null),
+            "callers must skip Value::Null before calling fold_percentile"
+        );
+        let p = match numeric_value(percentile) {
+            Some(Numeric::Int(i)) => i as f64,
+            Some(Numeric::Float(f)) => f,
+            None => {
+                return Err(QueryError::Type(format!(
+                "percentileCont()/percentileDisc()'s percentile argument must be numeric, got {}",
+                value_type_name(percentile)
+            )))
+            }
+        };
+        if !(0.0..=1.0).contains(&p) {
+            return Err(QueryError::Type(format!(
+                "percentileCont()/percentileDisc()'s percentile argument must be between 0.0 and \
+                 1.0, got {p}"
+            )));
+        }
+        match self {
+            AggAcc::PercentileCont {
+                distinct,
+                values,
+                percentile,
+            } => {
+                *percentile = Some(p);
+                if !dedup_seen(distinct, value)? {
+                    return Ok(());
+                }
+                match numeric_value(value) {
+                    Some(Numeric::Int(i)) => values.push(i as f64),
+                    Some(Numeric::Float(f)) => values.push(f),
+                    None => {
+                        return Err(QueryError::Type(format!(
+                            "percentileCont() requires a numeric argument, got {}",
+                            value_type_name(value)
+                        )))
+                    }
+                }
+            }
+            AggAcc::PercentileDisc {
+                distinct,
+                values,
+                percentile,
+            } => {
+                *percentile = Some(p);
+                if numeric_value(value).is_none() {
+                    return Err(QueryError::Type(format!(
+                        "percentileDisc() requires a numeric argument, got {}",
+                        value_type_name(value)
+                    )));
+                }
+                if dedup_seen(distinct, value)? {
+                    values.push(value.clone());
+                }
+            }
+            _ => unreachable!("fold_percentile called on a non-percentile accumulator"),
         }
         Ok(())
     }
@@ -369,6 +475,60 @@ impl AggAcc {
             }
             AggAcc::Min { best, .. } | AggAcc::Max { best, .. } => best.unwrap_or(Value::Null),
             AggAcc::Collect { items, .. } => Value::List(items),
+            AggAcc::PercentileCont {
+                mut values,
+                percentile,
+                ..
+            } => {
+                if values.is_empty() {
+                    return Value::Null;
+                }
+                // No contributing row means no percentile either -- but
+                // `values` can't be non-empty without one, since
+                // `fold_percentile` always sets it alongside pushing a
+                // value.
+                let p = percentile.expect("non-empty values implies a captured percentile");
+                values.sort_by(f64::total_cmp);
+                let n = values.len();
+                let rank = p * (n as f64 - 1.0);
+                let lower = rank.floor() as usize;
+                let upper = rank.ceil() as usize;
+                let result = if lower == upper {
+                    values[lower]
+                } else {
+                    let weight = rank - lower as f64;
+                    values[lower] + (values[upper] - values[lower]) * weight
+                };
+                Value::Property(PropertyValue::Float(result))
+            }
+            AggAcc::PercentileDisc {
+                values, percentile, ..
+            } => {
+                if values.is_empty() {
+                    return Value::Null;
+                }
+                let p = percentile.expect("non-empty values implies a captured percentile");
+                let mut ranked: Vec<(f64, Value)> = values
+                    .into_iter()
+                    .map(|v| {
+                        let key = match numeric_value(&v) {
+                            Some(Numeric::Int(i)) => i as f64,
+                            Some(Numeric::Float(f)) => f,
+                            // `fold_percentile` already rejected any
+                            // non-numeric value before it could reach here.
+                            None => unreachable!(
+                                "percentileDisc() accumulator holds a non-numeric value"
+                            ),
+                        };
+                        (key, v)
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let n = ranked.len();
+                let idx = ((p * n as f64).ceil() as isize - 1).max(0) as usize;
+                let idx = idx.min(n - 1);
+                ranked.into_iter().nth(idx).expect("idx < n").1
+            }
         }
     }
 }

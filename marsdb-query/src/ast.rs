@@ -290,7 +290,17 @@ pub enum ArithOp {
 pub fn is_aggregate_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "collect"
+        "count" | "sum" | "avg" | "min" | "max" | "collect" | "percentilecont" | "percentiledisc"
+    )
+}
+
+/// `percentileCont`/`percentileDisc` are the only aggregates that take a
+/// second argument (the percentile, `0.0..=1.0`) alongside the value being
+/// aggregated -- every other name in `is_aggregate_name` takes exactly one.
+pub fn is_percentile_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "percentilecont" | "percentiledisc"
     )
 }
 

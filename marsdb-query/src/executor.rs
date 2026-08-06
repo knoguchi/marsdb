@@ -13,9 +13,10 @@ use marsdb_graph::{
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
 use crate::ast::{
-    is_aggregate_name, ArithOp, CompareOp, Expr, Literal, MergeClause, NodePattern, Pattern,
-    PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection, RemoveItem, ReturnExpr,
-    ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail, UnwindClause, WithClause, WithExpr,
+    is_aggregate_name, is_percentile_name, ArithOp, CompareOp, Expr, Literal, MergeClause,
+    NodePattern, Pattern, PropAccess, QuantifierKind, QueryClause, QueryPart, RelDirection,
+    RemoveItem, ReturnExpr, ReturnItem, ReturnTail, SetItem, SortDir, Statement, Tail,
+    UnwindClause, WithClause, WithExpr,
 };
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, LogicalPlan};
@@ -1926,7 +1927,7 @@ impl<'a> Executor<'a> {
             let group = &mut groups[group_idx];
             group.row_count += 1;
             for (i, item) in items.iter().enumerate() {
-                let ReturnExpr::Call { args, .. } = &item.expr else {
+                let ReturnExpr::Call { name, args, .. } = &item.expr else {
                     continue;
                 };
                 if !is_top_level_aggregate(&item.expr) {
@@ -1939,7 +1940,20 @@ impl<'a> Executor<'a> {
                 // while `count(*)` (tracked via `row_count`, not an
                 // accumulator at all) includes it.
                 let value = self.eval_return_expr(txn, &args[0], row)?;
-                if !matches!(value, Value::Null) {
+                if is_percentile_name(name) {
+                    // percentileCont/percentileDisc's second argument (the
+                    // percentile) is evaluated per row too -- in practice
+                    // always a constant across the group, but nothing
+                    // structurally requires that, so it's just evaluated
+                    // fresh every row like any other expression rather than
+                    // memoized once.
+                    let percentile = self.eval_return_expr(txn, &args[1], row)?;
+                    if !matches!(value, Value::Null) {
+                        if let Some(acc) = &mut group.accs[i] {
+                            acc.fold_percentile(&value, &percentile)?;
+                        }
+                    }
+                } else if !matches!(value, Value::Null) {
                     if let Some(acc) = &mut group.accs[i] {
                         acc.fold(&value)?;
                     }
@@ -3872,28 +3886,40 @@ pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryErr
         match &item.expr {
             ReturnExpr::CountStar => {}
             ReturnExpr::Call { name, args, .. } if is_aggregate_name(name) => {
-                if args.len() != 1 {
-                    return Err(QueryError::Semantic(format!(
-                        "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
-                    )));
+                // `percentileCont`/`percentileDisc` take a second argument
+                // (the percentile) alongside the value being aggregated —
+                // every other aggregate takes exactly one.
+                let expected_args = if is_percentile_name(name) { 2 } else { 1 };
+                if args.len() != expected_args {
+                    return Err(QueryError::Semantic(if expected_args == 2 {
+                        format!(
+                            "{name}() takes exactly two arguments (the value, then the percentile)"
+                        )
+                    } else {
+                        format!(
+                            "{name}() takes exactly one argument (use count(*) for a row count with no argument)"
+                        )
+                    }));
                 }
-                if contains_aggregate(&args[0]) {
-                    return Err(QueryError::Semantic(format!(
-                        "aggregate function '{name}' can't take another aggregate as an argument"
-                    )));
-                }
-                // `count(rand())` etc -- an aggregate's argument must be
-                // deterministic per row for grouping/re-execution to have
-                // well-defined semantics, which `rand()` (a fresh value on
-                // every call, see its own docs) fundamentally breaks. Real
-                // Cypher rejects this at compile time (TCK's Return6
-                // [15], `NonConstantExpression`), not just "whatever value
-                // it happens to produce."
-                if contains_rand_call(&args[0]) {
-                    return Err(QueryError::Semantic(format!(
-                        "aggregate function '{name}' can't take a non-deterministic expression \
-                         (e.g. rand()) as an argument"
-                    )));
+                for arg in args {
+                    if contains_aggregate(arg) {
+                        return Err(QueryError::Semantic(format!(
+                            "aggregate function '{name}' can't take another aggregate as an argument"
+                        )));
+                    }
+                    // `count(rand())` etc -- an aggregate's argument must be
+                    // deterministic per row for grouping/re-execution to have
+                    // well-defined semantics, which `rand()` (a fresh value on
+                    // every call, see its own docs) fundamentally breaks. Real
+                    // Cypher rejects this at compile time (TCK's Return6
+                    // [15], `NonConstantExpression`), not just "whatever value
+                    // it happens to produce."
+                    if contains_rand_call(arg) {
+                        return Err(QueryError::Semantic(format!(
+                            "aggregate function '{name}' can't take a non-deterministic expression \
+                             (e.g. rand()) as an argument"
+                        )));
+                    }
                 }
             }
             other => {

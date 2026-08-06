@@ -911,6 +911,77 @@ fn order_by_desc_reverses_the_whole_cross_type_order_null_and_nan_included() {
 }
 
 #[test]
+fn percentile_cont_and_disc_match_tck_aggregation6() {
+    // TCK expressions/aggregation Aggregation6 [1]/[2]: percentileDisc/
+    // percentileCont(n.price, p) over {10.0, 20.0, 30.0}.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({price: 10.0})");
+    run(&store, "CREATE ({price: 20.0})");
+    run(&store, "CREATE ({price: 30.0})");
+
+    fn float_at(result: &marsdb_query::QueryResult) -> f64 {
+        match &result.rows[0][0] {
+            Value::Property(marsdb_graph::PropertyValue::Float(f)) => *f,
+            other => panic!("unexpected value {other:?}"),
+        }
+    }
+
+    for (p, expected) in [(0.0, 10.0), (0.5, 20.0), (1.0, 30.0)] {
+        let result = run(
+            &store,
+            &format!("MATCH (n) RETURN percentileDisc(n.price, {p}) AS p"),
+        );
+        assert_eq!(float_at(&result), expected, "percentileDisc({p})");
+        let result = run(
+            &store,
+            &format!("MATCH (n) RETURN percentileCont(n.price, {p}) AS p"),
+        );
+        assert_eq!(float_at(&result), expected, "percentileCont({p})");
+    }
+}
+
+#[test]
+fn percentile_cont_interpolates_between_ranks() {
+    // percentileCont interpolates linearly between the two closest ranks
+    // when the percentile doesn't land exactly on one; percentileDisc
+    // never interpolates, it always returns one of the actual inputs.
+    let store = GraphStore::open_memory().unwrap();
+    for price in ["10.0", "20.0", "30.0", "40.0"] {
+        run(&store, &format!("CREATE ({{price: {price}}})"));
+    }
+    let result = run(&store, "MATCH (n) RETURN percentileCont(n.price, 0.5) AS p");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => {
+            assert!((*f - 25.0).abs() < 1e-9, "expected 25.0, got {f}")
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+    let result = run(&store, "MATCH (n) RETURN percentileDisc(n.price, 0.5) AS p");
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Float(f)) => {
+            assert!(
+                *f == 20.0 || *f == 30.0,
+                "expected an actual input, got {f}"
+            )
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
+fn percentile_out_of_range_is_a_runtime_error() {
+    // TCK Aggregation6 [3]/[4]: percentile must be in 0.0..=1.0.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ({price: 10.0})");
+    for bad in ["1000", "-1", "1.1"] {
+        let stmt = parse(&format!("MATCH (n) RETURN percentileCont(n.price, {bad})")).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err());
+        let stmt = parse(&format!("MATCH (n) RETURN percentileDisc(n.price, {bad})")).unwrap();
+        assert!(Executor::new(&store).execute(&stmt).is_err());
+    }
+}
+
+#[test]
 fn variable_length_hop_cannot_reuse_an_earlier_fixed_hops_edge() {
     // TCK clauses/match Match5 [27]: real Cypher's edge-isomorphism rule
     // (no relationship repeated within one MATCH pattern) applies across a
