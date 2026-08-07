@@ -28,6 +28,20 @@ pub enum ExpandDirection {
     Either,
 }
 
+/// How an `IndexSeek`'s lookup value is obtained. `Fixed` is known before
+/// the first row (a literal, or a `$param` — already resolved to a
+/// concrete `Literal` upstream, see `Literal::Param`'s own doc comment —
+/// so it lands here too, not as a separate case) and reused across every
+/// seed row, same cross-join shape `stream_scan` already has. `RowExpr`
+/// depends on the *current* seed row (`UNWIND row ... MATCH (n {prop:
+/// row.field})` — `row.field` varies per row) and must be re-evaluated for
+/// each one; see `Executor::stream_index_seek`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexSeekValue {
+    Fixed(PropertyValue),
+    RowExpr(ReturnExpr),
+}
+
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
     AllNodesScan {
@@ -42,14 +56,15 @@ pub enum LogicalPlan {
     /// every candidate node's record to check the property. Never produced
     /// by `build_match_plan` directly (which has no storage access, so no
     /// way to know which indexes exist) — `planner::apply_index_seeks`
-    /// rewrites a `Filter(Compare(var.prop = literal))` over a
-    /// `NodeByLabelScan` into this, post-build, once a real `Txn` is
+    /// rewrites a `Filter(Compare(var.prop = literal))` (or the
+    /// `GeneralCompare`/`row.prop` shape `IndexSeekValue::RowExpr` covers)
+    /// over a `NodeByLabelScan` into this, post-build, once a real `Txn` is
     /// available to check `GraphStore::index_def_in_txn`.
     IndexSeek {
         var: String,
         label: String,
         prop: String,
-        value: PropertyValue,
+        value: IndexSeekValue,
     },
     /// "Start from the rows already bound coming into this statement" —
     /// used when a `QueryPart`'s pattern start-variable was already bound

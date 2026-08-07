@@ -25,7 +25,7 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 use crate::executor::with_item_output_name;
-use crate::ir::{ExpandDirection, LogicalPlan};
+use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars};
 
 pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, QueryError> {
@@ -389,10 +389,16 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             label,
             prop,
             value,
-        } => out.push(format!(
-            "{pad}IndexSeek({var}:{label} {{{prop}: {}}})",
-            format_property_value(value)
-        )),
+        } => {
+            let value = match value {
+                IndexSeekValue::Fixed(pv) => format_property_value(pv),
+                // No dedicated formatter for the full expression grammar
+                // here -- same Debug fallback DELETE/SET already use
+                // above.
+                IndexSeekValue::RowExpr(expr) => format!("{expr:?}"),
+            };
+            out.push(format!("{pad}IndexSeek({var}:{label} {{{prop}: {value}}})"))
+        }
         LogicalPlan::Seed { var } => out.push(format!("{pad}Seed({var})")),
         LogicalPlan::Expand {
             input,

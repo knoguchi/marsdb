@@ -7,7 +7,7 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 use crate::executor::literal_to_value;
-use crate::ir::{ExpandDirection, LogicalPlan};
+use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 
 struct VarNamer {
     next: usize,
@@ -389,6 +389,25 @@ fn rebuild_and(mut exprs: Vec<Expr>) -> Option<Expr> {
 /// AS var MERGE (c:N {var: var})`, TCK's Merge1 [8] -- an earlier version
 /// of this codebase rejected it outright at plan-build time, which was
 /// wrong, not a real Cypher restriction).
+/// Conservative "could this expression's value depend on `var`" check —
+/// used by `apply_index_seeks` to confirm a `GeneralCompare` conjunct's
+/// non-scanned side is safe to evaluate once per seed row (not once per
+/// candidate node `var` could bind to). Recurses through the two shapes
+/// real bulk-load data actually produces (`row.field`, and `row.a.b` —
+/// `PropOf`'s nested-base case, e.g. APOC's own exported `row.start.movieId`
+/// shape); anything else (a function call, arithmetic, `CASE`, ...) is
+/// treated as "might reference it," not walked further, so the caller
+/// just declines to promote rather than risking a wrong answer.
+fn return_expr_references_var(expr: &ReturnExpr, var: &str) -> bool {
+    match expr {
+        ReturnExpr::Var(v) => v == var,
+        ReturnExpr::Prop(pa) => pa.var == var,
+        ReturnExpr::PropOf(base, _) => return_expr_references_var(base, var),
+        ReturnExpr::Lit(_) | ReturnExpr::CountStar => false,
+        _ => true,
+    }
+}
+
 fn pattern_prop_predicate(var: &str, key: &str, expr: &ReturnExpr) -> Expr {
     let access = PropAccess {
         var: var.to_string(),
@@ -516,7 +535,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                         var: var.clone(),
                         label: label.clone(),
                         prop: pa.prop,
-                        value: literal_to_value(&lit),
+                        value: IndexSeekValue::Fixed(literal_to_value(&lit)),
                     };
                     return Ok(match rebuild_and(candidates) {
                         Some(predicate) => LogicalPlan::Filter {
@@ -525,6 +544,52 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                         },
                         None => seek,
                     });
+                }
+                // No literal-valued conjunct had a declared index. A
+                // row-dependent one still might (`UNWIND rows AS row MATCH
+                // (n:Label {prop: row.field})` -- exactly the shape a bulk
+                // import's relationship-creation pass uses, one indexed
+                // lookup per incoming row instead of a full label scan
+                // repeated per row). No cardinality to rank these by (the
+                // value isn't known until execution), so just take the
+                // first match with a declared index rather than the
+                // most-selective one the literal branch above picks.
+                for (i, c) in candidates.iter().enumerate() {
+                    let Expr::GeneralCompare(ReturnExpr::Prop(pa), CompareOp::Eq, other) = c else {
+                        continue;
+                    };
+                    if pa.var != *var {
+                        continue;
+                    }
+                    // Guards against a self-referential `n.a = n.b` (or
+                    // `n.a = n.b.c`, ...) ever reaching here
+                    // (pattern_prop_predicate never produces that shape
+                    // today, but nothing else stops a future caller from
+                    // trying) -- `other` must be evaluable from the row
+                    // *without* the very node this scan is trying to find.
+                    if return_expr_references_var(other, var) {
+                        continue;
+                    }
+                    if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_some() {
+                        let Expr::GeneralCompare(ReturnExpr::Prop(pa), _, value_expr) =
+                            candidates.remove(i)
+                        else {
+                            unreachable!("just matched this index above, shape can't have changed")
+                        };
+                        let seek = LogicalPlan::IndexSeek {
+                            var: var.clone(),
+                            label: label.clone(),
+                            prop: pa.prop,
+                            value: IndexSeekValue::RowExpr(value_expr),
+                        };
+                        return Ok(match rebuild_and(candidates) {
+                            Some(predicate) => LogicalPlan::Filter {
+                                input: Box::new(seek),
+                                predicate,
+                            },
+                            None => seek,
+                        });
+                    }
                 }
             }
             match rebuild_and(candidates) {
@@ -649,7 +714,10 @@ mod tests {
                 assert_eq!(var, "n");
                 assert_eq!(label, "Person");
                 assert_eq!(prop, "email");
-                assert_eq!(value, PropertyValue::String("alice@x.com".to_string()));
+                assert_eq!(
+                    value,
+                    IndexSeekValue::Fixed(PropertyValue::String("alice@x.com".to_string()))
+                );
             }
             other => panic!("expected an IndexSeek, got {other:?}"),
         }
@@ -696,7 +764,10 @@ mod tests {
                 assert_eq!(var, "n");
                 assert_eq!(label, "Person");
                 assert_eq!(prop, "email");
-                assert_eq!(value, PropertyValue::String("alice@x.com".to_string()));
+                assert_eq!(
+                    value,
+                    IndexSeekValue::Fixed(PropertyValue::String("alice@x.com".to_string()))
+                );
             }
             other => panic!("expected an IndexSeek, got {other:?}"),
         }
@@ -769,7 +840,10 @@ mod tests {
                 match *input {
                     LogicalPlan::IndexSeek { prop, value, .. } => {
                         assert_eq!(prop, "email");
-                        assert_eq!(value, PropertyValue::String("user7@x.com".to_string()));
+                        assert_eq!(
+                            value,
+                            IndexSeekValue::Fixed(PropertyValue::String("user7@x.com".to_string()))
+                        );
                     }
                     other => panic!("expected the seek underneath, got {other:?}"),
                 }

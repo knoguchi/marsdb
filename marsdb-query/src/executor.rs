@@ -19,7 +19,7 @@ use crate::ast::{
     Tail, UnwindClause, WithClause, WithExpr,
 };
 use crate::error::QueryError;
-use crate::ir::{ExpandDirection, LogicalPlan};
+use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::parse_helpers::validate_named_path_pattern;
 use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars};
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
@@ -365,7 +365,7 @@ struct IndexSeekSpec<'a> {
     var: &'a str,
     label: &'a str,
     prop: &'a str,
-    value: &'a PropertyValue,
+    value: &'a IndexSeekValue,
 }
 
 /// Read-only context `Executor::rewrite_composed_item` needs to resolve a
@@ -3396,6 +3396,18 @@ impl<'a> Executor<'a> {
     /// `LIMIT` needs, so the same "ask storage for at most the budget,
     /// not everything" reasoning applies, just against `PROPERTY_INDEX`
     /// instead of `NODE_LABEL_INDEX`.
+    ///
+    /// `spec.value` is either fixed for the whole seek (a literal, or a
+    /// `$param` already resolved to one -- looked up once, reused across
+    /// every seed row, same as before this `enum` existed) or row-
+    /// dependent (`IndexSeekValue::RowExpr`, e.g. `row.field` from an
+    /// enclosing `UNWIND`) -- re-evaluated and re-looked-up for each seed
+    /// row, since a different row can mean a different lookup value. This
+    /// is the fix for what was previously *always* a `NodeByLabelScan` +
+    /// `Filter` for that shape (`planner::apply_index_seeks` only
+    /// recognized a literal-valued equality, never a per-row one) -- an
+    /// O(label size) scan repeated per incoming row, the exact pattern a
+    /// bulk import's relationship-creation pass hits hardest.
     fn stream_index_seek<'s>(
         &'s self,
         txn: Txn<'s>,
@@ -3404,62 +3416,129 @@ impl<'a> Executor<'a> {
         guard: &'s ExecutionGuard<'_>,
         row_limit: Option<usize>,
     ) -> RowStream<'s> {
-        let mut initialized = false;
-        let mut node_ids: Vec<NodeId> = Vec::new();
-        let mut seed_index = 0usize;
-        let mut node_index = 0usize;
-        let mut done = false;
-        let stream = std::iter::from_fn(move || {
-            if done || seed.is_empty() {
-                return None;
-            }
-            if !initialized {
-                initialized = true;
-                let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
-                    max_rows
-                        .checked_div(seed.len())
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                });
-                let storage_limit = match (row_limit, budget_node_limit) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-                let result = match storage_limit {
-                    Some(limit) => GraphStore::lookup_by_index_limited_in_txn(
-                        txn, spec.label, spec.prop, spec.value, limit,
-                    ),
-                    None => {
-                        GraphStore::lookup_by_index_in_txn(txn, spec.label, spec.prop, spec.value)
-                    }
-                };
-                match result {
-                    Ok(ids) => node_ids = ids,
-                    Err(error) => {
-                        done = true;
-                        return Some(Err(error.into()));
-                    }
-                }
-            }
-            if node_ids.is_empty() || seed_index >= seed.len() {
-                return None;
-            }
-            if let Err(error) = guard.checkpoint() {
-                done = true;
-                return Some(Err(error));
-            }
-            let mut row = seed[seed_index].clone();
-            row.insert(spec.var.to_string(), Binding::Node(node_ids[node_index]));
-            node_index += 1;
-            if node_index == node_ids.len() {
-                node_index = 0;
-                seed_index += 1;
-            }
-            Some(Ok(row))
+        let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+            max_rows
+                .checked_div(seed.len().max(1))
+                .unwrap_or(0)
+                .saturating_add(1)
         });
-        Self::count_stream(Box::new(stream), guard)
+        let storage_limit = match (row_limit, budget_node_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let lookup = move |value: &PropertyValue| -> Result<Vec<NodeId>, QueryError> {
+            match storage_limit {
+                Some(limit) => GraphStore::lookup_by_index_limited_in_txn(
+                    txn, spec.label, spec.prop, value, limit,
+                )
+                .map_err(Into::into),
+                None => GraphStore::lookup_by_index_in_txn(txn, spec.label, spec.prop, value)
+                    .map_err(Into::into),
+            }
+        };
+        match spec.value {
+            // One lookup, reused across every seed row -- identical shape
+            // to `stream_scan`'s own cross join, and to this function
+            // before `IndexSeekValue` existed.
+            IndexSeekValue::Fixed(value) => {
+                let mut node_ids: Option<Vec<NodeId>> = None;
+                let mut seed_index = 0usize;
+                let mut node_index = 0usize;
+                let mut done = false;
+                let stream = std::iter::from_fn(move || {
+                    if done || seed.is_empty() {
+                        return None;
+                    }
+                    let ids = match &node_ids {
+                        Some(ids) => ids,
+                        None => match lookup(value) {
+                            Ok(ids) => node_ids.insert(ids),
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error));
+                            }
+                        },
+                    };
+                    if ids.is_empty() || seed_index >= seed.len() {
+                        return None;
+                    }
+                    if let Err(error) = guard.checkpoint() {
+                        done = true;
+                        return Some(Err(error));
+                    }
+                    let mut row = seed[seed_index].clone();
+                    row.insert(spec.var.to_string(), Binding::Node(ids[node_index]));
+                    node_index += 1;
+                    if node_index == ids.len() {
+                        node_index = 0;
+                        seed_index += 1;
+                    }
+                    Some(Ok(row))
+                });
+                Self::count_stream(Box::new(stream), guard)
+            }
+            // A fresh lookup per seed row -- `expr` (e.g. `row.field` from
+            // an enclosing `UNWIND`) can evaluate to a different value for
+            // each one, so last row's `node_ids` can't be reused for the
+            // next.
+            IndexSeekValue::RowExpr(expr) => {
+                let mut node_ids: Vec<NodeId> = Vec::new();
+                let mut seed_index = 0usize;
+                let mut node_index = 0usize;
+                let mut done = false;
+                let stream = std::iter::from_fn(move || loop {
+                    if done || seed_index >= seed.len() {
+                        return None;
+                    }
+                    if node_index == 0 {
+                        let evaluated =
+                            match self.eval_return_expr(txn, expr, &seed[seed_index], guard) {
+                                Ok(v) => v,
+                                Err(error) => {
+                                    done = true;
+                                    return Some(Err(error));
+                                }
+                            };
+                        let value = value_to_property_value(&evaluated);
+                        // Real Cypher's three-valued logic: comparing
+                        // against `null` is "unknown", not "find nodes
+                        // whose stored value happens to be Null" -- this
+                        // row contributes zero rows, same as the Filter
+                        // fallback this replaces would reject it outright.
+                        if matches!(value, PropertyValue::Null) {
+                            seed_index += 1;
+                            continue;
+                        }
+                        node_ids = match lookup(&value) {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error));
+                            }
+                        };
+                        if node_ids.is_empty() {
+                            seed_index += 1;
+                            continue;
+                        }
+                    }
+                    if let Err(error) = guard.checkpoint() {
+                        done = true;
+                        return Some(Err(error));
+                    }
+                    let mut row = seed[seed_index].clone();
+                    row.insert(spec.var.to_string(), Binding::Node(node_ids[node_index]));
+                    node_index += 1;
+                    if node_index == node_ids.len() {
+                        node_index = 0;
+                        seed_index += 1;
+                    }
+                    return Some(Ok(row));
+                });
+                Self::count_stream(Box::new(stream), guard)
+            }
+        }
     }
 
     fn expand_variable_row(
