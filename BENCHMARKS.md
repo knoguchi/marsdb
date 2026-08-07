@@ -313,6 +313,37 @@ Dropping Neo4j's uniqueness constraints for plain indexes only recovered
 overhead. What's actually different between the two engines' write paths
 at this workload isn't isolated by this measurement.
 
+## Full lifecycle comparison: load/query/update/delete
+
+Measured 2026-08-06, same dataset and machine as above, via
+[marsdb-demo](https://github.com/knoguchi/marsdb-demo)'s
+`benchmarks/recommendations/bench.sh` — a reproducible script, not a
+one-off run, meant to be re-run as MarsDB's internals change (see that
+repo for the exact query/update/delete statements and how to run it
+yourself). Single run each, same caveat as above about run-to-run
+variance (this and the load-only numbers two sections up used slightly
+different container-startup conditions and aren't directly comparable to
+each other's Neo4j column, only within their own row).
+
+| Phase | MarsDB | Neo4j |
+|---|---|---|
+| Load | 64.9 s | 178.9 s |
+| Query (5 read queries, lifted from Neo4j's own tutorial for this dataset) | 0.22 s | 1.27 s |
+| Update (point update, bulk update, new relationship) | 0.09 s | 1.08 s |
+| Delete (single relationship, `DETACH DELETE`, bulk) | 0.50 s | 1.12 s |
+
+Neo4j's numbers are *phase* totals, not per-query — `cypher-shell` has no
+persistent scripting session with per-statement timing the way MarsDB's
+embedded API does, and spawning a fresh process per statement would make
+every query read as ~0.9s of pure connection cold-start, not real query
+cost. MarsDB's own per-query breakdown (real, since it's all one
+in-process `Database` handle) is in `bench.sh`'s own output/`results.md`.
+
+Finding these numbers directly caused two real MarsDB planner fixes
+(`IndexSeek` never firing for a row/`$param`-bound equality, and a
+`WHERE` clause on a multi-hop pattern's start node never reaching the
+scan it should filter) — both already landed, see `CHANGELOG.md`.
+
 ## Scope of these numbers
 
 - No disk-backed sustained-write benchmarks — everything above ran against
