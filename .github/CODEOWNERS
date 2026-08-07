@@ -1,0 +1,4 @@
+# Default owner for everything in the repo, unless a later, more
+# specific rule overrides it -- see
+# https://docs.github.com/articles/about-code-owners
+* @knoguchi
