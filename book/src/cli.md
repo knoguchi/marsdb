@@ -2,7 +2,7 @@
 
 ## Install
 
-**CLI** — installs the `marsdb` binary:
+**CLI** — installs the `mars` binary:
 
 ```
 cargo install marsdb-cli
@@ -17,20 +17,21 @@ brew install knoguchi/marsdb/marsdb
 ## Usage
 
 ```
-marsdb                                  # in-memory REPL
-marsdb mydata.db                        # file-backed REPL
-marsdb mydata.db "MATCH (n) RETURN n"   # run one query, exit
-marsdb :memory: "..."                   # explicit in-memory, one-shot
-marsdb mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
+mars                                  # in-memory REPL
+mars mydata.db                        # file-backed REPL
+mars mydata.db "MATCH (n) RETURN n"   # run one query, exit
+mars :memory: "..."                   # explicit in-memory, one-shot
+mars mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
+mars mydata.db < script.cypher        # piped stdin, same ;-separated batch
 ```
 
 The REPL accepts any Cypher statement terminated by `;`. Ctrl-D exits.
 
 ```
-$ marsdb :memory:
+$ mars :memory:
 MarsDB graph database. Enter Cypher statements terminated by `;`. Ctrl-D to exit.
-marsdb> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
-marsdb> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
+mars> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
+mars> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
 a.name | b.name
 Alice | Bob
 ```
