@@ -892,6 +892,7 @@ dependencies = [
  "marsdb",
  "marsdb-graph",
  "rustyline",
+ "tempfile",
 ]
 
 [[package]]

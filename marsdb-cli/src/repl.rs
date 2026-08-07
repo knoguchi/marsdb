@@ -11,7 +11,7 @@ pub fn run(db: &Database) -> ExitCode {
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
-            eprintln!("marsdb: failed to start REPL: {e}");
+            eprintln!("mars: failed to start REPL: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -21,7 +21,7 @@ pub fn run(db: &Database) -> ExitCode {
     let mut buffer = String::new();
     loop {
         let prompt = if buffer.is_empty() {
-            "marsdb> "
+            "mars> "
         } else {
             "   ...> "
         };
@@ -38,7 +38,7 @@ pub fn run(db: &Database) -> ExitCode {
                     let _ = rl.add_history_entry(query.as_str());
                     match db.execute(&query) {
                         Ok(result) => format::print_table(&result),
-                        Err(e) => eprintln!("marsdb: {e}"),
+                        Err(e) => eprintln!("mars: {e}"),
                     }
                 }
             }
@@ -48,7 +48,7 @@ pub fn run(db: &Database) -> ExitCode {
             }
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("marsdb: readline error: {e}");
+                eprintln!("mars: readline error: {e}");
                 break;
             }
         }
