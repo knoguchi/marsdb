@@ -2,9 +2,10 @@
 
 Measured 2026-08-03 on a single MacBook (Apple Silicon, arm64), release build,
 in-process (`cargo bench`, [criterion](https://github.com/bheisler/criterion.rs)).
-No other graph database was benchmarked under the same conditions — these
-numbers aren't a competitive comparison, they're here to track regressions
-and show where the current architecture's cost is.
+These numbers aren't a competitive comparison, they're here to track
+regressions and show where the current architecture's cost is — with one
+exception, a real dataset-load comparison against Neo4j, see
+[Load comparison](#load-comparison-recommendations-dataset) below.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
 `cypher_ops`, `ldbc_ops`, `aggregate_ops`, `concurrency_ops`, and
@@ -277,13 +278,49 @@ compiles.
 
 Reproduce: `cargo bench -p marsdb --bench concurrency_ops`.
 
+## Load comparison: recommendations dataset
+
+Measured 2026-08-06, same MacBook as above. Not a `criterion` micro-bench —
+an end-to-end load of a real, fixed dataset: Neo4j's [recommendations
+example graph](https://github.com/neo4j-graph-examples/recommendations)
+(movies + cast/crew from OMDb, users + ratings from MovieLens), extracted
+from its own `neo4j-admin database load` dump via a real Neo4j 5.26
+instance and `apoc.export.cypher.all`, then loaded into both engines from
+the *same* generated Cypher script (source-data provenance and extraction
+steps are in [marsdb-demo](https://github.com/knoguchi/marsdb-demo)'s
+`recommendations` demo). File-backed database on both sides, wall-clock
+time for the whole load, single run each (not averaged over multiple
+trials).
+
+Neo4j ran in Docker (`neo4j:5.26`, official image); MarsDB ran natively.
+That's a real, uncontrolled difference in the comparison, not something
+this table corrects for.
+
+| | Nodes | Relationships | Load time |
+|---|---|---|---|
+| MarsDB | 28,863 | 166,261 | 59.7 s |
+| Neo4j, with the script's own `CREATE CONSTRAINT`s (unique indexes) | 28,863 | 166,261 | 162.8 s |
+| Neo4j, constraints swapped for plain (non-unique) indexes matching MarsDB's | 28,863 | 166,261 | 144.7 s |
+
+Both engines loaded via plain Cypher (`UNWIND` batches of `MERGE`/`CREATE`,
+no bulk/CSV-import fast path on either side), auto-committing one
+transaction per statement. Node/relationship counts are byte-identical
+across all three rows — same source data, same final graph, only load
+time differs.
+
+Dropping Neo4j's uniqueness constraints for plain indexes only recovered
+~18s (162.8s -> 144.7s) — most of the gap isn't constraint-checking
+overhead. What's actually different between the two engines' write paths
+at this workload isn't isolated by this measurement.
+
 ## Scope of these numbers
 
 - No disk-backed sustained-write benchmarks — everything above ran against
   `Database::in_memory()`; file-backed throughput under real fsync pressure
   hasn't been measured separately.
-- No comparison against Neo4j, JanusGraph, Neptune, or any other graph
-  database.
+- The Neo4j comparison above covers one dataset *load*, nothing else —
+  no query-latency comparison, no other dataset, no JanusGraph/Neptune/
+  other graph database.
 - No benchmarks yet for `CASE`/function calls (`coalesce()`/`toInteger()`)
   in isolation — they're cheap scalar operations exercised inside the
   `WITH`-chaining query above, but not measured standalone.
