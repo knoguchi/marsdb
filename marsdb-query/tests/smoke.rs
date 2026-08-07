@@ -3985,6 +3985,51 @@ fn node_cache_is_disabled_within_a_single_write_statement() {
     }
 }
 
+/// The node cache's reset (clear + enable/disable based on
+/// `is_read_only`) must happen on *every* statement-execution entry
+/// point, not just `execute`/`execute_with_options` -- `Executor` has a
+/// second, separate entry point (`execute_in_write_transaction`, used by
+/// an explicit multi-statement `Transaction` or a group-commit loop with
+/// an already-open `WriteTransaction`), and `node_cache` is a field on
+/// `Executor` shared by both, not private to either. A read via
+/// `execute` leaves the cache populated and enabled; a write via
+/// `execute_in_write_transaction` on the *same* `Executor` right after
+/// must not inherit that state.
+#[test]
+fn node_cache_resets_across_the_write_transaction_entry_point_too() {
+    let store = GraphStore::open_memory().unwrap();
+    let executor = Executor::new(&store);
+
+    executor
+        .execute(&parse("CREATE (:Item {name: 'v1'})").unwrap())
+        .unwrap();
+    // Read-only, via the `execute` entry point -- populates the cache
+    // and leaves `node_cache_enabled` set until the *next* entry-point
+    // call resets it.
+    executor
+        .execute(&parse("MATCH (n:Item) RETURN n.name").unwrap())
+        .unwrap();
+
+    // Same node, but now via the *other* entry point, and this
+    // statement mutates it then reads it back within itself -- must see
+    // its own fresh write, not the previous statement's cached 'v1'.
+    let write_txn = store.begin_write().unwrap();
+    let result = executor
+        .execute_in_write_transaction(
+            &parse("MATCH (n:Item) SET n.name = 'v2' WITH n RETURN n.name AS after").unwrap(),
+            &write_txn,
+        )
+        .unwrap();
+    write_txn.commit().unwrap();
+
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "v2"),
+        other => {
+            panic!("unexpected value {other:?}, cache leaked across the write-txn entry point")
+        }
+    }
+}
+
 /// A bare (unparenthesized) `var:Label` used directly as a `WITH ...
 /// WHERE` predicate (`WHERE i.var > 'te' AND i:TextNode`) -- distinct
 /// from `label_check_expr`'s own `(n:Foo)` parenthesized general-

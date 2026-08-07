@@ -406,18 +406,28 @@ pub struct Executor<'a> {
     /// Cypher's guarantee that every such call *within one query*
     /// returns the same value (see `temporal::NowSnapshot`'s docs).
     now: Cell<Option<temporal::NowSnapshot>>,
-    /// `NodeId -> Node` memo, cleared at the start of every statement
-    /// (`execute_with_guard`) and only ever consulted/populated for a
-    /// read-only statement (`node_cache_enabled`) -- a write statement
-    /// can mutate a node's props/labels mid-statement (`SET`, `REMOVE`),
-    /// so a cached record could go stale within the same statement; a
-    /// read-only statement has one consistent snapshot for its whole
-    /// duration, so caching is safe unconditionally there. Found via a
-    /// real flamegraph: `get_node_in_txn`'s postcard decode of the full
-    /// `NodeRecord` (every property, not just the ones a query reads)
-    /// summed to ~40% of read-path time on a real dataset, much of it
-    /// the *same* node decoded repeatedly (`RETURN n.a, n.b ORDER BY
-    /// n.c` decodes `n` three times).
+    /// `NodeId -> Node` memo, cleared at the start of every statement --
+    /// both entry points (`execute_with_guard` and
+    /// `execute_in_write_transaction_with_guard`, see their own reset
+    /// lines) must do this, since `node_cache` is a field on `Executor`
+    /// shared by both, not private to either -- and only ever consulted/
+    /// populated for a read-only statement (`node_cache_enabled`) -- a
+    /// write statement can mutate a node's props/labels mid-statement
+    /// (`SET`, `REMOVE`), so a cached record could go stale within the
+    /// same statement; a read-only statement has one consistent snapshot
+    /// for its whole duration, so caching is safe unconditionally there.
+    /// Found via a real flamegraph: `get_node_in_txn`'s postcard decode
+    /// of the full `NodeRecord` (every property, not just the ones a
+    /// query reads) summed to ~40% of read-path time on a real dataset,
+    /// much of it the *same* node decoded repeatedly (`RETURN n.a, n.b
+    /// ORDER BY n.c` decodes `n` three times).
+    ///
+    /// Currently unbounded -- a read-only statement that scans wide
+    /// retains an `Rc<Node>` for every node it touches until the
+    /// statement ends, where the pre-cache code decoded-and-dropped per
+    /// row. On a dataset larger than RAM this can turn a slow query into
+    /// an OOM risk; see mars-kvb for a size-capped follow-up (stop
+    /// inserting past N entries, keep serving existing hits).
     node_cache: RefCell<HashMap<NodeId, Rc<Node>>>,
     node_cache_enabled: Cell<bool>,
 }
@@ -599,6 +609,17 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
+        // Same cache-generation reset as the top-level path
+        // (`execute_with_guard`) -- this is a second, separate entry
+        // point into statement execution (an explicit multi-statement
+        // `Transaction`, or a group-commit loop, calls this directly with
+        // an already-open `write_txn` instead of going through
+        // `execute`/`execute_with_options`), and `node_cache` is a field
+        // on `Executor`, not something either entry point owns privately
+        // -- skipping the reset here left the flag/map from whatever this
+        // `Executor` last did through the *other* entry point in effect.
+        self.node_cache.borrow_mut().clear();
+        self.node_cache_enabled.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Same "never mutates" contract as the top-level path -- opens
             // its own ReadTransaction rather than touching the caller's
