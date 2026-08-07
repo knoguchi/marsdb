@@ -1,26 +1,17 @@
-use marsdb_storage::{ReadableTable, Txn, WriteTransaction};
+use marsdb_storage::{ReadableTable, Txn};
 
 use crate::error::GraphError;
 use crate::id::next_id;
+use crate::write_ctx::WriteCtx;
 
 /// Look up (or allocate) the u32 id interned for `label`, inside a write txn.
-pub(crate) fn intern_label(write_txn: &WriteTransaction, label: &str) -> Result<u32, GraphError> {
-    {
-        let l2i = write_txn.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
-        let existing = l2i.get(label)?.map(|g| g.value());
-        if let Some(existing) = existing {
-            return Ok(existing);
-        }
+pub(crate) fn intern_label(ctx: &mut WriteCtx, label: &str) -> Result<u32, GraphError> {
+    if let Some(existing) = ctx.label_to_id()?.get(label)?.map(|g| g.value()) {
+        return Ok(existing);
     }
-    let id = next_id(write_txn, "next_label_id")? as u32;
-    {
-        let mut l2i = write_txn.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
-        l2i.insert(label, id)?;
-    }
-    {
-        let mut i2l = write_txn.open_table(marsdb_storage::tables::ID_TO_LABEL)?;
-        i2l.insert(id, label)?;
-    }
+    let id = next_id(ctx, "next_label_id")? as u32;
+    ctx.label_to_id()?.insert(label, id)?;
+    ctx.id_to_label()?.insert(id, label)?;
     Ok(id)
 }
 

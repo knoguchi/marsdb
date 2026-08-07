@@ -6,6 +6,7 @@ mod labels;
 mod model;
 mod props;
 mod store;
+mod write_ctx;
 
 pub use error::GraphError;
 pub use index::IndexDef;
