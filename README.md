@@ -7,8 +7,10 @@
 [![License](https://img.shields.io/crates/l/marsdb.svg)](#license)
 [![openCypher TCK](https://img.shields.io/badge/openCypher_TCK-99.9%25-brightgreen)](CYPHER_COVERAGE.md)
 
-An embeddable property-graph database with an openCypher query subset:
-single binary, single file, optional in-memory mode. Full manual:
+An embeddable property-graph database, highly openCypher-conformant
+(99.9% on the official TCK, 0 wrong-result scenarios — see
+[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the known gaps): single
+binary, single file, optional in-memory mode. Full manual:
 [knoguchi.github.io/marsdb](https://knoguchi.github.io/marsdb/).
 
 ```
@@ -288,12 +290,12 @@ corpus made libFuzzer's own startup/seed-bootstrapping phase (not anything
 in MarsDB) take upwards of an hour instead of seconds on this target; a
 seeded corpus doesn't hit it.
 
-`marsdb-tck` runs a real subset of the
+`marsdb-tck` runs the real
 [openCypher TCK](https://github.com/opencypher/openCypher) (pulled in as a
 git submodule pinned to a fixed commit — see `marsdb-tck/VENDOR.md`; 220
 `.feature` files, 3880 scenarios) against MarsDB, via a purpose-built
-Gherkin-subset parser and structural result comparison (not string
-matching):
+parser for the subset of Gherkin the TCK's `.feature` files actually use,
+and structural result comparison (not string matching):
 
 ```
 git submodule update --init marsdb-tck/openCypher
