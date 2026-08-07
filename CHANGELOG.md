@@ -5,6 +5,15 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,
+  `id_to_prop`, `index_defs`, `property_index`) from the set they eagerly
+  create/copy. Node and relationship data survived a backup intact, but
+  every declared index — including unique constraints — silently
+  disappeared from the restored database; the planner fell back to full
+  scans and duplicate values that should have been rejected were
+  silently accepted.
+
 ## [0.7.1] - 2026-08-07
 
 ### Added

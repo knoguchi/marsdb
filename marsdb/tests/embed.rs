@@ -213,6 +213,44 @@ fn backup_is_queryable_and_preserves_relationships() {
 }
 
 #[test]
+fn backup_preserves_declared_indexes_and_unique_constraints() {
+    let source = Database::in_memory().unwrap();
+    source
+        .execute("CREATE INDEX ON :Person(email) UNIQUE")
+        .unwrap();
+    source
+        .execute("CREATE (:Person {email: 'alice@x.com'})")
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("backup.redb");
+    source.backup_to(&path).unwrap();
+
+    let backup = Database::open(&path).unwrap();
+
+    // The index itself must still be seekable, not silently gone.
+    let plan = backup
+        .execute("EXPLAIN MATCH (p:Person {email: 'alice@x.com'}) RETURN p")
+        .unwrap();
+    let plan_text = plan
+        .rows
+        .iter()
+        .map(|row| format!("{row:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("IndexSeek"),
+        "expected an IndexSeek in the restored database's plan, got: {plan_text}"
+    );
+
+    // And the unique constraint must still be enforced, not just the plan shape.
+    let err = backup
+        .execute("CREATE (:Person {email: 'alice@x.com'})")
+        .unwrap_err();
+    assert!(err.to_string().contains("unique"), "got: {err}");
+}
+
+#[test]
 fn integrity_check_reports_graph_counts() {
     let mut db = Database::in_memory().unwrap();
     db.execute("CREATE (:Person)-[:KNOWS]->(:Person)").unwrap();

@@ -83,6 +83,10 @@ impl StorageEngine {
             write_txn.open_multimap_table(tables::ADJ_OUT)?;
             write_txn.open_multimap_table(tables::ADJ_IN)?;
             write_txn.open_multimap_table(tables::NODE_LABEL_INDEX)?;
+            write_txn.open_table(tables::PROP_TO_ID)?;
+            write_txn.open_table(tables::ID_TO_PROP)?;
+            write_txn.open_table(tables::INDEX_DEFS)?;
+            write_txn.open_multimap_table(tables::PROPERTY_INDEX)?;
         }
         write_txn.commit()?;
         Ok(Self { db })
@@ -151,6 +155,10 @@ impl StorageEngine {
             copy_multimap!(tables::ADJ_OUT);
             copy_multimap!(tables::ADJ_IN);
             copy_multimap!(tables::NODE_LABEL_INDEX);
+            copy_table!(tables::PROP_TO_ID);
+            copy_table!(tables::ID_TO_PROP);
+            copy_table!(tables::INDEX_DEFS);
+            copy_multimap!(tables::PROPERTY_INDEX);
 
             write.commit()?;
             Ok::<(), StorageError>(())
