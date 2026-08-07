@@ -3,7 +3,9 @@
 //! variable-length patterns. `cypher_ops.rs` only covers CREATE and a plain
 //! 1-hop MATCH, which none of these exercise.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use marsdb::Database;
 
 /// `(n0:Item {idx:0})-[:R]->(n1:Item {idx:1})-> ... ->(n_hops:Item {idx:hops})`,

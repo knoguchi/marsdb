@@ -5,11 +5,12 @@
 //! should run in parallel instead of queueing behind redb's single-writer
 //! lock the way every statement did before this feature.
 
+use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use marsdb::Database;
 
 const TOTAL_READS: usize = 200;

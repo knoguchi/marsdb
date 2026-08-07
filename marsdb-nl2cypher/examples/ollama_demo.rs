@@ -27,7 +27,8 @@ impl LlmClient for OllamaClient {
                 "prompt": prompt,
                 "stream": false,
             }))?
-            .into_json()?;
+            .body_mut()
+            .read_json()?;
         let text = response
             .get("response")
             .and_then(|v| v.as_str())

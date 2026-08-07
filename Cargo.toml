@@ -47,13 +47,13 @@ keywords = ["graph-database", "cypher", "opencypher", "embedded", "database"]
 categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]
-redb = "2"
+redb = "4"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
-thiserror = "1"
+thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-rustyline = "14"
-criterion = "0.5"
+rustyline = "18"
+criterion = "0.8"
 tempfile = "3"
 # Calendar math (leap years, month lengths) plus the system clock (`date()`
 # with no arguments) -- `iana-time-zone`/`js-sys`/`winapi` etc are off via
