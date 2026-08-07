@@ -5,6 +5,27 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-07
+
+### Breaking
+- **The CLI binary is now named `mars`, not `marsdb`.** `cargo install
+  marsdb-cli` installs `mars` on `PATH`; any script invoking the old
+  `marsdb` binary name needs updating. The crate name (`marsdb-cli`) is
+  unchanged.
+
+### Added
+- `mars --nl "<question>"` translates a plain-English question into
+  Cypher via a local [Ollama](https://ollama.com) instance and runs it
+  (read-only) — wires the existing `marsdb-nl2cypher` crate into the CLI.
+- The CLI now reads a `;`-separated batch from stdin when it isn't a
+  terminal (`mars mydata.db < script.cypher`), avoiding the OS's
+  single-argument length cap (`ARG_MAX`, ~1MB on macOS) that a large
+  script passed as the `QUERY` argument would otherwise hit.
+- Every built-in function's argument count is now checked before
+  evaluation, producing a clear arity error instead of a confusing
+  type-mismatch or `None`-related failure when called with too few or
+  too many arguments.
+
 ### Fixed
 - `END` is now usable as a bound variable name (`MATCH (start)-[r]->(end)
   RETURN end`) — previously rejected outright, even though real Cypher
@@ -22,6 +43,14 @@ All notable changes to MarsDB are documented here. Format loosely follows
   the index; the `WHERE`-clause form's filter sat above the whole
   traversal instead of directly on the scan it should narrow, an
   unindexed full label scan even with a matching index declared.
+- Parsing a large multi-statement batch in one call (`parse_many`, used
+  by `execute_batch` and the CLI's stdin path) no longer holds every
+  statement's parse tree in memory at once — peak memory now scales with
+  the largest single statement, not the whole batch. A 29MB/9,771-statement
+  script dropped from ~13GB to ~600MB peak RSS.
+- `marsdb-nl2cypher`'s generated-Cypher extraction now strips a stray
+  trailing markdown code fence even when the model's response has no
+  matching opening fence (some models emit one without the other).
 
 Found via a real ~29k-node/166k-relationship dataset load/query
 benchmark — see BENCHMARKS.md's "Full lifecycle comparison" section and

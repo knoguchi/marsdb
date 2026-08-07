@@ -1,16 +1,20 @@
 [package]
 name = "marsdb-nl2cypher"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+rust-version.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Natural-language-to-Cypher translation for MarsDB: schema introspection, prompt building, and validate-and-repair against a pluggable LLM client."
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.7.0" }
-marsdb-query = { path = "../marsdb-query", version = "0.7.0" }
+marsdb = { path = "../marsdb", version = "0.8.0" }
+marsdb-query = { path = "../marsdb-query", version = "0.8.0" }
 
 [dev-dependencies]
 tempfile.workspace = true
