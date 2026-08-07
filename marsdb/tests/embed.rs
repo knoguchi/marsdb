@@ -247,7 +247,15 @@ fn backup_preserves_declared_indexes_and_unique_constraints() {
     let err = backup
         .execute("CREATE (:Person {email: 'alice@x.com'})")
         .unwrap_err();
-    assert!(err.to_string().contains("unique"), "got: {err}");
+    assert!(
+        matches!(
+            err,
+            marsdb::Error::Query(marsdb_query::QueryError::Graph(
+                marsdb_graph::GraphError::UniqueConstraintViolation { .. }
+            ))
+        ),
+        "got: {err}"
+    );
 }
 
 #[test]
