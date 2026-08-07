@@ -13,8 +13,8 @@ jobs:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: Build wheel
@@ -24,7 +24,7 @@ jobs:
           command: build
           args: --release --out dist
           target: ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: marsdb-python/dist
@@ -32,7 +32,7 @@ jobs:
   linux-wheels:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -41,7 +41,7 @@ jobs:
           args: --release --out dist
           target: x86_64-unknown-linux-gnu
           manylinux: auto
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-x86_64-unknown-linux-gnu
           path: marsdb-python/dist
@@ -49,14 +49,14 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           working-directory: marsdb-python
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: marsdb-python/dist
@@ -65,7 +65,7 @@ jobs:
     needs: [macos-wheels, linux-wheels, sdist]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
