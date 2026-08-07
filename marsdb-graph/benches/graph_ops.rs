@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use marsdb_graph::{Direction, GraphStore, PropertyValue};
 
 fn bench_create_node(c: &mut Criterion) {

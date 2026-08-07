@@ -4,7 +4,9 @@
 //! comment in executor.rs) — these benchmarks are here specifically to show
 //! that cost, not just confirm aggregation works.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use marsdb::Database;
 
 /// `n` `Item` nodes, `idx` 0..n, `cat` = `idx % num_groups` (so

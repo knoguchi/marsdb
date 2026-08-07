@@ -5,6 +5,18 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- `redb` (the storage engine) bumped 2.x -> 4.1.0, plus `thiserror` 1->2,
+  `rustyline` 14->18, `criterion` 0.5->0.8, `ureq` 2->3.
+
+### Breaking
+- **On-disk database files created by any MarsDB release through v0.6.0
+  can no longer be opened.** redb 3.0 dropped support for its own v2 file
+  format (what every prior MarsDB release wrote, since none of them opted
+  into the v3 format redb 2.6 already supported); redb 4.x only reads v3+.
+  No migration path is provided — recreate the database. Pre-1.0, no
+  known production data depends on this.
+
 ## [0.6.0] - 2026-08-06
 
 ### Added

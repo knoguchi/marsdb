@@ -13,8 +13,8 @@ pub use txn::{MultimapTableHandle, TableHandle, Txn};
 // Re-exported so callers can open transactions/tables without a direct redb
 // dependency of their own.
 pub use redb::{
-    MultimapTableDefinition, ReadTransaction, ReadableMultimapTable, ReadableTable,
-    TableDefinition, WriteTransaction,
+    MultimapTableDefinition, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable, TableDefinition, WriteTransaction,
 };
 
 use std::fs::OpenOptions;
