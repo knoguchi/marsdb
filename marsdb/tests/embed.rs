@@ -121,6 +121,51 @@ fn execute_batch_stops_at_first_runtime_failure_but_keeps_earlier_commits() {
 }
 
 #[test]
+fn execute_batch_grouped_matches_execute_batch_results() {
+    let db = Database::in_memory().unwrap();
+    let results = db
+        .execute_batch_grouped(
+            "CREATE (a:Item {idx: 1}); CREATE (b:Item {idx: 2}); MATCH (n:Item) RETURN n.idx",
+            2,
+        )
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[2].rows.len(), 2);
+}
+
+#[test]
+fn execute_batch_grouped_rolls_back_the_whole_group_on_failure_but_keeps_earlier_groups() {
+    let db = Database::in_memory().unwrap();
+    // group_size 2 chunks these 4 statements as [idx1, idx2] (commits) and
+    // [idx3, failing statement] -- idx3 must be rolled back along with the
+    // failure even though it ran successfully, because it's in the same group.
+    let err = db
+        .execute_batch_grouped(
+            "CREATE (a:Item {idx: 1}); CREATE (b:Item {idx: 2}); \
+             CREATE (c:Item {idx: 3}); MATCH (missing) DELETE nonexistent",
+            2,
+        )
+        .unwrap_err();
+    assert!(matches!(err, marsdb::Error::Query(_)));
+
+    let result = db.execute("MATCH (n:Item) RETURN n.idx").unwrap();
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "only the first, fully-committed group should survive -- idx 3 must roll back with the failure"
+    );
+}
+
+#[test]
+fn execute_batch_grouped_with_group_size_zero_behaves_like_one() {
+    let db = Database::in_memory().unwrap();
+    let results = db
+        .execute_batch_grouped("CREATE (a:Item {idx: 1}); CREATE (b:Item {idx: 2})", 0)
+        .unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
 fn explicit_transaction_commits_multiple_statements_atomically() {
     let db = Database::in_memory().unwrap();
     let mut tx = db.begin_transaction().unwrap();
