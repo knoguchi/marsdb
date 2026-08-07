@@ -1,7 +1,6 @@
 //! Pure, grammar-agnostic parsing helpers shared by `antlr_visitor.rs` --
-//! extracted from the old pest-based `parser.rs` at Phase 3 cutover (see
-//! `grammar/README.md`/beads `mars-cuk`), which reused these as-is via
-//! `pub(crate)` visibility throughout Phase 2 rather than re-deriving
+//! extracted from the old pest-based `parser.rs` at cutover (see
+//! `grammar/README.md`), which reused these as-is rather than re-deriving
 //! them. None of these ever touched `pest::Pair`/`Rule` directly.
 
 use crate::ast::*;
@@ -31,8 +30,8 @@ pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), Qu
 /// `LogicalPlan::VarExpand`'s edge-isomorphism handling
 /// (`exclude_edge_sets`/`exclude_edge_var`) now tracks a variable-length
 /// hop's internally-traversed edges in both directions (an earlier fixed
-/// hop excluding a later `VarExpand`, and vice versa) -- see `mars-pbp`,
-/// fixed via TCK's Match4 `[7]`.
+/// hop excluding a later `VarExpand`, and vice versa) -- fixed via TCK's
+/// Match4 `[7]`.
 pub(crate) fn validate_named_path_pattern(_pattern: &Pattern) -> Result<(), QueryError> {
     Ok(())
 }

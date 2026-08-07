@@ -22,6 +22,10 @@ Alice | Bob
 
 ## Install
 
+Requires Rust 1.82+ (MSRV, verified via clippy's own `incompatible_msrv`
+lint — not tested against every toolchain above that, CI just runs each
+runner's current stable).
+
 **CLI** — installs the `marsdb` binary:
 
 ```
@@ -112,10 +116,16 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install maturin && maturin develop
 ```
 
-**Go**: not published yet — no `go get`-able module path. Bindings live in
-[`marsdb-go`](./marsdb-go) (cgo, via a C ABI crate,
-[`marsdb-capi`](./marsdb-capi)); see that README for the two-step build
-(Rust cdylib, then `go build`) and a full example.
+**Go**:
+
+```
+go get github.com/knoguchi/marsdb/marsdb-go
+```
+
+Go modules resolve straight from the public Git host — no separate
+registry step. Bindings live in [`marsdb-go`](./marsdb-go) (cgo, via a C
+ABI crate, [`marsdb-capi`](./marsdb-capi)); see that README for the
+two-step build (Rust cdylib, then `go build`) and a full example.
 
 ```go
 db, _ := marsdb.InMemory() // or marsdb.Open(path)

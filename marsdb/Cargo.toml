@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
+rust-version.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Embeddable property-graph database with an openCypher query subset: single binary, single file, optional in-memory mode."
 
 [lib]

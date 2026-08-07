@@ -6,8 +6,8 @@
 // dead-code analysis can't see through.
 #![allow(dead_code)]
 
-//! ANTLR-based AST builder (`mars-nog`/`mars-cuk`) -- replaced the old
-//! pest-tree-walk (`parser.rs`/`cypher.pest`, deleted at cutover) as this
+//! ANTLR-based AST builder -- replaced the old pest-tree-walk
+//! (`parser.rs`/`cypher.pest`, deleted at cutover) as this
 //! crate's real Cypher parser. `parse_antlr`/`parse_antlr_many` are
 //! re-exported by `lib.rs` as `parse`/`parse_many`.
 //!
@@ -898,8 +898,8 @@ impl AstBuilder {
         // TCK: the old `if LT ... else if GT ...` order silently treated
         // `<-[:FOO]->` as plain `Left`, both letting CREATE wrongly
         // succeed (Create2 [20]) and giving MATCH's own undirected
-        // multi-hop patterns the wrong direction entirely (mars-w37,
-        // Match5 [27]/Match6 [12]'s wrong row counts).
+        // multi-hop patterns the wrong direction entirely
+        // (Match5 [27]/Match6 [12]'s wrong row counts).
         rel.direction = match (ctx.LT().is_some(), ctx.GT().is_some()) {
             (true, false) => RelDirection::Left,
             (false, true) => RelDirection::Right,
@@ -2633,9 +2633,9 @@ impl AstBuilder {
     }
 }
 
-/// The real implementation behind `lib.rs`'s public `parse` (Phase 3
-/// cutover, mars-cuk/mars-nog) -- the pest-based `parser.rs`/`cypher.pest`
-/// this replaced are gone (see `grammar/README.md`).
+/// The real implementation behind `lib.rs`'s public `parse` -- the
+/// pest-based `parser.rs`/`cypher.pest` this replaced are gone (see
+/// `grammar/README.md`).
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
@@ -3125,7 +3125,7 @@ mod tests {
         );
         // Both arrowheads (`<-...->`) is the same undirected/either shape
         // as neither -- regression found via the TCK (Match6 [12]/
-        // Create2 [20]/mars-w37): used to silently resolve to Left,
+        // Create2 [20]): used to silently resolve to Left,
         // checking LT before GT and never noticing GT was also present.
         assert_eq!(
             parse_pattern("(a)<-->(b)").unwrap().hops[0].0.direction,
@@ -3315,8 +3315,7 @@ mod tests {
     #[test]
     fn named_path_over_variable_length_mixed_with_another_hop_is_supported() {
         // Was rejected until the `LogicalPlan::VarExpand` edge-isomorphism
-        // gap (`mars-pbp`) was fixed -- see `validate_named_path_pattern`'s
-        // docs.
+        // gap was fixed -- see `validate_named_path_pattern`'s docs.
         let parts = parse_match("MATCH p = (a)-[*1..3]->(b)-->(c)").unwrap();
         assert_eq!(parts[0].path_var.as_deref(), Some("p"));
     }

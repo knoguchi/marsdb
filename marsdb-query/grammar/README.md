@@ -2,242 +2,117 @@
 
 `CypherLexer.g4` / `CypherParser.g4` are vendored from
 [`antlr/grammars-v4/cypher`](https://github.com/antlr/grammars-v4/tree/master/cypher)
-(BSD-3-Clause, Copyright (c) 2022 Boris Zhguchev — see license header in each
-file). This is a community ANTLR4 grammar for Cypher, not an openCypher-project
-artifact — openCypher's own `grammar/` directory (vendored via the
-`marsdb-tck/openCypher` submodule) is hand-written ISO WG3 BNF prose
-(`openCypher.bnf`), not machine-generatable into ANTLR form. There is no
-official openCypher `Cypher.g4`.
+(BSD-3-Clause, Copyright (c) 2022 Boris Zhguchev — see the license header in
+each file). That project is a community ANTLR4 grammar for Cypher; it is not
+maintained by the openCypher project, and openCypher itself has no official
+`.g4` file (its own grammar, vendored here via the `marsdb-tck/openCypher`
+submodule, is hand-written ISO WG3 BNF prose in `openCypher.bnf`, not
+machine-generatable into ANTLR form).
 
-These two files are the reconciliation target: adapt them against
-`marsdb-tck/openCypher/grammar/openCypher.bnf` (spec) and the TCK corpus
-(conformance), not treat them as ground truth as-is.
+These two files are patched against `openCypher.bnf` and the openCypher TCK
+test corpus — not treated as correct as vendored.
 
-## Local fixes to upstream
+## Fixes to the upstream grammar
 
-`CypherLexer.g4` has two changes from upstream `antlr/grammars-v4/cypher`,
-found via the TCK spike below and confirmed with `antlr_debug_tree_text`
-(returns the raw parse tree text, showing exactly what got tokenized):
+All of these are real bugs relative to `openCypher.bnf`, found by running the
+TCK against the parser:
 
-- `CHAR_LITERAL` (single-quoted strings) used `?` instead of `*`, capping
-  content at 0-1 characters. Any real single-quoted Cypher string (2+ chars
-  — i.e. almost all of them) failed to tokenize as this rule.
-- `ERRCHAR` sent any unrecognized character to the `HIDDEN` channel instead
-  of erroring — silently discarding it rather than raising a syntax error.
+- **String literals silently corrupted.** `CHAR_LITERAL` used `?` instead of
+  `*`, capping single-quoted string content at 0-1 characters, and `ERRCHAR`
+  routed unrecognized characters to a hidden channel instead of raising an
+  error. Together these didn't reject bad input, they silently mis-tokenized
+  it: `RETURN 'hello world'` parsed as `RETURN hello world` (quotes and space
+  dropped). Fixed by widening `CHAR_LITERAL` to `*` and removing `ERRCHAR`.
+- **Identifiers could start with a digit.** `ID: LetterOrDigit+;` let a
+  number lex as an identifier instead of a `DIGIT` token almost everywhere,
+  breaking positions that specifically require a number (e.g. `[:REL*2]`).
+  Fixed to `ID: Letter LetterOrDigit*;`, matching `openCypher.bnf`'s
+  identifier rule (must start with a letter).
+- **No leading zero allowed in integers.** `Digits: [1-9] ([0-9_]* [0-9])?;`
+  couldn't tokenize `007`. `openCypher.bnf` has no such restriction. Fixed to
+  `[0-9] (...)?`.
+- **Hex/octal literals didn't work.** The hex rule referenced the wrong
+  fragment name, and octal had no `0o`-prefixed form at all (as
+  `openCypher.bnf` requires). Fixed both.
+- **Double negation didn't parse.** `notExpression: NOT? comparisonExpression`
+  allowed only one `NOT`, so `NOT NOT true` failed. Fixed to `NOT*`.
+- **Ordinary subtraction without spaces failed.** `DIGIT`'s optional leading
+  `SUB?` let the lexer's longest-match rule swallow a binary minus into the
+  next operand's token, so `5-1` mis-tokenized. The parser already handles
+  unary minus correctly elsewhere, so this was redundant and wrong. Removed.
+- **Multi-part queries rejected valid clause chains.** The rule for what can
+  appear between two `WITH`s only allowed updating clauses (CREATE/MERGE/
+  DELETE/SET/REMOVE), not reading clauses (MATCH/UNWIND/CALL) — so
+  `WITH ... UNWIND ... WITH ...` couldn't parse. Fixed to allow either.
+- **Operator precedence was wrong.** `IN`/`STARTS WITH`/`ENDS WITH`/
+  `CONTAINS`/`IS NULL` bound tighter than arithmetic, so
+  `n.val + 0 IS NULL` parsed as `n.val + (0 IS NULL)` instead of
+  `(n.val + 0) IS NULL`. Fixed to match `openCypher.bnf`'s real precedence
+  (these bind below the simple comparison operators, above arithmetic).
 
-Combined, these two didn't just reject valid strings — they silently
-mis-parsed them: `RETURN 'hello world'` tokenized as `RETURN` `hello`
-`world` (quotes and space vanished), and `RETURN foo('a:b')` tokenized as
-`RETURN foo(a:b)` (a symbol with a label predicate, not a string argument)
-— both accepted as different, wrong queries instead of rejected. Fixed by
-widening `CHAR_LITERAL` to `*` and removing `ERRCHAR` (ANTLR's default
-lexer behavior raises a real `syntax_error` on unmatched input once there's
-no catch-all swallowing it first).
+These fixes took TCK parse-acceptance from 90.5% to 99.4%; the remaining
+0.6% are scenarios the TCK itself expects to fail (`Expected::AnyError`).
 
-Two more fixes, same file, same discovery method:
+## Extensions beyond openCypher
 
-- `ID: LetterOrDigit+;` let an identifier start with — or be entirely
-  composed of — digits. Per `openCypher.bnf`'s
-  `<regular identifier> ::= <identifier start> [<identifier extend>...]`,
-  where `<identifier start>` is Unicode `XID_START` (excludes digits;
-  digits are only valid as `XID_CONTINUE`, i.e. after the first
-  character), an identifier can never start with a digit. Since `DIGIT`
-  and `ID` tied in length on pure-digit input and `ID` was declared
-  first, ANTLR's tie-break silently lexed numbers as identifiers
-  everywhere *except* grammar positions that specifically require
-  `DIGIT` (e.g. variable-length relationship bounds `[:REL*2]`), where
-  it hard-failed instead of parsing the number. Fixed to
-  `ID: Letter LetterOrDigit*;` (first character must be a letter).
-- `Digits: [1-9] ([0-9_]* [0-9])?;` disallowed a leading zero, but
-  `openCypher.bnf`'s `<unsigned decimal integer>` is just
-  `<digit> [{[_]<digit>}...]` — no such restriction. `007` couldn't
-  tokenize as `DIGIT` at all under the old rule. Fixed to `[0-9] (...)?`.
+Not upstream-worthy — no basis in `openCypher.bnf`. Present here because
+MarsDB supports them:
 
-These fixes raised the TCK parse-acceptance comparison below from 90.5%
-to 96.4% and eliminated the entire `Temporal1/2/10` (149 cases) and
-`Match5` (27 cases) disagreement categories — those weren't real grammar
-gaps, just corrupted date-string literals (`'2018-01-01T12:00'` contains
-`-`/`:`) and bounded variable-length relationship patterns
-(`[:REL*2]`/`[:REL*1..3]`) failing on their numeric bounds.
+- **`EXPLAIN <statement>`** — describe the plan without running it. Grammar
+  only; `EXPLAIN` doesn't yet wrap `CALL`.
+- **`CREATE INDEX ON :Label(prop) [UNIQUE]`** — the older single-property
+  index syntax, not real Cypher's newer `CREATE INDEX FOR (n:Label) ON
+  (n.prop)`.
+- **`shortestPath((a)-[*..5]-(b))`** — single-path form only, no
+  `allShortestPaths`. Real Neo4j Cypher syntax, but not part of
+  `openCypher.bnf` or the TCK.
+- **`;`-separated multi-statement batches** — `CREATE (a); CREATE (b);` as
+  one textual submission (`parse_many`). Not a Cypher concept; needed for
+  this crate's own multi-statement API.
 
-One structural (not lexer) fix, in `CypherParser.g4`:
+## Why ANTLR (and this specific fork)
 
-- `multiPartQ : readingStatement* (updatingStatement* withSt)+ singlePartQ;`
-  only allowed `updatingStatement`s (CREATE/MERGE/DELETE/SET/REMOVE)
-  between a multi-part query's `WITH` boundaries, not `readingStatement`s
-  (MATCH/UNWIND/CALL) — so ordinary, idiomatic chains like
-  `WITH ... UNWIND ... WITH ...` or `WITH ... MATCH ... WITH ...` couldn't
-  parse at all. `readingStatement` can't satisfy `updatingStatement*`, and
-  `singlePartQ` (what the grammar falls back to once the `(...)+ ` group
-  can't continue) has no `withSt` of its own to absorb a second `WITH`.
-  Fixed to `((readingStatement | updatingStatement)* withSt)+`.
+Mainline ANTLR4 has no Rust code-generation target. This project uses the
+actively maintained fork that adds one:
 
-This raised acceptance from 96.4% to 98.5% and eliminated the entire
-`Quantifier9/10/11/12` disagreement category (64 cases) — those TCK
-scenarios chain several `UNWIND`/`WITH` pairs, which simply couldn't
-parse under the old rule.
-
-Four more, back in `CypherLexer.g4`/`CypherParser.g4` (the diagnostic was
-also extended at this point to cross-check each reject against the TCK
-scenario's own expected outcome — `Expected::AnyError` cases are supposed
-to reject, so only mismatches count as real bugs):
-
-- `DIGIT`'s hex alternative referenced `HexDigit` (singular — a bare
-  `[0-9a-f]` single-char fragment) instead of `HexDigits` (plural — the
-  actual `0x`-prefixed fragment, defined but never used). `0x1` etc
-  couldn't tokenize as a hex literal at all.
-- No `0o`-prefixed octal support existed at all (the old `OctalDigit` was
-  `'0' Digits`, a bare-leading-zero form with no basis in
-  `openCypher.bnf`, which defines `<unsigned octal integer>` as requiring
-  an explicit `0o` prefix). Added a proper `OctalDigits` fragment.
-- `notExpression: NOT? comparisonExpression;` allowed at most one `NOT`,
-  so `NOT NOT true` (ordinary double negation) couldn't parse. Fixed to
-  `NOT*`.
-- `DIGIT`'s leading `SUB?` let the lexer's maximal-munch rule greedily
-  swallow a *binary* minus into the next operand's token: tokenizing
-  `5-1` starting at position 1, `-1` (2 chars, matches `SUB? Digits`)
-  beats `-` alone (1 char, `SUB`) under longest-match, leaving two
-  adjacent `DIGIT` tokens with no operator between them — a parse error
-  on ordinary subtraction with no surrounding whitespace. The parser
-  already has correct unary-minus handling at the right precedence level
-  (`unaryAddSubExpression: (PLUS | SUB)? atomicExpression`), so `DIGIT`
-  embedding its own sign was both redundant and actively wrong. Removed.
-
-These raised acceptance from 98.5% to 99.4% (3858/3880) and brought real
-grammar bugs to zero — all 22 remaining rejects are scenarios the TCK
-itself expects to fail (`Expected::AnyError`), confirmed by cross-checking
-each one, not assumed.
-
-One more, found later (Phase 2/3, mars-nog) by a *behavioral* dry-run
-(temporarily pointing this crate's real `parse`/`parse_many` at the new
-visitor and running the full `smoke.rs` suite) rather than the TCK
-parse-comparison spike above — parse-only comparison can't catch a
-precedence bug where both sides still merely "parse successfully", just
-into the wrong tree:
-
-- `IN`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`/`IS NULL` attached at
-  `atomicExpression`'s level — tighter than `+`/`-`/`*`/`/`/`^` — so
-  `n.val + 0 IS NULL` parsed as `n.val + (0 IS NULL)` instead of `(n.val
-  + 0) IS NULL`. Verified against `openCypher.bnf`'s own `<comparison
-  predicate>` chain (not assumed from `cypher.pest`, which has its own,
-  independently-derived precedence chain) — `<advanced comparison
-  predicate part 2>` (which is exactly these operators) takes `<advanced
-  comparison predicand> ::= <arithmetic value expression>` as its operand,
-  meaning they sit *above* arithmetic, below the simple comparison
-  operators (`=`/`<>`/`<`/`>`/`<=`/`>=`). Fixed by moving them off
-  `atomicExpression` into a new `stringListNullExpression` rule between
-  `comparisonExpression` and `addSubExpression` (`stringExpression`'s own
-  RHS widened from `propertyOrLabelExpression` to `addSubExpression` to
-  match); `atomicExpression` keeps only the real postfix forms (index/
-  slice), which — unlike these — spec (`<postfix expression> ::= ... |
-  <postfix expression> <postfix operator>`) and real usage (`list[0][1]`)
-  both expect to genuinely chain, so an existing "at most one suffix"
-  restriction was also removed as no longer necessary at that level (it
-  had been papering over the conflated precedence, not a real limit —
-  `3 IN [1,2,3][0..2]` needed both fixed together).
-
-Same class of bug as the ones above (a real, spec-verifiable defect, not
-a mars-specific choice) — sent upstream too.
-
-## Local extensions (not from upstream, not real openCypher)
-
-Unlike the fixes above, these additions aren't upstream-worthy — they
-have no basis in `openCypher.bnf` at all, mirroring `cypher.pest`'s own
-identically-scoped mars-specific extensions (not sent to
-`antlr/grammars-v4`, which tracks real Cypher, not this):
-
-- `explainSt : EXPLAIN (createIndexSt | regularQuery)` — `EXPLAIN
-  <statement>` (describe the plan without running it). Never wraps another
-  `explainSt` or `standaloneCall` (CALL has no `Statement` representation
-  in this grammar's visitor yet regardless — see mars-82w).
-- `createIndexSt : CREATE INDEX ON COLON name LPAREN name RPAREN UNIQUE?`
-  — `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE`. Deliberately the
-  older, simpler single-property syntax, not real openCypher's newer
-  `CREATE INDEX FOR (n:Label) ON (n.prop)` / `CREATE CONSTRAINT ... IS
-  UNIQUE`.
-
-Both needed two new lexer tokens (`EXPLAIN`, `INDEX`) added to
-`reservedWord` too, so `name` (label/property positions) can still absorb
-them — only `symbol` (bound-variable positions) excludes reserved words,
-matching every other keyword already in that list.
-
-A third, same class (real Neo4j Cypher syntax, but absent from
-`openCypher.bnf`/the TCK — confirmed by grep, not assumed — so treated as
-a local extension here too, mirroring `cypher.pest`'s own
-`shortest_path_wrapper`):
-
-- `patternPart : (symbol ASSIGN)? (shortestPathWrapper | patternElem)`,
-  `shortestPathWrapper : SHORTEST_PATH LPAREN patternElem RPAREN` —
-  `shortestPath((a)-[*..5]-(b))`. Only the single-path form, not
-  `allShortestPaths(...)` (pest doesn't have that either). Grammar-
-  permissive — `patternPart` is shared by MATCH/CREATE/MERGE, so this adds
-  a new lexer token, `SHORTEST_PATH` (also added to `reservedWord`), and
-  syntactically-legal-but-visitor-rejected positions (CREATE, MERGE, any
-  comma position but the first) rather than threading a MATCH-only rule
-  through three call sites — same "grammar permissive, visitor enforces
-  the exact constraint" split already used for `(symbol ASSIGN)?` on the
-  same rule.
-
-A fourth: `queries : query (SEMI query)* EOF` — a `;`-separated batch of
-one or more statements (`"CREATE (a); CREATE (b); MATCH (n) RETURN n"`),
-parsed via `parse_antlr_many`. Mirrors `cypher.pest`'s own `queries` rule
-exactly, including having no trailing `SEMI?` of its own (a single
-genuinely-trailing `;` is stripped in Rust before parsing, same as
-`parser::parse_many` already does, avoiding the same ambiguity its own
-doc comment describes). Not from openCypher either — real Cypher has no
-concept of a single textual submission containing multiple statements at
-all — but needed for parity with `parser::parse_many`, part of this
-crate's real public API.
-
-## Why this toolchain
-
-ANTLR4's Rust code-generation target is not in mainline ANTLR4 (never merged
-upstream). The actively maintained fork living under the `antlr4rust` GitHub
-org is what this repo uses:
-
-- Generator (Java tool): [`antlr4rust/antlr4`](https://github.com/antlr4rust/antlr4),
-  release `v0.5.0`, jar `antlr4-4.13.3-SNAPSHOT-complete.jar` — targets ANTLR
-  4.13.3, current with mainline ANTLR4.
+- Generator (Java tool): [`antlr4rust/antlr4`](https://github.com/antlr4rust/antlr4)
+  `v0.5.0`, targeting ANTLR 4.13.3.
 - Runtime (Rust crate): [`antlr4rust`](https://crates.io/crates/antlr4rust)
-  (note: **not** the older, stale `antlr-rust` crate — same project lineage,
-  different/renamed crate, actively published through 0.5.2).
-
-Verified working end-to-end (jar → generated Rust → compiles → parses) before
-adopting this path; see beads issue `mars-0mn`.
+  — not the older, unmaintained `antlr-rust` crate.
 
 ## Regenerating
 
-Only needed when `CypherLexer.g4`/`CypherParser.g4` change (grammar fixes) —
-not part of the normal build. Generated output is committed to
-`marsdb-query/src/generated/`.
+Only needed when `CypherLexer.g4`/`CypherParser.g4` change. Generated output
+is committed to `marsdb-query/src/generated/` — this is not part of the
+normal build.
 
-```
-# One-time: fetch the generator jar (pin: v0.5.0 / ANTLR 4.13.3)
+```sh
+# One-time: fetch the generator jar (pinned: v0.5.0 / ANTLR 4.13.3)
 curl -sL -o /tmp/antlr4.jar \
   https://github.com/antlr4rust/antlr4/releases/download/v0.5.0/antlr4-4.13.3-SNAPSHOT-complete.jar
 
-# Generate into a scratch dir first -- the parser grammar's `tokenVocab`
-# import looks for CypherLexer.tokens next to the source .g4 files, so
-# `-o marsdb-query/src/generated` directly fails with "cannot find tokens
-# file". Generating alongside the .g4 source and then copying works.
+# Generate into a scratch dir, not straight into src/generated: the parser
+# grammar's `tokenVocab` import looks for CypherLexer.tokens next to the
+# source .g4 files, so generating directly into another directory fails
+# with "cannot find tokens file".
 rm -rf /tmp/antlr-gen && mkdir -p /tmp/antlr-gen
 cp marsdb-query/grammar/*.g4 /tmp/antlr-gen/
 (cd /tmp/antlr-gen && java -jar /tmp/antlr4.jar -Dlanguage=Rust -visitor \
   CypherLexer.g4 CypherParser.g4)
+
+# Replace the generated files. This also deletes the hand-written
+# antlr_accepts/antlr_debug_tree_text/mod declarations at the top of
+# mod.rs (same glob) -- recover that part from git after copying.
 rm -f marsdb-query/src/generated/*.rs marsdb-query/src/generated/*.tokens \
   marsdb-query/src/generated/*.interp
 cp /tmp/antlr-gen/*.rs /tmp/antlr-gen/*.tokens /tmp/antlr-gen/*.interp \
   marsdb-query/src/generated/
 
-# ANTLR's own formatting doesn't match rustfmt -- CI's fmt --check job
-# will fail on freshly generated output otherwise. Also re-add the hand
-# written antlr_accepts/antlr_debug_tree_text/mod declarations at the top
-# of mod.rs -- the `rm -f *.rs` above deletes it along with the generated
-# files since it matches the same glob; recover from git and re-copy in
-# the generated `pub mod` lines if the file list has changed.
+# ANTLR's output formatting doesn't match rustfmt; CI's fmt check will
+# fail on freshly generated output otherwise.
 cargo fmt -p marsdb-query
 ```
 
 Commit the resulting `marsdb-query/src/generated/*.rs` alongside the `.g4`
-change. `marsdb-query/Cargo.toml` pins the matching runtime:
-`antlr4rust = "0.5.2"`.
+change. `marsdb-query/Cargo.toml` pins the matching runtime version
+(`antlr4rust = "0.5.2"`).

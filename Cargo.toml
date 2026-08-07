@@ -27,10 +27,24 @@ exclude = ["marsdb-python"]
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
+# Verified via clippy's own `incompatible_msrv` lint (not guessed) --
+# `Option::is_none_or` (stable since 1.82.0) is the newest stdlib item
+# actually used anywhere in the workspace. Not tested against every
+# toolchain above that; CI just runs whatever stable each GitHub-hosted
+# runner ships.
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/knoguchi/marsdb"
 homepage = "https://github.com/knoguchi/marsdb"
+# The mdBook manual, not docs.rs -- crates.io falls back to docs.rs
+# automatically when this field is unset, so this is deliberately the
+# more useful link for someone evaluating the project (install/CLI/
+# embedding guides, Cypher support table), not a duplicate of the
+# auto-generated rustdoc.
+documentation = "https://knoguchi.github.io/marsdb/"
 readme = "README.md"
+keywords = ["graph-database", "cypher", "opencypher", "embedded", "database"]
+categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]
 redb = "2"

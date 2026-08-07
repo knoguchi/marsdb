@@ -103,7 +103,7 @@ pub enum LogicalPlan {
         /// valued names, each row's own set unioned into the BFS's
         /// excluded-edges seed alongside `exclude_edge_vars`' single ids
         /// (TCK's Match4 `[7]`, found via a real double-count once this
-        /// direction was still missing -- see `mars-pbp`).
+        /// direction was still missing).
         exclude_edge_sets: Vec<String>,
         /// This hop's *own* internal, always-synthesized name (regardless
         /// of `path_segment_var`/`rel_list_var` below) that

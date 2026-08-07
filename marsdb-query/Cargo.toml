@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
+rust-version.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "openCypher query subset parser, planner, and executor used internally by MarsDB."
 
 [dependencies]
