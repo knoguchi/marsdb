@@ -958,6 +958,95 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
     }
 }
 
+/// `(min, max)` argument count for a built-in function name (aggregates
+/// included, case-insensitively matched same as everywhere else this
+/// codebase dispatches on a function name) -- `max: None` means unbounded
+/// (`coalesce` only). `None` for a name this doesn't recognize at all --
+/// the "unknown function" error further down in `infer_expr` still
+/// covers that case, this only ever narrows an already-known function.
+///
+/// Checked once, compile-time, before any per-argument work: real
+/// Cypher's `InvalidNumberOfArguments` is knowable from the call's AST
+/// shape alone, no data needed, so it belongs in the same "Semantic, not
+/// Type" bucket `CYPHER_COVERAGE.md`'s error taxonomy already documents
+/// -- not a runtime error some call sites already produced ad hoc
+/// (`range()`/`replace()`/`duration.between()`/`*.truncate()`), and
+/// others (`datetime.fromepoch()`, most everything else) never checked
+/// at all, silently reading a plain missing argument as `Type` error
+/// with the wrong type reported (`{:?}` of `None`, not "no such
+/// argument").
+fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "count" | "sum" | "avg" | "min" | "max" | "collect" => (1, Some(1)),
+        "percentilecont" | "percentiledisc" => (2, Some(2)),
+        "coalesce" => (1, None),
+        "tointeger" | "tostring" | "tofloat" | "toboolean" => (1, Some(1)),
+        "date" | "localtime" | "time" | "localdatetime" | "datetime" => (0, Some(1)),
+        // 0 args in the ordinary case, but real Cypher also accepts
+        // exactly 1 -- if it's `null`, the call propagates `null` rather
+        // than erroring (TCK's Temporal4 `[13]`, tests this uniformly
+        // across the whole family even though these functions have no
+        // real parameter otherwise; the runtime's own `now_or_null`
+        // already implements this). `rand()` has no such exception --
+        // real Cypher's `rand()` is always exactly 0 args.
+        "date.transaction"
+        | "date.statement"
+        | "date.realtime"
+        | "localtime.transaction"
+        | "localtime.statement"
+        | "localtime.realtime"
+        | "time.transaction"
+        | "time.statement"
+        | "time.realtime"
+        | "localdatetime.transaction"
+        | "localdatetime.statement"
+        | "localdatetime.realtime"
+        | "datetime.transaction"
+        | "datetime.statement"
+        | "datetime.realtime" => (0, Some(1)),
+        "rand" => (0, Some(0)),
+        "duration" => (1, Some(1)),
+        "datetime.fromepoch" => (2, Some(2)),
+        "datetime.fromepochmillis" => (1, Some(1)),
+        "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
+            (2, Some(2))
+        }
+        "date.truncate"
+        | "localtime.truncate"
+        | "time.truncate"
+        | "localdatetime.truncate"
+        | "datetime.truncate" => (2, Some(3)),
+        "length" | "nodes" | "relationships" | "type" | "startnode" | "endnode" | "keys"
+        | "labels" | "properties" | "id" | "size" | "exists" | "head" | "last" | "tail"
+        | "toupper" | "upper" | "tolower" | "lower" | "trim" | "ltrim" | "rtrim" | "reverse"
+        | "abs" | "ceil" | "floor" | "round" | "sqrt" | "sign" => (1, Some(1)),
+        "range" => (2, Some(3)),
+        "split" | "left" | "right" => (2, Some(2)),
+        "substring" => (2, Some(3)),
+        "replace" => (3, Some(3)),
+        _ => return None,
+    })
+}
+
+fn check_arity(name: &str, arg_count: usize) -> Result<(), QueryError> {
+    let Some((min, max)) = function_arity(name) else {
+        return Ok(());
+    };
+    let ok = arg_count >= min && max.is_none_or(|max| arg_count <= max);
+    if ok {
+        return Ok(());
+    }
+    let arg_word = |n: usize| if n == 1 { "argument" } else { "arguments" };
+    let expected = match max {
+        Some(max) if max == min => format!("exactly {min} {}", arg_word(min)),
+        Some(max) => format!("{min} to {max} arguments"),
+        None => format!("at least {min} {}", arg_word(min)),
+    };
+    Err(semantic(format!(
+        "{name}() expects {expected}, got {arg_count}"
+    )))
+}
+
 fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
     Ok(match expr {
         ReturnExpr::Var(var) => lookup(scope, var, "expression")?.clone(),
@@ -992,6 +1081,7 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
         ReturnExpr::Lit(Literal::Null) => Kind::Unknown,
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => Kind::Scalar,
         ReturnExpr::Call { name, args, .. } => {
+            check_arity(name, args.len())?;
             let arg_kinds = args
                 .iter()
                 .map(|arg| infer_expr(arg, scope))
