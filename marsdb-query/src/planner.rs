@@ -55,6 +55,35 @@ pub fn build_match_plan(
     } else {
         scan_for(&start_var, &pattern.start)?
     };
+    // Push WHERE-clause conjuncts that depend *only* on the start node down
+    // to wrap its scan directly, rather than leaving every conjunct in the
+    // one big Filter this function otherwise wraps around the *whole*
+    // pattern (every hop's Expand included) at the very end. Without this,
+    // a multi-hop pattern's `WHERE start.prop = <literal>` sits above every
+    // Expand, so `apply_index_seeks` (which only looks at what's
+    // *immediately* under a Filter) never reaches the NodeByLabelScan it
+    // should rewrite — real difference between `MATCH (a {prop: 'x'})-->()`
+    // (inline property, already index-seek-eligible before this fix) and
+    // the equivalent `MATCH (a)-->() WHERE a.prop = 'x'`.
+    let mut where_conjuncts = Vec::new();
+    if let Some(expr) = where_clause {
+        push_conjuncts(expr.clone(), &mut where_conjuncts);
+    }
+    let mut start_only = Vec::new();
+    where_conjuncts.retain(|c| {
+        if conjunct_sole_var(c) == Some(start_var.as_str()) {
+            start_only.push(c.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(predicate) = rebuild_and(start_only) {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
     let mut from_var = start_var.clone();
     // Real Cypher pattern matching is edge-isomorphic: no single MATCH
     // pattern may bind two hops to the *same* relationship instance, even
@@ -296,10 +325,10 @@ pub fn build_match_plan(
         }
         from_var = to_var;
     }
-    if let Some(expr) = where_clause {
+    if let Some(predicate) = rebuild_and(where_conjuncts) {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),
-            predicate: expr.clone(),
+            predicate,
         };
     }
     Ok(plan)
@@ -362,6 +391,30 @@ fn push_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
             push_conjuncts(*r, out);
         }
         other => out.push(other),
+    }
+}
+
+/// The single variable this conjunct exclusively depends on, if pushing it
+/// down to wrap that variable's own scan directly (rather than leaving it
+/// in the Filter that wraps the *whole* pattern, at the very end of
+/// `build_match_plan`) is provably safe. Deliberately narrow: only the
+/// simple leaf shapes already known to reference exactly the variable(s)
+/// named in them — a conjunct this doesn't recognize (`And`/`Or`/`VarEq`,
+/// a `PropCompare`/`GeneralCompare` naming two *different* variables,
+/// pattern predicates, ...) returns `None`, leaving it exactly where it
+/// already was rather than guessing.
+fn conjunct_sole_var(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Compare(pa, _, _) | Expr::IsNull(pa) => Some(&pa.var),
+        Expr::HasLabel(var, _) => Some(var),
+        Expr::PropCompare(l, _, r) if l.var == r.var => Some(&l.var),
+        Expr::GeneralCompare(ReturnExpr::Prop(pa), _, other)
+            if !return_expr_references_var(other, &pa.var) =>
+        {
+            Some(&pa.var)
+        }
+        Expr::GeneralIsNull(ReturnExpr::Prop(pa)) => Some(&pa.var),
+        _ => None,
     }
 }
 
