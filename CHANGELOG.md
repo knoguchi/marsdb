@@ -5,6 +5,15 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- `Database::execute_batch_grouped(cypher, group_size)`: commits once
+  every `group_size` statements instead of once per statement like
+  `execute_batch` does. Every commit fsyncs, so bulk loads were
+  fsync-bound; on a real 9,771-statement load script this cut load time
+  from 69.1s to 13.4s at `group_size: 100` (measured). Trades
+  crash-safety granularity for throughput — a failure or crash rolls
+  back the whole group it's in, not just the failing statement.
+
 ### Fixed
 - `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,
   `id_to_prop`, `index_defs`, `property_index`) from the set they eagerly
