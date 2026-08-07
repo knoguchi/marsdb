@@ -5,20 +5,14 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-08-07
-
-### Breaking
-- **The CLI binary is now named `mars`, not `marsdb`.** `cargo install
-  marsdb-cli` installs `mars` on `PATH`; any script invoking the old
-  `marsdb` binary name needs updating. The crate name (`marsdb-cli`) is
-  unchanged.
+## [0.7.1] - 2026-08-07
 
 ### Added
-- `mars --nl "<question>"` translates a plain-English question into
+- `marsdb --nl "<question>"` translates a plain-English question into
   Cypher via a local [Ollama](https://ollama.com) instance and runs it
   (read-only) — wires the existing `marsdb-nl2cypher` crate into the CLI.
 - The CLI now reads a `;`-separated batch from stdin when it isn't a
-  terminal (`mars mydata.db < script.cypher`), avoiding the OS's
+  terminal (`marsdb mydata.db < script.cypher`), avoiding the OS's
   single-argument length cap (`ARG_MAX`, ~1MB on macOS) that a large
   script passed as the `QUERY` argument would otherwise hit.
 - Every built-in function's argument count is now checked before

@@ -3,14 +3,14 @@
 MarsDB is an embeddable property-graph database with an openCypher query
 subset: single binary, single file, optional in-memory mode. No server
 process, no network protocol — it links into your Rust, Python, or Go
-program (or runs standalone via the `mars` CLI) the same way SQLite
+program (or runs standalone via the `marsdb` CLI) the same way SQLite
 does for relational data.
 
 ```
-$ mars :memory:
+$ marsdb :memory:
 MarsDB graph database. Enter Cypher statements terminated by `;`. Ctrl-D to exit.
-mars> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
-mars> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
+marsdb> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
+marsdb> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
 a.name | b.name
 Alice | Bob
 ```

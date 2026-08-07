@@ -10,7 +10,7 @@ mod repl;
 
 /// MarsDB: an embeddable property-graph database. Single binary, single file.
 #[derive(Parser)]
-#[command(name = "mars")]
+#[command(name = "marsdb")]
 struct Cli {
     /// Database file path, or `:memory:` for a transient in-memory database.
     /// Omit entirely for an in-memory database.
@@ -40,7 +40,7 @@ fn run_batch(db: &Database, cypher: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("mars: {e}");
+            eprintln!("marsdb: {e}");
             ExitCode::FAILURE
         }
     }
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
     let db = match db {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("mars: failed to open database: {e}");
+            eprintln!("marsdb: failed to open database: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -77,7 +77,7 @@ fn main() -> ExitCode {
     if !stdin.is_terminal() {
         let mut input = String::new();
         if let Err(e) = stdin.read_to_string(&mut input) {
-            eprintln!("mars: failed to read stdin: {e}");
+            eprintln!("marsdb: failed to read stdin: {e}");
             return ExitCode::FAILURE;
         }
         return run_batch(&db, &input);
