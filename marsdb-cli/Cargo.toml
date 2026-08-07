@@ -13,13 +13,13 @@ categories.workspace = true
 description = "CLI for MarsDB, an embeddable property-graph database: single binary, single file."
 
 [[bin]]
-name = "mars"
+name = "marsdb"
 path = "src/main.rs"
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.8.0" }
-marsdb-graph = { path = "../marsdb-graph", version = "0.8.0" }
-marsdb-nl2cypher = { path = "../marsdb-nl2cypher", version = "0.8.0" }
+marsdb = { path = "../marsdb", version = "0.7.1" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.7.1" }
+marsdb-nl2cypher = { path = "../marsdb-nl2cypher", version = "0.7.1" }
 clap.workspace = true
 rustyline.workspace = true
 ureq = { version = "3", features = ["json"] }

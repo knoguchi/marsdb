@@ -12,10 +12,10 @@ single binary, single file, optional in-memory mode. Full manual:
 [knoguchi.github.io/marsdb](https://knoguchi.github.io/marsdb/).
 
 ```
-$ mars :memory:
+$ marsdb :memory:
 MarsDB graph database. Enter Cypher statements terminated by `;`. Ctrl-D to exit.
-mars> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
-mars> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
+marsdb> CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'});
+marsdb> MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;
 a.name | b.name
 Alice | Bob
 ```
@@ -26,7 +26,7 @@ Requires Rust 1.82+ (MSRV, verified via clippy's own `incompatible_msrv`
 lint — not tested against every toolchain above that, CI just runs each
 runner's current stable).
 
-**CLI** — installs the `mars` binary:
+**CLI** — installs the `marsdb` binary:
 
 ```
 cargo install marsdb-cli
@@ -137,12 +137,12 @@ rows, _ := db.Execute("MATCH (n:Person) RETURN n.name AS name")
 ## CLI usage
 
 ```
-mars                                  # in-memory REPL
-mars mydata.db                        # file-backed REPL
-mars mydata.db "MATCH (n) RETURN n"   # run one query, exit
-mars :memory: "..."                   # explicit in-memory, one-shot
-mars mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
-mars mydata.db < script.cypher        # piped stdin, same ;-separated batch
+marsdb                                  # in-memory REPL
+marsdb mydata.db                        # file-backed REPL
+marsdb mydata.db "MATCH (n) RETURN n"   # run one query, exit
+marsdb :memory: "..."                   # explicit in-memory, one-shot
+marsdb mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
+marsdb mydata.db < script.cypher        # piped stdin, same ;-separated batch
 ```
 
 ## Natural language -> Cypher
@@ -169,13 +169,13 @@ writes are rejected before execution unless the caller explicitly uses
 `translate_and_run_with_policy(..., ExecutionPolicy::AllowWrites)` after
 performing its own authentication and authorization.
 
-The `mars` CLI wires this up against a local [Ollama](https://ollama.com)
+The `marsdb` CLI wires this up against a local [Ollama](https://ollama.com)
 instance via `--nl`:
 
 ```
 ollama serve &
 ollama pull llama3.2
-mars mydata.db --nl "who does Alice know?"
+marsdb mydata.db --nl "who does Alice know?"
 ```
 
 Set `OLLAMA_MODEL` to use a model other than the default `llama3.2`. A
@@ -198,7 +198,7 @@ marsdb-storage   thin trait boundary over redb (file + in-memory backends)
 marsdb-graph     property graph model, CRUD, KV/adjacency encoding
 marsdb-query     openCypher subset: ANTLR4 grammar -> AST -> IR -> executor
 marsdb           embeddable public Rust API (Database::open/in_memory/execute)
-marsdb-cli       the `mars` binary (REPL + one-shot mode)
+marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
 marsdb-capi      C ABI (opaque handle + JSON results), basis for non-Rust bindings
 marsdb-go        Go bindings, via cgo against marsdb-capi

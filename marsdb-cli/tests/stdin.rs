@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_stdin(db_path: &str, cypher: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mars"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_marsdb"))
         .arg(db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
