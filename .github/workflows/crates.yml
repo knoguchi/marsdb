@@ -29,5 +29,7 @@ jobs:
         run: cargo publish -p marsdb-query
       - name: Publish marsdb
         run: cargo publish -p marsdb
+      - name: Publish marsdb-nl2cypher
+        run: cargo publish -p marsdb-nl2cypher
       - name: Publish marsdb-cli
         run: cargo publish -p marsdb-cli
