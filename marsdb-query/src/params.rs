@@ -499,9 +499,15 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
         // syntax in Cypher -- see cypher.pest's docs: a date/duration is
         // always built via `date(...)`/`duration(...)`), so a Date/
         // Duration bound in from Rust as a `$param` has nowhere to
-        // substitute to. Erroring here (not silently dropping to Null) is
-        // the same "a real gap should say so, not produce a plausible-
-        // looking wrong answer" stance `apply_arith` already documents.
+        // substitute to *here specifically* -- this function only produces
+        // a bare `Literal`, for the one spot that structurally requires
+        // one (pattern-level `Expr::Compare`'s RHS, `n.prop = $x`). In
+        // ordinary expression position, a temporal-valued `$param`
+        // substitutes into a `ReturnExpr::Call` (e.g. `date("...")`)
+        // instead -- see `property_value_to_return_expr`, not this
+        // function. Erroring here (not silently dropping to Null) is the
+        // same "a real gap should say so, not produce a plausible-looking
+        // wrong answer" stance `apply_arith` already documents.
         PropertyValue::Date(_)
         | PropertyValue::Duration { .. }
         | PropertyValue::LocalTime(_)
@@ -509,7 +515,8 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
         | PropertyValue::LocalDateTime { .. }
         | PropertyValue::DateTime { .. } => {
             return Err(QueryError::Type(format!(
-                "${name}: passing a temporal value as a query parameter isn't supported yet"
+                "${name}: passing a temporal value as a query parameter isn't supported in a \
+                 pattern-level property comparison (only in ordinary expression position)"
             )))
         }
         // Same "no literal syntax to substitute to" gap as the temporal
@@ -565,6 +572,62 @@ fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<Retur
                 .map(|(key, value)| Ok((key.clone(), property_value_to_return_expr(name, value)?)))
                 .collect::<Result<Vec<_>, QueryError>>()?,
         ),
+        // `property_value_to_literal`'s temporal arm can't represent these
+        // (no `Literal::Date`/etc -- there's no temporal *literal* syntax
+        // in Cypher). But ordinary expression position -- unlike a bare
+        // pattern-level `Literal` -- allows a `ReturnExpr::Call`, and every
+        // temporal constructor already accepts its own formatted string
+        // back (that's exactly what makes `toString()` round-trip), so a
+        // temporal-valued param becomes a call to the matching constructor
+        // over its formatted string here, instead of erroring.
+        PropertyValue::Date(d) => temporal_call("date", crate::temporal::format_date(*d)),
+        PropertyValue::Duration {
+            months,
+            days,
+            seconds,
+            nanos,
+        } => temporal_call(
+            "duration",
+            crate::temporal::format_duration(*months, *days, *seconds, *nanos),
+        ),
+        PropertyValue::LocalTime(nanos_of_day) => temporal_call(
+            "localtime",
+            crate::temporal::format_local_time(*nanos_of_day),
+        ),
+        PropertyValue::Time {
+            nanos_of_day,
+            offset_seconds,
+        } => temporal_call(
+            "time",
+            crate::temporal::format_time(*nanos_of_day, *offset_seconds),
+        ),
+        PropertyValue::LocalDateTime {
+            epoch_seconds,
+            nanos,
+        } => temporal_call(
+            "localdatetime",
+            crate::temporal::format_local_date_time(*epoch_seconds, *nanos),
+        ),
+        PropertyValue::DateTime {
+            epoch_seconds,
+            nanos,
+            zone,
+        } => temporal_call(
+            "datetime",
+            crate::temporal::format_date_time(
+                *epoch_seconds,
+                *nanos,
+                &crate::executor::tz_from_graph(zone),
+            ),
+        ),
         other => ReturnExpr::Lit(property_value_to_literal(name, other)?),
     })
+}
+
+fn temporal_call(name: &str, formatted: String) -> ReturnExpr {
+    ReturnExpr::Call {
+        name: name.to_string(),
+        args: vec![ReturnExpr::Lit(Literal::String(formatted))],
+        distinct: false,
+    }
 }

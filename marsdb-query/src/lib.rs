@@ -15,7 +15,7 @@ mod semantic;
 pub mod temporal;
 mod value;
 
-pub use antlr_visitor::{parse_antlr as parse, parse_antlr_many as parse_many};
+pub use antlr_visitor::{parse_antlr as parse, parse_antlr_many as parse_many, split_statements};
 pub use ast::{Literal, Statement};
 pub use error::QueryError;
 pub use executor::{

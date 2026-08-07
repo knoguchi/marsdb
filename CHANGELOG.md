@@ -13,6 +13,22 @@ All notable changes to MarsDB are documented here. Format loosely follows
   from 69.1s to 13.4s at `group_size: 100` (measured). Trades
   crash-safety granularity for throughput — a failure or crash rolls
   back the whole group it's in, not just the failing statement.
+- `$param` values now support the temporal `PropertyValue` variants
+  (`Date`, `Duration`, `LocalTime`, `Time`, `LocalDateTime`, `DateTime`)
+  in ordinary expression position (`RETURN $x`, `UNWIND $x`, `SET n +=
+  $x`, nested inside a list/map param), instead of erroring with
+  "passing a temporal value as a query parameter isn't supported yet".
+  Found profiling a bulk-load script: parsing a literal-Cypher dump
+  dominated load time (~70%, flamegraph-confirmed), and binding the
+  data as `$rows` params instead of literal text — the standard "parse
+  once, bind many" fix — needs this to work for any dataset with dated
+  properties. On the same 9,771-statement script, parameterized replay
+  through `execute_batch_grouped` took 5.25s, down from 12.1s for
+  group-commit alone and 69.1s for the original per-statement path.
+- `marsdb_query::split_statements`: made public (was already used
+  internally by `parse_many`) — quote/backtick-aware `;`-splitting of
+  raw Cypher text without building a parse tree, useful for tooling that
+  needs statement boundaries in source text, not just parsed ASTs.
 
 ### Fixed
 - `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,
