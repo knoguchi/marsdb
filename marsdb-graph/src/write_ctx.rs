@@ -97,16 +97,41 @@ impl<'txn> WriteCtx<'txn> {
         }
     }
 
-    table_accessor!(meta, meta, marsdb_storage::tables::META, Table<&'static str, u64>);
-    table_accessor!(label_to_id, label_to_id, marsdb_storage::tables::LABEL_TO_ID, Table<&'static str, u32>);
+    table_accessor!(
+        meta,
+        meta,
+        marsdb_storage::tables::META,
+        Table<&'static str, u64>
+    );
+    table_accessor!(
+        label_to_id,
+        label_to_id,
+        marsdb_storage::tables::LABEL_TO_ID,
+        Table<&'static str, u32>
+    );
     table_accessor!(id_to_label, id_to_label, marsdb_storage::tables::ID_TO_LABEL, Table<u32, &'static str>);
     table_accessor!(nodes, nodes, marsdb_storage::tables::NODES, Table<u64, &'static [u8]>);
     table_accessor!(edges, edges, marsdb_storage::tables::EDGES, Table<u64, &'static [u8]>);
     multimap_accessor!(adj_out, adj_out, marsdb_storage::tables::ADJ_OUT, MultimapTable<u64, &'static [u8]>);
     multimap_accessor!(adj_in, adj_in, marsdb_storage::tables::ADJ_IN, MultimapTable<u64, &'static [u8]>);
     multimap_accessor!(node_label_index, node_label_index, marsdb_storage::tables::NODE_LABEL_INDEX, MultimapTable<u32, u64>);
-    table_accessor!(prop_to_id, prop_to_id, marsdb_storage::tables::PROP_TO_ID, Table<&'static str, u32>);
+    table_accessor!(
+        prop_to_id,
+        prop_to_id,
+        marsdb_storage::tables::PROP_TO_ID,
+        Table<&'static str, u32>
+    );
     table_accessor!(id_to_prop, id_to_prop, marsdb_storage::tables::ID_TO_PROP, Table<u32, &'static str>);
-    table_accessor!(index_defs, index_defs, marsdb_storage::tables::INDEX_DEFS, Table<&'static [u8], &'static [u8]>);
-    multimap_accessor!(property_index, property_index, marsdb_storage::tables::PROPERTY_INDEX, MultimapTable<&'static [u8], u64>);
+    table_accessor!(
+        index_defs,
+        index_defs,
+        marsdb_storage::tables::INDEX_DEFS,
+        Table<&'static [u8], &'static [u8]>
+    );
+    multimap_accessor!(
+        property_index,
+        property_index,
+        marsdb_storage::tables::PROPERTY_INDEX,
+        MultimapTable<&'static [u8], u64>
+    );
 }

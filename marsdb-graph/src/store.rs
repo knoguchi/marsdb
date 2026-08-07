@@ -515,7 +515,10 @@ impl GraphStore {
     /// it would try to open every table twice and hit redb's
     /// `TableAlreadyOpen`.
     fn delete_edge_ctx(ctx: &mut WriteCtx, id: EdgeId) -> Result<bool, GraphError> {
-        let Some(record_bytes) = ctx.edges()?.remove(id.0)?.map(|guard| guard.value().to_vec())
+        let Some(record_bytes) = ctx
+            .edges()?
+            .remove(id.0)?
+            .map(|guard| guard.value().to_vec())
         else {
             return Ok(false);
         };
@@ -565,7 +568,10 @@ impl GraphStore {
         for edge_id in incident {
             Self::delete_edge_ctx(&mut ctx, edge_id)?;
         }
-        let Some(removed_bytes) = ctx.nodes()?.remove(id.0)?.map(|guard| guard.value().to_vec())
+        let Some(removed_bytes) = ctx
+            .nodes()?
+            .remove(id.0)?
+            .map(|guard| guard.value().to_vec())
         else {
             return Ok(false);
         };

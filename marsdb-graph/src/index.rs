@@ -222,7 +222,8 @@ pub(crate) fn create_index(
     }
 
     let encoded = postcard::to_allocvec(&IndexDef { unique })?;
-    ctx.index_defs()?.insert(prefix.as_slice(), encoded.as_slice())?;
+    ctx.index_defs()?
+        .insert(prefix.as_slice(), encoded.as_slice())?;
     for (key, node_id) in entries {
         ctx.property_index()?.insert(key.as_slice(), node_id)?;
     }
