@@ -2693,62 +2693,81 @@ pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     AstBuilder::new().visit(&*query_ctx).into_statement()
 }
 
-/// The real implementation behind `lib.rs`'s public `parse_many` (Phase 3
-/// cutover) -- parses a `;`-separated batch of one or more statements
-/// (`"CREATE (a); CREATE (b); MATCH (n) RETURN n"`). `queries : query
-/// (SEMI query)* EOF` is a mars-specific grammar extension (see
-/// `grammar/README.md`), including stripping a single genuinely-trailing
-/// `;` in Rust before parsing -- the grammar rule itself has no trailing
-/// `SEMI?`, to avoid a `queries`/`script` prefix ambiguity.
+/// The real implementation behind `lib.rs`'s public `parse_many` --
+/// parses a `;`-separated batch of one or more statements (`"CREATE (a);
+/// CREATE (b); MATCH (n) RETURN n"`). Splits the input into individual
+/// statements itself (`split_statements`, respecting Cypher's quoting
+/// rules) and parses each one independently via `parse_antlr`, rather
+/// than parsing the whole batch as one shared ANTLR tree the way the
+/// grammar's own `queries : query (SEMI query)* EOF` rule (a
+/// mars-specific extension, see `grammar/README.md`) would: building one
+/// tree for a large batch means every statement's tree is alive in
+/// memory simultaneously until the last one is converted to a
+/// lightweight `Statement` and the whole tree can finally drop.
+/// Confirmed via `/usr/bin/time -l`: a real 29MB/9,771-statement import
+/// script peaked at 13GB RSS in the parse step alone (before any
+/// execution) parsed the old way. Splitting first means only the
+/// *largest single statement's* tree is ever alive at once.
+///
+/// Also strips a single genuinely-trailing `;` first, same as before --
+/// `script : query SEMI? EOF` (what `parse_antlr` uses per statement)
+/// already tolerates one, but stripping it here first keeps
+/// `split_statements` from ever seeing a trailing empty segment.
 pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
-    use crate::generated::cypherlexer::CypherLexer;
-    use crate::generated::cypherparser::{CypherParser, QueriesContextAttrs};
-    use antlr4rust::common_token_stream::CommonTokenStream;
-    use antlr4rust::error_listener::ErrorListener;
-    use antlr4rust::recognizer::Recognizer;
-    use antlr4rust::token_factory::TokenFactory;
-    use antlr4rust::InputStream;
-    use antlr4rust::Parser as _;
-    use std::cell::RefCell;
-
-    struct CollectErrors(Rc<RefCell<Vec<String>>>);
-    impl<'a, T: Recognizer<'a>> ErrorListener<'a, T> for CollectErrors {
-        fn syntax_error(
-            &self,
-            _recognizer: &T,
-            _offending_symbol: Option<&<T::TF as TokenFactory<'a>>::Inner>,
-            line: isize,
-            column: isize,
-            msg: &str,
-            _e: Option<&antlr4rust::errors::ANTLRError>,
-        ) {
-            self.0
-                .borrow_mut()
-                .push(format!("line {line}:{column} {msg}"));
-        }
-    }
-
     let trimmed = input.trim_end();
     let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
-
-    let errors = Rc::new(RefCell::new(Vec::new()));
-    let stream = InputStream::new(trimmed);
-    let mut lexer = CypherLexer::new(stream);
-    lexer.remove_error_listeners();
-    lexer.add_error_listener(Box::new(CollectErrors(errors.clone())));
-    let tokens = CommonTokenStream::new(lexer);
-    let mut parser = CypherParser::new(tokens);
-    parser.remove_error_listeners();
-    parser.add_error_listener(Box::new(CollectErrors(errors.clone())));
-    let ctx = parser
-        .queries()
-        .map_err(|e| QueryError::Syntax(e.to_string()))?;
-    if let Some(msg) = errors.borrow().first() {
-        return Err(QueryError::Syntax(format!("syntax error: {msg}")));
-    }
-    ctx.query_all()
+    split_statements(trimmed)
         .into_iter()
-        .map(|q| AstBuilder::new().visit(&*q).into_statement())
+        .map(parse_antlr)
+        .collect()
+}
+
+/// Splits `;`-separated statement text into individual statement slices
+/// without building any parse tree -- a `;` inside a single-quoted
+/// (`'...'`), double-quoted (`"..."`), or backtick-quoted (`` `...` ``)
+/// region is never treated as a separator, matching exactly what the
+/// lexer's own `CHAR_LITERAL`/`STRING_LITERAL`/`ESC_LITERAL` rules
+/// consider part of the literal (see `grammar/CypherLexer.g4`).
+/// Backtick-quoted identifiers have no escape sequences in this grammar
+/// (`ESC_LITERAL : '`' .*? '`'`) -- a backslash there is just a literal
+/// character, not an escape introducer, unlike inside the other two.
+/// Doesn't validate escape sequences itself (that's `parse_antlr`'s job
+/// once each slice is actually parsed) -- only tracks "am I currently
+/// inside a quoted region" well enough to find the real separators.
+fn split_statements(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut starts = vec![0usize];
+    let mut semicolons = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' && q != b'`' {
+                    i += 1; // skip the escaped character too
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' | b'`' => quote = Some(b),
+                b';' => {
+                    semicolons.push(i);
+                    starts.push(i + 1);
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| {
+            let end = semicolons.get(idx).copied().unwrap_or(bytes.len());
+            &input[start..end]
+        })
         .collect()
 }
 
@@ -4717,6 +4736,47 @@ mod tests {
     fn parse_antlr_many_semicolon_inside_string_literal_not_a_separator() {
         let stmts = parse_antlr_many("RETURN ';'").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn split_statements_respects_all_three_quote_forms() {
+        // Single-quoted, double-quoted, and backtick-quoted (identifier)
+        // -- a `;` inside any of them is content, not a separator.
+        assert_eq!(
+            split_statements("RETURN ';'; RETURN 1"),
+            vec!["RETURN ';'", " RETURN 1"]
+        );
+        assert_eq!(
+            split_statements(r#"RETURN ";"; RETURN 1"#),
+            vec![r#"RETURN ";""#, " RETURN 1"]
+        );
+        assert_eq!(
+            split_statements("MATCH (`a;b`) RETURN 1; RETURN 2"),
+            vec!["MATCH (`a;b`) RETURN 1", " RETURN 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_handles_escaped_quotes_inside_a_literal() {
+        // An escaped closing quote (`\'`) doesn't end the string early --
+        // the real `;` separator is the *second* one, past both escaped
+        // quotes.
+        assert_eq!(
+            split_statements(r"RETURN 'it\'s; a test'; RETURN 1"),
+            vec![r"RETURN 'it\'s; a test'", " RETURN 1"]
+        );
+    }
+
+    #[test]
+    fn split_statements_backtick_literal_has_no_escapes() {
+        // Unlike '...'/"...", a backtick-quoted identifier has no escape
+        // sequences in this grammar (`ESC_LITERAL : '`' .*? '`'`) -- a
+        // backslash inside one is just a literal character, the *very
+        // next* backtick closes it regardless of what precedes it.
+        assert_eq!(
+            split_statements(r"MATCH (`a\`) RETURN 1; RETURN 2"),
+            vec![r"MATCH (`a\`) RETURN 1", " RETURN 2"]
+        );
     }
 
     #[test]
