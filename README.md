@@ -299,6 +299,13 @@ signal this exists to produce, not the flat pass-rate over the whole
 suite. Side-effect assertions and the TCK's typed error taxonomy aren't
 checked (see the crate's doc comments for why).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks to run
+before opening a PR, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for
+community expectations. Found a security issue? See
+[SECURITY.md](SECURITY.md) — please don't open a public issue for it.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or

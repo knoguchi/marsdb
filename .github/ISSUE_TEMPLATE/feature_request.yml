@@ -1,0 +1,23 @@
+name: Feature request
+description: A Cypher feature, API, or capability MarsDB doesn't have yet
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: What are you trying to do
+      description: The real use case this would unblock, not just the
+        feature itself.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What you'd want the API/Cypher syntax to look like,
+        if you have an opinion.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: Is there a current way to do this, even if awkward?

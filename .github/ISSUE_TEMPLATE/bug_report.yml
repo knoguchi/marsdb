@@ -1,0 +1,45 @@
+name: Bug report
+description: Something doesn't work the way it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: A clear description of the bug. If it's a wrong query
+        result, include the expected vs. actual output.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A minimal Cypher query (and setup, if needed) that
+        reproduces this. Smaller is easier to fix fast.
+      render: cypher
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MarsDB version
+      description: "`cargo tree -p marsdb` or the crate/PyPI version, or a commit SHA if built from source"
+    validations:
+      required: true
+  - type: dropdown
+    id: binding
+    attributes:
+      label: Which binding
+      options:
+        - Rust (marsdb)
+        - Python (marsdb-python)
+        - Go (marsdb-go)
+        - CLI (marsdb-cli)
+        - C API (marsdb-capi)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Rust/Python/Go version if relevant
