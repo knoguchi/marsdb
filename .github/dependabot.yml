@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Root workspace -- covers marsdb-storage/graph/query/marsdb/cli/capi/
+  # nl2cypher/tck/crash-harness, everything with a Cargo.toml under the
+  # workspace member list plus marsdb-python (path-based, still resolved
+  # even though it's workspace-excluded).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-dependencies:
+        patterns: ["*"]
+
+  # marsdb-python has its own Cargo.lock (workspace-excluded, see the
+  # comment on the root Cargo.toml's own `exclude`) -- a separate entry
+  # since Dependabot resolves each Cargo.lock independently.
+  - package-ecosystem: cargo
+    directory: /marsdb-python
+    schedule:
+      interval: weekly
+    groups:
+      cargo-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-dependencies:
+        patterns: ["*"]

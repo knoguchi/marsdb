@@ -22,6 +22,10 @@ Alice | Bob
 
 ## Install
 
+Requires Rust 1.82+ (MSRV, verified via clippy's own `incompatible_msrv`
+lint — not tested against every toolchain above that, CI just runs each
+runner's current stable).
+
 **CLI** — installs the `marsdb` binary:
 
 ```
