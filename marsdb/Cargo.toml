@@ -26,6 +26,8 @@ thiserror.workspace = true
 tempfile = "3"
 criterion.workspace = true
 plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series", "histogram"] }
+postcard.workspace = true
+serde.workspace = true
 
 [[bench]]
 name = "cypher_ops"

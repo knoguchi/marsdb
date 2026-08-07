@@ -873,6 +873,8 @@ dependencies = [
  "marsdb-query",
  "marsdb-storage",
  "plotters",
+ "postcard",
+ "serde",
  "tempfile",
  "thiserror",
 ]

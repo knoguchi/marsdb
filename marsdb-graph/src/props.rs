@@ -1,39 +1,20 @@
-use marsdb_storage::{ReadableTable, Txn, WriteTransaction};
+use marsdb_storage::{ReadableTable, Txn};
 
 use crate::error::GraphError;
 use crate::id::next_id;
+use crate::write_ctx::WriteCtx;
 
 /// Look up (or allocate) the u32 id interned for `prop`, inside a write
 /// txn. Mirrors `labels::intern_label` — property names are interned
 /// globally, not per-label, since the same name is common across labels.
-pub(crate) fn intern_prop(write_txn: &WriteTransaction, prop: &str) -> Result<u32, GraphError> {
-    {
-        let p2i = write_txn.open_table(marsdb_storage::tables::PROP_TO_ID)?;
-        let existing = p2i.get(prop)?.map(|g| g.value());
-        if let Some(existing) = existing {
-            return Ok(existing);
-        }
+pub(crate) fn intern_prop(ctx: &mut WriteCtx, prop: &str) -> Result<u32, GraphError> {
+    if let Some(existing) = ctx.prop_to_id()?.get(prop)?.map(|g| g.value()) {
+        return Ok(existing);
     }
-    let id = next_id(write_txn, "next_prop_id")? as u32;
-    {
-        let mut p2i = write_txn.open_table(marsdb_storage::tables::PROP_TO_ID)?;
-        p2i.insert(prop, id)?;
-    }
-    {
-        let mut i2p = write_txn.open_table(marsdb_storage::tables::ID_TO_PROP)?;
-        i2p.insert(id, prop)?;
-    }
+    let id = next_id(ctx, "next_prop_id")? as u32;
+    ctx.prop_to_id()?.insert(prop, id)?;
+    ctx.id_to_prop()?.insert(id, prop)?;
     Ok(id)
-}
-
-/// Resolve a previously interned property id back to its string. Mirrors
-/// `labels::resolve_label`.
-pub(crate) fn resolve_prop(txn: Txn, prop_id: u32) -> Result<String, GraphError> {
-    let i2p = txn.open_table(marsdb_storage::tables::ID_TO_PROP)?;
-    let value = i2p.get(prop_id)?.ok_or_else(|| {
-        GraphError::CorruptData(format!("prop id {prop_id} has no interned string"))
-    })?;
-    Ok(value.value().to_string())
 }
 
 /// Look up the id for `prop` without allocating one. `None` means `prop`

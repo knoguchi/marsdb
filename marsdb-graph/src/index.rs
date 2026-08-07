@@ -5,13 +5,14 @@
 
 use std::collections::BTreeMap;
 
-use marsdb_storage::{ReadableMultimapTable, ReadableTable, Txn, WriteTransaction};
+use marsdb_storage::{ReadableMultimapTable, ReadableTable, Txn};
 use serde::{Deserialize, Serialize};
 
 use crate::error::GraphError;
-use crate::labels::{lookup_label_id, resolve_label};
+use crate::labels::lookup_label_id;
 use crate::model::{NodeId, PropertyValue};
-use crate::props::{lookup_prop_id, resolve_prop};
+use crate::props::lookup_prop_id;
+use crate::write_ctx::WriteCtx;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IndexDef {
@@ -172,22 +173,19 @@ fn index_key(label_id: u32, prop_id: u32, value: &PropertyValue) -> Vec<u8> {
 /// Idempotent by (label, prop) identity, not by `unique`-ness — calling
 /// this again on an already-indexed pair is an error, same as most
 /// databases' `CREATE INDEX` (no silent redefinition).
-pub fn create_index(
-    write_txn: &WriteTransaction,
+pub(crate) fn create_index(
+    ctx: &mut WriteCtx,
     label: &str,
     prop: &str,
     unique: bool,
 ) -> Result<(), GraphError> {
-    let label_id = crate::labels::intern_label(write_txn, label)?;
-    let prop_id = crate::props::intern_prop(write_txn, prop)?;
+    let label_id = crate::labels::intern_label(ctx, label)?;
+    let prop_id = crate::props::intern_prop(ctx, prop)?;
     let prefix = index_prefix(label_id, prop_id);
-    {
-        let defs = write_txn.open_table(marsdb_storage::tables::INDEX_DEFS)?;
-        if defs.get(prefix.as_slice())?.is_some() {
-            return Err(GraphError::CorruptData(format!(
-                "index on label {label:?} property {prop:?} already exists"
-            )));
-        }
+    if ctx.index_defs()?.get(prefix.as_slice())?.is_some() {
+        return Err(GraphError::CorruptData(format!(
+            "index on label {label:?} property {prop:?} already exists"
+        )));
     }
 
     // Backfill: walk every node with this label (via the existing
@@ -196,23 +194,19 @@ pub fn create_index(
     // it entirely -- a missing property never appears in the index, same
     // as `IS NULL`/absence being indistinguishable elsewhere in this
     // codebase).
-    let label_index = write_txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
-    let node_ids: Vec<u64> = label_index
+    let node_ids: Vec<u64> = ctx
+        .node_label_index()?
         .get(label_id)?
         .map(|entry| entry.map(|value| value.value()).map_err(GraphError::from))
         .collect::<Result<Vec<_>, GraphError>>()?;
-    drop(label_index);
     let mut entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(node_ids.len());
-    {
-        let nodes = write_txn.open_table(marsdb_storage::tables::NODES)?;
-        for node_id in &node_ids {
-            let Some(guard) = nodes.get(*node_id)? else {
-                continue;
-            };
-            let record: crate::encode::NodeRecord = crate::encode::decode(guard.value())?;
-            if let Some(value) = record.props.get(prop) {
-                entries.push((index_key(label_id, prop_id, value), *node_id));
-            }
+    for node_id in &node_ids {
+        let Some(guard) = ctx.nodes()?.get(*node_id)? else {
+            continue;
+        };
+        let record: crate::encode::NodeRecord = crate::encode::decode(guard.value())?;
+        if let Some(value) = record.props.get(prop) {
+            entries.push((index_key(label_id, prop_id, value), *node_id));
         }
     }
     if unique {
@@ -227,16 +221,10 @@ pub fn create_index(
         }
     }
 
-    {
-        let mut defs = write_txn.open_table(marsdb_storage::tables::INDEX_DEFS)?;
-        let encoded = postcard::to_allocvec(&IndexDef { unique })?;
-        defs.insert(prefix.as_slice(), encoded.as_slice())?;
-    }
-    {
-        let mut index = write_txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
-        for (key, node_id) in entries {
-            index.insert(key.as_slice(), node_id)?;
-        }
+    let encoded = postcard::to_allocvec(&IndexDef { unique })?;
+    ctx.index_defs()?.insert(prefix.as_slice(), encoded.as_slice())?;
+    for (key, node_id) in entries {
+        ctx.property_index()?.insert(key.as_slice(), node_id)?;
     }
     Ok(())
 }
@@ -342,38 +330,64 @@ pub fn match_count(
 /// number of *declared indexes* is expected to be small, unlike node
 /// counts) and filtered in memory.
 fn indexes_for_labels(
-    txn: Txn,
+    ctx: &mut WriteCtx,
     label_ids: &[u32],
 ) -> Result<Vec<(u32, u32, String, IndexDef)>, GraphError> {
-    let defs = match txn.open_table(marsdb_storage::tables::INDEX_DEFS) {
-        Ok(table) => table,
-        Err(marsdb_storage::StorageError::Table(redb::TableError::TableDoesNotExist(_))) => {
-            return Ok(Vec::new())
+    // Collected into an owned Vec first, not resolved inline in the loop
+    // below -- `ctx.index_defs()?.iter()?` holds `ctx` mutably borrowed for
+    // the iterator's whole lifetime, and `resolve_prop_ctx` below needs its
+    // own fresh `&mut ctx` (to lazily open `id_to_prop`), which can't
+    // coexist with that borrow.
+    let raw: Vec<(u32, u32, IndexDef)> = {
+        let mut raw = Vec::new();
+        for entry in ctx.index_defs()?.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            let label_id = u32::from_be_bytes(
+                key_bytes[0..4]
+                    .try_into()
+                    .expect("index key prefix is 8 bytes"),
+            );
+            if !label_ids.contains(&label_id) {
+                continue;
+            }
+            let prop_id = u32::from_be_bytes(
+                key_bytes[4..8]
+                    .try_into()
+                    .expect("index key prefix is 8 bytes"),
+            );
+            let def: IndexDef = postcard::from_bytes(value.value())?;
+            raw.push((label_id, prop_id, def));
         }
-        Err(e) => return Err(e.into()),
+        raw
     };
-    let mut out = Vec::new();
-    for entry in defs.iter()? {
-        let (key, value) = entry?;
-        let key_bytes = key.value();
-        let label_id = u32::from_be_bytes(
-            key_bytes[0..4]
-                .try_into()
-                .expect("index key prefix is 8 bytes"),
-        );
-        if !label_ids.contains(&label_id) {
-            continue;
-        }
-        let prop_id = u32::from_be_bytes(
-            key_bytes[4..8]
-                .try_into()
-                .expect("index key prefix is 8 bytes"),
-        );
-        let def: IndexDef = postcard::from_bytes(value.value())?;
-        let prop_name = resolve_prop(txn, prop_id)?;
-        out.push((label_id, prop_id, prop_name, def));
-    }
-    Ok(out)
+    raw.into_iter()
+        .map(|(label_id, prop_id, def)| {
+            let prop_name = resolve_prop_ctx(ctx, prop_id)?;
+            Ok((label_id, prop_id, prop_name, def))
+        })
+        .collect()
+}
+
+/// `labels::resolve_label`/`props::resolve_prop` equivalents reading
+/// directly from an already-open `WriteCtx` handle, instead of opening
+/// `ID_TO_LABEL`/`ID_TO_PROP` again via `Txn` (which `WriteCtx` already
+/// holds open -- a second live handle to the same table would be
+/// `TableAlreadyOpen`). Small deliberate duplication, not a shared helper
+/// with the `Txn`-based versions -- those stay untouched for the read
+/// path (see `WriteCtx`'s own docs).
+fn resolve_label_ctx(ctx: &mut WriteCtx, label_id: u32) -> Result<String, GraphError> {
+    let value = ctx.id_to_label()?.get(label_id)?.ok_or_else(|| {
+        GraphError::CorruptData(format!("label id {label_id} has no interned string"))
+    })?;
+    Ok(value.value().to_string())
+}
+
+fn resolve_prop_ctx(ctx: &mut WriteCtx, prop_id: u32) -> Result<String, GraphError> {
+    let value = ctx.id_to_prop()?.get(prop_id)?.ok_or_else(|| {
+        GraphError::CorruptData(format!("prop id {prop_id} has no interned string"))
+    })?;
+    Ok(value.value().to_string())
 }
 
 /// Identifies one declared index, both by id (for the actual key/lookup)
@@ -388,39 +402,32 @@ struct IndexTarget<'a> {
 }
 
 fn insert_entry(
-    write_txn: &WriteTransaction,
+    ctx: &mut WriteCtx,
     target: &IndexTarget<'_>,
     value: &PropertyValue,
     node_id: u64,
     unique: bool,
 ) -> Result<(), GraphError> {
     let key = index_key(target.label_id, target.prop_id, value);
-    if unique {
-        let index = write_txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
-        let exists = index.get(key.as_slice())?.next().is_some();
-        drop(index);
-        if exists {
-            return Err(GraphError::UniqueConstraintViolation {
-                label: target.label.to_string(),
-                property: target.prop.to_string(),
-            });
-        }
+    if unique && ctx.property_index()?.get(key.as_slice())?.next().is_some() {
+        return Err(GraphError::UniqueConstraintViolation {
+            label: target.label.to_string(),
+            property: target.prop.to_string(),
+        });
     }
-    let mut index = write_txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
-    index.insert(key.as_slice(), node_id)?;
+    ctx.property_index()?.insert(key.as_slice(), node_id)?;
     Ok(())
 }
 
 fn remove_entry(
-    write_txn: &WriteTransaction,
+    ctx: &mut WriteCtx,
     label_id: u32,
     prop_id: u32,
     value: &PropertyValue,
     node_id: u64,
 ) -> Result<(), GraphError> {
     let key = index_key(label_id, prop_id, value);
-    let mut index = write_txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
-    index.remove(key.as_slice(), node_id)?;
+    ctx.property_index()?.remove(key.as_slice(), node_id)?;
     Ok(())
 }
 
@@ -430,23 +437,22 @@ fn remove_entry(
 /// given) and on `SET n:Label` (`label_ids` = just the one newly-added
 /// label — indexes on labels the node already had are untouched, since
 /// nothing about their entries changed).
-pub fn on_node_created(
-    write_txn: &WriteTransaction,
+pub(crate) fn on_node_created(
+    ctx: &mut WriteCtx,
     node_id: u64,
     label_ids: &[u32],
     props: &BTreeMap<String, PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)?
-    {
+    for (label_id, prop_id, prop_name, def) in indexes_for_labels(ctx, label_ids)? {
         if let Some(value) = props.get(&prop_name) {
-            let label = resolve_label(Txn::Write(write_txn), label_id)?;
+            let label = resolve_label_ctx(ctx, label_id)?;
             let target = IndexTarget {
                 label_id,
                 prop_id,
                 label: &label,
                 prop: &prop_name,
             };
-            insert_entry(write_txn, &target, value, node_id, def.unique)?;
+            insert_entry(ctx, &target, value, node_id, def.unique)?;
         }
     }
     Ok(())
@@ -457,17 +463,15 @@ pub fn on_node_created(
 /// change) has a value for. Called on node deletion (`label_ids` = every
 /// label the node had) and on `REMOVE n:Label` (`label_ids` = just the one
 /// removed label).
-pub fn on_node_deleted(
-    write_txn: &WriteTransaction,
+pub(crate) fn on_node_deleted(
+    ctx: &mut WriteCtx,
     node_id: u64,
     label_ids: &[u32],
     props: &BTreeMap<String, PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, _def) in
-        indexes_for_labels(Txn::Write(write_txn), label_ids)?
-    {
+    for (label_id, prop_id, prop_name, _def) in indexes_for_labels(ctx, label_ids)? {
         if let Some(value) = props.get(&prop_name) {
-            remove_entry(write_txn, label_id, prop_id, value, node_id)?;
+            remove_entry(ctx, label_id, prop_id, value, node_id)?;
         }
     }
     Ok(())
@@ -482,31 +486,30 @@ pub fn on_node_deleted(
 /// and gets indexed like any other value (matches `create_index`'s own
 /// backfill, which only skips a property that's *absent*, not one whose
 /// value is `Null`).
-pub fn on_node_prop_changed(
-    write_txn: &WriteTransaction,
+pub(crate) fn on_node_prop_changed(
+    ctx: &mut WriteCtx,
     node_id: u64,
     label_ids: &[u32],
     prop: &str,
     old_value: Option<&PropertyValue>,
     new_value: Option<&PropertyValue>,
 ) -> Result<(), GraphError> {
-    for (label_id, prop_id, prop_name, def) in indexes_for_labels(Txn::Write(write_txn), label_ids)?
-    {
+    for (label_id, prop_id, prop_name, def) in indexes_for_labels(ctx, label_ids)? {
         if prop_name != prop {
             continue;
         }
         if let Some(old) = old_value {
-            remove_entry(write_txn, label_id, prop_id, old, node_id)?;
+            remove_entry(ctx, label_id, prop_id, old, node_id)?;
         }
         if let Some(new) = new_value {
-            let label = resolve_label(Txn::Write(write_txn), label_id)?;
+            let label = resolve_label_ctx(ctx, label_id)?;
             let target = IndexTarget {
                 label_id,
                 prop_id,
                 label: &label,
                 prop: &prop_name,
             };
-            insert_entry(write_txn, &target, new, node_id, def.unique)?;
+            insert_entry(ctx, &target, new, node_id, def.unique)?;
         }
     }
     Ok(())

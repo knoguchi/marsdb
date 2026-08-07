@@ -30,6 +30,17 @@ All notable changes to MarsDB are documented here. Format loosely follows
   raw Cypher text without building a parse tree, useful for tooling that
   needs statement boundaries in source text, not just parsed ASTs.
 
+### Changed
+- Every `GraphStore::*_in_txn` write helper (`create_node_in_txn`,
+  `create_edge_in_txn`, `set_node_prop_in_txn`, `create_index_in_txn`, ...)
+  now caches its redb table handles for the call instead of reopening the
+  same table repeatedly as it works through label/property interning,
+  the actual write, and index maintenance. Internal only — no API change.
+  Found via a flamegraph: `WriteTransaction::open_table` summed to
+  23.21% of replay time on the real 9,771-statement load script,
+  the single biggest cost after group commit (#153) and parameterized
+  loading (#154). Cut to 16.91%, wall time 4.89s → ~4.2s (measured).
+
 ### Fixed
 - `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,
   `id_to_prop`, `index_defs`, `property_index`) from the set they eagerly
