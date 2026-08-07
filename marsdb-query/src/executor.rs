@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc,
@@ -7,8 +8,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use marsdb_graph::{
-    AdjEntry, Direction, Edge, EdgeId, GraphStore, NodeId, PropertyValue, Txn, TzId as GraphTzId,
-    WriteTransaction,
+    AdjEntry, Direction, Edge, EdgeId, GraphStore, Node, NodeId, PropertyValue, Txn,
+    TzId as GraphTzId, WriteTransaction,
 };
 
 use crate::aggregate::{property_value_hash_key, value_hash_key, AggAcc, HashKey};
@@ -405,6 +406,30 @@ pub struct Executor<'a> {
     /// Cypher's guarantee that every such call *within one query*
     /// returns the same value (see `temporal::NowSnapshot`'s docs).
     now: Cell<Option<temporal::NowSnapshot>>,
+    /// `NodeId -> Node` memo, cleared at the start of every statement --
+    /// both entry points (`execute_with_guard` and
+    /// `execute_in_write_transaction_with_guard`, see their own reset
+    /// lines) must do this, since `node_cache` is a field on `Executor`
+    /// shared by both, not private to either -- and only ever consulted/
+    /// populated for a read-only statement (`node_cache_enabled`) -- a
+    /// write statement can mutate a node's props/labels mid-statement
+    /// (`SET`, `REMOVE`), so a cached record could go stale within the
+    /// same statement; a read-only statement has one consistent snapshot
+    /// for its whole duration, so caching is safe unconditionally there.
+    /// Found via a real flamegraph: `get_node_in_txn`'s postcard decode
+    /// of the full `NodeRecord` (every property, not just the ones a
+    /// query reads) summed to ~40% of read-path time on a real dataset,
+    /// much of it the *same* node decoded repeatedly (`RETURN n.a, n.b
+    /// ORDER BY n.c` decodes `n` three times).
+    ///
+    /// Currently unbounded -- a read-only statement that scans wide
+    /// retains an `Rc<Node>` for every node it touches until the
+    /// statement ends, where the pre-cache code decoded-and-dropped per
+    /// row. On a dataset larger than RAM this can turn a slow query into
+    /// an OOM risk; see mars-kvb for a size-capped follow-up (stop
+    /// inserting past N entries, keep serving existing hits).
+    node_cache: RefCell<HashMap<NodeId, Rc<Node>>>,
+    node_cache_enabled: Cell<bool>,
 }
 
 impl<'a> Executor<'a> {
@@ -412,7 +437,27 @@ impl<'a> Executor<'a> {
         Self {
             store,
             now: Cell::new(None),
+            node_cache: RefCell::new(HashMap::new()),
+            node_cache_enabled: Cell::new(false),
         }
+    }
+
+    /// Cached equivalent of `GraphStore::get_node_in_txn` -- see
+    /// `node_cache`'s own docs for why this is safe only when the cache
+    /// is enabled (a read-only statement) and cleared between statements.
+    fn get_node_cached(&self, txn: Txn, id: NodeId) -> Result<Option<Rc<Node>>, QueryError> {
+        if self.node_cache_enabled.get() {
+            if let Some(cached) = self.node_cache.borrow().get(&id) {
+                return Ok(Some(Rc::clone(cached)));
+            }
+        }
+        let node = GraphStore::get_node_in_txn(txn, id)?.map(Rc::new);
+        if self.node_cache_enabled.get() {
+            if let Some(n) = &node {
+                self.node_cache.borrow_mut().insert(id, Rc::clone(n));
+            }
+        }
+        Ok(node)
     }
 
     fn now_snapshot(&self) -> temporal::NowSnapshot {
@@ -458,6 +503,12 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
+        // Fresh cache generation per statement -- an `Executor` is reused
+        // across many statements (`execute_batch`, group commit), so a
+        // cache that outlived one statement would return stale records
+        // for a node a *later* statement mutated.
+        self.node_cache.borrow_mut().clear();
+        self.node_cache_enabled.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Never opens a WriteTransaction, regardless of what `inner`
             // itself would otherwise mutate -- EXPLAIN describes a plan,
@@ -558,6 +609,17 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
+        // Same cache-generation reset as the top-level path
+        // (`execute_with_guard`) -- this is a second, separate entry
+        // point into statement execution (an explicit multi-statement
+        // `Transaction`, or a group-commit loop, calls this directly with
+        // an already-open `write_txn` instead of going through
+        // `execute`/`execute_with_options`), and `node_cache` is a field
+        // on `Executor`, not something either entry point owns privately
+        // -- skipping the reset here left the flag/map from whatever this
+        // `Executor` last did through the *other* entry point in effect.
+        self.node_cache.borrow_mut().clear();
+        self.node_cache_enabled.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Same "never mutates" contract as the top-level path -- opens
             // its own ReadTransaction rather than touching the caller's
@@ -2335,9 +2397,9 @@ impl<'a> Executor<'a> {
     /// `Value::Null`, same as everywhere else null is represented).
     fn binding_to_value(&self, txn: Txn, b: &Binding) -> Result<Value, QueryError> {
         Ok(match b {
-            Binding::Node(id) => Value::Node(deleted_entity_access(GraphStore::get_node_in_txn(
-                txn, *id,
-            )?)?),
+            Binding::Node(id) => {
+                Value::Node((*deleted_entity_access(self.get_node_cached(txn, *id)?)?).clone())
+            }
             Binding::Edge(id) => Value::Edge(deleted_entity_access(GraphStore::get_edge_in_txn(
                 txn, *id,
             )?)?),
@@ -2366,8 +2428,8 @@ impl<'a> Executor<'a> {
             None | Some(Value::Null) => Ok(Value::Null),
             Some(Value::Edge(e)) => {
                 let id = if which == "startnode" { e.src } else { e.dst };
-                let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, id)?)?;
-                Ok(Value::Node(node))
+                let node = deleted_entity_access(self.get_node_cached(txn, id)?)?;
+                Ok(Value::Node((*node).clone()))
             }
             Some(other) => Err(QueryError::Type(format!(
                 "{which}() expects a relationship, got {other:?}"
@@ -2425,9 +2487,9 @@ impl<'a> Executor<'a> {
             .iter()
             .map(|e| {
                 Ok(match e {
-                    PathBinding::Node(id) => PathElem::Node(deleted_entity_access(
-                        GraphStore::get_node_in_txn(txn, *id)?,
-                    )?),
+                    PathBinding::Node(id) => PathElem::Node(
+                        (*deleted_entity_access(self.get_node_cached(txn, *id)?)?).clone(),
+                    ),
                     PathBinding::Edge(id) => PathElem::Edge(deleted_entity_access(
                         GraphStore::get_edge_in_txn(txn, *id)?,
                     )?),
@@ -3782,7 +3844,7 @@ impl<'a> Executor<'a> {
                 let Binding::Node(id) = binding else {
                     return Err(QueryError::UnboundVariable(var.clone()));
                 };
-                let node = GraphStore::get_node_in_txn(txn, *id)?;
+                let node = self.get_node_cached(txn, *id)?;
                 Some(node.is_some_and(|n| n.labels.iter().any(|l| l == label)))
             }
             Expr::VarEq(a, b) => {
@@ -3904,7 +3966,7 @@ impl<'a> Executor<'a> {
             // scenario [15]), not a silent null. These are two different
             // kinds of "missing" and must not be collapsed into one.
             Binding::Node(id) => {
-                let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?;
+                let node = deleted_entity_access(self.get_node_cached(txn, *id)?)?;
                 Ok(node.props.get(&pa.prop).cloned())
             }
             Binding::Edge(id) => {
@@ -4395,7 +4457,7 @@ impl<'a> Executor<'a> {
                     .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 match binding {
                     Binding::Node(id) => {
-                        let node = deleted_entity_access(GraphStore::get_node_in_txn(txn, *id)?)?;
+                        let node = deleted_entity_access(self.get_node_cached(txn, *id)?)?;
                         Ok(Value::Literal(Literal::Bool(
                             labels.iter().all(|l| node.labels.contains(l)),
                         )))

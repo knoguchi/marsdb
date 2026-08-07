@@ -40,6 +40,19 @@ All notable changes to MarsDB are documented here. Format loosely follows
   23.21% of replay time on the real 9,771-statement load script,
   the single biggest cost after group commit (#153) and parameterized
   loading (#154). Cut to 16.91%, wall time 4.89s → ~4.2s (measured).
+- The executor now caches each node it decodes for the rest of a
+  read-only statement instead of re-decoding it from storage on every
+  access — `RETURN n.a, n.b ORDER BY n.c` decoded the same node three
+  times before. Disabled entirely for write statements (a `SET`/`REMOVE`
+  can change a node mid-statement, so a cached copy could go stale) and
+  cleared between statements on a reused `Executor` (`execute_batch`,
+  group commit). Internal only — no API change. Found via a flamegraph:
+  the postcard decode of a node's full stored record summed to ~40% of
+  read-path time on a real dataset. On the same dataset's canonical
+  multi-hop read queries (100 repeats, for a stable measurement), total
+  time dropped from 15.45s to ~9.7s (~37% faster); the two queries with
+  the most repeated node reads (`crimson_tide_collaborative_filtering`,
+  `inception_genre_similarity`) each dropped from ~65-70ms to ~39ms.
 
 ### Fixed
 - `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,

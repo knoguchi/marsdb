@@ -3919,6 +3919,117 @@ fn date_time_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u3
         .timestamp()
 }
 
+/// The executor's per-statement node decode cache (mars-m79) must not
+/// leak a stale record across statements when one `Executor` is reused
+/// for several (`execute_batch`, group commit) -- a node read in an
+/// earlier statement, then mutated in a later one, must show the new
+/// value on the next read, not the first statement's cached copy.
+#[test]
+fn node_cache_does_not_leak_stale_records_across_statements() {
+    let store = GraphStore::open_memory().unwrap();
+    let executor = Executor::new(&store);
+
+    let create = parse("CREATE (:Item {name: 'old'})").unwrap();
+    executor.execute(&create).unwrap();
+
+    // Populates the cache for this node under the first Executor use.
+    let read1 = parse("MATCH (n:Item) RETURN n.name").unwrap();
+    let result1 = executor.execute(&read1).unwrap();
+    match &result1.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "old"),
+        other => panic!("unexpected value {other:?}"),
+    }
+
+    let update = parse("MATCH (n:Item) SET n.name = 'new'").unwrap();
+    executor.execute(&update).unwrap();
+
+    // Same Executor, same node id -- must see the update, not stale
+    // cached data from `read1`'s statement.
+    let read2 = parse("MATCH (n:Item) RETURN n.name").unwrap();
+    let result2 = executor.execute(&read2).unwrap();
+    match &result2.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "new"),
+        other => panic!("unexpected value {other:?}, cache leaked a stale record"),
+    }
+}
+
+/// Within a single write statement, a later clause reading a node must
+/// see an earlier clause's own mutation to it, not a stale value -- the
+/// cache is disabled entirely for write statements (see `Executor::
+/// node_cache`'s docs), so this is really testing that the disable
+/// actually takes effect, not just that caching is scoped per-statement.
+#[test]
+fn node_cache_is_disabled_within_a_single_write_statement() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {name: 'old'})");
+
+    // One statement: reads n.name (would populate/consult the cache if
+    // it were mistakenly enabled for writes), then sets it, then a
+    // second MATCH...RETURN in the same statement (via UNION) reads it
+    // again -- must see 'new' both times it matters, never 'old' from a
+    // stale cache entry.
+    let result = run(
+        &store,
+        "MATCH (n:Item) WITH n, n.name AS before SET n.name = 'new' RETURN before, n.name AS after",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match (&result.rows[0][0], &result.rows[0][1]) {
+        (
+            Value::Property(marsdb_graph::PropertyValue::String(before)),
+            Value::Property(marsdb_graph::PropertyValue::String(after)),
+        ) => {
+            assert_eq!(before, "old");
+            assert_eq!(after, "new");
+        }
+        other => panic!("unexpected values {other:?}"),
+    }
+}
+
+/// The node cache's reset (clear + enable/disable based on
+/// `is_read_only`) must happen on *every* statement-execution entry
+/// point, not just `execute`/`execute_with_options` -- `Executor` has a
+/// second, separate entry point (`execute_in_write_transaction`, used by
+/// an explicit multi-statement `Transaction` or a group-commit loop with
+/// an already-open `WriteTransaction`), and `node_cache` is a field on
+/// `Executor` shared by both, not private to either. A read via
+/// `execute` leaves the cache populated and enabled; a write via
+/// `execute_in_write_transaction` on the *same* `Executor` right after
+/// must not inherit that state.
+#[test]
+fn node_cache_resets_across_the_write_transaction_entry_point_too() {
+    let store = GraphStore::open_memory().unwrap();
+    let executor = Executor::new(&store);
+
+    executor
+        .execute(&parse("CREATE (:Item {name: 'v1'})").unwrap())
+        .unwrap();
+    // Read-only, via the `execute` entry point -- populates the cache
+    // and leaves `node_cache_enabled` set until the *next* entry-point
+    // call resets it.
+    executor
+        .execute(&parse("MATCH (n:Item) RETURN n.name").unwrap())
+        .unwrap();
+
+    // Same node, but now via the *other* entry point, and this
+    // statement mutates it then reads it back within itself -- must see
+    // its own fresh write, not the previous statement's cached 'v1'.
+    let write_txn = store.begin_write().unwrap();
+    let result = executor
+        .execute_in_write_transaction(
+            &parse("MATCH (n:Item) SET n.name = 'v2' WITH n RETURN n.name AS after").unwrap(),
+            &write_txn,
+        )
+        .unwrap();
+    write_txn.commit().unwrap();
+
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "v2"),
+        other => {
+            panic!("unexpected value {other:?}, cache leaked across the write-txn entry point")
+        }
+    }
+}
+
 /// A bare (unparenthesized) `var:Label` used directly as a `WITH ...
 /// WHERE` predicate (`WHERE i.var > 'te' AND i:TextNode`) -- distinct
 /// from `label_check_expr`'s own `(n:Foo)` parenthesized general-
