@@ -3791,6 +3791,134 @@ fn list_valued_parameters_substitute_into_a_list_literal_expression() {
     assert_eq!(int(&result.rows[0][0]), 2);
 }
 
+/// A temporal-valued `$param`, in ordinary expression position -- there's
+/// no temporal *literal* syntax to substitute one into (same "no literal
+/// syntax" gap `list_valued_parameters_...` documents for lists), so
+/// `substitute_params` rewrites it into a call to the matching
+/// constructor (`date(...)`, `duration(...)`, ...) over its formatted
+/// string instead. All 6 temporal `PropertyValue` variants, plus nested
+/// inside a list/map -- the shape a bulk-load script binding a `$rows`
+/// param full of dated records actually needs.
+#[test]
+fn temporal_valued_parameters_substitute_into_a_constructor_call() {
+    use marsdb_graph::PropertyValue;
+    use std::collections::HashMap;
+
+    let store = GraphStore::open_memory().unwrap();
+    let cases: Vec<(&str, PropertyValue)> = vec![
+        ("date('2020-06-15')", date(2020, 6, 15)),
+        (
+            "duration('P1Y2M3D')",
+            PropertyValue::Duration {
+                months: 14,
+                days: 3,
+                seconds: 0,
+                nanos: 0,
+            },
+        ),
+        (
+            "localtime('12:34:56')",
+            PropertyValue::LocalTime(45_296_000_000_000),
+        ),
+        (
+            "time('12:34:56+02:00')",
+            PropertyValue::Time {
+                nanos_of_day: 45_296_000_000_000,
+                offset_seconds: 7200,
+            },
+        ),
+        (
+            "localdatetime('2020-06-15T12:34:56')",
+            PropertyValue::LocalDateTime {
+                epoch_seconds: date_time_epoch(2020, 6, 15, 12, 34, 56),
+                nanos: 0,
+            },
+        ),
+        (
+            "datetime('2020-06-15T12:34:56+02:00')",
+            PropertyValue::DateTime {
+                epoch_seconds: date_time_epoch(2020, 6, 15, 12, 34, 56) - 7200,
+                nanos: 0,
+                zone: marsdb_graph::TzId::Offset(7200),
+            },
+        ),
+        // Named-zone `DateTime` -- offset and zone name can drift apart
+        // (only the offset feeds `epoch_seconds`, `zone` is carried for
+        // display/round-tripping), the hairier of the two DateTime shapes.
+        (
+            "datetime('2020-06-15T12:34:56+02:00[Europe/Stockholm]')",
+            PropertyValue::DateTime {
+                epoch_seconds: date_time_epoch(2020, 6, 15, 10, 34, 56),
+                nanos: 0,
+                zone: marsdb_graph::TzId::Named("Europe/Stockholm".to_string()),
+            },
+        ),
+        // Mixed-sign `Duration` -- each component prints its own sign
+        // (`P-6M-15D`), not one shared prefix (see `format_duration`'s
+        // docs) -- the other hairy round-trip.
+        (
+            "duration('P-6M-15D')",
+            PropertyValue::Duration {
+                months: -6,
+                days: -15,
+                seconds: 0,
+                nanos: 0,
+            },
+        ),
+    ];
+
+    for (expected_expr, param_value) in cases {
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), param_value);
+        let mut actual = parse("RETURN $x AS v").unwrap();
+        marsdb_query::substitute_params(&mut actual, &params).unwrap();
+        let actual_result = Executor::new(&store).execute(&actual).unwrap();
+
+        let expected = parse(&format!("RETURN {expected_expr} AS v")).unwrap();
+        let expected_result = Executor::new(&store).execute(&expected).unwrap();
+
+        assert_eq!(
+            format!("{:?}", actual_result.rows[0][0]),
+            format!("{:?}", expected_result.rows[0][0]),
+            "param substitution for {expected_expr} didn't match a literal call to it"
+        );
+    }
+
+    // Nested inside a list-of-maps -- exactly the `UNWIND $rows AS row`
+    // bulk-load shape this was fixed for.
+    let mut row = std::collections::BTreeMap::new();
+    row.insert("born".to_string(), date(1984, 10, 11));
+    let rows = PropertyValue::List(vec![PropertyValue::Map(row)]);
+    let mut params = HashMap::new();
+    params.insert("rows".to_string(), rows);
+    let mut stmt = parse("UNWIND $rows AS row RETURN row.born AS v").unwrap();
+    marsdb_query::substitute_params(&mut stmt, &params).unwrap();
+    let result = Executor::new(&store).execute(&stmt).unwrap();
+    let expected = Executor::new(&store)
+        .execute(&parse("RETURN date('1984-10-11') AS v").unwrap())
+        .unwrap();
+    assert_eq!(
+        format!("{:?}", result.rows[0][0]),
+        format!("{:?}", expected.rows[0][0])
+    );
+}
+
+fn date(year: i32, month: u32, day: u32) -> marsdb_graph::PropertyValue {
+    let epoch_day = (chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap()
+        - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+    .num_days() as i32;
+    marsdb_graph::PropertyValue::Date(epoch_day)
+}
+
+fn date_time_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .and_hms_opt(hour, min, sec)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+}
+
 /// A bare (unparenthesized) `var:Label` used directly as a `WITH ...
 /// WHERE` predicate (`WHERE i.var > 'te' AND i:TextNode`) -- distinct
 /// from `label_check_expr`'s own `(n:Foo)` parenthesized general-

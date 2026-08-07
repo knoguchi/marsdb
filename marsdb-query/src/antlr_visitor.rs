@@ -2734,7 +2734,7 @@ pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
 /// Doesn't validate escape sequences itself (that's `parse_antlr`'s job
 /// once each slice is actually parsed) -- only tracks "am I currently
 /// inside a quoted region" well enough to find the real separators.
-fn split_statements(input: &str) -> Vec<&str> {
+pub fn split_statements(input: &str) -> Vec<&str> {
     let bytes = input.as_bytes();
     let mut starts = vec![0usize];
     let mut semicolons = Vec::new();

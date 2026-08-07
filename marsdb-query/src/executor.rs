@@ -6803,7 +6803,7 @@ fn as_date_time(v: &Value) -> Option<(i64, i32, temporal::TzId)> {
 /// shaped types (`temporal.rs` deliberately doesn't depend on
 /// `marsdb_graph`, see its own module doc comment), converted at this
 /// storage/query-layer boundary.
-fn tz_from_graph(zone: &GraphTzId) -> temporal::TzId {
+pub(crate) fn tz_from_graph(zone: &GraphTzId) -> temporal::TzId {
     match zone {
         GraphTzId::Offset(o) => temporal::TzId::Offset(*o),
         GraphTzId::Named(name) => temporal::TzId::Named(name.clone()),
