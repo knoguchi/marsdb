@@ -14,7 +14,7 @@ marsdb-query = { path = "../marsdb-query", version = "0.6.0" }
 
 [dev-dependencies]
 tempfile.workspace = true
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 serde_json = "1"
 
 [[example]]
