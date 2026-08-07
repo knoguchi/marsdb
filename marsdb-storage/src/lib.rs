@@ -83,6 +83,10 @@ impl StorageEngine {
             write_txn.open_multimap_table(tables::ADJ_OUT)?;
             write_txn.open_multimap_table(tables::ADJ_IN)?;
             write_txn.open_multimap_table(tables::NODE_LABEL_INDEX)?;
+            write_txn.open_table(tables::PROP_TO_ID)?;
+            write_txn.open_table(tables::ID_TO_PROP)?;
+            write_txn.open_table(tables::INDEX_DEFS)?;
+            write_txn.open_multimap_table(tables::PROPERTY_INDEX)?;
         }
         write_txn.commit()?;
         Ok(Self { db })
@@ -151,6 +155,10 @@ impl StorageEngine {
             copy_multimap!(tables::ADJ_OUT);
             copy_multimap!(tables::ADJ_IN);
             copy_multimap!(tables::NODE_LABEL_INDEX);
+            copy_table!(tables::PROP_TO_ID);
+            copy_table!(tables::ID_TO_PROP);
+            copy_table!(tables::INDEX_DEFS);
+            copy_multimap!(tables::PROPERTY_INDEX);
 
             write.commit()?;
             Ok::<(), StorageError>(())
@@ -279,5 +287,67 @@ mod tests {
         );
 
         assert!(matches!(source.backup_to(&path), Err(StorageError::Io(_))));
+    }
+
+    /// Guards against the exact bug this pair of methods once had recurring
+    /// the next time a table is added to `tables.rs`: rather than hardcoding
+    /// the current table list a second time, this asks redb itself what
+    /// tables exist on each side and compares, so a table added to
+    /// `from_db` but forgotten in `backup_to` (or vice versa) fails here
+    /// instead of silently losing data on the next real backup.
+    #[test]
+    fn backup_copies_every_table_that_exists_in_the_source() {
+        use redb::{MultimapTableHandle as _, TableHandle as _};
+        use std::collections::BTreeSet;
+
+        fn table_names(read: &ReadTransaction) -> BTreeSet<String> {
+            let mut names: BTreeSet<String> = read
+                .list_tables()
+                .unwrap()
+                .map(|t| t.name().to_string())
+                .collect();
+            names.extend(
+                read.list_multimap_tables()
+                    .unwrap()
+                    .map(|t| t.name().to_string()),
+            );
+            names
+        }
+
+        let source = StorageEngine::open_memory().unwrap();
+        // Touch every table explicitly, not just the ones `from_db` happens
+        // to eagerly create -- this must catch a missing `copy_table!` even
+        // if a future table is lazily created instead.
+        let write = source.begin_write().unwrap();
+        write
+            .open_table(tables::PROP_TO_ID)
+            .unwrap()
+            .insert("email", 1)
+            .unwrap();
+        write
+            .open_table(tables::ID_TO_PROP)
+            .unwrap()
+            .insert(1, "email")
+            .unwrap();
+        write
+            .open_table(tables::INDEX_DEFS)
+            .unwrap()
+            .insert(&[0u8, 0, 0, 0, 0, 0, 0, 1][..], &[0u8][..])
+            .unwrap();
+        write
+            .open_multimap_table(tables::PROPERTY_INDEX)
+            .unwrap()
+            .insert(&[0u8, 0, 0, 0, 0, 0, 0, 1][..], 6)
+            .unwrap();
+        write.commit().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("completeness.redb");
+        source.backup_to(&path).unwrap();
+        let backup = StorageEngine::open_file(&path).unwrap();
+
+        let source_tables = table_names(&source.begin_read().unwrap());
+        let backup_tables = table_names(&backup.begin_read().unwrap());
+        assert_eq!(source_tables, backup_tables);
     }
 }
