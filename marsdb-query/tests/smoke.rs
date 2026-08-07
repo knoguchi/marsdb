@@ -3842,6 +3842,29 @@ fn temporal_valued_parameters_substitute_into_a_constructor_call() {
                 zone: marsdb_graph::TzId::Offset(7200),
             },
         ),
+        // Named-zone `DateTime` -- offset and zone name can drift apart
+        // (only the offset feeds `epoch_seconds`, `zone` is carried for
+        // display/round-tripping), the hairier of the two DateTime shapes.
+        (
+            "datetime('2020-06-15T12:34:56+02:00[Europe/Stockholm]')",
+            PropertyValue::DateTime {
+                epoch_seconds: date_time_epoch(2020, 6, 15, 10, 34, 56),
+                nanos: 0,
+                zone: marsdb_graph::TzId::Named("Europe/Stockholm".to_string()),
+            },
+        ),
+        // Mixed-sign `Duration` -- each component prints its own sign
+        // (`P-6M-15D`), not one shared prefix (see `format_duration`'s
+        // docs) -- the other hairy round-trip.
+        (
+            "duration('P-6M-15D')",
+            PropertyValue::Duration {
+                months: -6,
+                days: -15,
+                seconds: 0,
+                nanos: 0,
+            },
+        ),
     ];
 
     for (expected_expr, param_value) in cases {
