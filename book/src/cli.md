@@ -23,9 +23,29 @@ mars mydata.db "MATCH (n) RETURN n"   # run one query, exit
 mars :memory: "..."                   # explicit in-memory, one-shot
 mars mydata.db "CREATE (a); CREATE (b); MATCH (n) RETURN n"  # ;-separated batch
 mars mydata.db < script.cypher        # piped stdin, same ;-separated batch
+mars mydata.db --nl "who does Alice know?"  # plain-English question via Ollama
 ```
 
 The REPL accepts any Cypher statement terminated by `;`. Ctrl-D exits.
+
+## Natural language queries
+
+`--nl` translates a plain-English question into Cypher and runs it, using a
+local [Ollama](https://ollama.com) instance:
+
+```
+ollama serve &
+ollama pull llama3.2
+mars mydata.db --nl "how many people are there?"
+```
+
+Set `OLLAMA_MODEL` to use a model other than the default `llama3.2`. The
+generated Cypher is printed before its results. Generated writes are
+rejected — `--nl` only ever runs read-only queries. The translation itself
+validates the generated Cypher's syntax and variable/type binding against
+the database's actual schema, retrying once with the validation error fed
+back if the first attempt doesn't parse — see the `marsdb-nl2cypher` crate
+for the underlying library.
 
 ```
 $ mars :memory:
