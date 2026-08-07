@@ -13,7 +13,7 @@ categories.workspace = true
 description = "Property graph model and CRUD storage layer used internally by MarsDB."
 
 [dependencies]
-marsdb-storage = { path = "../marsdb-storage", version = "0.6.0" }
+marsdb-storage = { path = "../marsdb-storage", version = "0.7.0" }
 redb.workspace = true
 serde.workspace = true
 postcard.workspace = true

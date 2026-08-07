@@ -5,9 +5,7 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
-### Changed
-- `redb` (the storage engine) bumped 2.x -> 4.1.0, plus `thiserror` 1->2,
-  `rustyline` 14->18, `criterion` 0.5->0.8, `ureq` 2->3.
+## [0.7.0] - 2026-08-07
 
 ### Breaking
 - **On-disk database files created by any MarsDB release through v0.6.0
@@ -16,6 +14,32 @@ All notable changes to MarsDB are documented here. Format loosely follows
   into the v3 format redb 2.6 already supported); redb 4.x only reads v3+.
   No migration path is provided — recreate the database. Pre-1.0, no
   known production data depends on this.
+
+### Changed
+- `redb` (the storage engine) bumped 2.x -> 4.1.0, plus `thiserror` 1->2,
+  `rustyline` 14->18, `criterion` 0.5->0.8, `ureq` 2->3, and the pinned
+  GitHub Actions (`checkout`, `setup-python`, `setup-go`, `codecov-action`,
+  etc.) to their current major versions.
+- crates.io metadata (`keywords`, `categories`, `documentation` pointing at
+  the mdBook manual) added to every published crate.
+- MSRV declared and enforced: `rust-version = "1.82"`, verified against
+  clippy's own `incompatible_msrv` lint (the actual stdlib APIs used
+  workspace-wide), not guessed from syntax alone.
+- Dependabot enabled (weekly, grouped) for both `Cargo.lock`s (root
+  workspace + `marsdb-python`'s own) and GitHub Actions. GitHub
+  Discussions enabled.
+- `marsdb-query/grammar/README.md` and `CYPHER_COVERAGE.md` rewritten:
+  cut from dense, narrative prose (some referencing internal issue IDs
+  with no external meaning) down to scannable, self-contained reference
+  docs.
+
+### Fixed
+- README's Go install instructions were stale (claimed no `go get`-able
+  module path); `go get github.com/knoguchi/marsdb/marsdb-go` already
+  resolves via the public Git host, verified directly.
+- OSS project hygiene: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
+  `SECURITY.md`, issue/PR templates, `CODEOWNERS` added at the repo root
+  (previously only in the manual, which GitHub doesn't look at for these).
 
 ## [0.6.0] - 2026-08-06
 
