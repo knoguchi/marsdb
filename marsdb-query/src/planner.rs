@@ -231,7 +231,7 @@ pub fn build_match_plan(
                 // `Expr::EdgeNotInSet` `Filter` below, or another
                 // `VarExpand`, via its own `exclude_edge_sets`) must
                 // exclude whatever this row's traversal happened to use
-                // (TCK's Match4 `[7]`, `mars-pbp`).
+                // (TCK's Match4 `[7]`).
                 prior_edge_sets.push(exclude_edge_var);
                 plan
             }
@@ -256,7 +256,7 @@ pub fn build_match_plan(
             }
             // Complementary direction: this fixed hop's own edge must not
             // be one an *earlier variable-length* hop of this same pattern
-            // already traversed (TCK's Match4 `[7]`, `mars-pbp`).
+            // already traversed (TCK's Match4 `[7]`).
             for prior_set in &prior_edge_sets {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),

@@ -4,8 +4,16 @@ Unlike [`marsdb-python`](./python.md) (PyO3, in-process), Go has no
 equivalent in-process FFI story with Rust, so [`marsdb-go`](https://github.com/knoguchi/marsdb/tree/main/marsdb-go)
 goes through the small C ABI crate, [`marsdb-capi`](./c-api.md), via cgo.
 
-**Not published anywhere yet** — no `go get`-able module path, no tagged
-release. Use it by cloning the repo and building both pieces locally.
+```
+go get github.com/knoguchi/marsdb/marsdb-go
+```
+
+Go modules resolve straight from the public Git host, no separate
+registry step — this works today even though the module isn't
+semver-tagged yet (resolves to a pseudo-version off `main`). The C ABI
+side still needs building locally either way (cgo can't fetch a
+prebuilt `.dylib`/`.so`), so most users will clone the repo and build
+both pieces as below.
 
 ## Build
 

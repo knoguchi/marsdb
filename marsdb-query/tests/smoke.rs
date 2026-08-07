@@ -4491,9 +4491,9 @@ fn named_path_over_a_single_variable_length_hop() {
 }
 
 /// Named-path capture over a pattern *mixing* variable-length hops with
-/// other hops -- was rejected until the `LogicalPlan::VarExpand`
-/// edge-isomorphism gap (`mars-pbp`) was fixed (TCK's Match4 `[7]`: an
-/// earlier double-count bug in exactly this shape). Two `*0..1` hops
+/// other hops -- was rejected until a `LogicalPlan::VarExpand`
+/// edge-isomorphism gap was fixed (TCK's Match4 `[7]`: an earlier
+/// double-count bug in exactly this shape). Two `*0..1` hops
 /// around a fixed middle hop -- each of `a`, `b`, `c` optionally coincide,
 /// so this must not silently drop or duplicate rows.
 #[test]
