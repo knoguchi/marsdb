@@ -296,17 +296,17 @@ Neo4j ran in Docker (`neo4j:5.26`, official image); MarsDB ran natively.
 That's a real, uncontrolled difference in the comparison, not something
 this table corrects for.
 
-| | MarsDB | Neo4j, with the script's own `CREATE CONSTRAINT`s (unique indexes) | Neo4j, constraints swapped for plain (non-unique) indexes matching MarsDB's |
-|---|---|---|---|
-| Nodes | 28,863 | 28,863 | 28,863 |
-| Relationships | 166,261 | 166,261 | 166,261 |
-| Load time | 59.7 s | 162.8 s | 144.7 s |
-
 Both engines loaded via plain Cypher (`UNWIND` batches of `MERGE`/`CREATE`,
 no bulk/CSV-import fast path on either side), auto-committing one
-transaction per statement. Node/relationship counts are byte-identical
-across all three rows — same source data, same final graph, only load
-time differs.
+transaction per statement, ending at the same 28,863 nodes / 166,261
+relationships in all three rows below — same source data, same final
+graph, only load time differs.
+
+| | Load time |
+|---|---|
+| MarsDB | 59.7 s |
+| Neo4j, with the script's own `CREATE CONSTRAINT`s (unique indexes) | 162.8 s |
+| Neo4j, constraints swapped for plain (non-unique) indexes matching MarsDB's | 144.7 s |
 
 Dropping Neo4j's uniqueness constraints for plain indexes only recovered
 ~18s (162.8s -> 144.7s) — most of the gap isn't constraint-checking
