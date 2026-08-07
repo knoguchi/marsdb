@@ -5,6 +5,7 @@ use clap::Parser;
 use marsdb::Database;
 
 mod format;
+mod nl;
 mod repl;
 
 /// MarsDB: an embeddable property-graph database. Single binary, single file.
@@ -23,6 +24,11 @@ struct Cli {
     /// Shorthand for an in-memory database (same as passing `:memory:`).
     #[arg(long)]
     memory: bool,
+
+    /// Ask a question in plain English instead of Cypher; translates it via
+    /// a local Ollama instance and runs the result. Read-only.
+    #[arg(long, value_name = "QUESTION")]
+    nl: Option<String>,
 }
 
 fn run_batch(db: &Database, cypher: &str) -> ExitCode {
@@ -58,6 +64,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Some(question) = &cli.nl {
+        return nl::run(&db, question);
+    }
 
     if let Some(query) = &cli.query {
         return run_batch(&db, query);

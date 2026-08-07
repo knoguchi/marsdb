@@ -249,7 +249,8 @@ pub fn build_prompt(
 fn extract_cypher(raw: &str) -> String {
     let trimmed = raw.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
-        return trimmed.to_string();
+        // No opening fence, but some models still emit a stray closing one.
+        return trimmed.trim_end_matches("```").trim().to_string();
     };
     let rest = rest.strip_prefix("cypher").unwrap_or(rest);
     let rest = rest.trim_start_matches('\n');
@@ -325,4 +326,30 @@ pub fn translate_and_run_with_policy(
     }
     let result = db.execute(&cypher).map_err(Nl2CypherError::Execute)?;
     Ok((cypher, result))
+}
+
+#[cfg(test)]
+mod extract_cypher_tests {
+    use super::extract_cypher;
+
+    #[test]
+    fn plain_response_is_unchanged() {
+        assert_eq!(extract_cypher("MATCH (n) RETURN n"), "MATCH (n) RETURN n");
+    }
+
+    #[test]
+    fn strips_a_balanced_fenced_block() {
+        assert_eq!(
+            extract_cypher("```cypher\nMATCH (n) RETURN n\n```"),
+            "MATCH (n) RETURN n"
+        );
+    }
+
+    #[test]
+    fn strips_a_stray_trailing_fence_with_no_opening_fence() {
+        assert_eq!(
+            extract_cypher("MATCH (n) RETURN n\n```"),
+            "MATCH (n) RETURN n"
+        );
+    }
 }

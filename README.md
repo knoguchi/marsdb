@@ -169,11 +169,19 @@ writes are rejected before execution unless the caller explicitly uses
 `translate_and_run_with_policy(..., ExecutionPolicy::AllowWrites)` after
 performing its own authentication and authorization.
 
-A real, runnable example against a local [Ollama](https://ollama.com) instance:
+The `mars` CLI wires this up against a local [Ollama](https://ollama.com)
+instance via `--nl`:
 
 ```
 ollama serve &
 ollama pull llama3.2
+mars mydata.db --nl "who does Alice know?"
+```
+
+Set `OLLAMA_MODEL` to use a model other than the default `llama3.2`. A
+runnable library-level example (same `OllamaClient` the CLI uses):
+
+```
 cargo run -p marsdb-nl2cypher --example ollama_demo
 ```
 
@@ -190,7 +198,7 @@ marsdb-storage   thin trait boundary over redb (file + in-memory backends)
 marsdb-graph     property graph model, CRUD, KV/adjacency encoding
 marsdb-query     openCypher subset: ANTLR4 grammar -> AST -> IR -> executor
 marsdb           embeddable public Rust API (Database::open/in_memory/execute)
-marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
+marsdb-cli       the `mars` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
 marsdb-capi      C ABI (opaque handle + JSON results), basis for non-Rust bindings
 marsdb-go        Go bindings, via cgo against marsdb-capi

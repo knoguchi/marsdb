@@ -891,8 +891,11 @@ dependencies = [
  "clap",
  "marsdb",
  "marsdb-graph",
+ "marsdb-nl2cypher",
  "rustyline",
+ "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]
