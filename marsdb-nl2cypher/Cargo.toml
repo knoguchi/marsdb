@@ -9,8 +9,8 @@ readme = "README.md"
 description = "Natural-language-to-Cypher translation for MarsDB: schema introspection, prompt building, and validate-and-repair against a pluggable LLM client."
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.6.0" }
-marsdb-query = { path = "../marsdb-query", version = "0.6.0" }
+marsdb = { path = "../marsdb", version = "0.7.0" }
+marsdb-query = { path = "../marsdb-query", version = "0.7.0" }
 
 [dev-dependencies]
 tempfile.workspace = true
