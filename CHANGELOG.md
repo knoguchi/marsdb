@@ -5,6 +5,29 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- `END` is now usable as a bound variable name (`MATCH (start)-[r]->(end)
+  RETURN end`) — previously rejected outright, even though real Cypher
+  allows it and it's the standard variable-naming convention for a
+  relationship's two endpoints in generated/exported Cypher (e.g. Neo4j's
+  own APOC export).
+- `IndexSeek` now fires for a `$param`-bound or `UNWIND`-row-bound
+  equality against an indexed property, not just a literal constant —
+  previously silently fell back to a full label scan repeated once per
+  incoming row, the exact shape any bulk-import script
+  (`UNWIND rows AS row MATCH (n:Label {id: row.id}) ...`) uses.
+- `IndexSeek` now also fires for a `WHERE` clause on a multi-hop
+  pattern's start node (`MATCH (a)-->() WHERE a.prop = 'x'`) — previously
+  only the inline-property form (`MATCH (a {prop: 'x'})-->()`) reached
+  the index; the `WHERE`-clause form's filter sat above the whole
+  traversal instead of directly on the scan it should narrow, an
+  unindexed full label scan even with a matching index declared.
+
+Found via a real ~29k-node/166k-relationship dataset load/query
+benchmark — see BENCHMARKS.md's "Full lifecycle comparison" section and
+[marsdb-demo](https://github.com/knoguchi/marsdb-demo)'s
+`benchmarks/recommendations`.
+
 ## [0.7.0] - 2026-08-07
 
 ### Breaking
