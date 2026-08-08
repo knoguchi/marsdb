@@ -552,6 +552,22 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 /// endpoint is strictly cheaper — ties keep written order, both for
 /// determinism and because reversal is never free to reason about.
 ///
+/// One more guard on top of the row comparison: reversal is declined
+/// when the written start has pushable filtering work its row estimate
+/// gives no credit for (`EndpointCost::filtered` — an unindexed or
+/// non-equality conjunct, e.g. `CONTAINS`), *unless* the far endpoint's
+/// estimate is seek-backed (`EndpointCost::seek_backed` — a bound Seed
+/// or a measured indexed-equality count, not merely a smaller label).
+/// Anchoring at the filtered endpoint prunes rows *before* any edge is
+/// expanded; reversal strands that filter above the first Expand, which
+/// then walks every edge its unfiltered side touches. The label-count
+/// comparison can't see either effect (it has no edge statistics and no
+/// selectivity estimate for a non-equality predicate), so a label-only
+/// advantage isn't trusted against a stranded filter — the benchmark
+/// query that surfaced this (`MATCH (m:Movie)<-[:RATED]-(u:User) WHERE
+/// m.title CONTAINS '...'`, 671 users vs 9125 movies but only 3 title
+/// matches) ran ~9x slower reversed than in written order.
+///
 /// Deliberately conservative, same stance as every other planner pass:
 /// only all-fixed-hop patterns are considered. A variable-length hop's
 /// own relationship-list binding (`[r*1..3]`) and named-path capture
@@ -578,58 +594,115 @@ pub fn plan_reversed_pattern(
     let end = &pattern.hops.last().expect("hops checked non-empty").1;
     let start_cost = endpoint_start_cost(&pattern.start, &conjuncts, carried_vars, txn)?;
     let end_cost = endpoint_start_cost(end, &conjuncts, carried_vars, txn)?;
-    if end_cost < start_cost {
+    if end_cost.rows < start_cost.rows && (!start_cost.filtered || end_cost.seek_backed) {
         Ok(Some(reverse_pattern(pattern)))
     } else {
         Ok(None)
     }
 }
 
-/// Rows the leaf scan would produce if the pattern started at `node` —
-/// see `plan_reversed_pattern`. 0 for an already-bound variable (a
-/// `Seed` reads no storage at all), else label count narrowed by the
-/// best indexed literal-equality candidate (the same candidates
-/// `apply_index_seeks` would fuse into an `IndexSeek` once this endpoint
-/// actually is the start).
+/// What `endpoint_start_cost` knows about starting a traversal at one
+/// endpoint — see `plan_reversed_pattern` for how the three fields
+/// combine into the reversal decision.
+struct EndpointCost {
+    /// Rows the leaf scan would produce: 0 for a bound `Seed`, else the
+    /// label count narrowed by the best indexed literal-equality
+    /// candidate.
+    rows: u64,
+    /// `rows` is a *measured* narrow figure — a bound `Seed` (reads no
+    /// storage at all) or an index's per-key entry count — rather than a
+    /// whole-label count.
+    seek_backed: bool,
+    /// The endpoint has pushable filtering work `rows` gives no credit
+    /// for: a non-equality conjunct (`CONTAINS`, a range, ...), an
+    /// equality with no index behind it, or a `$param` equality whose
+    /// value is unknown at plan time. Anchoring here would prune before
+    /// the first Expand; anchoring elsewhere strands the filter above it.
+    filtered: bool,
+}
+
+/// Cost facts for starting the pattern's traversal at `node` — see
+/// `plan_reversed_pattern` and `EndpointCost`. `rows` uses the same
+/// candidates `apply_index_seeks` would fuse into an `IndexSeek` once
+/// this endpoint actually is the start; anything pushable that *isn't*
+/// such a candidate can't narrow `rows` but still marks the endpoint
+/// `filtered`. Pushability here mirrors `build_match_plan`'s own
+/// start-only test (`conjunct_sole_var`), so `filtered` is only set for
+/// predicates that genuinely would wrap this endpoint's scan. A
+/// `HasLabel` conjunct is skipped outright: labels are what `rows`
+/// already counts, and an extra-label test has no per-label count to
+/// credit it with, so treating it as a stranded filter would suppress
+/// reversal for multi-label endpoints on no evidence.
 fn endpoint_start_cost(
     node: &NodePattern,
     conjuncts: &[Expr],
     carried_vars: &HashSet<String>,
     txn: Txn,
-) -> Result<u64, QueryError> {
+) -> Result<EndpointCost, QueryError> {
     if node.var.as_ref().is_some_and(|v| carried_vars.contains(v)) {
-        return Ok(0);
+        return Ok(EndpointCost {
+            rows: 0,
+            seek_backed: true,
+            filtered: false,
+        });
     }
-    let Some(label) = node.labels.first() else {
-        return Ok(GraphStore::node_count_in_txn(txn)?);
+    let label = node.labels.first();
+    let mut rows = match label {
+        Some(label) => GraphStore::label_count_in_txn(txn, label)?,
+        None => GraphStore::node_count_in_txn(txn)?,
     };
-    let mut cost = GraphStore::label_count_in_txn(txn, label)?;
-    let mut consider = |prop: &str, lit: &Literal| -> Result<(), QueryError> {
-        if matches!(lit, Literal::Param(_)) {
-            return Ok(());
+    let mut seek_backed = false;
+    let mut filtered = false;
+    let consider = |rows: &mut u64,
+                    seek_backed: &mut bool,
+                    filtered: &mut bool,
+                    prop: &str,
+                    lit: &Literal|
+     -> Result<(), QueryError> {
+        if !matches!(lit, Literal::Param(_)) {
+            if let Some(label) = label {
+                if GraphStore::index_def_in_txn(txn, label, prop)?.is_some() {
+                    let count = GraphStore::index_match_count_in_txn(
+                        txn,
+                        label,
+                        prop,
+                        &literal_to_value(lit),
+                    )?;
+                    *rows = (*rows).min(count);
+                    *seek_backed = true;
+                    return Ok(());
+                }
+            }
         }
-        if GraphStore::index_def_in_txn(txn, label, prop)?.is_some() {
-            let count =
-                GraphStore::index_match_count_in_txn(txn, label, prop, &literal_to_value(lit))?;
-            cost = cost.min(count);
-        }
+        *filtered = true;
         Ok(())
     };
     for (key, expr) in &node.props {
         if let ReturnExpr::Lit(lit) = expr {
-            consider(key, lit)?;
+            consider(&mut rows, &mut seek_backed, &mut filtered, key, lit)?;
+        } else {
+            filtered = true;
         }
     }
     if let Some(var) = &node.var {
         for c in conjuncts {
-            if let Expr::Compare(pa, CompareOp::Eq, lit) = c {
-                if pa.var == *var {
-                    consider(&pa.prop, lit)?;
+            if conjunct_sole_var(c) != Some(var.as_str()) {
+                continue;
+            }
+            match c {
+                Expr::Compare(pa, CompareOp::Eq, lit) => {
+                    consider(&mut rows, &mut seek_backed, &mut filtered, &pa.prop, lit)?
                 }
+                Expr::HasLabel(..) => {}
+                _ => filtered = true,
             }
         }
     }
-    Ok(cost)
+    Ok(EndpointCost {
+        rows,
+        seek_backed,
+        filtered,
+    })
 }
 
 /// The same pattern walked from its other end: node order reversed, each
@@ -1075,6 +1148,55 @@ mod tests {
         seed_people(&store, 20, 20);
         store.create_index("Rare", "id", false).unwrap();
         let part = part_from("MATCH (a:Rare)-[:R]->(b:Rare) WHERE b.id = 7 RETURN a");
+
+        let write = store.begin_write().unwrap();
+        let reversed = plan_reversed_pattern(
+            &part.pattern,
+            &part.where_clause,
+            &Default::default(),
+            Txn::Write(&write),
+        )
+        .unwrap()
+        .expect("expected reversal toward the indexed b.id = 7");
+        assert_eq!(reversed.start.var.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn keeps_written_order_when_reversal_would_strand_a_start_filter() {
+        // `WHERE a.id > 5` is pushable to a's scan but has no index and
+        // isn't an equality, so a's row estimate gets no credit for it
+        // (`EndpointCost::filtered`). Reversing toward the smaller Rare
+        // label would strand that filter above the Expand -- label count
+        // alone isn't trusted against a stranded filter, so written
+        // order stands. This is the shape of the recommendations
+        // benchmark's `m.title CONTAINS 'Matrix'` regression (9x).
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 1);
+        let part = part_from("MATCH (a:Common)-[:R]->(b:Rare) WHERE a.id > 5 RETURN a");
+
+        let write = store.begin_write().unwrap();
+        assert!(plan_reversed_pattern(
+            &part.pattern,
+            &part.where_clause,
+            &Default::default(),
+            Txn::Write(&write)
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn still_reverses_a_filtered_start_toward_an_indexed_far_equality() {
+        // Same stranded-filter start as above, but the far endpoint's
+        // advantage is a *measured* indexed-equality count
+        // (`EndpointCost::seek_backed`), not merely a smaller label --
+        // expanding from the one matching `b` beats scanning 20 `a`s no
+        // matter how selective a's filter turns out to be.
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 20);
+        store.create_index("Rare", "id", false).unwrap();
+        let part =
+            part_from("MATCH (a:Common)-[:R]->(b:Rare) WHERE a.id > 5 AND b.id = 7 RETURN a");
 
         let write = store.begin_write().unwrap();
         let reversed = plan_reversed_pattern(
