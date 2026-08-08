@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn as_date(v: &Value) -> Option<i32> {
+pub(crate) fn as_date(v: &Value) -> Option<i64> {
     match v {
         Value::Property(PropertyValue::Date(d)) => Some(*d),
         _ => None,
@@ -106,7 +106,7 @@ pub(crate) fn apply_temporal_arith(
     b: &Value,
 ) -> Result<Option<Value>, QueryError> {
     let date_plus_duration =
-        |d: i32, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
+        |d: i64, dur: temporal::DurationParts, negate: bool| -> Result<Value, QueryError> {
             let (months, days, seconds, nanos) = dur;
             temporal::add_duration_to_date(d, months, days, seconds, nanos, negate)
                 .map(|d| Value::Property(PropertyValue::Date(d)))
@@ -349,7 +349,7 @@ pub(crate) fn date_builtin(
 /// `ordinalDay` via `date_component`), for defaulting the alternate
 /// week/ordinal/quarter-date map-construction forms (see
 /// `calendar_fields_from_map`).
-pub(crate) fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i32, QueryError> {
+pub(crate) fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i64, QueryError> {
     match v {
         Value::Property(PropertyValue::Date(d)) => Ok(*d),
         Value::Property(PropertyValue::LocalDateTime { epoch_seconds, .. }) => {
@@ -449,7 +449,7 @@ pub(crate) const DATE_ALLOWED_KEYS: &[&str] = &[
     "date",
 ];
 
-pub(crate) fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i32, QueryError> {
+pub(crate) fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i64, QueryError> {
     let (year, month, day) = calendar_fields_from_map("date", m, DATE_ALLOWED_KEYS)?;
     temporal::epoch_day_from_ymd(year, month, day).ok_or_else(|| {
         QueryError::Type(format!(
@@ -475,7 +475,7 @@ pub(crate) fn calendar_fields_from_map(
     caller: &str,
     m: &BTreeMap<String, Value>,
     allowed: &[&str],
-) -> Result<(i32, u32, u32), QueryError> {
+) -> Result<(i64, u32, u32), QueryError> {
     if let Some(bad) = m.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(QueryError::Type(format!(
             "{caller}({{...}}) key '{bad}' isn't a recognized field"
@@ -497,13 +497,10 @@ pub(crate) fn calendar_fields_from_map(
 
     if m.contains_key("week") || m.contains_key("dayOfWeek") {
         let week_year = match m.get("year") {
-            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
-                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
-            })?,
-            None => i32::try_from(epoch_day_from_component("weekYear").ok_or_else(|| {
+            Some(v) => int_field("year", v)?,
+            None => epoch_day_from_component("weekYear").ok_or_else(|| {
                 QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
-            })?)
-            .unwrap(),
+            })?,
         };
         let week = match m.get("week") {
             Some(v) => u32::try_from(int_field("week", v)?).map_err(|_| {
@@ -525,7 +522,7 @@ pub(crate) fn calendar_fields_from_map(
                 ))
             })?;
         return Ok((
-            temporal::date_component(epoch_day, "year").unwrap() as i32,
+            temporal::date_component(epoch_day, "year").unwrap(),
             temporal::date_component(epoch_day, "month").unwrap() as u32,
             temporal::date_component(epoch_day, "day").unwrap() as u32,
         ));
@@ -533,13 +530,10 @@ pub(crate) fn calendar_fields_from_map(
 
     if m.contains_key("ordinalDay") {
         let year = match m.get("year") {
-            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
-                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
-            })?,
-            None => i32::try_from(epoch_day_from_component("year").ok_or_else(|| {
+            Some(v) => int_field("year", v)?,
+            None => epoch_day_from_component("year").ok_or_else(|| {
                 QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
-            })?)
-            .unwrap(),
+            })?,
         };
         let ordinal_raw = int_field("ordinalDay", m.get("ordinalDay").unwrap())?;
         let ordinal_day = u32::try_from(ordinal_raw).map_err(|_| {
@@ -560,13 +554,10 @@ pub(crate) fn calendar_fields_from_map(
 
     if m.contains_key("quarter") || m.contains_key("dayOfQuarter") {
         let year = match m.get("year") {
-            Some(v) => i32::try_from(int_field("year", v)?).map_err(|_| {
-                QueryError::Type(format!("{caller}({{...}})'s 'year' is out of range"))
-            })?,
-            None => i32::try_from(epoch_day_from_component("year").ok_or_else(|| {
+            Some(v) => int_field("year", v)?,
+            None => epoch_day_from_component("year").ok_or_else(|| {
                 QueryError::Type(format!("{caller}({{...}}) requires a 'year' key"))
-            })?)
-            .unwrap(),
+            })?,
         };
         let quarter = match m.get("quarter") {
             Some(v) => u32::try_from(int_field("quarter", v)?).map_err(|_| {
@@ -599,11 +590,7 @@ pub(crate) fn calendar_fields_from_map(
         None => epoch_day_from_component("year")
             .ok_or_else(|| QueryError::Type(format!("{caller}({{...}}) requires a 'year' key")))?,
     };
-    let year = i32::try_from(year_raw).map_err(|_| {
-        QueryError::Type(format!(
-            "{caller}({{...}})'s 'year' is out of range: {year_raw}"
-        ))
-    })?;
+    let year = year_raw;
     let month_raw = match m.get("month") {
         Some(v) => int_field("month", v)?,
         None => epoch_day_from_component("month").unwrap_or(1),
@@ -781,7 +768,7 @@ pub(crate) fn int_field(
 /// (`TIME`) regardless of which case produced it.
 pub(crate) fn clock_fields_from_map(
     m: &BTreeMap<String, Value>,
-    epoch_day: Option<i32>,
+    epoch_day: Option<i64>,
 ) -> Result<ClockBase, QueryError> {
     let (base_h, base_m, base_s, base_ns, base_zone) = if let Some(v) = m.get("time") {
         extract_time_base("time", v)?
@@ -1137,7 +1124,7 @@ pub(crate) fn local_date_time_builtin(
     // `{datetime: otherTemporal}` (TCK's Temporal3 [7]).
     if matches!(arg, Value::Property(PropertyValue::DateTime { .. })) {
         let epoch_day = extract_date_base_epoch_day("localdatetime() argument", arg)?;
-        let year = temporal::date_component(epoch_day, "year").unwrap() as i32;
+        let year = temporal::date_component(epoch_day, "year").unwrap();
         let month = temporal::date_component(epoch_day, "month").unwrap() as u32;
         let day = temporal::date_component(epoch_day, "day").unwrap() as u32;
         let (hour, minute, second, nanos, _) = extract_time_base("localdatetime() argument", arg)?;
@@ -1356,17 +1343,17 @@ pub(crate) fn between_operand(name: &str, v: &Value) -> Result<BetweenOperand, Q
 }
 
 /// `(epoch_day, nanos_of_day, zone)`, see `between_operand`'s docs.
-pub(crate) type BetweenOperand = (Option<i32>, Option<i64>, Option<temporal::TzId>);
+pub(crate) type BetweenOperand = (Option<i64>, Option<i64>, Option<temporal::TzId>);
 
 /// `(a_epoch_day, a_nanos_of_day, a_zone, b_epoch_day,
 /// b_nanos_of_day, b_zone) -> DurationParts` -- the shape
 /// every `temporal::duration_between`/`duration_in_months`/
 /// `duration_in_days`/`duration_in_seconds` function shares.
 pub(crate) type BetweenFn = fn(
-    Option<i32>,
+    Option<i64>,
     Option<i64>,
     Option<&temporal::TzId>,
-    Option<i32>,
+    Option<i64>,
     Option<i64>,
     Option<&temporal::TzId>,
 ) -> temporal::DurationParts;
@@ -1441,18 +1428,16 @@ pub(crate) fn parse_truncate_args<'a>(
 /// docs) -- other week/quarter/ordinal-day override keys stay
 /// unsupported, the same pre-existing construction gap as `date_from_map`.
 pub(crate) fn apply_date_overrides(
-    base_epoch_day: i32,
+    base_epoch_day: i64,
     map: Option<&BTreeMap<String, Value>>,
-) -> Result<i32, QueryError> {
+) -> Result<i64, QueryError> {
     let base_y = temporal::date_component(base_epoch_day, "year").unwrap();
     let base_m = temporal::date_component(base_epoch_day, "month").unwrap();
     let base_d = temporal::date_component(base_epoch_day, "day").unwrap();
     let Some(m) = map else {
         return Ok(base_epoch_day);
     };
-    let year_raw = int_field(m, "year", base_y)?;
-    let year = i32::try_from(year_raw)
-        .map_err(|_| QueryError::Type(format!("'year' is out of range: {year_raw}")))?;
+    let year = int_field(m, "year", base_y)?;
     let month_raw = int_field(m, "month", base_m)?;
     let month = u32::try_from(month_raw)
         .map_err(|_| QueryError::Type(format!("'month' is out of range: {month_raw}")))?;
@@ -1638,7 +1623,7 @@ pub(crate) fn time_truncate_builtin(args: &[Value]) -> Result<Value, QueryError>
 /// time. `day` is both at once (`truncate_date_unit`'s own `day` arm
 /// already returns the date unchanged), so trying the date-unit path
 /// first handles it correctly without a separate case.
-pub(crate) fn truncate_date_time(base_date: i32, base_time: i64, unit: &str) -> Option<(i32, i64)> {
+pub(crate) fn truncate_date_time(base_date: i64, base_time: i64, unit: &str) -> Option<(i64, i64)> {
     if let Some(d) = temporal::truncate_date_unit(base_date, unit) {
         Some((d, 0))
     } else {
@@ -1733,7 +1718,7 @@ pub(crate) fn date_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryE
         None => base_offset.unwrap_or(temporal::TzId::Offset(0)),
     };
     let calendar = temporal::CalendarDateTime {
-        year: temporal::date_component(final_date, "year").unwrap() as i32,
+        year: temporal::date_component(final_date, "year").unwrap(),
         month: temporal::date_component(final_date, "month").unwrap() as u32,
         day: temporal::date_component(final_date, "day").unwrap() as u32,
         hour: temporal::local_time_component(final_time, "hour").unwrap(),

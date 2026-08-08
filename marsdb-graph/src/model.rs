@@ -49,8 +49,12 @@ pub enum PropertyValue {
     /// and keeps comparison a plain integer compare. Conversion to/from
     /// calendar year/month/day and ISO-8601 text lives in `marsdb-query`
     /// (`temporal.rs`), not here -- this crate only stores the value, it
-    /// doesn't know Cypher's date grammar/semantics.
-    Date(i32),
+    /// doesn't know Cypher's date grammar/semantics. `i64`, not `i32`:
+    /// Cypher's full year range (±999_999_999, ISO 8601 expanded years)
+    /// reaches ±365 billion epoch days, past `i32`. Wire-compatible with
+    /// values written as `i32`: postcard varints don't encode the width,
+    /// and the index key encoding was already 8-byte (see `index.rs`).
+    Date(i64),
     /// An ISO-8601 duration (Cypher's `DURATION` type), kept in Neo4j's
     /// own four-component normalized form rather than as a single scalar
     /// -- months and days are *not* fungible with each other or with

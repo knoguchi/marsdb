@@ -36,7 +36,7 @@ pub(crate) enum HashKey {
     FloatBits(u64),
     Str(String),
     List(Vec<HashKey>),
-    Date(i32),
+    Date(i64),
     Duration(i64, i64, i64, i32),
     LocalTime(i64),
     // Keyed by the UTC-equivalent instant-of-day, not the raw wall-clock

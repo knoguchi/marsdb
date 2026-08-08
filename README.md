@@ -5,7 +5,7 @@
 [![docs.rs](https://img.shields.io/docsrs/marsdb)](https://docs.rs/marsdb)
 [![codecov](https://codecov.io/gh/knoguchi/marsdb/graph/badge.svg)](https://codecov.io/gh/knoguchi/marsdb)
 [![License](https://img.shields.io/crates/l/marsdb.svg)](#license)
-[![openCypher TCK](https://img.shields.io/badge/openCypher_TCK-99.9%25-brightgreen)](CYPHER_COVERAGE.md)
+[![openCypher TCK](https://img.shields.io/badge/openCypher_TCK-100%25-brightgreen)](CYPHER_COVERAGE.md)
 
 An embeddable property-graph database with an openCypher query subset:
 single binary, single file, optional in-memory mode. Full manual:
@@ -246,10 +246,8 @@ Full breakdown — every supported clause/expression/temporal-type shape,
 the error taxonomy, and a real, measured openCypher TCK conformance table
 by category — lives in **[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)**.
 
-Short version: 3878/3880 TCK scenarios pass (99.9%), 0 wrong-result
-scenarios. The only 2 non-passing scenarios need dates at year
-±999,999,999 — a real storage/library range limitation, not a bug (see
-[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md) for the exact explanation).
+Short version: 3880/3880 TCK scenarios pass (100%), 0 wrong-result
+scenarios.
 Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
@@ -309,13 +307,10 @@ git submodule update --init marsdb-tck/openCypher
 cargo run --release -p marsdb-tck
 ```
 
-Attempts every scenario in the vendored TCK — currently 3878/3880 pass,
-and the 2 that don't (dates far outside the representable range, see
-[CYPHER_COVERAGE.md](CYPHER_COVERAGE.md)) report as a distinct
-"unexpected" outcome, not lumped in with genuine wrong answers. 0
-scenarios currently return the wrong answer — the real, checked-for-real
-signal this exists to produce, not the flat pass-rate over the whole
-suite. Side-effect assertions and the TCK's typed error taxonomy aren't
+Attempts every scenario in the vendored TCK — currently 3880/3880 pass.
+A failing scenario would report as a distinct "unexpected" outcome, not
+lumped in with genuine wrong answers — the real, checked-for-real signal
+this exists to produce, not the flat pass-rate over the whole suite. Side-effect assertions and the TCK's typed error taxonomy aren't
 checked (see the crate's doc comments for why).
 
 ## Contributing

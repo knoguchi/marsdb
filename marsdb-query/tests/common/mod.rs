@@ -65,7 +65,7 @@ pub fn list_str_values(v: &Value) -> Vec<String> {
 pub fn date(year: i32, month: u32, day: u32) -> marsdb_graph::PropertyValue {
     let epoch_day = (chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap()
         - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-    .num_days() as i32;
+    .num_days();
     marsdb_graph::PropertyValue::Date(epoch_day)
 }
 

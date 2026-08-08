@@ -1,5 +1,31 @@
 //! Smoke tests: date/time/datetime/duration construction, arithmetic, truncation -- split from the original smoke.rs.
 
+/// ISO 8601 expanded years end-to-end -- the exact queries of TCK
+/// Temporal10 [9]/[10], which the i64/civil-calendar date core exists
+/// for (chrono's own range caps at ±262k years).
+#[test]
+fn expanded_year_dates_span_the_full_cypher_range() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN duration.between(date('-999999999-01-01'), date('+999999999-12-31')) AS duration",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "P1999999998Y11M30D");
+
+    let result = run(
+        &store,
+        "RETURN duration.inSeconds(localdatetime('-999999999-01-01'), \
+         localdatetime('+999999999-12-31T23:59:59')) AS duration",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "PT17531639991215H59M59S");
+
+    // Expanded-year date round-trips through storage and toString().
+    run(&store, "CREATE (:Event {at: date('+999999999-12-31')})");
+    let result = run(&store, "MATCH (e:Event) RETURN toString(e.at), e.at.year");
+    assert_eq!(temporal_str(&result.rows[0][0]), "+999999999-12-31");
+    assert_eq!(int_value(&result.rows[0][1]), 999_999_999);
+}
+
 mod common;
 #[allow(unused_imports)]
 use common::*;
