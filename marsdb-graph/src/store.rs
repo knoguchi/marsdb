@@ -409,6 +409,30 @@ impl GraphStore {
         }
     }
 
+    /// Per-property reader over ONE pre-opened `NODES` handle -- for a
+    /// caller probing many nodes' properties in a loop, where
+    /// `get_node_prop_in_txn`'s per-call table open would dominate (the
+    /// mars-3va lesson: opens measured 23.67% of a bulk load). Same
+    /// nested-`Option` contract as `get_node_prop_in_txn`.
+    #[allow(clippy::type_complexity)] // the nested Option IS the contract (see get_node_prop_in_txn)
+    pub fn node_prop_reader(
+        txn: Txn<'_>,
+    ) -> Result<
+        impl FnMut(NodeId, u32) -> Result<Option<Option<PropertyValue>>, GraphError> + '_,
+        GraphError,
+    > {
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        Ok(move |id: NodeId, prop_id: u32| {
+            let Some(guard) = nodes.get(id.0)? else {
+                return Ok(None);
+            };
+            match crate::encode::node_prop_raw(guard.value(), prop_id)? {
+                Some(raw) => Ok(Some(Some(crate::encode::decode_value(raw)?))),
+                None => Ok(Some(None)),
+            }
+        })
+    }
+
     /// Record-existence check without any decoding — for the per-property
     /// read path when the property name was never interned (the value is
     /// necessarily absent on every record, but a *deleted* node must still

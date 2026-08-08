@@ -4128,6 +4128,175 @@ fn fast_expand_count_matches_generic_path() {
     assert_eq!(flat[2].1, 2);
 }
 
+/// 1-hop variant of the fast path (matrix_review_counts' shape): single
+/// Expand + count(*) grouped by the expanded node. Same
+/// fast-vs-generic-equivalence discipline as the 2-hop test.
+#[test]
+fn fast_single_expand_count_matches_generic_path() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (a:Movie {title: 'A'}), (b:Movie {title: 'B'}), \
+         (u1:User {name: 'u1'}), (u2:User {name: 'u2'})",
+    );
+    for stmt in [
+        "MATCH (u:User {name:'u1'}), (m:Movie {title:'A'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'A'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'B'}) CREATE (u)-[:RATED]->(m)",
+    ] {
+        run(&store, stmt);
+    }
+    let fast = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WITH m, count(*) AS reviews \
+         ORDER BY reviews DESC LIMIT 5 RETURN m.title, reviews",
+    );
+    let generic = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WHERE u.name <> '\u{0}never' \
+         WITH m, count(*) AS reviews ORDER BY reviews DESC LIMIT 5 RETURN m.title, reviews",
+    );
+    assert_eq!(format!("{:?}", fast.rows), format!("{:?}", generic.rows));
+    assert_eq!(fast.rows.len(), 2);
+    match (&fast.rows[0][1], &fast.rows[1][1]) {
+        (
+            Value::Property(marsdb_graph::PropertyValue::Int(a)),
+            Value::Property(marsdb_graph::PropertyValue::Int(b)),
+        ) => {
+            assert_eq!((*a, *b), (2, 1));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// collect(mid.prop) variant (inception_genre_similarity's shape):
+/// 2-hop expansion grouped by the far node, collecting the MIDDLE node's
+/// property alongside count(*). Pins collect's null-skipping (one genre
+/// deliberately has no name) and in-group order equivalence.
+#[test]
+fn fast_expand_collect_matches_generic_path() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (m:Movie {title: 'Seed'}), (r1:Movie {title: 'R1'}), (r2:Movie {title: 'R2'}), \
+         (g1:Genre {name: 'Action'}), (g2:Genre {name: 'Drama'}), (g3:Genre)",
+    );
+    for stmt in [
+        "MATCH (m:Movie {title:'Seed'}), (g:Genre {name:'Action'}) CREATE (m)-[:IN_GENRE]->(g)",
+        "MATCH (m:Movie {title:'Seed'}), (g:Genre {name:'Drama'}) CREATE (m)-[:IN_GENRE]->(g)",
+        // The nameless genre: reachable, collected as null -> skipped.
+        "MATCH (m:Movie {title:'Seed'}), (g:Genre) WHERE g.name IS NULL CREATE (m)-[:IN_GENRE]->(g)",
+        "MATCH (r:Movie {title:'R1'}), (g:Genre {name:'Action'}) CREATE (r)-[:IN_GENRE]->(g)",
+        "MATCH (r:Movie {title:'R1'}), (g:Genre {name:'Drama'}) CREATE (r)-[:IN_GENRE]->(g)",
+        "MATCH (r:Movie {title:'R2'}), (g:Genre {name:'Drama'}) CREATE (r)-[:IN_GENRE]->(g)",
+        "MATCH (r:Movie {title:'R2'}), (g:Genre) WHERE g.name IS NULL CREATE (r)-[:IN_GENRE]->(g)",
+    ] {
+        run(&store, stmt);
+    }
+    let q_fast = "MATCH (m:Movie)-[:IN_GENRE]->(g:Genre)<-[:IN_GENRE]-(rec:Movie) \
+         WHERE m.title = 'Seed' \
+         WITH rec, collect(g.name) AS genres, count(*) AS commonGenres \
+         RETURN rec.title, genres, commonGenres ORDER BY commonGenres DESC";
+    // Recognizer-defeating variant: an extra inert predicate on rec.
+    let q_generic = "MATCH (m:Movie)-[:IN_GENRE]->(g:Genre)<-[:IN_GENRE]-(rec:Movie) \
+         WHERE m.title = 'Seed' AND rec.title <> '\u{0}never' \
+         WITH rec, collect(g.name) AS genres, count(*) AS commonGenres \
+         RETURN rec.title, genres, commonGenres ORDER BY commonGenres DESC";
+    let fast = run(&store, q_fast);
+    let generic = run(&store, q_generic);
+    assert_eq!(
+        format!("{:?}", fast.rows),
+        format!("{:?}", generic.rows),
+        "collect fast path diverged from the generic pipeline"
+    );
+    // R1 shares Action+Drama (2 paths, 2 names); R2 shares Drama + the
+    // nameless genre (2 paths, but only 1 collected name -- null skipped).
+    assert_eq!(fast.rows.len(), 2);
+}
+
+/// The tail hint lets the fast path pre-truncate groups when the FINAL
+/// clause's RETURN carries ORDER BY count + SKIP/LIMIT. SKIP must remain
+/// exact: the loop keeps skip+limit groups and the generic tail slices
+/// precisely -- this pins that no double-skip / short-keep sneaks in.
+#[test]
+fn fast_path_tail_order_skip_limit_matches_generic() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (s:Movie {title: 'Seed'}), (a:Movie {title: 'A'}), (b:Movie {title: 'B'}), \
+         (c:Movie {title: 'C'}), (u1:User {name: 'u1'}), (u2:User {name: 'u2'}), \
+         (u3:User {name: 'u3'})",
+    );
+    // Rating counts back to recs: A=3, B=2, C=1.
+    for (u, ms) in [
+        ("u1", vec!["Seed", "A", "B"]),
+        ("u2", vec!["Seed", "A", "B", "C"]),
+        ("u3", vec!["Seed", "A"]),
+    ] {
+        for m in ms {
+            run(
+                &store,
+                &format!(
+                    "MATCH (u:User {{name:'{u}'}}), (m:Movie {{title:'{m}'}}) \
+                     CREATE (u)-[:RATED]->(m)"
+                ),
+            );
+        }
+    }
+    let fast = run(
+        &store,
+        "MATCH (m:Movie {title: 'Seed'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \
+         WITH rec, count(*) AS c RETURN rec.title, c ORDER BY c DESC SKIP 1 LIMIT 1",
+    );
+    let generic = run(
+        &store,
+        "MATCH (m:Movie {title: 'Seed'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \
+         WHERE rec.title <> '\u{0}never' \
+         WITH rec, count(*) AS c RETURN rec.title, c ORDER BY c DESC SKIP 1 LIMIT 1",
+    );
+    assert_eq!(format!("{:?}", fast.rows), format!("{:?}", generic.rows));
+    assert_eq!(fast.rows.len(), 1);
+    match &fast.rows[0][1] {
+        Value::Property(marsdb_graph::PropertyValue::Int(c)) => assert_eq!(*c, 2), // B, after skipping A
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Seed enumeration's direct-predicate route (leaf = simple
+/// `var.prop <op> literal` filters over a scan, e.g. matrix's `title
+/// CONTAINS`) must match the generic pipeline — including a predicate on
+/// a property some nodes lack (absent -> filtered out, not an error).
+#[test]
+fn fast_path_contains_leaf_matches_generic() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (m1:Movie {title: 'The Matrix'}), (m2:Movie {title: 'The Matrix Reloaded'}), \
+         (m3:Movie {title: 'Speed'}), (m4:Movie), (u:User {name: 'u'})",
+    );
+    for title in ["The Matrix", "The Matrix Reloaded", "Speed"] {
+        run(
+            &store,
+            &format!(
+                "MATCH (u:User {{name:'u'}}), (m:Movie {{title:'{title}'}}) \
+                 CREATE (u)-[:RATED]->(m)"
+            ),
+        );
+    }
+    let fast = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WHERE m.title CONTAINS 'Matrix' \
+         WITH m, count(*) AS reviews RETURN m.title, reviews ORDER BY reviews DESC LIMIT 5",
+    );
+    let generic = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WHERE m.title CONTAINS 'Matrix' AND u.name <> '\u{0}n' \
+         WITH m, count(*) AS reviews RETURN m.title, reviews ORDER BY reviews DESC LIMIT 5",
+    );
+    assert_eq!(format!("{:?}", fast.rows), format!("{:?}", generic.rows));
+    assert_eq!(fast.rows.len(), 2, "only the two Matrix titles qualify");
+}
+
 #[test]
 fn node_cache_resets_across_the_write_transaction_entry_point_too() {
     let store = GraphStore::open_memory().unwrap();

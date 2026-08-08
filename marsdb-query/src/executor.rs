@@ -1483,11 +1483,32 @@ impl<'a> Executor<'a> {
                             // shape, the tight loop replaces BOTH the row
                             // materialization and the WITH's own grouping
                             // pass — so on a hit, this clause is done.
+                            let tail_hint = if is_final_clause {
+                                match (order_by, limit, tail) {
+                                    (
+                                        Some(keys),
+                                        Some(tail_limit),
+                                        Some(Tail::Return(items, false)),
+                                    ) if keys.len() == 1 && !has_aggregate(items) => {
+                                        let (key, dir) = &keys[0];
+                                        Some((
+                                            key,
+                                            *dir,
+                                            skip.unwrap_or(0).max(0) as usize
+                                                + tail_limit.max(0) as usize,
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
                             if let Some((rows, out_names)) = self.try_fast_expand_expand_count(
                                 txn,
                                 &plan,
                                 &part.with,
                                 &current_rows,
+                                tail_hint,
                                 guard,
                             )? {
                                 current_rows = rows;
@@ -3422,32 +3443,47 @@ impl<'a> Executor<'a> {
         }))
     }
 
-    /// Fast path for the `Expand -> Expand -> count(*) GROUP BY end-node`
-    /// shape (`MATCH (s ...)<-[:X]-(a)-[:Y]->(b) WITH b, count(*) AS c
-    /// ...` — collaborative filtering's skeleton): counts traversals in a
-    /// tight loop over `neighbors_in_txn` instead of materializing a
-    /// `BindingRow` per intermediate path. Motivation is measured, not
-    /// assumed: the same algorithm hand-rolled runs in ~1ms where the
-    /// generic pipeline takes ~100ms on the recommendations dataset
-    /// (`marsdb/examples/csr_falsifier.rs`) — the row machinery, not
-    /// storage, is ~99% of that query's time.
+    /// Fast path for aggregating expansion chains -- one or two `Expand`
+    /// hops feeding a `WITH` that groups by the final node and computes
+    /// `count(*)` and/or `collect(<mid-node>.prop)`:
+    ///
+    /// ```text
+    /// MATCH (s ...)-[:X]-(b)            WITH b, count(*) ...           (1 hop)
+    /// MATCH (s ...)-[:X]-(a)-[:Y]-(b)   WITH b, count(*) ...           (2 hops)
+    /// MATCH (s ...)-[:X]-(a)-[:Y]-(b)   WITH b, collect(a.p), count(*) (2 hops)
+    /// ```
+    ///
+    /// Counts/collects in a tight loop over `neighbors_in_txn` instead of
+    /// materializing a `BindingRow` per intermediate path. Motivation is
+    /// measured, not assumed: the same algorithm hand-rolled runs in ~1ms
+    /// where the generic pipeline takes ~100ms on the recommendations
+    /// dataset (`marsdb/examples/csr_falsifier.rs`) -- the row machinery,
+    /// not storage, is ~99% of that query's time; the first (2-hop count)
+    /// entry measured ~25x end-to-end on that suite.
     ///
     /// Deliberately conservative: returns `Ok(None)` (generic path) for
     /// ANY shape it doesn't fully recognize. What it accepts:
-    /// - plan = `[Filter*] Expand2([Filter*] Expand1(leaf))`, both
-    ///   expansions single-typed (or untyped) and directed (no `Either`),
-    ///   leaf free of any expansion/`Seed` (evaluated via the generic
-    ///   stream — an `IndexSeek`/scan/`Filter` chain);
-    /// - inter/outer filters drawn only from the shapes
-    ///   `build_match_plan` synthesizes for this pattern: `HasLabel` on
-    ///   the hop nodes, and the edge-isomorphism `Not(VarEq(r2, r1))`
+    /// - plan = `[Filter*] Expand([Filter*] Expand(leaf))` or
+    ///   `[Filter*] Expand(leaf)`, every expansion single-typed (or
+    ///   untyped) and directed (no `Either`), leaf free of any
+    ///   expansion/`Seed` (evaluated via the generic stream);
+    /// - filters drawn only from the shapes `build_match_plan`
+    ///   synthesizes here: `HasLabel` on the hop nodes, and the
+    ///   edge-isomorphism `Not(VarEq(r2, r1))` between the two hops
     ///   (honored in-loop by skipping `e2.edge_id == e1.edge_id`);
-    /// - `WITH` = exactly {`Var(b)`, `count(*)`} (either order, aliases
-    ///   fine), no `*`/`WHERE`, ORDER BY only on the count column;
-    /// - no carried bindings entering the clause (fresh statement rows).
+    /// - `WITH` = `Var(final-node)` plus any mix of `count(*)` and
+    ///   `collect(<mid-node>.prop)` (2-hop only, non-DISTINCT), no
+    ///   `*`/`WHERE`, ORDER BY only on the count column;
+    /// - no carried bindings entering the clause.
+    ///
+    /// `collect()` skips null/absent values (real Cypher's rule), reads
+    /// the property through the per-prop directory path, and memoizes it
+    /// per mid-node. Group and in-group encounter order both follow
+    /// traversal order, matching the generic grouping pass's
+    /// first-encounter semantics for ORDER BY ties and collect contents.
     ///
     /// `HasLabel` checks use per-label node-id sets loaded once via
-    /// `NODE_LABEL_INDEX` — O(label size) setup instead of a per-candidate
+    /// `NODE_LABEL_INDEX` -- O(label size) setup instead of a per-candidate
     /// record read in the hot loop.
     fn try_fast_expand_expand_count(
         &self,
@@ -3455,6 +3491,16 @@ impl<'a> Executor<'a> {
         plan: &LogicalPlan,
         with: &Option<WithClause>,
         current_rows: &[BindingRow],
+        // When this MATCH is the statement's final clause and the tail is
+        // a plain (non-aggregating, non-DISTINCT) RETURN whose ORDER
+        // BY/SKIP/LIMIT ride on the count column, the hint lets the loop
+        // sort groups and keep only skip+limit of them BEFORE building
+        // any rows -- the generic tail then re-sorts and slices that tiny
+        // prefix exactly (same key, same tie order), so semantics are
+        // unchanged while the 6k-groups-for-a-LIMIT-5 case stops
+        // materializing 6k rows. Measured motivation: inception's
+        // remaining ~40ms was almost entirely this tail.
+        tail_hint: Option<(&ReturnExpr, SortDir, usize)>,
         guard: &ExecutionGuard<'_>,
     ) -> Result<Option<FastCountResult>, QueryError> {
         // -- clause-context checks --------------------------------------
@@ -3462,45 +3508,11 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
         let Some(with) = with else { return Ok(None) };
-        if with.star || with.distinct || with.where_clause.is_some() || with.items.len() != 2 {
+        if with.star || with.distinct || with.where_clause.is_some() || with.items.len() < 2 {
             return Ok(None);
         }
-        // -- WITH-shape: exactly {Var(group), count(*)} ------------------
-        let (group_idx, count_idx) = match (&with.items[0].expr, &with.items[1].expr) {
-            (ReturnExpr::Var(_), ReturnExpr::CountStar) => (0, 1),
-            (ReturnExpr::CountStar, ReturnExpr::Var(_)) => (1, 0),
-            _ => return Ok(None),
-        };
-        let ReturnExpr::Var(group_var) = &with.items[group_idx].expr else {
-            unreachable!("matched above");
-        };
-        let names: Vec<String> = with
-            .items
-            .iter()
-            .enumerate()
-            .map(with_item_output_name)
-            .collect();
-        let (group_name, count_name) = (&names[group_idx], &names[count_idx]);
-        // ORDER BY: only "by the count column" (any direction) or absent.
-        let count_sort: Option<SortDir> = match &with.order_by {
-            None => None,
-            Some(keys) => {
-                let [(key, dir)] = keys.as_slice() else {
-                    return Ok(None);
-                };
-                let matches_count = match key {
-                    ReturnExpr::Var(v) => v == count_name,
-                    ReturnExpr::CountStar => true,
-                    _ => false,
-                };
-                if !matches_count {
-                    return Ok(None);
-                }
-                Some(*dir)
-            }
-        };
 
-        // -- plan shape: [Filter*] Expand2([Filter*] Expand1(leaf)) ------
+        // -- plan shape: 1 or 2 Expand stages over a non-expanding leaf --
         fn peel<'p>(mut plan: &'p LogicalPlan, preds: &mut Vec<&'p Expr>) -> &'p LogicalPlan {
             while let LogicalPlan::Filter { input, predicate } = plan {
                 push_conjunct_refs(predicate, preds);
@@ -3516,65 +3528,180 @@ impl<'a> Executor<'a> {
                 out.push(expr);
             }
         }
-        let mut outer_preds = Vec::new();
-        let LogicalPlan::Expand {
-            input: e2_input,
-            from_var: from2,
-            to_var: to2,
-            rel_var: rel2,
-            rel_labels: labels2,
-            direction: dir2,
-        } = peel(plan, &mut outer_preds)
-        else {
-            return Ok(None);
+        struct Stage<'p> {
+            from: &'p str,
+            to: &'p str,
+            rel_var: Option<&'p str>,
+            label: Option<&'p str>,
+            dir: Direction,
+            preds: Vec<&'p Expr>,
+        }
+        // Collected outermost-first, reversed to innermost-first below.
+        let mut stages: Vec<Stage<'_>> = Vec::new();
+        let mut cursor = plan;
+        let leaf = loop {
+            let mut preds = Vec::new();
+            match peel(cursor, &mut preds) {
+                LogicalPlan::Expand {
+                    input,
+                    from_var,
+                    to_var,
+                    rel_var,
+                    rel_labels,
+                    direction,
+                } if stages.len() < 2 => {
+                    let (Some(dir), Some(label)) =
+                        (fast_direction(*direction), fast_label(rel_labels))
+                    else {
+                        return Ok(None);
+                    };
+                    stages.push(Stage {
+                        from: from_var,
+                        to: to_var,
+                        rel_var: rel_var.as_deref(),
+                        label,
+                        dir,
+                        preds,
+                    });
+                    cursor = input;
+                }
+                _ => {
+                    if stages.is_empty() || plan_contains_expansion(cursor) {
+                        return Ok(None);
+                    }
+                    // The leaf keeps its own filter chain (`cursor`, not
+                    // the peeled node): a start-node predicate the planner
+                    // pushed down (`WHERE m.title = ...` without an index)
+                    // is just part of leaf evaluation, which runs through
+                    // the generic stream anyway.
+                    break cursor;
+                }
+            }
         };
-        let mut inner_preds = Vec::new();
-        let LogicalPlan::Expand {
-            input: leaf,
-            from_var: from1,
-            to_var: to1,
-            rel_var: rel1,
-            rel_labels: labels1,
-            direction: dir1,
-        } = peel(e2_input, &mut inner_preds)
-        else {
-            return Ok(None);
-        };
-        if group_var != to2 || from2 != to1 {
+        stages.reverse(); // innermost (hop 1) first
+        if stages.len() == 2 && stages[1].from != stages[0].to {
             return Ok(None);
         }
-        let (Some(d1), Some(d2)) = (fast_direction(*dir1), fast_direction(*dir2)) else {
-            return Ok(None);
-        };
-        let (Some(l1), Some(l2)) = (fast_label(labels1), fast_label(labels2)) else {
-            return Ok(None);
-        };
-        if plan_contains_expansion(leaf) {
-            return Ok(None);
-        }
+        let final_to = stages.last().expect("at least one stage").to;
+        let origin = stages[0].from;
+        let mid_var = (stages.len() == 2).then(|| stages[0].to);
 
-        // -- predicate classification ------------------------------------
-        let mut a_labels: Vec<&str> = Vec::new();
-        let mut b_labels: Vec<&str> = Vec::new();
-        let mut isomorphism = false;
-        for pred in inner_preds {
-            match pred {
-                Expr::HasLabel(v, l) if v == to1 => a_labels.push(l),
+        // -- WITH-shape: Var(final) + {count(*) | collect(mid.prop)}* ----
+        enum OutCol<'p> {
+            Group,
+            Count,
+            Collect(&'p str), // mid-node property name
+        }
+        let mut cols: Vec<OutCol<'_>> = Vec::with_capacity(with.items.len());
+        // The grouping key: either the chain's far end (collaborative
+        // filtering) or its origin (matrix_review_counts groups by the
+        // seed and counts its expansions).
+        let mut group_seen = false;
+        let mut group_by_origin = false;
+        let mut count_seen = false;
+        for item in &with.items {
+            match &item.expr {
+                ReturnExpr::Var(v) if v == final_to && !group_seen => {
+                    group_seen = true;
+                    cols.push(OutCol::Group);
+                }
+                ReturnExpr::Var(v) if v == origin && !group_seen => {
+                    group_seen = true;
+                    group_by_origin = true;
+                    cols.push(OutCol::Group);
+                }
+                ReturnExpr::CountStar if !count_seen => {
+                    count_seen = true;
+                    cols.push(OutCol::Count);
+                }
+                ReturnExpr::Call {
+                    name,
+                    args,
+                    distinct: false,
+                } if name.eq_ignore_ascii_case("collect") => {
+                    let [ReturnExpr::Prop(pa)] = args.as_slice() else {
+                        return Ok(None);
+                    };
+                    let Some(mid) = mid_var else { return Ok(None) };
+                    if pa.var != mid {
+                        return Ok(None);
+                    }
+                    cols.push(OutCol::Collect(&pa.prop));
+                }
                 _ => return Ok(None),
             }
         }
-        for pred in outer_preds {
-            match pred {
-                Expr::HasLabel(v, l) if v == to2 => b_labels.push(l),
-                Expr::Not(inner) => match (&**inner, rel1, rel2) {
-                    (Expr::VarEq(x, y), Some(r1), Some(r2))
-                        if (x == r1 && y == r2) || (x == r2 && y == r1) =>
-                    {
-                        isomorphism = true;
+        if !group_seen {
+            return Ok(None);
+        }
+        let names: Vec<String> = with
+            .items
+            .iter()
+            .enumerate()
+            .map(with_item_output_name)
+            .collect();
+        let count_name = cols
+            .iter()
+            .position(|c| matches!(c, OutCol::Count))
+            .map(|i| names[i].as_str());
+        // ORDER BY: only "by the count column" (any direction) or absent.
+        let mut pre_keep: Option<usize> = None;
+        let count_sort: Option<SortDir> = match &with.order_by {
+            None => {
+                // No WITH-level ordering: the tail hint (final clause,
+                // plain RETURN ordered by the count column) can take over.
+                match tail_hint {
+                    Some((key, dir, keep)) if with.skip.is_none() && with.limit.is_none() => {
+                        let matches_count = match key {
+                            ReturnExpr::Var(v) => count_name == Some(v.as_str()),
+                            ReturnExpr::CountStar => count_seen,
+                            _ => false,
+                        };
+                        if matches_count {
+                            pre_keep = Some(keep);
+                            Some(dir)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Some(keys) => {
+                let [(key, dir)] = keys.as_slice() else {
+                    return Ok(None);
+                };
+                let matches_count = match key {
+                    ReturnExpr::Var(v) => count_name == Some(v.as_str()),
+                    ReturnExpr::CountStar => count_seen,
+                    _ => false,
+                };
+                if !matches_count {
+                    return Ok(None);
+                }
+                Some(*dir)
+            }
+        };
+
+        // -- predicate classification per stage --------------------------
+        let mut stage_label_filters: Vec<Vec<&str>> = vec![Vec::new(); stages.len()];
+        let mut isomorphism = false;
+        for (i, stage) in stages.iter().enumerate() {
+            for pred in &stage.preds {
+                match pred {
+                    Expr::HasLabel(v, l) if v == stage.to => stage_label_filters[i].push(l),
+                    Expr::Not(inner) if i == 1 => {
+                        match (&**inner, stages[0].rel_var, stage.rel_var) {
+                            (Expr::VarEq(x, y), Some(r1), Some(r2))
+                                if (x == r1 && y == r2) || (x == r2 && y == r1) =>
+                            {
+                                isomorphism = true;
+                            }
+                            _ => return Ok(None),
+                        }
                     }
                     _ => return Ok(None),
-                },
-                _ => return Ok(None),
+                }
             }
         }
 
@@ -3589,60 +3716,211 @@ impl<'a> Executor<'a> {
                     .collect(),
             )
         };
-        let a_sets = a_labels
+        let stage_sets: Vec<Vec<std::collections::HashSet<u64>>> = stage_label_filters
             .iter()
-            .map(|l| label_set(l))
-            .collect::<Result<Vec<_>, _>>()?;
-        let b_sets = b_labels
+            .map(|labels| labels.iter().map(|l| label_set(l)).collect())
+            .collect::<Result<_, _>>()?;
+        // Collected properties: resolve names to interned ids once.
+        let collect_prop_ids: Vec<Option<u32>> = cols
             .iter()
-            .map(|l| label_set(l))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|c| match c {
+                OutCol::Collect(prop) => self.prop_id_for(txn, prop),
+                _ => Ok(None),
+            })
+            .collect::<Result<_, _>>()?;
 
-        // Seed nodes from the generic stream over the leaf (few rows:
-        // an IndexSeek or filtered scan).
+        // Seed nodes. For a filtered scan/seek leaf, enumerate candidate
+        // ids directly and evaluate the leaf's predicates against ONE
+        // reused row buffer -- the generic stream builds a fresh
+        // `HashMap` row per candidate, which for an unindexed predicate
+        // over a big label (matrix_review_counts: `title CONTAINS` over
+        // 9k movies) was the query's remaining cost. Any leaf shape this
+        // doesn't cover falls back to the generic stream.
         let mut seeds = Vec::new();
-        for row in self.eval_plan(txn, leaf, current_rows, guard)? {
-            match row.get(from1) {
-                Some(Binding::Node(id)) => seeds.push(*id),
-                _ => return Ok(None),
+        let mut leaf_preds = Vec::new();
+        let leaf_base = peel(leaf, &mut leaf_preds);
+        let leaf_candidates: Option<Vec<NodeId>> = match leaf_base {
+            LogicalPlan::AllNodesScan { var } if var == stages[0].from => Some(
+                GraphStore::all_node_ids_limited_in_txn(txn, None, usize::MAX)?,
+            ),
+            LogicalPlan::NodeByLabelScan { var, label } if var == stages[0].from => Some(
+                GraphStore::all_node_ids_limited_in_txn(txn, Some(label), usize::MAX)?,
+            ),
+            LogicalPlan::IndexSeek {
+                var,
+                label,
+                prop,
+                value: crate::ir::IndexSeekValue::Fixed(value),
+            } if var == stages[0].from => {
+                Some(GraphStore::lookup_by_index_in_txn(txn, label, prop, value)?)
+            }
+            _ => None,
+        };
+        match leaf_candidates {
+            Some(candidates) => {
+                // All-simple-predicate leaves (`var.prop <op> literal`,
+                // matrix's `title CONTAINS ...`) evaluate through one
+                // pre-opened NODES handle and the shared `compare` --
+                // no per-candidate table open, no probe row, no
+                // `eval_expr` dispatch. Anything else keeps the probe-row
+                // route below.
+                let simple: Option<Vec<(&PropAccess, CompareOp, &Literal)>> = leaf_preds
+                    .iter()
+                    .map(|pred| match pred {
+                        Expr::Compare(pa, op, lit) if pa.var == stages[0].from => {
+                            Some((pa, *op, lit))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(simple) = simple {
+                    let pred_ids: Vec<Option<u32>> = simple
+                        .iter()
+                        .map(|(pa, _, _)| self.prop_id_for(txn, &pa.prop))
+                        .collect::<Result<_, _>>()?;
+                    let mut read_prop = GraphStore::node_prop_reader(txn)?;
+                    'cand: for id in candidates {
+                        guard.checkpoint()?;
+                        for ((_, op, lit), prop_id) in simple.iter().zip(&pred_ids) {
+                            let value = match prop_id {
+                                Some(pid) => read_prop(id, *pid)?.flatten(),
+                                None => None,
+                            };
+                            if compare(&value, *op, lit) != Some(true) {
+                                continue 'cand;
+                            }
+                        }
+                        seeds.push(id);
+                    }
+                } else {
+                    let mut probe = BindingRow::new();
+                    for id in candidates {
+                        guard.checkpoint()?;
+                        probe.insert(stages[0].from.to_string(), Binding::Node(id));
+                        let mut pass = true;
+                        for pred in &leaf_preds {
+                            if self.eval_expr(txn, pred, &probe, guard)? != Some(true) {
+                                pass = false;
+                                break;
+                            }
+                        }
+                        if pass {
+                            seeds.push(id);
+                        }
+                    }
+                }
+            }
+            None => {
+                for row in self.eval_plan(txn, leaf, current_rows, guard)? {
+                    match row.get(stages[0].from) {
+                        Some(Binding::Node(id)) => seeds.push(*id),
+                        _ => return Ok(None),
+                    }
+                }
             }
         }
 
         // -- the tight loop ----------------------------------------------
-        // Encounter-ordered groups so ORDER BY ties break the same way the
-        // generic grouping pass (first-encounter order) breaks them.
+        struct Group {
+            count: i64,
+            collects: Vec<Vec<Value>>,
+        }
+        let n_collects = cols
+            .iter()
+            .filter(|c| matches!(c, OutCol::Collect(_)))
+            .count();
         let mut order: Vec<u64> = Vec::new();
-        let mut counts: HashMap<u64, i64> = HashMap::new();
+        let mut groups: HashMap<u64, Group> = HashMap::new();
+        // Per-mid-node property memo: the same mid node recurs across
+        // seeds/edges and its collected property is stable within the
+        // snapshot.
+        let mut mid_prop_memo: HashMap<(u64, u32), Option<Value>> = HashMap::new();
+        let mut mid_values: Vec<Option<Value>> = vec![None; n_collects];
+        let one_hop = stages.len() == 1;
         for &s in &seeds {
             guard.checkpoint()?;
-            for e1 in GraphStore::neighbors_in_txn(txn, s, d1, l1)? {
+            for e1 in GraphStore::neighbors_in_txn(txn, s, stages[0].dir, stages[0].label)? {
                 guard.relationship_expansion()?;
-                if !a_sets.iter().all(|set| set.contains(&e1.other.0)) {
+                if !stage_sets[0].iter().all(|set| set.contains(&e1.other.0)) {
                     continue;
                 }
+                if one_hop {
+                    let key = if group_by_origin { s.0 } else { e1.other.0 };
+                    let group = groups.entry(key).or_insert_with(|| {
+                        order.push(key);
+                        Group {
+                            count: 0,
+                            collects: vec![Vec::new(); n_collects],
+                        }
+                    });
+                    group.count += 1;
+                    continue;
+                }
+                // Resolve this mid node's collected properties once.
+                let mut ci = 0usize;
+                for (col, prop_id) in cols.iter().zip(&collect_prop_ids) {
+                    if let OutCol::Collect(_) = col {
+                        mid_values[ci] = match prop_id {
+                            Some(pid) => mid_prop_memo
+                                .entry((e1.other.0, *pid))
+                                .or_insert_with(|| {
+                                    GraphStore::get_node_prop_in_txn(txn, e1.other, *pid)
+                                        .ok()
+                                        .flatten()
+                                        .flatten()
+                                        .map(property_value_to_value)
+                                })
+                                .clone(),
+                            None => None, // never-interned property: absent everywhere
+                        };
+                        ci += 1;
+                    }
+                }
                 guard.checkpoint()?;
-                for e2 in GraphStore::neighbors_in_txn(txn, e1.other, d2, l2)? {
+                for e2 in
+                    GraphStore::neighbors_in_txn(txn, e1.other, stages[1].dir, stages[1].label)?
+                {
                     guard.relationship_expansion()?;
                     if isomorphism && e2.edge_id == e1.edge_id {
                         continue;
                     }
-                    if !b_sets.iter().all(|set| set.contains(&e2.other.0)) {
+                    if !stage_sets[1].iter().all(|set| set.contains(&e2.other.0)) {
                         continue;
                     }
-                    *counts.entry(e2.other.0).or_insert_with(|| {
-                        order.push(e2.other.0);
-                        0
-                    }) += 1;
+                    let key = if group_by_origin { s.0 } else { e2.other.0 };
+                    let group = groups.entry(key).or_insert_with(|| {
+                        order.push(key);
+                        Group {
+                            count: 0,
+                            collects: vec![Vec::new(); n_collects],
+                        }
+                    });
+                    group.count += 1;
+                    for (ci, value) in mid_values.iter().enumerate() {
+                        // collect() skips nulls, real Cypher's rule.
+                        if let Some(v) = value {
+                            group.collects[ci].push(v.clone());
+                        }
+                    }
                 }
             }
         }
 
         // -- project, order, skip/limit ----------------------------------
-        let mut grouped: Vec<(u64, i64)> = order.into_iter().map(|id| (id, counts[&id])).collect();
+        let mut grouped: Vec<(u64, Group)> = order
+            .into_iter()
+            .map(|id| {
+                let group = groups.remove(&id).expect("group recorded in order");
+                (id, group)
+            })
+            .collect();
         match count_sort {
-            Some(SortDir::Asc) => grouped.sort_by_key(|&(_, c)| c),
-            Some(SortDir::Desc) => grouped.sort_by_key(|&(_, c)| std::cmp::Reverse(c)),
+            Some(SortDir::Asc) => grouped.sort_by_key(|(_, g)| g.count),
+            Some(SortDir::Desc) => grouped.sort_by_key(|(_, g)| std::cmp::Reverse(g.count)),
             None => {}
+        }
+        if let Some(keep) = pre_keep {
+            grouped.truncate(keep);
         }
         let skip_n = skip.unwrap_or(0).max(0) as usize;
         if skip_n > 0 {
@@ -3653,16 +3931,29 @@ impl<'a> Executor<'a> {
         }
         let rows: Vec<BindingRow> = grouped
             .into_iter()
-            .map(|(id, count)| {
+            .map(|(id, group)| {
                 let mut row = BindingRow::new();
-                row.insert(group_name.clone(), Binding::Node(NodeId(id)));
-                row.insert(
-                    count_name.clone(),
-                    Binding::Value(PropertyValue::Int(count)),
-                );
+                let mut collects = group.collects.into_iter();
+                for (col, name) in cols.iter().zip(&names) {
+                    let binding = match col {
+                        OutCol::Group => Binding::Node(NodeId(id)),
+                        OutCol::Count => Binding::Value(PropertyValue::Int(group.count)),
+                        OutCol::Collect(_) => {
+                            Binding::List(collects.next().expect("one list per collect column"))
+                        }
+                    };
+                    row.insert(name.clone(), binding);
+                }
                 row
             })
             .collect();
+        if std::env::var("MARSDB_FAST_DEBUG").is_ok() {
+            eprintln!(
+                "[fast-path FIRED] stages={} groups={}",
+                stages.len(),
+                rows.len()
+            );
+        }
         Ok(Some((rows, names.into_iter().collect())))
     }
 
