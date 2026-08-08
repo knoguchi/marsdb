@@ -457,6 +457,22 @@ fn return_expr_references_var(expr: &ReturnExpr, var: &str) -> bool {
         ReturnExpr::Prop(pa) => pa.var == var,
         ReturnExpr::PropOf(base, _) => return_expr_references_var(base, var),
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => false,
+        // A function call references `var` iff any argument does -- so
+        // `date('2020-01-10')` (the shape a `$param`-substituted temporal
+        // equality takes, mars-9ez) is promotable while `date(n.born)`
+        // correctly isn't. `rand()` is the one argument-free call whose
+        // *value* still can't be hoisted from per-candidate to
+        // per-seed-row evaluation (a fresh number each call is the whole
+        // point of it), so it's treated as referencing everything; a
+        // rand() nested deeper inside an argument hits this same arm
+        // through the recursion. The temporal now-functions (`date()`,
+        // `timestamp()`, ...) are NOT excluded: they're pinned to one
+        // per-statement `NowSnapshot`, so per-seed-row evaluation returns
+        // the identical value per-candidate evaluation would.
+        ReturnExpr::Call { name, args, .. } => {
+            name.eq_ignore_ascii_case("rand")
+                || args.iter().any(|a| return_expr_references_var(a, var))
+        }
         _ => true,
     }
 }
@@ -855,6 +871,78 @@ mod tests {
                 }
             }
             other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fuses_a_literal_arg_call_equality_into_a_row_expr_index_seek() {
+        // `n.joined = date('2020-01-10')` -- the shape a `$param`-
+        // substituted temporal equality takes (mars-9ez). The call's
+        // arguments are all var-free, so it's evaluable once per seed row
+        // and must promote to an IndexSeek with a RowExpr value, not stay
+        // a per-candidate Filter over the label scan.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Event", "joined", false).unwrap();
+        let part = part_from("MATCH (n:Event) WHERE n.joined = date('2020-01-10') RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::IndexSeek {
+                prop,
+                value: IndexSeekValue::RowExpr(ReturnExpr::Call { name, .. }),
+                ..
+            } => {
+                assert_eq!(prop, "joined");
+                assert_eq!(name, "date");
+            }
+            other => panic!("expected a RowExpr IndexSeek on the call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_promote_a_call_whose_argument_references_the_scan_var() {
+        // `date(n.born)` needs `n` itself to evaluate -- promoting it
+        // would evaluate against a row that doesn't have `n` yet.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Event", "joined", false).unwrap();
+        let part = part_from("MATCH (n:Event) WHERE n.joined = date(n.born) RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::NodeByLabelScan { .. }));
+            }
+            other => panic!("expected a Filter over the scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_promote_a_rand_call() {
+        // rand() has no arguments but must still evaluate per candidate
+        // row, not once per seed row -- hoisting it into an IndexSeek
+        // value would change which rows match.
+        let store = GraphStore::open_memory().unwrap();
+        store.create_index("Event", "score", false).unwrap();
+        let part = part_from("MATCH (n:Event) WHERE n.score = rand() RETURN n");
+
+        let write = store.begin_write().unwrap();
+        let plan =
+            build_match_plan(&part.pattern, &part.where_clause, &Default::default()).unwrap();
+        let plan = apply_index_seeks(plan, Txn::Write(&write)).unwrap();
+
+        match plan {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::NodeByLabelScan { .. }));
+            }
+            other => panic!("expected a Filter over the scan, got {other:?}"),
         }
     }
 
