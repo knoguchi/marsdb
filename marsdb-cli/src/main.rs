@@ -10,7 +10,7 @@ mod repl;
 
 /// MarsDB: an embeddable property-graph database. Single binary, single file.
 #[derive(Parser)]
-#[command(name = "marsdb")]
+#[command(name = "marsdb", version)]
 struct Cli {
     /// Database file path, or `:memory:` for a transient in-memory database.
     /// Omit entirely for an in-memory database.
