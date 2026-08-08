@@ -84,8 +84,8 @@ impl StorageEngine {
             write_txn.open_table(tables::ID_TO_LABEL)?;
             write_txn.open_table(tables::NODES)?;
             write_txn.open_table(tables::EDGES)?;
-            write_txn.open_multimap_table(tables::ADJ_OUT)?;
-            write_txn.open_multimap_table(tables::ADJ_IN)?;
+            write_txn.open_table(tables::ADJ_OUT)?;
+            write_txn.open_table(tables::ADJ_IN)?;
             write_txn.open_multimap_table(tables::NODE_LABEL_INDEX)?;
             write_txn.open_table(tables::PROP_TO_ID)?;
             write_txn.open_table(tables::ID_TO_PROP)?;
@@ -156,8 +156,8 @@ impl StorageEngine {
             copy_table!(tables::ID_TO_LABEL);
             copy_table!(tables::NODES);
             copy_table!(tables::EDGES);
-            copy_multimap!(tables::ADJ_OUT);
-            copy_multimap!(tables::ADJ_IN);
+            copy_table!(tables::ADJ_OUT);
+            copy_table!(tables::ADJ_IN);
             copy_multimap!(tables::NODE_LABEL_INDEX);
             copy_table!(tables::PROP_TO_ID);
             copy_table!(tables::ID_TO_PROP);

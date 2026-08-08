@@ -47,8 +47,8 @@ pub(crate) struct WriteCtx<'txn> {
     id_to_label: Option<Table<'txn, u32, &'static str>>,
     nodes: Option<Table<'txn, u64, &'static [u8]>>,
     edges: Option<Table<'txn, u64, &'static [u8]>>,
-    adj_out: Option<MultimapTable<'txn, u64, &'static [u8]>>,
-    adj_in: Option<MultimapTable<'txn, u64, &'static [u8]>>,
+    adj_out: Option<Table<'txn, &'static [u8], u64>>,
+    adj_in: Option<Table<'txn, &'static [u8], u64>>,
     node_label_index: Option<MultimapTable<'txn, u32, u64>>,
     prop_to_id: Option<Table<'txn, &'static str, u32>>,
     id_to_prop: Option<Table<'txn, u32, &'static str>>,
@@ -112,8 +112,18 @@ impl<'txn> WriteCtx<'txn> {
     table_accessor!(id_to_label, id_to_label, marsdb_storage::tables::ID_TO_LABEL, Table<u32, &'static str>);
     table_accessor!(nodes, nodes, marsdb_storage::tables::NODES, Table<u64, &'static [u8]>);
     table_accessor!(edges, edges, marsdb_storage::tables::EDGES, Table<u64, &'static [u8]>);
-    multimap_accessor!(adj_out, adj_out, marsdb_storage::tables::ADJ_OUT, MultimapTable<u64, &'static [u8]>);
-    multimap_accessor!(adj_in, adj_in, marsdb_storage::tables::ADJ_IN, MultimapTable<u64, &'static [u8]>);
+    table_accessor!(
+        adj_out,
+        adj_out,
+        marsdb_storage::tables::ADJ_OUT,
+        Table<&'static [u8], u64>
+    );
+    table_accessor!(
+        adj_in,
+        adj_in,
+        marsdb_storage::tables::ADJ_IN,
+        Table<&'static [u8], u64>
+    );
     multimap_accessor!(node_label_index, node_label_index, marsdb_storage::tables::NODE_LABEL_INDEX, MultimapTable<u32, u64>);
     table_accessor!(
         prop_to_id,

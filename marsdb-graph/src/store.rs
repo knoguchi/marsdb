@@ -210,46 +210,34 @@ impl GraphStore {
 
     fn check_adjacency(
         read: &ReadTransaction,
-        definition: marsdb_storage::MultimapTableDefinition<u64, &[u8]>,
+        definition: marsdb_storage::TableDefinition<&[u8], u64>,
         nodes: &BTreeMap<u64, Vec<u32>>,
         edges: &BTreeMap<u64, (u32, u64, u64)>,
         outgoing: bool,
     ) -> Result<BTreeSet<(u64, u64, u64, u32)>, GraphError> {
-        let table = read.open_multimap_table(definition)?;
+        let table = read.open_table(definition)?;
         let mut found = BTreeSet::new();
         for entry in table.iter()? {
-            let (owner, values) = entry?;
-            let owner = owner.value();
+            let (key, value) = entry?;
+            let (owner, key_label_id, edge_id) = crate::model::parse_adj_key(key.value())?;
+            let other = value.value();
             if !nodes.contains_key(&owner) {
                 return Err(GraphError::CorruptData(format!(
                     "adjacency references missing owner node {owner}"
                 )));
             }
-            for value in values {
-                let adjacency = AdjEntry::decode(value?.value())?;
-                let Some(&(label_id, src, dst)) = edges.get(&adjacency.edge_id.0) else {
-                    return Err(GraphError::CorruptData(format!(
-                        "adjacency references missing edge {}",
-                        adjacency.edge_id.0
-                    )));
-                };
-                let expected = if outgoing { (src, dst) } else { (dst, src) };
-                if owner != expected.0
-                    || adjacency.other.0 != expected.1
-                    || adjacency.label_id != label_id
-                {
-                    return Err(GraphError::CorruptData(format!(
-                        "adjacency entry for edge {} does not match the edge record",
-                        adjacency.edge_id.0
-                    )));
-                }
-                found.insert((
-                    owner,
-                    adjacency.edge_id.0,
-                    adjacency.other.0,
-                    adjacency.label_id,
-                ));
+            let Some(&(label_id, src, dst)) = edges.get(&edge_id) else {
+                return Err(GraphError::CorruptData(format!(
+                    "adjacency references missing edge {edge_id}"
+                )));
+            };
+            let expected = if outgoing { (src, dst) } else { (dst, src) };
+            if owner != expected.0 || other != expected.1 || key_label_id != label_id {
+                return Err(GraphError::CorruptData(format!(
+                    "adjacency entry for edge {edge_id} does not match the edge record"
+                )));
             }
+            found.insert((owner, edge_id, other, key_label_id));
         }
         Ok(found)
     }
@@ -486,20 +474,10 @@ impl GraphStore {
         let bytes = encode_edge(&record, |name| intern_prop(ctx, name))?;
         ctx.edges()?.insert(id, bytes.as_slice())?;
 
-        let out_entry = AdjEntry {
-            edge_id: EdgeId(id),
-            other: dst,
-            label_id,
-        }
-        .encode();
-        let in_entry = AdjEntry {
-            edge_id: EdgeId(id),
-            other: src,
-            label_id,
-        }
-        .encode();
-        ctx.adj_out()?.insert(src.0, out_entry.as_slice())?;
-        ctx.adj_in()?.insert(dst.0, in_entry.as_slice())?;
+        let out_key = crate::model::adj_key(src.0, label_id, id);
+        let in_key = crate::model::adj_key(dst.0, label_id, id);
+        ctx.adj_out()?.insert(out_key.as_slice(), dst.0)?;
+        ctx.adj_in()?.insert(in_key.as_slice(), src.0)?;
         Ok(EdgeId(id))
     }
 
@@ -551,24 +529,30 @@ impl GraphStore {
         dir: Direction,
         label_filter: Option<&str>,
     ) -> Result<Vec<AdjEntry>, GraphError> {
-        let label_id_filter = match label_filter {
+        // Typed expansion narrows the key range itself (`node ++ label`
+        // prefix) instead of post-filtering a full entry scan -- the
+        // O(matching degree) fix this composite key layout exists for.
+        let (lo, hi) = match label_filter {
             Some(l) => match lookup_label_id(txn, l)? {
-                Some(id) => Some(id),
+                Some(lid) => crate::model::adj_label_bounds(node.0, lid),
                 None => return Ok(Vec::new()),
             },
-            None => None,
+            None => crate::model::adj_node_bounds(node.0),
         };
         let mut result = Vec::new();
         let table_def = match dir {
             Direction::Out => marsdb_storage::tables::ADJ_OUT,
             Direction::In => marsdb_storage::tables::ADJ_IN,
         };
-        let table = txn.open_multimap_table(table_def)?;
-        for item in table.get(node.0)? {
-            let entry = AdjEntry::decode(item?.value())?;
-            if label_id_filter.is_none_or(|lid| lid == entry.label_id) {
-                result.push(entry);
-            }
+        let table = txn.open_table(table_def)?;
+        for item in table.range(&lo[..]..=&hi[..])? {
+            let (key, value) = item?;
+            let (_, label_id, edge_id) = crate::model::parse_adj_key(key.value())?;
+            result.push(AdjEntry {
+                edge_id: EdgeId(edge_id),
+                other: NodeId(value.value()),
+                label_id,
+            });
         }
         Ok(result)
     }
@@ -605,20 +589,10 @@ impl GraphStore {
         // Header-only read: adjacency cleanup needs (label, src, dst),
         // never the edge's properties -- skips every prop-name resolution.
         let (label_id, src, dst) = edge_header(&record_bytes)?;
-        let out_entry = AdjEntry {
-            edge_id: id,
-            other: NodeId(dst),
-            label_id,
-        }
-        .encode();
-        let in_entry = AdjEntry {
-            edge_id: id,
-            other: NodeId(src),
-            label_id,
-        }
-        .encode();
-        ctx.adj_out()?.remove(src, out_entry.as_slice())?;
-        ctx.adj_in()?.remove(dst, in_entry.as_slice())?;
+        let out_key = crate::model::adj_key(src, label_id, id.0);
+        let in_key = crate::model::adj_key(dst, label_id, id.0);
+        ctx.adj_out()?.remove(out_key.as_slice())?;
+        ctx.adj_in()?.remove(in_key.as_slice())?;
         Ok(true)
     }
 
@@ -638,11 +612,16 @@ impl GraphStore {
     ) -> Result<bool, GraphError> {
         let mut ctx = WriteCtx::open(write_txn);
         let mut incident: Vec<EdgeId> = Vec::new();
-        for item in ctx.adj_out()?.get(id.0)? {
-            incident.push(AdjEntry::decode(item?.value())?.edge_id);
+        let (lo, hi) = crate::model::adj_node_bounds(id.0);
+        for item in ctx.adj_out()?.range(&lo[..]..=&hi[..])? {
+            let (key, _) = item?;
+            let (_, _, edge_id) = crate::model::parse_adj_key(key.value())?;
+            incident.push(EdgeId(edge_id));
         }
-        for item in ctx.adj_in()?.get(id.0)? {
-            incident.push(AdjEntry::decode(item?.value())?.edge_id);
+        for item in ctx.adj_in()?.range(&lo[..]..=&hi[..])? {
+            let (key, _) = item?;
+            let (_, _, edge_id) = crate::model::parse_adj_key(key.value())?;
+            incident.push(EdgeId(edge_id));
         }
         if !incident.is_empty() && !detach {
             return Err(GraphError::NodeHasEdges(id));
@@ -1104,16 +1083,11 @@ mod tests {
         let node = store.create_node(&[], BTreeMap::new()).unwrap();
 
         let write = store.begin_write().unwrap();
-        let bytes = AdjEntry {
-            edge_id: EdgeId(999),
-            other: node,
-            label_id: 0,
-        }
-        .encode();
+        let key = crate::model::adj_key(node.0, 0, 999);
         write
-            .open_multimap_table(marsdb_storage::tables::ADJ_OUT)
+            .open_table(marsdb_storage::tables::ADJ_OUT)
             .unwrap()
-            .insert(node.0, bytes.as_slice())
+            .insert(key.as_slice(), node.0)
             .unwrap();
         write.commit().unwrap();
 

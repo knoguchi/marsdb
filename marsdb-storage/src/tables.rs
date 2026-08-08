@@ -15,11 +15,21 @@ pub const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 /// edge_id -> postcard-encoded EdgeRecord.
 pub const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 
-/// src node_id -> set of encoded AdjEntry bytes (outgoing edges).
-pub const ADJ_OUT: MultimapTableDefinition<u64, &[u8]> = MultimapTableDefinition::new("adj_out");
+/// Outgoing adjacency as a composite-key plain table (v1.5 step 2):
+/// `src_node_id(8B BE) ++ label_id(4B BE) ++ edge_id(8B BE)` -> dst
+/// node_id. B-tree key order clusters one node's edges together and,
+/// within a node, groups them by label — so a typed expansion
+/// (`-[:KNOWS]->`) is a prefix `range()` over `node ++ label`, touching
+/// only matching entries (`O(matching degree)`), and an untyped expansion
+/// is the wider `node ++ *` prefix. The composite-key-on-sorted-KV shape
+/// is the industry-standard pattern-B layout for exactly this. Replaces a
+/// `node_id -> {20-byte AdjEntry}` multimap whose per-node entries were
+/// ordered by edge id, forcing every typed expansion to decode and
+/// label-check the node's entire entry set (`O(total degree)`).
+pub const ADJ_OUT: TableDefinition<&[u8], u64> = TableDefinition::new("adj_out");
 
-/// dst node_id -> set of encoded AdjEntry bytes (incoming edges).
-pub const ADJ_IN: MultimapTableDefinition<u64, &[u8]> = MultimapTableDefinition::new("adj_in");
+/// Incoming mirror of `ADJ_OUT`: `dst ++ label ++ edge` -> src node_id.
+pub const ADJ_IN: TableDefinition<&[u8], u64> = TableDefinition::new("adj_in");
 
 /// label_id -> set of node_ids carrying that label. Secondary index so a
 /// label-filtered scan (`NodeByLabelScan`) can look up matching nodes

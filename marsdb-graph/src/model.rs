@@ -170,29 +170,47 @@ pub struct AdjEntry {
     pub label_id: u32,
 }
 
-impl AdjEntry {
-    pub(crate) fn encode(&self) -> [u8; 20] {
-        let mut buf = [0u8; 20];
-        buf[0..8].copy_from_slice(&self.edge_id.0.to_be_bytes());
-        buf[8..16].copy_from_slice(&self.other.0.to_be_bytes());
-        buf[16..20].copy_from_slice(&self.label_id.to_be_bytes());
-        buf
-    }
+/// Composite-key layout for `ADJ_OUT`/`ADJ_IN` (v1.5 step 2):
+/// `owner_node(8B BE) ++ label_id(4B BE) ++ edge_id(8B BE)` -> other
+/// node id as the value. All-BE so plain byte order sorts by (owner,
+/// label, edge) — one node's edges are contiguous, and label-typed
+/// expansion is a sub-prefix range within them. `AdjEntry` itself stays
+/// the in-memory traversal-candidate type; only its storage layout moved
+/// from a 20-byte multimap *value* to this key shape.
+pub(crate) fn adj_key(owner: u64, label_id: u32, edge_id: u64) -> [u8; 20] {
+    let mut buf = [0u8; 20];
+    buf[0..8].copy_from_slice(&owner.to_be_bytes());
+    buf[8..12].copy_from_slice(&label_id.to_be_bytes());
+    buf[12..20].copy_from_slice(&edge_id.to_be_bytes());
+    buf
+}
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, crate::GraphError> {
-        let bytes: &[u8; 20] = bytes.try_into().map_err(|_| {
-            crate::GraphError::CorruptData(format!(
-                "adjacency entry has {} bytes; expected 20",
-                bytes.len()
-            ))
-        })?;
-        let edge_id = u64::from_be_bytes(bytes[0..8].try_into().expect("fixed-size slice"));
-        let other = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed-size slice"));
-        let label_id = u32::from_be_bytes(bytes[16..20].try_into().expect("fixed-size slice"));
-        Ok(AdjEntry {
-            edge_id: EdgeId(edge_id),
-            other: NodeId(other),
-            label_id,
-        })
-    }
+/// Inclusive key bounds covering every adjacency entry a node owns,
+/// any label — the untyped-expansion prefix.
+pub(crate) fn adj_node_bounds(owner: u64) -> ([u8; 20], [u8; 20]) {
+    (adj_key(owner, 0, 0), adj_key(owner, u32::MAX, u64::MAX))
+}
+
+/// Inclusive key bounds covering one node's entries under one label —
+/// the typed-expansion prefix (`O(matching degree)`).
+pub(crate) fn adj_label_bounds(owner: u64, label_id: u32) -> ([u8; 20], [u8; 20]) {
+    (
+        adj_key(owner, label_id, 0),
+        adj_key(owner, label_id, u64::MAX),
+    )
+}
+
+/// Parse a stored adjacency key back into `(owner, label_id, edge_id)`.
+pub(crate) fn parse_adj_key(bytes: &[u8]) -> Result<(u64, u32, u64), crate::GraphError> {
+    let bytes: &[u8; 20] = bytes.try_into().map_err(|_| {
+        crate::GraphError::CorruptData(format!(
+            "adjacency key has {} bytes; expected 20",
+            bytes.len()
+        ))
+    })?;
+    Ok((
+        u64::from_be_bytes(bytes[0..8].try_into().expect("fixed-size slice")),
+        u32::from_be_bytes(bytes[8..12].try_into().expect("fixed-size slice")),
+        u64::from_be_bytes(bytes[12..20].try_into().expect("fixed-size slice")),
+    ))
 }
