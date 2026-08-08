@@ -388,6 +388,9 @@ struct ResultModifiers<'a> {
 }
 
 type BindingRow = HashMap<String, Binding>;
+/// A fast-path hit: the finished (grouped/ordered/limited) rows plus the
+/// clause's output names for `carried_vars`.
+type FastCountResult = (Vec<BindingRow>, HashSet<String>);
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
 /// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
@@ -1475,6 +1478,22 @@ impl<'a> Executor<'a> {
                             let new_vars = pattern_new_vars(&part.pattern, &carried_vars);
                             self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
                         } else {
+                            // Aggregating-expansion fast path: when the
+                            // plan+WITH match the counted-double-expand
+                            // shape, the tight loop replaces BOTH the row
+                            // materialization and the WITH's own grouping
+                            // pass — so on a hit, this clause is done.
+                            if let Some((rows, out_names)) = self.try_fast_expand_expand_count(
+                                txn,
+                                &plan,
+                                &part.with,
+                                &current_rows,
+                                guard,
+                            )? {
+                                current_rows = rows;
+                                carried_vars = out_names;
+                                continue;
+                            }
                             self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
                         }
                     };
@@ -3401,6 +3420,250 @@ impl<'a> Executor<'a> {
             }
             Some(item)
         }))
+    }
+
+    /// Fast path for the `Expand -> Expand -> count(*) GROUP BY end-node`
+    /// shape (`MATCH (s ...)<-[:X]-(a)-[:Y]->(b) WITH b, count(*) AS c
+    /// ...` — collaborative filtering's skeleton): counts traversals in a
+    /// tight loop over `neighbors_in_txn` instead of materializing a
+    /// `BindingRow` per intermediate path. Motivation is measured, not
+    /// assumed: the same algorithm hand-rolled runs in ~1ms where the
+    /// generic pipeline takes ~100ms on the recommendations dataset
+    /// (`marsdb/examples/csr_falsifier.rs`) — the row machinery, not
+    /// storage, is ~99% of that query's time.
+    ///
+    /// Deliberately conservative: returns `Ok(None)` (generic path) for
+    /// ANY shape it doesn't fully recognize. What it accepts:
+    /// - plan = `[Filter*] Expand2([Filter*] Expand1(leaf))`, both
+    ///   expansions single-typed (or untyped) and directed (no `Either`),
+    ///   leaf free of any expansion/`Seed` (evaluated via the generic
+    ///   stream — an `IndexSeek`/scan/`Filter` chain);
+    /// - inter/outer filters drawn only from the shapes
+    ///   `build_match_plan` synthesizes for this pattern: `HasLabel` on
+    ///   the hop nodes, and the edge-isomorphism `Not(VarEq(r2, r1))`
+    ///   (honored in-loop by skipping `e2.edge_id == e1.edge_id`);
+    /// - `WITH` = exactly {`Var(b)`, `count(*)`} (either order, aliases
+    ///   fine), no `*`/`WHERE`, ORDER BY only on the count column;
+    /// - no carried bindings entering the clause (fresh statement rows).
+    ///
+    /// `HasLabel` checks use per-label node-id sets loaded once via
+    /// `NODE_LABEL_INDEX` — O(label size) setup instead of a per-candidate
+    /// record read in the hot loop.
+    fn try_fast_expand_expand_count(
+        &self,
+        txn: Txn,
+        plan: &LogicalPlan,
+        with: &Option<WithClause>,
+        current_rows: &[BindingRow],
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Option<FastCountResult>, QueryError> {
+        // -- clause-context checks --------------------------------------
+        if current_rows.len() != 1 || !current_rows[0].is_empty() {
+            return Ok(None);
+        }
+        let Some(with) = with else { return Ok(None) };
+        if with.star || with.distinct || with.where_clause.is_some() || with.items.len() != 2 {
+            return Ok(None);
+        }
+        // -- WITH-shape: exactly {Var(group), count(*)} ------------------
+        let (group_idx, count_idx) = match (&with.items[0].expr, &with.items[1].expr) {
+            (ReturnExpr::Var(_), ReturnExpr::CountStar) => (0, 1),
+            (ReturnExpr::CountStar, ReturnExpr::Var(_)) => (1, 0),
+            _ => return Ok(None),
+        };
+        let ReturnExpr::Var(group_var) = &with.items[group_idx].expr else {
+            unreachable!("matched above");
+        };
+        let names: Vec<String> = with
+            .items
+            .iter()
+            .enumerate()
+            .map(with_item_output_name)
+            .collect();
+        let (group_name, count_name) = (&names[group_idx], &names[count_idx]);
+        // ORDER BY: only "by the count column" (any direction) or absent.
+        let count_sort: Option<SortDir> = match &with.order_by {
+            None => None,
+            Some(keys) => {
+                let [(key, dir)] = keys.as_slice() else {
+                    return Ok(None);
+                };
+                let matches_count = match key {
+                    ReturnExpr::Var(v) => v == count_name,
+                    ReturnExpr::CountStar => true,
+                    _ => false,
+                };
+                if !matches_count {
+                    return Ok(None);
+                }
+                Some(*dir)
+            }
+        };
+
+        // -- plan shape: [Filter*] Expand2([Filter*] Expand1(leaf)) ------
+        fn peel<'p>(mut plan: &'p LogicalPlan, preds: &mut Vec<&'p Expr>) -> &'p LogicalPlan {
+            while let LogicalPlan::Filter { input, predicate } = plan {
+                push_conjunct_refs(predicate, preds);
+                plan = input;
+            }
+            plan
+        }
+        fn push_conjunct_refs<'p>(expr: &'p Expr, out: &mut Vec<&'p Expr>) {
+            if let Expr::And(l, r) = expr {
+                push_conjunct_refs(l, out);
+                push_conjunct_refs(r, out);
+            } else {
+                out.push(expr);
+            }
+        }
+        let mut outer_preds = Vec::new();
+        let LogicalPlan::Expand {
+            input: e2_input,
+            from_var: from2,
+            to_var: to2,
+            rel_var: rel2,
+            rel_labels: labels2,
+            direction: dir2,
+        } = peel(plan, &mut outer_preds)
+        else {
+            return Ok(None);
+        };
+        let mut inner_preds = Vec::new();
+        let LogicalPlan::Expand {
+            input: leaf,
+            from_var: from1,
+            to_var: to1,
+            rel_var: rel1,
+            rel_labels: labels1,
+            direction: dir1,
+        } = peel(e2_input, &mut inner_preds)
+        else {
+            return Ok(None);
+        };
+        if group_var != to2 || from2 != to1 {
+            return Ok(None);
+        }
+        let (Some(d1), Some(d2)) = (fast_direction(*dir1), fast_direction(*dir2)) else {
+            return Ok(None);
+        };
+        let (Some(l1), Some(l2)) = (fast_label(labels1), fast_label(labels2)) else {
+            return Ok(None);
+        };
+        if plan_contains_expansion(leaf) {
+            return Ok(None);
+        }
+
+        // -- predicate classification ------------------------------------
+        let mut a_labels: Vec<&str> = Vec::new();
+        let mut b_labels: Vec<&str> = Vec::new();
+        let mut isomorphism = false;
+        for pred in inner_preds {
+            match pred {
+                Expr::HasLabel(v, l) if v == to1 => a_labels.push(l),
+                _ => return Ok(None),
+            }
+        }
+        for pred in outer_preds {
+            match pred {
+                Expr::HasLabel(v, l) if v == to2 => b_labels.push(l),
+                Expr::Not(inner) => match (&**inner, rel1, rel2) {
+                    (Expr::VarEq(x, y), Some(r1), Some(r2))
+                        if (x == r1 && y == r2) || (x == r2 && y == r1) =>
+                    {
+                        isomorphism = true;
+                    }
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            }
+        }
+
+        // -- resolve everything the loop needs ---------------------------
+        let skip = self.resolve_skip_limit(txn, with.skip.as_ref(), "SKIP", guard)?;
+        let limit = self.resolve_skip_limit(txn, with.limit.as_ref(), "LIMIT", guard)?;
+        let label_set = |label: &str| -> Result<std::collections::HashSet<u64>, QueryError> {
+            Ok(
+                GraphStore::all_node_ids_limited_in_txn(txn, Some(label), usize::MAX)?
+                    .into_iter()
+                    .map(|n| n.0)
+                    .collect(),
+            )
+        };
+        let a_sets = a_labels
+            .iter()
+            .map(|l| label_set(l))
+            .collect::<Result<Vec<_>, _>>()?;
+        let b_sets = b_labels
+            .iter()
+            .map(|l| label_set(l))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Seed nodes from the generic stream over the leaf (few rows:
+        // an IndexSeek or filtered scan).
+        let mut seeds = Vec::new();
+        for row in self.eval_plan(txn, leaf, current_rows, guard)? {
+            match row.get(from1) {
+                Some(Binding::Node(id)) => seeds.push(*id),
+                _ => return Ok(None),
+            }
+        }
+
+        // -- the tight loop ----------------------------------------------
+        // Encounter-ordered groups so ORDER BY ties break the same way the
+        // generic grouping pass (first-encounter order) breaks them.
+        let mut order: Vec<u64> = Vec::new();
+        let mut counts: HashMap<u64, i64> = HashMap::new();
+        for &s in &seeds {
+            guard.checkpoint()?;
+            for e1 in GraphStore::neighbors_in_txn(txn, s, d1, l1)? {
+                guard.relationship_expansion()?;
+                if !a_sets.iter().all(|set| set.contains(&e1.other.0)) {
+                    continue;
+                }
+                guard.checkpoint()?;
+                for e2 in GraphStore::neighbors_in_txn(txn, e1.other, d2, l2)? {
+                    guard.relationship_expansion()?;
+                    if isomorphism && e2.edge_id == e1.edge_id {
+                        continue;
+                    }
+                    if !b_sets.iter().all(|set| set.contains(&e2.other.0)) {
+                        continue;
+                    }
+                    *counts.entry(e2.other.0).or_insert_with(|| {
+                        order.push(e2.other.0);
+                        0
+                    }) += 1;
+                }
+            }
+        }
+
+        // -- project, order, skip/limit ----------------------------------
+        let mut grouped: Vec<(u64, i64)> = order.into_iter().map(|id| (id, counts[&id])).collect();
+        match count_sort {
+            Some(SortDir::Asc) => grouped.sort_by_key(|&(_, c)| c),
+            Some(SortDir::Desc) => grouped.sort_by_key(|&(_, c)| std::cmp::Reverse(c)),
+            None => {}
+        }
+        let skip_n = skip.unwrap_or(0).max(0) as usize;
+        if skip_n > 0 {
+            grouped.drain(0..skip_n.min(grouped.len()));
+        }
+        if let Some(limit) = limit {
+            grouped.truncate(limit.max(0) as usize);
+        }
+        let rows: Vec<BindingRow> = grouped
+            .into_iter()
+            .map(|(id, count)| {
+                let mut row = BindingRow::new();
+                row.insert(group_name.clone(), Binding::Node(NodeId(id)));
+                row.insert(
+                    count_name.clone(),
+                    Binding::Value(PropertyValue::Int(count)),
+                );
+                row
+            })
+            .collect();
+        Ok(Some((rows, names.into_iter().collect())))
     }
 
     fn stream_scan<'s>(
@@ -5539,6 +5802,45 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
 /// iff this is true, otherwise the existing row-at-a-time path runs
 /// completely unchanged (zero perf/behavior impact on non-aggregating
 /// queries).
+/// `try_fast_expand_expand_count`'s direction support: single concrete
+/// direction only — `Either` needs the two-call-plus-dedupe treatment the
+/// generic path does, out of the fast path's scope.
+fn fast_direction(dir: ExpandDirection) -> Option<Direction> {
+    match dir {
+        ExpandDirection::Out => Some(Direction::Out),
+        ExpandDirection::In => Some(Direction::In),
+        ExpandDirection::Either => None,
+    }
+}
+
+/// Single-type (`Some`) or untyped (`None`) relationship filter — the
+/// multi-type `[:A|B]` list needs per-type iteration, out of scope.
+/// Outer `None` = unsupported shape, inner `Option` = the filter itself.
+#[allow(clippy::option_option)]
+fn fast_label(labels: &[String]) -> Option<Option<&str>> {
+    match labels {
+        [] => Some(None),
+        [one] => Some(Some(one.as_str())),
+        _ => None,
+    }
+}
+
+/// Does this (sub)plan contain any expansion or externally-seeded input?
+/// The fast path evaluates its leaf through the generic stream, but only
+/// when the leaf is a pure scan/seek/filter chain.
+fn plan_contains_expansion(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Expand { .. }
+        | LogicalPlan::VarExpand { .. }
+        | LogicalPlan::MatchRelList { .. }
+        | LogicalPlan::Seed { .. } => true,
+        LogicalPlan::Filter { input, .. } => plan_contains_expansion(input),
+        LogicalPlan::AllNodesScan { .. }
+        | LogicalPlan::NodeByLabelScan { .. }
+        | LogicalPlan::IndexSeek { .. } => false,
+    }
+}
+
 pub(crate) fn has_aggregate(items: &[ReturnItem]) -> bool {
     // `contains_aggregate`, not a narrower "is the item's whole top-level
     // expression itself an aggregate call" check -- an aggregate nested
