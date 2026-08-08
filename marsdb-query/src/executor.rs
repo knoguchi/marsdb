@@ -427,35 +427,40 @@ pub struct Executor<'a> {
     /// both entry points (`execute_with_guard` and
     /// `execute_in_write_transaction_with_guard`, see their own reset
     /// lines) must do this, since `node_cache` is a field on `Executor`
-    /// shared by both, not private to either -- and only ever consulted/
-    /// populated for a read-only statement (`node_cache_enabled`) -- a
-    /// write statement can mutate a node's props/labels mid-statement
-    /// (`SET`, `REMOVE`), so a cached record could go stale within the
-    /// same statement; a read-only statement has one consistent snapshot
-    /// for its whole duration, so caching is safe unconditionally there.
-    /// Found via a real flamegraph: `get_node_in_txn`'s postcard decode
-    /// of the full `NodeRecord` (every property, not just the ones a
-    /// query reads) summed to ~40% of read-path time on a real dataset,
-    /// much of it the *same* node decoded repeatedly (`RETURN n.a, n.b
-    /// ORDER BY n.c` decodes `n` three times).
+    /// shared by both, not private to either. Serves *every* statement:
+    /// read-only ones have one consistent snapshot for their whole
+    /// duration, and write statements stay coherent by evicting a node's
+    /// entry at every site that mutates or deletes that node's record
+    /// (`uncache_node` -- SET/REMOVE on props or labels, node DELETE).
+    /// An earlier version disabled the cache for write statements
+    /// wholesale ("the write path was never the hot case") -- wrong for
+    /// a predicate-driven bulk `DELETE r`, whose MATCH phase
+    /// label-checks both endpoint nodes of every expanded edge: with the
+    /// cache off that's a full node decode per *row* (~380ms of a ~490ms
+    /// statement on the recommendations benchmark, users re-decoded
+    /// ~150x each), with it on it's one decode per *distinct* node.
+    /// Found via a real flamegraph both times: `get_node_in_txn`'s
+    /// postcard decode of the full `NodeRecord` (every property, not
+    /// just the ones a query reads) is the dominant term, much of it the
+    /// *same* node decoded repeatedly (`RETURN n.a, n.b ORDER BY n.c`
+    /// decodes `n` three times).
     ///
-    /// Currently unbounded -- a read-only statement that scans wide
-    /// retains an `Rc<Node>` for every node it touches until the
-    /// statement ends, where the pre-cache code decoded-and-dropped per
-    /// row. On a dataset larger than RAM this can turn a slow query into
-    /// an OOM risk; see mars-kvb for a size-capped follow-up (stop
-    /// inserting past N entries, keep serving existing hits).
+    /// Currently unbounded -- a statement that scans wide retains an
+    /// `Rc<Node>` for every node it touches until the statement ends,
+    /// where the pre-cache code decoded-and-dropped per row. On a
+    /// dataset larger than RAM this can turn a slow query into an OOM
+    /// risk; see mars-kvb for a size-capped follow-up (stop inserting
+    /// past N entries, keep serving existing hits).
     node_cache: RefCell<HashMap<NodeId, Rc<Node>>>,
-    node_cache_enabled: Cell<bool>,
+    /// Whether the executing statement is read-only. Gates the one memo
+    /// entry kind that can go stale mid-write-statement: `prop_id_for`'s
+    /// `None` ("name never interned") answers -- a later `CREATE`/`SET`
+    /// in the same statement can intern that very name. `Some(id)`
+    /// entries are immutable facts and are memoized unconditionally.
+    read_only_stmt: Cell<bool>,
     /// Prop-name -> interned-id memo for the per-property read path
-    /// (`lookup_prop`), sharing `node_cache`'s exact lifecycle and
-    /// enable-gating: cleared at every statement entry point, consulted
-    /// only for read-only statements. A write statement can intern a new
-    /// property name mid-statement (`CREATE (n {fresh: 1})` then a later
-    /// clause reading `c.fresh`), so a memoized "never interned" would go
-    /// stale within that same statement -- write statements look the id up
-    /// fresh per access instead (a single table get, and the write path
-    /// was never the hot case this memo exists for).
+    /// (`lookup_prop`), cleared at every statement entry point alongside
+    /// `node_cache`. See `read_only_stmt` for the `None`-entry gating.
     prop_id_memo: RefCell<HashMap<String, Option<u32>>>,
 }
 
@@ -465,27 +470,38 @@ impl<'a> Executor<'a> {
             store,
             now: Cell::new(None),
             node_cache: RefCell::new(HashMap::new()),
-            node_cache_enabled: Cell::new(false),
+            read_only_stmt: Cell::new(false),
             prop_id_memo: RefCell::new(HashMap::new()),
         }
     }
 
     /// Cached equivalent of `GraphStore::get_node_in_txn` -- see
-    /// `node_cache`'s own docs for why this is safe only when the cache
-    /// is enabled (a read-only statement) and cleared between statements.
+    /// `node_cache`'s own docs. Always caches: write statements keep the
+    /// cache coherent by evicting a node's entry at every site that
+    /// mutates or deletes that node's record (`uncache_node`), so a
+    /// statement that never touches node records -- a predicate-driven
+    /// bulk `DELETE r`, whose MATCH phase label-checks both endpoints of
+    /// every expanded edge -- gets the same per-distinct-node decode a
+    /// read-only statement does instead of a full record decode per row.
     fn get_node_cached(&self, txn: Txn, id: NodeId) -> Result<Option<Rc<Node>>, QueryError> {
-        if self.node_cache_enabled.get() {
-            if let Some(cached) = self.node_cache.borrow().get(&id) {
-                return Ok(Some(Rc::clone(cached)));
-            }
+        if let Some(cached) = self.node_cache.borrow().get(&id) {
+            return Ok(Some(Rc::clone(cached)));
         }
         let node = GraphStore::get_node_in_txn(txn, id)?.map(Rc::new);
-        if self.node_cache_enabled.get() {
-            if let Some(n) = &node {
-                self.node_cache.borrow_mut().insert(id, Rc::clone(n));
-            }
+        if let Some(n) = &node {
+            self.node_cache.borrow_mut().insert(id, Rc::clone(n));
         }
         Ok(node)
+    }
+
+    /// Evict one node from `node_cache`. Every write-path site that
+    /// mutates or deletes an *existing* node's record (SET/REMOVE on
+    /// props or labels, DELETE of the node) must call this with the id
+    /// it just changed -- that eviction is the entire coherence story
+    /// that lets `get_node_cached` serve write statements at all. Node
+    /// *creation* sites don't need it: a fresh id can't have been cached.
+    fn uncache_node(&self, id: NodeId) {
+        self.node_cache.borrow_mut().remove(&id);
     }
 
     fn now_snapshot(&self) -> temporal::NowSnapshot {
@@ -537,7 +553,7 @@ impl<'a> Executor<'a> {
         // for a node a *later* statement mutated.
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
-        self.node_cache_enabled.set(is_read_only(stmt));
+        self.read_only_stmt.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Never opens a WriteTransaction, regardless of what `inner`
             // itself would otherwise mutate -- EXPLAIN describes a plan,
@@ -649,7 +665,7 @@ impl<'a> Executor<'a> {
         // `Executor` last did through the *other* entry point in effect.
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
-        self.node_cache_enabled.set(is_read_only(stmt));
+        self.read_only_stmt.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Same "never mutates" contract as the top-level path -- opens
             // its own ReadTransaction rather than touching the caller's
@@ -1660,7 +1676,7 @@ impl<'a> Executor<'a> {
                     let write_txn = require_write_txn(txn);
                     for row in &current_rows {
                         for item in items {
-                            apply_remove_item(write_txn, row, item)?;
+                            apply_remove_item(self, write_txn, row, item)?;
                         }
                     }
                 }
@@ -4498,13 +4514,16 @@ impl<'a> Executor<'a> {
     /// statements bypass the memo (mid-statement interning would make a
     /// cached `None` stale within the same statement).
     fn prop_id_for(&self, txn: Txn, name: &str) -> Result<Option<u32>, QueryError> {
-        if self.node_cache_enabled.get() {
-            if let Some(cached) = self.prop_id_memo.borrow().get(name) {
-                return Ok(*cached);
-            }
+        if let Some(cached) = self.prop_id_memo.borrow().get(name) {
+            return Ok(*cached);
         }
         let id = GraphStore::lookup_prop_id_in_txn(txn, name)?;
-        if self.node_cache_enabled.get() {
+        // A name -> Some(id) interning is immutable once made, so a hit
+        // is safe to memoize in any statement. A `None` ("never
+        // interned") can go stale *within a write statement* -- a later
+        // `CREATE`/`SET` can intern that very name -- so `None` is only
+        // memoized where nothing can intern: a read-only statement.
+        if id.is_some() || self.read_only_stmt.get() {
             self.prop_id_memo.borrow_mut().insert(name.to_string(), id);
         }
         Ok(id)
@@ -4537,10 +4556,11 @@ impl<'a> Executor<'a> {
             // them). The nested Option from `get_node_prop_in_txn`
             // preserves the deleted-vs-absent split above.
             Binding::Node(id) => {
-                if self.node_cache_enabled.get() {
-                    if let Some(cached) = self.node_cache.borrow().get(id) {
-                        return Ok(cached.props.get(&pa.prop).cloned());
-                    }
+                // Safe for write statements too: every node-mutating
+                // site evicts (`uncache_node`), so a surviving cache
+                // entry is current by construction.
+                if let Some(cached) = self.node_cache.borrow().get(id) {
+                    return Ok(cached.props.get(&pa.prop).cloned());
                 }
                 match self.prop_id_for(txn, &pa.prop)? {
                     Some(prop_id) => Ok(deleted_entity_access(GraphStore::get_node_prop_in_txn(
@@ -5200,47 +5220,87 @@ impl<'a> Executor<'a> {
     ) -> Result<(), QueryError> {
         let mut deleted_edges = HashSet::new();
         let mut pending_nodes = HashSet::new();
-        for row in rows {
-            for target in targets {
-                // A bare variable (`DELETE r, a, b`, by far the common
-                // case) deletes by the raw id already sitting in the row's
-                // `Binding` -- no existence check, no property fetch.
-                // That's what lets `DELETE r, a, b` work when two rows of
-                // the same undirected match both reference the same `a`/
-                // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
-                // row's own dedup lookup must succeed even though the
-                // first row already deleted them. Anything else (`list[0]`,
-                // `map.key`, a whole path variable's *elements* accessed
-                // computedly, ...) has no such raw shortcut and goes
-                // through real evaluation instead -- which correctly does
-                // still error via `deleted_entity_access` if it tries to
-                // read a property off something already gone, since that's
-                // a genuine access, not just a re-statement of identity.
-                if let ReturnExpr::Var(name) = target {
+        // All-bare-variable target lists (`DELETE r`, `DELETE r, a, b` --
+        // by far the common case, and the only shape a predicate-driven
+        // bulk delete produces) never evaluate anything between edge
+        // deletions, so the edge ids can be collected across every row
+        // first and deleted in one `delete_edges_in_txn` batch: one
+        // `WriteCtx` and one label-name resolution per distinct type,
+        // instead of a whole-edge fetch plus a fresh `WriteCtx` (and its
+        // table opens) per edge. Observably identical to deleting
+        // inline -- with no expression evaluation in the loop there is no
+        // read that could distinguish "deleted already" from "deleted at
+        // the end", and `guard`'s deleted-edge-type bookkeeping is only
+        // consulted by later statements. Any computed target (`list[0]`,
+        // `map.key`, ...) falls back to the per-edge path below, whose
+        // immediate deletes are what let a later target's evaluation
+        // correctly error via `deleted_entity_access` on touching an
+        // already-deleted entity.
+        if targets.iter().all(|t| matches!(t, ReturnExpr::Var(_))) {
+            let mut edge_ids: Vec<EdgeId> = Vec::new();
+            for row in rows {
+                for target in targets {
+                    let ReturnExpr::Var(name) = target else {
+                        unreachable!("checked all-Var above");
+                    };
                     let binding = row
                         .get(name)
                         .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
-                    delete_binding(
-                        txn,
+                    collect_delete_binding(
                         binding,
-                        write_txn,
                         &mut deleted_edges,
+                        &mut edge_ids,
                         &mut pending_nodes,
-                        guard,
                     )?;
-                } else {
-                    let value = self.eval_return_expr(txn, target, row, guard)?;
-                    delete_value(
-                        &value,
-                        write_txn,
-                        &mut deleted_edges,
-                        &mut pending_nodes,
-                        guard,
-                    )?;
+                }
+            }
+            for (id, label) in GraphStore::delete_edges_in_txn(write_txn, &edge_ids)? {
+                guard.record_deleted_edge_type(id, label);
+            }
+        } else {
+            for row in rows {
+                for target in targets {
+                    // A bare variable (`DELETE r, a, b`, by far the common
+                    // case) deletes by the raw id already sitting in the row's
+                    // `Binding` -- no existence check, no property fetch.
+                    // That's what lets `DELETE r, a, b` work when two rows of
+                    // the same undirected match both reference the same `a`/
+                    // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
+                    // row's own dedup lookup must succeed even though the
+                    // first row already deleted them. Anything else (`list[0]`,
+                    // `map.key`, a whole path variable's *elements* accessed
+                    // computedly, ...) has no such raw shortcut and goes
+                    // through real evaluation instead -- which correctly does
+                    // still error via `deleted_entity_access` if it tries to
+                    // read a property off something already gone, since that's
+                    // a genuine access, not just a re-statement of identity.
+                    if let ReturnExpr::Var(name) = target {
+                        let binding = row
+                            .get(name)
+                            .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
+                        delete_binding(
+                            txn,
+                            binding,
+                            write_txn,
+                            &mut deleted_edges,
+                            &mut pending_nodes,
+                            guard,
+                        )?;
+                    } else {
+                        let value = self.eval_return_expr(txn, target, row, guard)?;
+                        delete_value(
+                            &value,
+                            write_txn,
+                            &mut deleted_edges,
+                            &mut pending_nodes,
+                            guard,
+                        )?;
+                    }
                 }
             }
         }
         for id in pending_nodes {
+            self.uncache_node(id);
             GraphStore::delete_node_in_txn(write_txn, id, detach)?;
         }
         Ok(())
@@ -5313,7 +5373,7 @@ impl<'a> Executor<'a> {
         let write_txn = require_write_txn(txn);
         for row in rows {
             for item in items {
-                apply_remove_item(write_txn, row, item)?;
+                apply_remove_item(self, write_txn, row, item)?;
             }
         }
         match ret {
@@ -5446,6 +5506,9 @@ impl<'a> Executor<'a> {
                 // just the `Literal::Null` token), not something checkable
                 // from the AST alone -- `SET n.prop = coalesce(x, null)`
                 // must remove the property too if `x` turns out null.
+                if let Some(id) = node_id {
+                    self.uncache_node(id);
+                }
                 if matches!(value, Value::Null) {
                     if let Some(id) = node_id {
                         GraphStore::remove_node_prop_in_txn(write_txn, id, &pa.prop)?;
@@ -5476,6 +5539,7 @@ impl<'a> Executor<'a> {
                     .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
                 match binding {
                     Binding::Node(id) => {
+                        self.uncache_node(*id);
                         for label in labels {
                             GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
                         }
@@ -5511,6 +5575,9 @@ impl<'a> Executor<'a> {
                     return Err(QueryError::UnboundVariable(format!(
                         "'{var}' is a WITH-projected scalar, not a node/edge — SET needs a graph binding"
                     )));
+                }
+                if let Some(id) = node_id {
+                    self.uncache_node(id);
                 }
                 let map_value = self.eval_return_expr(txn, value, row, guard)?;
                 // A map literal is the common case, but real Cypher also
@@ -5627,6 +5694,55 @@ fn record_and_delete_edge(
     Ok(())
 }
 
+/// `delete_binding`'s collect-only twin for the batched all-bare-variable
+/// path in `delete_targets`: identical target-shape rules (nodes pended,
+/// path edges before path nodes, null a no-op, scalar/list/map a type
+/// error), but edge ids go into `edge_ids` (deduped through
+/// `deleted_edges`, preserving first-encounter order) for one
+/// `delete_edges_in_txn` call instead of being deleted one `WriteCtx`
+/// apiece.
+fn collect_delete_binding(
+    binding: &Binding,
+    deleted_edges: &mut HashSet<EdgeId>,
+    edge_ids: &mut Vec<EdgeId>,
+    pending_nodes: &mut HashSet<NodeId>,
+) -> Result<(), QueryError> {
+    match binding {
+        Binding::Node(id) => {
+            pending_nodes.insert(*id);
+        }
+        Binding::Edge(id) => {
+            if deleted_edges.insert(*id) {
+                edge_ids.push(*id);
+            }
+        }
+        Binding::Path(elems) => {
+            for elem in elems {
+                if let PathBinding::Edge(id) = elem {
+                    if deleted_edges.insert(*id) {
+                        edge_ids.push(*id);
+                    }
+                }
+            }
+            for elem in elems {
+                if let PathBinding::Node(id) = elem {
+                    pending_nodes.insert(*id);
+                }
+            }
+        }
+        // A null binding is a real, legal DELETE target -- an `OPTIONAL
+        // MATCH` that didn't match pads its variables with null, and
+        // deleting that is a documented no-op, not an error.
+        Binding::Value(PropertyValue::Null) => {}
+        Binding::Value(_) | Binding::List(_) | Binding::Map(_) => {
+            return Err(QueryError::Type(
+                "DELETE needs a node, relationship, or path, not a scalar/list/map".into(),
+            ))
+        }
+    }
+    Ok(())
+}
+
 fn delete_binding(
     txn: Txn,
     binding: &Binding,
@@ -5724,6 +5840,7 @@ fn delete_value(
 }
 
 fn apply_remove_item(
+    executor: &Executor<'_>,
     write_txn: &WriteTransaction,
     row: &BindingRow,
     item: &RemoveItem,
@@ -5735,6 +5852,7 @@ fn apply_remove_item(
                 .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
             match binding {
                 Binding::Node(id) => {
+                    executor.uncache_node(*id);
                     GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
                 }
                 Binding::Edge(id) => {
@@ -5758,6 +5876,7 @@ fn apply_remove_item(
                 .ok_or_else(|| QueryError::UnboundVariable(var.clone()))?;
             match binding {
                 Binding::Node(id) => {
+                    executor.uncache_node(*id);
                     for label in labels {
                         GraphStore::remove_node_label_in_txn(write_txn, *id, label)?;
                     }

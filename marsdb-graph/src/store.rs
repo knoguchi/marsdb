@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use marsdb_storage::{
@@ -593,7 +593,53 @@ impl GraphStore {
         id: EdgeId,
     ) -> Result<bool, GraphError> {
         let mut ctx = WriteCtx::open(write_txn);
-        Self::delete_edge_ctx(&mut ctx, id)
+        Ok(Self::delete_edge_ctx(&mut ctx, id)?.is_some())
+    }
+
+    /// Batch form of `delete_edge_in_txn`: one `WriteCtx` across every
+    /// id instead of a fresh one (and its table opens) per edge, and the
+    /// deleted edges' label names resolved here — once per distinct
+    /// label id, while the ctx is already open — instead of a separate
+    /// whole-edge fetch per id on the caller's side. Measured ~neutral
+    /// on wall time vs the per-edge path (a scattered bulk delete's cost
+    /// lives in the executor's match phase, not here — sorting the ids
+    /// into per-table passes was tried too and moved nothing), so this
+    /// exists for the API shape: one call for a `DELETE r` statement's
+    /// whole edge set, doing strictly less redundant work. Returns
+    /// `(id, label name)` for each edge that actually existed — an id
+    /// already gone (a duplicate in `ids`, or deleted by an earlier
+    /// statement) is silently skipped, same contract as the single-edge
+    /// form's `false`.
+    pub fn delete_edges_in_txn(
+        write_txn: &WriteTransaction,
+        ids: &[EdgeId],
+    ) -> Result<Vec<(EdgeId, String)>, GraphError> {
+        let mut ctx = WriteCtx::open(write_txn);
+        let mut label_names: HashMap<u32, String> = HashMap::new();
+        let mut deleted = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(label_id) = Self::delete_edge_ctx(&mut ctx, id)? else {
+                continue;
+            };
+            let name = match label_names.entry(label_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let name = ctx
+                        .id_to_label()?
+                        .get(label_id)?
+                        .ok_or_else(|| {
+                            GraphError::CorruptData(format!(
+                                "label id {label_id} has no interned string"
+                            ))
+                        })?
+                        .value()
+                        .to_string();
+                    e.insert(name).clone()
+                }
+            };
+            deleted.push((id, name));
+        }
+        Ok(deleted)
     }
 
     /// Internal, `WriteCtx`-based logic -- `delete_node_in_txn` calls this
@@ -601,14 +647,15 @@ impl GraphStore {
     /// deleted node's incident edges, since it already has its own `ctx`
     /// open for the same transaction; opening a second `WriteCtx` on top of
     /// it would try to open every table twice and hit redb's
-    /// `TableAlreadyOpen`.
-    fn delete_edge_ctx(ctx: &mut WriteCtx, id: EdgeId) -> Result<bool, GraphError> {
+    /// `TableAlreadyOpen`. Returns the deleted edge's label id, `None` if
+    /// the edge didn't exist.
+    fn delete_edge_ctx(ctx: &mut WriteCtx, id: EdgeId) -> Result<Option<u32>, GraphError> {
         let Some(record_bytes) = ctx
             .edges()?
             .remove(id.0)?
             .map(|guard| guard.value().to_vec())
         else {
-            return Ok(false);
+            return Ok(None);
         };
         // Header-only read: adjacency cleanup needs (label, src, dst),
         // never the edge's properties -- skips every prop-name resolution.
@@ -617,7 +664,7 @@ impl GraphStore {
             .remove(crate::model::adj_key(src, label_id, id.0))?;
         ctx.adj_in()?
             .remove(crate::model::adj_key(dst, label_id, id.0))?;
-        Ok(true)
+        Ok(Some(label_id))
     }
 
     /// Delete a node. If `detach` is false and the node has incident edges,
