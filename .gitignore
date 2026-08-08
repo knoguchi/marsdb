@@ -8,3 +8,5 @@ __pycache__/
 /task_tracker.svg
 /social_graph.svg
 /params_and_batch.svg
+.claude/
+.beads/

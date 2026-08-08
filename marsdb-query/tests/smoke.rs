@@ -4049,6 +4049,85 @@ fn never_interned_property_is_null_on_live_nodes_but_still_errors_on_deleted_one
 /// `execute` leaves the cache populated and enabled; a write via
 /// `execute_in_write_transaction` on the *same* `Executor` right after
 /// must not inherit that state.
+/// The Expand->Expand->count(*) fast path must produce byte-identical
+/// results to the generic pipeline. Same collaborative-filtering query
+/// run twice: once in the exact fast-path shape, once with a `WHERE`
+/// predicate the recognizer doesn't accept (forcing the generic path) —
+/// the two must agree on rows AND order. The fixture deliberately
+/// includes the two semantic traps: a duplicate parallel edge (rec == m
+/// must be counted when reached via a *different* edge) and the
+/// single-edge user (whose only path back is the same edge, excluded by
+/// edge isomorphism).
+#[test]
+fn fast_expand_count_matches_generic_path() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (m:Movie {title: 'Target'}), (x:Movie {title: 'X'}), (y:Movie {title: 'Y'}), \
+         (u1:User {name: 'u1'}), (u2:User {name: 'u2'}), (u3:User {name: 'u3'})",
+    );
+    // u1 rates Target and X; u2 rates Target, X, Y; u3 rates ONLY Target
+    // (isomorphism: contributes nothing). u2 also rates Target TWICE
+    // (parallel edge): the second edge makes Target itself reachable as a
+    // recommendation via a different edge — must be counted, not
+    // special-cased away.
+    for stmt in [
+        "MATCH (u:User {name:'u1'}), (m:Movie {title:'Target'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u1'}), (m:Movie {title:'X'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'Target'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'Target'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'X'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u2'}), (m:Movie {title:'Y'}) CREATE (u)-[:RATED]->(m)",
+        "MATCH (u:User {name:'u3'}), (m:Movie {title:'Target'}) CREATE (u)-[:RATED]->(m)",
+    ] {
+        run(&store, stmt);
+    }
+
+    let fast = run(
+        &store,
+        "MATCH (m:Movie {title: 'Target'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \
+         WITH rec, count(*) AS c ORDER BY c DESC LIMIT 5 RETURN rec.title, c",
+    );
+    // Same query with a recognizer-defeating (but semantically inert)
+    // WHERE — routes through the generic pipeline.
+    let generic = run(
+        &store,
+        "MATCH (m:Movie {title: 'Target'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \
+         WHERE rec.title <> '\u{0}never' \
+         WITH rec, count(*) AS c ORDER BY c DESC LIMIT 5 RETURN rec.title, c",
+    );
+    assert_eq!(
+        format!("{:?}", fast.rows),
+        format!("{:?}", generic.rows),
+        "fast path diverged from the generic pipeline"
+    );
+    // And pin the absolute expectation so both being wrong together can't
+    // slip through. X = 3 (once via u1, twice via u2's two Target edges);
+    // Target = 2 (u2's parallel edges cross-count each other: e1->e2 and
+    // e2->e1, both surviving the r1 != r2 isomorphism check); Y = 2 (via
+    // each of u2's Target edges). u3 contributes nothing (its only path
+    // back is its own edge, excluded by isomorphism).
+    let flat: Vec<(String, i64)> = fast
+        .rows
+        .iter()
+        .map(|r| {
+            let title = match &r[0] {
+                Value::Property(marsdb_graph::PropertyValue::String(s)) => s.clone(),
+                other => panic!("unexpected {other:?}"),
+            };
+            let c = match &r[1] {
+                Value::Property(marsdb_graph::PropertyValue::Int(i)) => *i,
+                other => panic!("unexpected {other:?}"),
+            };
+            (title, c)
+        })
+        .collect();
+    assert_eq!(flat.len(), 3);
+    assert_eq!(flat[0], ("X".to_string(), 3));
+    assert_eq!(flat[1].1, 2);
+    assert_eq!(flat[2].1, 2);
+}
+
 #[test]
 fn node_cache_resets_across_the_write_transaction_entry_point_too() {
     let store = GraphStore::open_memory().unwrap();
