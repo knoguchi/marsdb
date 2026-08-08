@@ -15,7 +15,7 @@ pub const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 /// edge_id -> postcard-encoded EdgeRecord.
 pub const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 
-/// Outgoing adjacency as a composite-key plain table (v1.5 step 2):
+/// Outgoing adjacency as a composite-key plain table (v2 step 2):
 /// `(src_node_id, label_id, edge_id)` -> dst node_id. redb tuple keys are
 /// FIXED-WIDTH (mars-am7: erasing fixed-width keys to `&[u8]` measured
 /// +34% file size on this exact codebase — a first cut of this change

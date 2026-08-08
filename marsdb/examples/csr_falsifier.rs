@@ -5,7 +5,7 @@
 //! Workload: crimson_tide_collaborative_filtering's expansion core --
 //! Movie<-[:RATED]-User-[:RATED]->Movie, count per recommended movie --
 //! run (a) through `neighbors_in_txn` (the composite-key B-tree range
-//! path v1.5 ships) and (b) through a CSR built at "statement start"
+//! path v2 ships) and (b) through a CSR built at "statement start"
 //! from the same store. Same algorithm, same counts, only the adjacency
 //! representation differs. Not shipped -- scratch measurement tool.
 //!
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let read = store.begin_read()?;
     let txn = Txn::Read(&read);
 
-    // ---- (a) B-tree range path: the shipped v1.5 expansion ----
+    // ---- (a) B-tree range path: the shipped v2 expansion ----
     let t = Instant::now();
     let mut btree_top = Vec::new();
     for _ in 0..iters {

@@ -174,7 +174,7 @@ pub struct AdjEntry {
     pub label_id: u32,
 }
 
-/// Composite-key layout for `ADJ_OUT`/`ADJ_IN` (v1.5 step 2):
+/// Composite-key layout for `ADJ_OUT`/`ADJ_IN` (v2 step 2):
 /// `(owner_node, label_id, edge_id)` tuple key -> other node id as the
 /// value. A redb tuple of fixed-width integers stays fixed-width (a
 /// byte-packed `[u8; 20]` key here measured a 2x database file — the

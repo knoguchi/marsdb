@@ -358,16 +358,16 @@ scan it should filter) — both already landed, see `CHANGELOG.md`.
 - No benchmarks for `REMOVE`, `SET`-label, or the `STARTS WITH`/`ENDS
   WITH`/`CONTAINS` string predicates yet.
 
-## v1.5 format changes: end-to-end gate (recommendations dataset, 2026-08-08)
+## v2 format changes: end-to-end gate (recommendations dataset, 2026-08-08)
 
 Real 28,863-node / recommendations dataset (marsdb-demo), 9,771-statement
 parameterized load via group commit (`group_size=1000`), 100x
 `queries.cypher` via `run_named_queries`. Same machine, same run session,
-main (`0ea4c19`) vs the v1.5 branch (directory record format + interned
+main (`0ea4c19`) vs the v2 branch (directory record format + interned
 prop-id per-property reads + composite-tuple-key adjacency). Two query
 runs per side, both reported.
 
-| | main | v1.5 |
+| | main | v2 |
 |---|---|---|
 | load (param replay, 9,771 stmts) | 5.34s | 5.60-6.41s |
 | 100x read queries | 12.81s / 12.57s | 10.99s / 10.91s (**1.16x**) |
@@ -384,7 +384,8 @@ Notes, measured not asserted:
   every create). Acceptable; group commit still dominates.
 - File size: first cut of the composite adjacency key byte-packed it as
   `&[u8]` and measured a **2x database file** (145.9MB) — the same
-  fixed-width-erasure tax measured on the v2 abstraction branch
-  (mars-am7, +34%) — fixed by switching to redb tuple keys
+  fixed-width-erasure tax measured on the (since-abandoned) hand-rolled
+  storage-engine branch (mars-am7, +34%) — fixed by switching to redb
+  tuple keys
   `(u64, u32, u64)` before merge. Recorded because it's the second time
   this exact mistake was made in this codebase.

@@ -4528,7 +4528,7 @@ impl<'a> Executor<'a> {
             // scenario [15]), not a silent null. These are two different
             // kinds of "missing" and must not be collapsed into one.
             //
-            // Per-property read path (v1.5 step 1b): a node already
+            // Per-property read path (v2 step 1b): a node already
             // materialized in this statement's cache answers from the map;
             // otherwise this reads ONE directory entry from the stored
             // record -- no full decode, no name resolution, no cache
