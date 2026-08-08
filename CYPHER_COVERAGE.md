@@ -283,6 +283,19 @@ atomic unit. Not valid inside a caller-owned `Database::begin_transaction`
 handle (that API has its own `commit()`/`rollback()` methods) or
 `execute_batch_grouped` (whose grouping is its own transaction policy).
 
+An open session transaction holds the storage engine's single writer, so
+an abandoned one blocks every other writer in the process.
+`Database::set_session_transaction_timeout` (off by default, like the
+equivalent knobs real deployments ship) mitigates: a session transaction
+idle past the limit is rolled back by the next statement to arrive, which
+gets an explicit `SessionTransactionTimedOut` error rather than a
+misleading "no open transaction".
+
+Isolation: read-only statements outside a transaction run on MVCC
+snapshots (snapshot isolation, non-blocking, parallel); writers are
+serialized by the storage engine's single-writer lock. Single writer +
+snapshot readers = serializable — there is no weaker level to configure.
+
 ## Error taxonomy
 
 `QueryError` is typed, not one flat string:

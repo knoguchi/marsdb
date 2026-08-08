@@ -161,3 +161,87 @@ fn explain_of_a_session_statement_errors() {
     let db = Database::in_memory().unwrap();
     assert!(db.execute("EXPLAIN BEGIN").is_err());
 }
+
+#[test]
+fn idle_timeout_rolls_back_and_reports_on_the_next_statement() {
+    let db = Database::in_memory().unwrap();
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(50)));
+    db.execute("BEGIN").unwrap();
+    db.execute("CREATE (:N)").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let err = db.execute("COMMIT").unwrap_err();
+    assert!(
+        matches!(err, marsdb::Error::SessionTransactionTimedOut { .. }),
+        "expected the explicit timeout error, got: {err}"
+    );
+    // Transaction gone, its writes discarded, session usable again.
+    assert_eq!(count(&db), 0);
+    db.execute("CREATE (:N)").unwrap();
+    assert_eq!(count(&db), 1);
+}
+
+#[test]
+fn activity_refreshes_the_idle_clock() {
+    let db = Database::in_memory().unwrap();
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(200)));
+    db.execute("BEGIN").unwrap();
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        db.execute("CREATE (:N)").unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count(&db), 3);
+}
+
+#[test]
+fn timeout_discovered_by_a_plain_statement_not_just_commit() {
+    let db = Database::in_memory().unwrap();
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(50)));
+    db.execute("BEGIN").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(matches!(
+        db.execute("CREATE (:N)").unwrap_err(),
+        marsdb::Error::SessionTransactionTimedOut { .. }
+    ));
+    // The discovering statement paid the error; the next one autocommits.
+    db.execute("CREATE (:N)").unwrap();
+    assert_eq!(count(&db), 1);
+}
+
+#[test]
+fn clearing_the_timeout_disables_expiry() {
+    let db = Database::in_memory().unwrap();
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(20)));
+    db.set_session_transaction_timeout(None);
+    db.execute("BEGIN").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    db.execute("CREATE (:N)").unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count(&db), 1);
+}
+
+#[test]
+fn expiring_the_session_transaction_unblocks_a_waiting_writer() {
+    use std::sync::Arc;
+    // A caller-owned begin_transaction() blocks on redb's single writer
+    // while the session transaction is open; expiry (triggered here by
+    // the session's own next statement) must release it.
+    let db = Arc::new(Database::in_memory().unwrap());
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(50)));
+    db.execute("BEGIN").unwrap();
+
+    let db2 = Arc::clone(&db);
+    let waiter = std::thread::spawn(move || {
+        let mut txn = db2.begin_transaction().unwrap(); // blocks until expiry
+        txn.execute("CREATE (:FromWaiter)").unwrap();
+        txn.commit().unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(matches!(
+        db.execute("MATCH (n) RETURN n").unwrap_err(),
+        marsdb::Error::SessionTransactionTimedOut { .. }
+    ));
+    waiter.join().unwrap();
+    assert_eq!(count(&db), 1);
+}
