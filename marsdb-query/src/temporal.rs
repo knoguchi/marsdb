@@ -16,9 +16,7 @@
 //! README's "Cypher coverage" section for the exact list of what that
 //! leaves out of TCK's `expressions/temporal` suite.
 
-use chrono::{
-    Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike,
-};
+use chrono::{LocalResult, NaiveDateTime, Offset, TimeZone, Timelike};
 
 /// A `DateTime`'s zone -- a plain, `marsdb_graph`-independent mirror of
 /// `PropertyValue::DateTime`'s own `zone: marsdb_graph::model::TzId`
@@ -45,20 +43,145 @@ const AVG_MONTH_DAYS: f64 = 365.2425 / 12.0;
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 
-/// `PropertyValue::Date`'s epoch-day origin -- 1970-01-01, matching the
-/// same convention `std::time::UNIX_EPOCH`/most other systems use, so
-/// nothing here needs to remember an unusual offset.
-fn epoch() -> NaiveDate {
-    NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date")
+// ---------------------------------------------------------------------
+// Proleptic-Gregorian civil-calendar core (Howard Hinnant's algorithms)
+// ---------------------------------------------------------------------
+// Pure i64 integer math, deliberately not chrono: chrono's `NaiveDate`
+// caps years at ±262_143, far short of Cypher's ±999_999_999 (ISO 8601
+// expanded years -- TCK Temporal10 [9]/[10] exercises the full range).
+// chrono remains only for `capture_now` and named-IANA-zone resolution
+// (which is inherently bounded by chrono-tz's own range; a named zone at
+// year ±10^9 has no meaningful IANA data anyway). Epoch-day origin is
+// 1970-01-01, same as `std::time::UNIX_EPOCH`.
+
+/// Cypher's documented year range (java.time's, which real Cypher
+/// mirrors). Every constructor validates against it; epoch days for
+/// this range (±365 billion) always fit i64 with room for nanosecond
+/// totals in i128.
+pub const MIN_YEAR: i64 = -999_999_999;
+pub const MAX_YEAR: i64 = 999_999_999;
+
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
-pub fn epoch_day_from_ymd(year: i32, month: u32, day: u32) -> Option<i32> {
-    let d = NaiveDate::from_ymd_opt(year, month, day)?;
-    Some(d.signed_duration_since(epoch()).num_days() as i32)
+fn last_day_of_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
-fn date_from_epoch_day(epoch_day: i32) -> NaiveDate {
-    epoch() + chrono::Duration::days(epoch_day as i64)
+/// Epoch days for an already-validated civil y/m/d.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - (m <= 2) as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m as i64 + 9) % 12; // March=0 .. February=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of `days_from_civil`: `(year, month, day)` for an epoch day.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (y + (m <= 2) as i64, m, d)
+}
+
+/// ISO weekday, 1=Monday..7=Sunday (1970-01-01 was a Thursday, 4).
+fn iso_weekday_from_days(z: i64) -> i64 {
+    (z + 3).rem_euclid(7) + 1
+}
+
+fn ordinal_day_of(y: i64, m: u32, d: u32) -> i64 {
+    days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1
+}
+
+fn days_in_year(y: i64) -> i64 {
+    if is_leap_year(y) {
+        366
+    } else {
+        365
+    }
+}
+
+/// ISO 8601 week count for a week-numbering year: 53 iff Jan 1 falls on
+/// a Thursday, or on a Wednesday of a leap year; else 52.
+fn iso_weeks_in_year(y: i64) -> i64 {
+    let jan1 = iso_weekday_from_days(days_from_civil(y, 1, 1));
+    if jan1 == 4 || (is_leap_year(y) && jan1 == 3) {
+        53
+    } else {
+        52
+    }
+}
+
+/// `(iso_week_year, iso_week)` for an epoch day -- the week-numbering
+/// year diverges from the calendar year near a year boundary.
+fn iso_week_of(z: i64) -> (i64, i64) {
+    let (y, m, d) = civil_from_days(z);
+    let doy = ordinal_day_of(y, m, d);
+    let wd = iso_weekday_from_days(z);
+    let week = (doy - wd + 10) / 7;
+    if week < 1 {
+        (y - 1, iso_weeks_in_year(y - 1))
+    } else if week > iso_weeks_in_year(y) {
+        (y + 1, 1)
+    } else {
+        (y, week)
+    }
+}
+
+/// The Monday of ISO week 1 of `week_year` -- January 4 is always in
+/// week 1, so it anchors the calculation.
+fn iso_week1_monday(week_year: i64) -> i64 {
+    let jan4 = days_from_civil(week_year, 1, 4);
+    jan4 - (iso_weekday_from_days(jan4) - 1)
+}
+
+/// Calendar month shift with end-of-month clamping (Jan 31 + 1 month =
+/// Feb 28/29, not an error and not Mar 3) -- the same rule
+/// `checked_add_months` had when this was chrono-backed.
+fn add_months_to_epoch_day(z: i64, months: i64) -> Option<i64> {
+    let (y, m, d) = civil_from_days(z);
+    let total = y
+        .checked_mul(12)?
+        .checked_add(m as i64 - 1)?
+        .checked_add(months)?;
+    let ny = total.div_euclid(12);
+    let nm = total.rem_euclid(12) as u32 + 1;
+    if !(MIN_YEAR..=MAX_YEAR).contains(&ny) {
+        return None;
+    }
+    let nd = d.min(last_day_of_month(ny, nm));
+    Some(days_from_civil(ny, nm, nd))
+}
+
+pub fn epoch_day_from_ymd(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    if day < 1 || day > last_day_of_month(year, month) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
 }
 
 /// A single captured instant, pre-derived into every shape a no-arg
@@ -71,7 +194,7 @@ fn date_from_epoch_day(epoch_day: i32) -> NaiveDate {
 /// is what makes that guarantee hold even within a single construction.
 #[derive(Clone, Copy)]
 pub struct NowSnapshot {
-    pub epoch_day: i32,
+    pub epoch_day: i64,
     pub nanos_of_day: i64,
     pub epoch_seconds: i64,
     pub nanos: i32,
@@ -90,23 +213,28 @@ pub fn capture_now() -> NowSnapshot {
     }
 }
 
-pub fn format_date(epoch_day: i32) -> String {
-    let d = date_from_epoch_day(epoch_day);
-    // `{:04}` pads a positive year to at least 4 digits (real Cypher/ISO-
-    // 8601's normal case); a negative or >9999 year prints with however
-    // many digits it needs rather than a fixed width -- MarsDB doesn't
-    // claim exact ISO-8601 extended-year formatting, just enough to
-    // round-trip through `parse_date` for the realistic years the TCK
-    // (and any real workload) actually exercises.
-    format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())
+pub fn format_date(epoch_day: i64) -> String {
+    let (y, m, d) = civil_from_days(epoch_day);
+    if (0..=9999).contains(&y) {
+        format!("{y:04}-{m:02}-{d:02}")
+    } else {
+        // ISO 8601 expanded year: explicit sign outside 0000..=9999
+        // (`+999999999-12-31`, `-999999999-01-01`) -- round-trips
+        // through `parse_date`'s own sign handling.
+        format!("{y:+}-{m:02}-{d:02}")
+    }
 }
 
 /// Parses every date string form MarsDB supports: the plain calendar
 /// forms `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY` (missing
 /// month/day default to `1`), ISO week-date `YYYY-Www[-D]`/`YYYYWww[D]`
-/// (missing day defaults to `1`), and ordinal-date `YYYY-DDD`/`YYYYDDD`
-/// (see `parse_week_or_ordinal_date`).
-pub fn parse_date(s: &str) -> Option<i32> {
+/// (missing day defaults to `1`), ordinal-date `YYYY-DDD`/`YYYYDDD`
+/// (see `parse_week_or_ordinal_date`), and ISO 8601 expanded years --
+/// an explicit leading sign with up to 9 year digits
+/// (`'-999999999-01-01'`, `'+999999999-12-31'`, TCK Temporal10
+/// [9]/[10]). The sign is stripped here and applied to whichever year
+/// field the body then parses (calendar, week, or ordinal alike).
+pub fn parse_date(s: &str) -> Option<i64> {
     let s = s.trim();
     // The compact forms below use byte offsets because their grammar is
     // ASCII-only. Reject non-ASCII input before slicing so malformed user
@@ -114,16 +242,21 @@ pub fn parse_date(s: &str) -> Option<i32> {
     if !s.is_ascii() {
         return None;
     }
+    let (year_sign, s) = match s.as_bytes().first()? {
+        b'+' => (1i64, &s[1..]),
+        b'-' => (-1i64, &s[1..]),
+        _ => (1, s),
+    };
     // ISO week-date (`YYYY-Www[-D]` / `YYYYWww[D]`) and ordinal-date
     // (`YYYY-DDD` / `YYYYDDD`) forms -- checked before the plain calendar
     // forms below since a `W` unambiguously marks a week-date, and a
     // 7-digit no-`-` run is ordinal (a plain compact calendar date is
     // either 4, 6, or 8 digits, never 7).
-    if let Some(epoch_day) = parse_week_or_ordinal_date(s) {
+    if let Some(epoch_day) = parse_week_or_ordinal_date(s, year_sign) {
         return Some(epoch_day);
     }
     let (year, month, day) = if let Some((y, rest)) = s.split_once('-') {
-        let year: i32 = y.parse().ok()?;
+        let year: i64 = y.parse().ok()?;
         match rest.split_once('-') {
             Some((m, d)) => (year, m.parse().ok()?, d.parse().ok()?),
             None => (year, rest.parse().ok()?, 1),
@@ -140,47 +273,47 @@ pub fn parse_date(s: &str) -> Option<i32> {
             _ => return None,
         }
     };
-    epoch_day_from_ymd(year, month, day)
+    epoch_day_from_ymd(year_sign * year, month, day)
 }
 
 /// ISO week-date (`YYYY-Www[-D]` / `YYYYWww[D]`, day defaults to `1` when
 /// omitted) and ordinal-date (`YYYY-DDD` / `YYYYDDD`) string forms --
 /// `None` for anything not matching one of these two shapes (the plain
 /// calendar forms fall through to `parse_date`'s own parsing).
-fn parse_week_or_ordinal_date(s: &str) -> Option<i32> {
+fn parse_week_or_ordinal_date(s: &str, year_sign: i64) -> Option<i64> {
     if let Some((y, rest)) = s.split_once('-') {
         if let Some(w) = rest.strip_prefix('W') {
-            let week_year: i32 = y.parse().ok()?;
+            let week_year: i64 = y.parse().ok()?;
             let (week, day) = match w.split_once('-') {
                 Some((w, d)) => (w.parse().ok()?, d.parse().ok()?),
                 None => (w.parse().ok()?, 1),
             };
-            return epoch_day_from_week_fields(week_year, week, day);
+            return epoch_day_from_week_fields(year_sign * week_year, week, day);
         }
         // `YYYY-DDD` -- an ordinal date, distinguished from the plain
         // `YYYY-MM` calendar form by `rest`'s length (3 digits, not 2).
         if rest.len() == 3 && rest.bytes().all(|b| b.is_ascii_digit()) {
-            let year: i32 = y.parse().ok()?;
+            let year: i64 = y.parse().ok()?;
             let ordinal: u32 = rest.parse().ok()?;
-            return epoch_day_from_ordinal_fields(year, ordinal);
+            return epoch_day_from_ordinal_fields(year_sign * year, ordinal);
         }
         return None;
     }
     if s.len() >= 5 {
         if let Some(w) = s[4..].strip_prefix('W') {
-            let week_year: i32 = s[0..4].parse().ok()?;
+            let week_year: i64 = s[0..4].parse().ok()?;
             let (week, day) = match w.len() {
                 2 => (w.parse().ok()?, 1),
                 3 => (w[0..2].parse().ok()?, w[2..3].parse().ok()?),
                 _ => return None,
             };
-            return epoch_day_from_week_fields(week_year, week, day);
+            return epoch_day_from_week_fields(year_sign * week_year, week, day);
         }
     }
     if s.len() == 7 && s.bytes().all(|b| b.is_ascii_digit()) {
-        let year: i32 = s[0..4].parse().ok()?;
+        let year: i64 = s[0..4].parse().ok()?;
         let ordinal: u32 = s[4..7].parse().ok()?;
-        return epoch_day_from_ordinal_fields(year, ordinal);
+        return epoch_day_from_ordinal_fields(year_sign * year, ordinal);
     }
     None
 }
@@ -193,38 +326,21 @@ fn parse_week_or_ordinal_date(s: &str) -> Option<i32> {
 /// property name this doesn't recognize (the caller treats that the same
 /// as a missing property, matching every other `.prop` access in this
 /// codebase).
-pub fn date_component(epoch_day: i32, prop: &str) -> Option<i64> {
-    let d = date_from_epoch_day(epoch_day);
+pub fn date_component(epoch_day: i64, prop: &str) -> Option<i64> {
+    let (y, m, d) = civil_from_days(epoch_day);
     Some(match prop {
-        "year" => d.year() as i64,
-        "month" => d.month() as i64,
-        "day" => d.day() as i64,
-        "quarter" => ((d.month() - 1) / 3 + 1) as i64,
-        "ordinalDay" => d.ordinal() as i64,
-        "weekDay" | "dayOfWeek" => d.weekday().number_from_monday() as i64,
-        "week" => d.iso_week().week() as i64,
-        "weekYear" => d.iso_week().year() as i64,
+        "year" => y,
+        "month" => m as i64,
+        "day" => d as i64,
+        "quarter" => ((m - 1) / 3 + 1) as i64,
+        "ordinalDay" => ordinal_day_of(y, m, d),
+        "weekDay" | "dayOfWeek" => iso_weekday_from_days(epoch_day),
+        "week" => iso_week_of(epoch_day).1,
+        "weekYear" => iso_week_of(epoch_day).0,
         "dayOfQuarter" => {
-            let quarter_start_month = (d.month() - 1) / 3 * 3 + 1;
-            let quarter_start = NaiveDate::from_ymd_opt(d.year(), quarter_start_month, 1)?;
-            d.signed_duration_since(quarter_start).num_days() + 1
+            let quarter_start_month = (m - 1) / 3 * 3 + 1;
+            epoch_day - days_from_civil(y, quarter_start_month, 1) + 1
         }
-        _ => return None,
-    })
-}
-
-/// ISO week-date's `1..=7` (Monday=1) -> chrono's `Weekday`, the inverse
-/// of `date_component`'s `"dayOfWeek"` (`number_from_monday`).
-fn weekday_from_iso_number(n: i64) -> Option<chrono::Weekday> {
-    use chrono::Weekday::*;
-    Some(match n {
-        1 => Mon,
-        2 => Tue,
-        3 => Wed,
-        4 => Thu,
-        5 => Fri,
-        6 => Sat,
-        7 => Sun,
         _ => return None,
     })
 }
@@ -235,30 +351,38 @@ fn weekday_from_iso_number(n: i64) -> Option<chrono::Weekday> {
 /// calendar year of the resulting date (they diverge near a year
 /// boundary -- e.g. week-year 1817 week 1 day 2 is calendar date
 /// 1816-12-31, TCK's Temporal1 [1]).
-pub fn epoch_day_from_week_fields(week_year: i32, week: u32, day_of_week: i64) -> Option<i32> {
-    let weekday = weekday_from_iso_number(day_of_week)?;
-    let d = NaiveDate::from_isoywd_opt(week_year, week, weekday)?;
-    Some(d.signed_duration_since(epoch()).num_days() as i32)
+pub fn epoch_day_from_week_fields(week_year: i64, week: u32, day_of_week: i64) -> Option<i64> {
+    if !(MIN_YEAR..=MAX_YEAR).contains(&week_year)
+        || !(1..=7).contains(&day_of_week)
+        || week < 1
+        || week as i64 > iso_weeks_in_year(week_year)
+    {
+        return None;
+    }
+    Some(iso_week1_monday(week_year) + (week as i64 - 1) * 7 + (day_of_week - 1))
 }
 
 /// Constructs an epoch-day from a calendar year plus an ordinal day
 /// (`1..=365`/`366`) -- the inverse of `date_component`'s `"ordinalDay"`.
-pub fn epoch_day_from_ordinal_fields(year: i32, ordinal_day: u32) -> Option<i32> {
-    let d = NaiveDate::from_yo_opt(year, ordinal_day)?;
-    Some(d.signed_duration_since(epoch()).num_days() as i32)
+pub fn epoch_day_from_ordinal_fields(year: i64, ordinal_day: u32) -> Option<i64> {
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year)
+        || ordinal_day < 1
+        || ordinal_day as i64 > days_in_year(year)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, 1, 1) + ordinal_day as i64 - 1)
 }
 
 /// Constructs an epoch-day from a calendar year, quarter (`1..=4`), and
 /// day-of-quarter (`1`-based) -- the inverse of `date_component`'s
 /// `"quarter"`/`"dayOfQuarter"`.
-pub fn epoch_day_from_quarter_fields(year: i32, quarter: u32, day_of_quarter: i64) -> Option<i32> {
-    if !(1..=4).contains(&quarter) {
+pub fn epoch_day_from_quarter_fields(year: i64, quarter: u32, day_of_quarter: i64) -> Option<i64> {
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year) || !(1..=4).contains(&quarter) {
         return None;
     }
     let quarter_start_month = (quarter - 1) * 3 + 1;
-    let quarter_start = NaiveDate::from_ymd_opt(year, quarter_start_month, 1)?;
-    let d = quarter_start.checked_add_signed(chrono::Duration::days(day_of_quarter - 1))?;
-    Some(d.signed_duration_since(epoch()).num_days() as i32)
+    Some(days_from_civil(year, quarter_start_month, 1) + (day_of_quarter - 1))
 }
 
 /// Adds a `Duration` to a `Date` via real calendar month arithmetic
@@ -285,13 +409,13 @@ pub fn epoch_day_from_quarter_fields(year: i32, quarter: u32, day_of_quarter: i6
 /// provides truncates to that lower precision" -- Date's precision floor
 /// is one day.
 pub fn add_duration_to_date(
-    epoch_day: i32,
+    epoch_day: i64,
     months: i64,
     days: i64,
     seconds: i64,
     nanos: i32,
     negate: bool,
-) -> Option<i32> {
+) -> Option<i64> {
     let total_ns: i128 = seconds as i128 * NANOS_PER_SEC + nanos as i128;
     let extra_days = (total_ns / (86_400 * NANOS_PER_SEC)) as i64;
     let days = days.checked_add(extra_days)?;
@@ -300,14 +424,14 @@ pub fn add_duration_to_date(
     } else {
         (months, days)
     };
-    let d = date_from_epoch_day(epoch_day);
-    let with_months = if months >= 0 {
-        d.checked_add_months(chrono::Months::new(months.try_into().ok()?))?
-    } else {
-        d.checked_sub_months(chrono::Months::new(months.checked_neg()?.try_into().ok()?))?
-    };
-    let result = with_months.checked_add_signed(chrono::Duration::try_days(days)?)?;
-    Some(result.signed_duration_since(epoch()).num_days() as i32)
+    let result = add_months_to_epoch_day(epoch_day, months)?.checked_add(days)?;
+    // Keep the result inside Cypher's year range -- the chrono-backed
+    // version got this via NaiveDate's own (smaller) range failing.
+    let (y, _, _) = civil_from_days(result);
+    if !(MIN_YEAR..=MAX_YEAR).contains(&y) {
+        return None;
+    }
+    Some(result)
 }
 
 /// The four independently-signed components of a normalized `Duration`,
@@ -981,20 +1105,20 @@ pub fn format_time(nanos_of_day: i64, offset_seconds: i32) -> String {
 /// still gets a `nanos_of_day` in `0..NANOS_PER_DAY` (Rust's `%` on a
 /// negative dividend returns a negative remainder, which would put the
 /// "same calendar day" one day off).
-pub fn split_epoch_seconds(epoch_seconds: i64) -> (i32, i64) {
-    let epoch_day = epoch_seconds.div_euclid(SECONDS_PER_DAY) as i32;
+pub fn split_epoch_seconds(epoch_seconds: i64) -> (i64, i64) {
+    let epoch_day = epoch_seconds.div_euclid(SECONDS_PER_DAY);
     let secs_of_day = epoch_seconds.rem_euclid(SECONDS_PER_DAY);
     (epoch_day, secs_of_day * 1_000_000_000)
 }
 
-pub fn combine_epoch_day_and_nanos_of_day(epoch_day: i32, nanos_of_day: i64) -> i64 {
-    epoch_day as i64 * SECONDS_PER_DAY + nanos_of_day / 1_000_000_000
+pub fn combine_epoch_day_and_nanos_of_day(epoch_day: i64, nanos_of_day: i64) -> i64 {
+    epoch_day * SECONDS_PER_DAY + nanos_of_day / 1_000_000_000
 }
 
 /// Combines an `(epoch_day, nanos_of_day)` pair into `LocalDateTime`'s
 /// own `(epoch_seconds, nanos)` storage shape -- shared by `<type>.
 /// truncate()`'s date+time recombination step.
-pub fn combine_date_and_time(epoch_day: i32, nanos_of_day: i64) -> (i64, i32) {
+pub fn combine_date_and_time(epoch_day: i64, nanos_of_day: i64) -> (i64, i32) {
     (
         combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day),
         (nanos_of_day % 1_000_000_000) as i32,
@@ -1007,7 +1131,7 @@ pub fn combine_date_and_time(epoch_day: i32, nanos_of_day: i64) -> (i64, i32) {
 /// matching this codebase's established convention for that lint (see
 /// e.g. `executor.rs`'s `VarExpandSpec`/`IndexSeekSpec`).
 pub struct CalendarDateTime {
-    pub year: i32,
+    pub year: i64,
     pub month: u32,
     pub day: u32,
     pub hour: i64,
@@ -1045,7 +1169,7 @@ pub fn date_time_from_fields(f: CalendarDateTime, zone: &TzId) -> Option<(i64, i
             let tz = parse_timezone_name(name)?;
             let epoch_day = epoch_day_from_ymd(f.year, f.month, f.day)?;
             let nanos_of_day = local_time_nanos_from_fields(f.hour, f.minute, f.second, f.nanos)?;
-            let naive = naive_datetime_from(epoch_day, nanos_of_day);
+            let naive = chrono_naive_from(epoch_day, nanos_of_day)?;
             let (epoch_seconds, _offset) = utc_from_local_and_named_zone(naive, tz)?;
             Some((epoch_seconds, (nanos_of_day % 1_000_000_000) as i32))
         }
@@ -1054,12 +1178,21 @@ pub fn date_time_from_fields(f: CalendarDateTime, zone: &TzId) -> Option<(i64, i
 
 /// Parses `YYYY-MM-DDTHH:MM:SS.fff` (and the compact/date-only-precision
 /// variants `parse_date` already supports for the date half) into a
-/// naive `(epoch_seconds, nanos)` instant.
+/// naive `(epoch_seconds, nanos)` instant. A date-only string (no `T`)
+/// is also accepted, reading as midnight -- real Cypher's
+/// `localdatetime('-999999999-01-01')` (TCK Temporal10 [10]).
 pub fn parse_local_date_time(s: &str) -> Option<(i64, i32)> {
     let s = s.trim();
-    let (date_part, time_part) = s.split_once('T')?;
+    let (date_part, time_part) = match s.split_once('T') {
+        Some(parts) => parts,
+        None => (s, ""),
+    };
     let epoch_day = parse_date(date_part)?;
-    let nanos_of_day = parse_time_of_day(time_part)?;
+    let nanos_of_day = if time_part.is_empty() {
+        0
+    } else {
+        parse_time_of_day(time_part)?
+    };
     Some((
         combine_epoch_day_and_nanos_of_day(epoch_day, nanos_of_day),
         (nanos_of_day % 1_000_000_000) as i32,
@@ -1102,7 +1235,7 @@ pub fn parse_date_time(s: &str) -> Option<(i64, i32, TzId)> {
         }
         (None, Some(zone_str)) => {
             let tz = parse_timezone_name(zone_str)?;
-            let naive = naive_datetime_from(epoch_day, nanos_of_day);
+            let naive = chrono_naive_from(epoch_day, nanos_of_day)?;
             let (epoch_seconds, _offset) = utc_from_local_and_named_zone(naive, tz)?;
             Some((
                 epoch_seconds,
@@ -1204,13 +1337,7 @@ pub fn add_duration_to_local_date_time(
         (months, days, seconds, nanos)
     };
     let (epoch_day, nanos_of_day) = split_epoch_seconds(epoch_seconds);
-    let d = date_from_epoch_day(epoch_day);
-    let with_months = if months >= 0 {
-        d.checked_add_months(chrono::Months::new(months.try_into().ok()?))?
-    } else {
-        d.checked_sub_months(chrono::Months::new(months.checked_neg()?.try_into().ok()?))?
-    };
-    let new_epoch_day = with_months.signed_duration_since(epoch()).num_days();
+    let new_epoch_day = add_months_to_epoch_day(epoch_day, months)?;
 
     let total_ns: i128 = nanos_of_day as i128
         + existing_nanos as i128
@@ -1307,14 +1434,29 @@ fn utc_from_local_and_named_zone(naive: NaiveDateTime, tz: chrono_tz::Tz) -> Opt
 
 const NANOS_PER_DAY_I64: i64 = SECONDS_PER_DAY * 1_000_000_000;
 
-fn naive_datetime_from(epoch_day: i32, nanos_of_day: i64) -> NaiveDateTime {
-    let secs = (nanos_of_day / 1_000_000_000) as u32;
-    let nanos = (nanos_of_day % 1_000_000_000) as u32;
-    NaiveDateTime::new(
-        date_from_epoch_day(epoch_day),
-        NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
-            .expect("nanos_of_day is always in 0..NANOS_PER_DAY by construction"),
-    )
+/// A civil (zone-less) date-time as this module's own pair -- replaces
+/// chrono's `NaiveDateTime` in the `duration.between` core so the full
+/// ±999_999_999-year range works (see the civil-core section's docs).
+#[derive(Clone, Copy)]
+struct CivilDateTime {
+    epoch_day: i64,
+    nanos_of_day: i64,
+}
+
+/// Total nanoseconds since the epoch -- i128 because the full year
+/// range's span (~6.3e25 ns) far exceeds i64.
+fn civil_total_ns(dt: CivilDateTime) -> i128 {
+    dt.epoch_day as i128 * NANOS_PER_DAY_I64 as i128 + dt.nanos_of_day as i128
+}
+
+/// `NaiveDateTime` for the chrono-backed named-zone paths only -- `None`
+/// outside chrono's own ±262k-year range (a named IANA zone has no
+/// meaningful data at such years; fixed offsets never come through
+/// here).
+fn chrono_naive_from(epoch_day: i64, nanos_of_day: i64) -> Option<NaiveDateTime> {
+    let secs = epoch_day.checked_mul(SECONDS_PER_DAY)? + nanos_of_day / 1_000_000_000;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, (nanos_of_day % 1_000_000_000) as u32)
+        .map(|utc| utc.naive_utc())
 }
 
 /// `java.time`'s `LocalDate`-difference-in-whole-months primitive
@@ -1323,28 +1465,25 @@ fn naive_datetime_from(epoch_day: i32, nanos_of_day: i64) -> NaiveDateTime {
 /// `proleptic_month * 32 + day_of_month` value (32 safely exceeds any
 /// month's real day count) so one integer division gives the exact
 /// whole-month count, day-of-month aware, without a real calendar walk.
-fn proleptic_month(d: NaiveDate) -> i64 {
-    d.year() as i64 * 12 + d.month() as i64 - 1
+fn packed_proleptic(epoch_day: i64) -> i64 {
+    let (y, m, d) = civil_from_days(epoch_day);
+    (y * 12 + m as i64 - 1) * 32 + d as i64
 }
 
-fn months_between_dates(a: NaiveDate, b: NaiveDate) -> i64 {
-    let packed_a = proleptic_month(a) * 32 + a.day() as i64;
-    let packed_b = proleptic_month(b) * 32 + b.day() as i64;
-    (packed_b - packed_a) / 32
+fn months_between_days(a: i64, b: i64) -> i64 {
+    (packed_proleptic(b) - packed_proleptic(a)) / 32
 }
 
 /// Adds `months` to `dt`'s *date* only (real calendar month arithmetic,
 /// clamping to the shorter month's last day, same as
 /// `add_duration_to_date`), keeping the time-of-day unchanged.
-fn shift_months(dt: NaiveDateTime, months: i64) -> NaiveDateTime {
-    let d = dt.date();
-    let shifted = if months >= 0 {
-        d.checked_add_months(chrono::Months::new(months as u32))
-    } else {
-        d.checked_sub_months(chrono::Months::new((-months) as u32))
+fn shift_months(dt: CivilDateTime, months: i64) -> CivilDateTime {
+    let shifted = add_months_to_epoch_day(dt.epoch_day, months)
+        .expect("months_between_days never shifts past the endpoint it was computed from");
+    CivilDateTime {
+        epoch_day: shifted,
+        nanos_of_day: dt.nanos_of_day,
     }
-    .expect("TCK-scale month shifts stay well within NaiveDate's range");
-    NaiveDateTime::new(shifted, dt.time())
 }
 
 /// Shared core of `duration.between`/`.inMonths`/`.inDays`/
@@ -1372,88 +1511,81 @@ fn shift_months(dt: NaiveDateTime, months: i64) -> NaiveDateTime {
 /// date+time target still reports a bare whole-day count with the
 /// sub-day remainder silently truncated away, not carried as a
 /// remaining `T...` component).
-fn to_utc_instant_tz(dt: NaiveDateTime, zone: &TzId) -> NaiveDateTime {
+fn to_utc_instant_ns(dt: CivilDateTime, zone: &TzId) -> i128 {
     match zone {
-        TzId::Offset(o) => dt - chrono::Duration::seconds(*o as i64),
+        TzId::Offset(o) => civil_total_ns(dt) - *o as i128 * NANOS_PER_SEC,
         TzId::Named(name) => {
-            if let Some(tz) = parse_timezone_name(name) {
-                if let Some((epoch_seconds, _)) = utc_from_local_and_named_zone(dt, tz) {
-                    return chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_seconds, 0)
-                        .map(|utc| utc.naive_utc())
-                        .unwrap_or(dt);
+            if let (Some(tz), Some(naive)) = (
+                parse_timezone_name(name),
+                chrono_naive_from(dt.epoch_day, dt.nanos_of_day),
+            ) {
+                if let Some((epoch_seconds, _)) = utc_from_local_and_named_zone(naive, tz) {
+                    return epoch_seconds as i128 * NANOS_PER_SEC
+                        + (dt.nanos_of_day % 1_000_000_000) as i128;
                 }
             }
-            dt
+            civil_total_ns(dt)
         }
     }
 }
 
 fn elapsed_ns(
-    from: NaiveDateTime,
+    from: CivilDateTime,
     from_zone: Option<&TzId>,
-    to: NaiveDateTime,
+    to: CivilDateTime,
     to_zone: Option<&TzId>,
-) -> i64 {
-    let delta = match (from_zone, to_zone) {
-        (Some(fz), Some(tz)) => to_utc_instant_tz(to, tz) - to_utc_instant_tz(from, fz),
-        (Some(fz), None) => to_utc_instant_tz(to, fz) - to_utc_instant_tz(from, fz),
-        (None, Some(tz)) => to_utc_instant_tz(to, tz) - to_utc_instant_tz(from, tz),
-        (None, None) => to - from,
-    };
-    delta
-        .num_nanoseconds()
-        .expect("TCK-scale gaps stay well within i64 nanoseconds")
+) -> i128 {
+    match (from_zone, to_zone) {
+        (Some(fz), Some(tz)) => to_utc_instant_ns(to, tz) - to_utc_instant_ns(from, fz),
+        (Some(fz), None) => to_utc_instant_ns(to, fz) - to_utc_instant_ns(from, fz),
+        (None, Some(tz)) => to_utc_instant_ns(to, tz) - to_utc_instant_ns(from, tz),
+        (None, None) => civil_total_ns(to) - civil_total_ns(from),
+    }
 }
 
 fn months_between_datetimes_offset_aware(
-    from: NaiveDateTime,
+    from: CivilDateTime,
     from_zone: Option<&TzId>,
-    to: NaiveDateTime,
+    to: CivilDateTime,
     to_zone: Option<&TzId>,
 ) -> i64 {
-    let mut months = months_between_dates(from.date(), to.date());
+    let mut months = months_between_days(from.epoch_day, to.epoch_day);
     let shifted = shift_months(from, months);
-    let overshot = match (from_zone, to_zone) {
-        (Some(fz), Some(tz)) => to_utc_instant_tz(shifted, fz) > to_utc_instant_tz(to, tz),
-        (Some(fz), None) => to_utc_instant_tz(shifted, fz) > to_utc_instant_tz(to, fz),
-        (None, Some(tz)) => to_utc_instant_tz(shifted, tz) > to_utc_instant_tz(to, tz),
-        (None, None) => shifted > to,
-    };
-    let undershot = match (from_zone, to_zone) {
-        (Some(fz), Some(tz)) => to_utc_instant_tz(shifted, fz) < to_utc_instant_tz(to, tz),
-        (Some(fz), None) => to_utc_instant_tz(shifted, fz) < to_utc_instant_tz(to, fz),
-        (None, Some(tz)) => to_utc_instant_tz(shifted, tz) < to_utc_instant_tz(to, tz),
-        (None, None) => shifted < to,
-    };
-    if months > 0 && overshot {
+    let delta = elapsed_ns(shifted, from_zone, to, to_zone);
+    if months > 0 && delta < 0 {
         months -= 1;
-    } else if months < 0 && undershot {
+    } else if months < 0 && delta > 0 {
         months += 1;
     }
     months
 }
 
-fn time_to_utc_nanos(nanos_of_day: i64, zone: &TzId, ref_date: Option<i32>) -> i64 {
-    let epoch_day = ref_date.unwrap_or(0);
-    let dt = naive_datetime_from(epoch_day, nanos_of_day);
-    let utc = to_utc_instant_tz(dt, zone);
-    (utc.signed_duration_since(epoch().and_hms_opt(0, 0, 0).unwrap()))
-        .num_nanoseconds()
-        .unwrap_or(0)
+fn time_to_utc_nanos(nanos_of_day: i64, zone: &TzId, ref_date: Option<i64>) -> i128 {
+    let dt = CivilDateTime {
+        epoch_day: ref_date.unwrap_or(0),
+        nanos_of_day,
+    };
+    to_utc_instant_ns(dt, zone)
 }
 
 fn between_components(
-    a_date: Option<i32>,
+    a_date: Option<i64>,
     a_time: Option<i64>,
     a_zone: Option<&TzId>,
-    b_date: Option<i32>,
+    b_date: Option<i64>,
     b_time: Option<i64>,
     b_zone: Option<&TzId>,
-) -> (i64, i64, i64) {
+) -> (i64, i128, i128) {
     match (a_date, b_date) {
         (Some(ad), Some(bd)) => {
-            let from = naive_datetime_from(ad, a_time.unwrap_or(0));
-            let to = naive_datetime_from(bd, b_time.unwrap_or(0));
+            let from = CivilDateTime {
+                epoch_day: ad,
+                nanos_of_day: a_time.unwrap_or(0),
+            };
+            let to = CivilDateTime {
+                epoch_day: bd,
+                nanos_of_day: b_time.unwrap_or(0),
+            };
             let months = months_between_datetimes_offset_aware(from, a_zone, to, b_zone);
             let shifted = shift_months(from, months);
             let shifted_remaining_ns = elapsed_ns(shifted, a_zone, to, b_zone);
@@ -1489,7 +1621,7 @@ fn between_components(
                     let bt = time_to_utc_nanos(b_time.unwrap_or(0), bz, b_date);
                     bt - at
                 }
-                (None, None) => b_time.unwrap_or(0) - a_time.unwrap_or(0),
+                (None, None) => (b_time.unwrap_or(0) - a_time.unwrap_or(0)) as i128,
             };
             (0, diff, diff)
         }
@@ -1497,27 +1629,30 @@ fn between_components(
 }
 
 pub fn duration_between(
-    a_date: Option<i32>,
+    a_date: Option<i64>,
     a_time: Option<i64>,
     a_zone: Option<&TzId>,
-    b_date: Option<i32>,
+    b_date: Option<i64>,
     b_time: Option<i64>,
     b_zone: Option<&TzId>,
 ) -> DurationParts {
     let (months, shifted_ns, _) =
         between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
-    let days = shifted_ns / NANOS_PER_DAY_I64;
-    let rem = shifted_ns % NANOS_PER_DAY_I64;
-    let seconds = rem.div_euclid(NANOS_PER_SEC as i64);
-    let nanos = rem.rem_euclid(NANOS_PER_SEC as i64) as i32;
+    // After the month shift the remainder spans at most one month of
+    // calendar distance -- days always fit i64; the sub-day remainder
+    // always fits i64 seconds.
+    let days = (shifted_ns / NANOS_PER_DAY_I64 as i128) as i64;
+    let rem = shifted_ns % NANOS_PER_DAY_I64 as i128;
+    let seconds = rem.div_euclid(NANOS_PER_SEC) as i64;
+    let nanos = rem.rem_euclid(NANOS_PER_SEC) as i32;
     (months, days, seconds, nanos)
 }
 
 pub fn duration_in_months(
-    a_date: Option<i32>,
+    a_date: Option<i64>,
     a_time: Option<i64>,
     a_zone: Option<&TzId>,
-    b_date: Option<i32>,
+    b_date: Option<i64>,
     b_time: Option<i64>,
     b_zone: Option<&TzId>,
 ) -> DurationParts {
@@ -1526,22 +1661,22 @@ pub fn duration_in_months(
 }
 
 pub fn duration_in_days(
-    a_date: Option<i32>,
+    a_date: Option<i64>,
     a_time: Option<i64>,
     a_zone: Option<&TzId>,
-    b_date: Option<i32>,
+    b_date: Option<i64>,
     b_time: Option<i64>,
     b_zone: Option<&TzId>,
 ) -> DurationParts {
     let (_, _, raw) = between_components(a_date, a_time, a_zone, b_date, b_time, b_zone);
-    (0, raw / NANOS_PER_DAY_I64, 0, 0)
+    (0, (raw / NANOS_PER_DAY_I64 as i128) as i64, 0, 0)
 }
 
 pub fn duration_in_seconds(
-    a_date: Option<i32>,
+    a_date: Option<i64>,
     a_time: Option<i64>,
     a_zone: Option<&TzId>,
-    b_date: Option<i32>,
+    b_date: Option<i64>,
     b_time: Option<i64>,
     b_zone: Option<&TzId>,
 ) -> DurationParts {
@@ -1549,8 +1684,10 @@ pub fn duration_in_seconds(
     (
         0,
         0,
-        raw.div_euclid(NANOS_PER_SEC as i64),
-        raw.rem_euclid(NANOS_PER_SEC as i64) as i32,
+        // The full-year-range span (~6.3e16 s) fits i64 seconds even
+        // though its nanosecond total doesn't.
+        raw.div_euclid(NANOS_PER_SEC) as i64,
+        raw.rem_euclid(NANOS_PER_SEC) as i32,
     )
 }
 
@@ -1565,28 +1702,24 @@ pub fn duration_in_seconds(
 /// (`2017 -> 2000`, `1984 -> 1900`/`1980`) -- plain `year -
 /// year.rem_euclid(N)`, correct for negative years too since
 /// `rem_euclid` is always non-negative. `week`/`weekYear` use the same
-/// ISO week-date `chrono` already computes for `.week`/`.weekYear`
-/// component access (`date_component`) -- the Monday of that ISO week/
-/// week-year.
-pub fn truncate_date_unit(epoch_day: i32, unit: &str) -> Option<i32> {
-    let d = date_from_epoch_day(epoch_day);
-    let y = d.year();
-    let to_epoch_day = |d: NaiveDate| d.signed_duration_since(epoch()).num_days() as i32;
+/// ISO week-date math as `.week`/`.weekYear` component access
+/// (`date_component`) -- the Monday of that ISO week/week-year.
+pub fn truncate_date_unit(epoch_day: i64, unit: &str) -> Option<i64> {
+    let (y, m, _) = civil_from_days(epoch_day);
     match unit {
         "millennium" => epoch_day_from_ymd(y - y.rem_euclid(1000), 1, 1),
         "century" => epoch_day_from_ymd(y - y.rem_euclid(100), 1, 1),
         "decade" => epoch_day_from_ymd(y - y.rem_euclid(10), 1, 1),
         "year" => epoch_day_from_ymd(y, 1, 1),
-        "quarter" => epoch_day_from_ymd(y, (d.month() - 1) / 3 * 3 + 1, 1),
-        "month" => epoch_day_from_ymd(y, d.month(), 1),
+        "quarter" => epoch_day_from_ymd(y, (m - 1) / 3 * 3 + 1, 1),
+        "month" => epoch_day_from_ymd(y, m, 1),
         "week" => {
-            let iso = d.iso_week();
-            NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)
-                .map(to_epoch_day)
+            let (week_year, week) = iso_week_of(epoch_day);
+            Some(iso_week1_monday(week_year) + (week - 1) * 7)
         }
         "weekYear" => {
-            let iso = d.iso_week();
-            NaiveDate::from_isoywd_opt(iso.year(), 1, chrono::Weekday::Mon).map(to_epoch_day)
+            let (week_year, _) = iso_week_of(epoch_day);
+            Some(iso_week1_monday(week_year))
         }
         "day" => Some(epoch_day),
         _ => None,
@@ -1600,15 +1733,13 @@ pub fn truncate_date_unit(epoch_day: i32, unit: &str) -> Option<i32> {
 /// week-date construction from a `{year, week, dayOfWeek}` triple with
 /// no existing anchor date (that's `epoch_day_from_week_fields`).
 /// `None` for an out-of-range `day_of_week`.
-pub fn set_iso_weekday(epoch_day: i32, day_of_week: i64) -> Option<i32> {
+pub fn set_iso_weekday(epoch_day: i64, day_of_week: i64) -> Option<i64> {
     if !(1..=7).contains(&day_of_week) {
         return None;
     }
-    let d = date_from_epoch_day(epoch_day);
-    let iso = d.iso_week();
-    let monday = NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)?;
-    let result = monday + chrono::Duration::days(day_of_week - 1);
-    Some(result.signed_duration_since(epoch()).num_days() as i32)
+    let (week_year, week) = iso_week_of(epoch_day);
+    let monday = iso_week1_monday(week_year) + (week - 1) * 7;
+    Some(monday + (day_of_week - 1))
 }
 
 /// Truncates a time-of-day down to the start of `unit` -- `None` for
@@ -1885,5 +2016,83 @@ mod tests {
 
     fn format_duration_parts(p: DurationParts) -> String {
         format_duration(p.0, p.1, p.2, p.3)
+    }
+
+    /// The hand-rolled civil core must agree with chrono everywhere
+    /// chrono can go -- sweeps ±~2.7 millennia of epoch days at a prime
+    /// stride and cross-checks every derived component.
+    #[test]
+    fn civil_core_matches_chrono_across_its_range() {
+        use chrono::Datelike;
+        for epoch_day in (-1_000_000..1_000_000i64).step_by(9973) {
+            let d = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+                + chrono::Duration::days(epoch_day);
+            let (y, m, day) = civil_from_days(epoch_day);
+            assert_eq!((y, m, day), (d.year() as i64, d.month(), d.day()));
+            assert_eq!(days_from_civil(y, m, day), epoch_day);
+            assert_eq!(
+                iso_weekday_from_days(epoch_day),
+                d.weekday().number_from_monday() as i64
+            );
+            let iso = d.iso_week();
+            assert_eq!(
+                iso_week_of(epoch_day),
+                (iso.year() as i64, iso.week() as i64)
+            );
+            assert_eq!(ordinal_day_of(y, m, day), d.ordinal() as i64);
+        }
+    }
+
+    #[test]
+    fn expanded_year_dates_parse_and_round_trip() {
+        let min = parse_date("-999999999-01-01").unwrap();
+        let max = parse_date("+999999999-12-31").unwrap();
+        assert_eq!(format_date(min), "-999999999-01-01");
+        assert_eq!(format_date(max), "+999999999-12-31");
+        assert_eq!(date_component(min, "year"), Some(-999_999_999));
+        assert_eq!(date_component(max, "year"), Some(999_999_999));
+        // Normal-range years stay unsigned/4-digit-padded.
+        assert_eq!(format_date(parse_date("2020-01-10").unwrap()), "2020-01-10");
+        assert_eq!(format_date(parse_date("0033-06-01").unwrap()), "0033-06-01");
+    }
+
+    #[test]
+    fn year_range_and_calendar_validity_are_enforced() {
+        assert!(parse_date("+1000000000-01-01").is_none());
+        assert!(parse_date("-1000000000-01-01").is_none());
+        assert!(epoch_day_from_ymd(2020, 13, 1).is_none());
+        assert!(epoch_day_from_ymd(2020, 2, 30).is_none());
+        // Century leap rules: 1900 isn't a leap year, 2000 is.
+        assert!(epoch_day_from_ymd(1900, 2, 29).is_none());
+        assert!(epoch_day_from_ymd(2000, 2, 29).is_some());
+    }
+
+    /// TCK Temporal10 [9]: the full-range duration.between.
+    #[test]
+    fn duration_between_spans_the_full_year_range() {
+        let a = parse_date("-999999999-01-01").unwrap();
+        let b = parse_date("+999999999-12-31").unwrap();
+        let parts = duration_between(Some(a), None, None, Some(b), None, None);
+        assert_eq!(format_duration_parts(parts), "P1999999998Y11M30D");
+    }
+
+    /// TCK Temporal10 [10]: the full-range duration.inSeconds (whose
+    /// nanosecond total overflows i64 -- the i128 core's own regression
+    /// test).
+    #[test]
+    fn duration_in_seconds_spans_the_full_year_range() {
+        let (a_secs, a_nanos) = parse_local_date_time("-999999999-01-01").unwrap();
+        let (b_secs, b_nanos) = parse_local_date_time("+999999999-12-31T23:59:59").unwrap();
+        let (a_day, a_nod) = split_epoch_seconds(a_secs);
+        let (b_day, b_nod) = split_epoch_seconds(b_secs);
+        let parts = duration_in_seconds(
+            Some(a_day),
+            Some(a_nod + a_nanos as i64),
+            None,
+            Some(b_day),
+            Some(b_nod + b_nanos as i64),
+            None,
+        );
+        assert_eq!(format_duration_parts(parts), "PT17531639991215H59M59S");
     }
 }

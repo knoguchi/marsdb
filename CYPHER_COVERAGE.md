@@ -54,15 +54,11 @@ errored *at all* (not the specific error kind). See
 | expressions/precedence | 104 | 104 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/quantifier | 604 | 604 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/string | 32 | 32 | 0 | 0 | 0 | 0 | 100.0% |
-| expressions/temporal* | 1004 | 1002 | 0 | 2 | 0 | 0 | 99.8% |
+| expressions/temporal | 1004 | 1004 | 0 | 0 | 0 | 0 | 100.0% |
 | expressions/typeConversion | 47 | 47 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 0 | 0 | 0 | 0 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 0 | 0 | 0 | 0 | 100.0% |
-| **TOTAL** | **3880** | **3878** | **0** | **2** | **0** | **0** | **99.9%** |
-
-\* The 2 failures are `Temporal10 [9]`/`[10]`: dates at year
-`±999,999,999`. Deliberately unfixed — see
-[Temporal types](#temporal-types) below for why.
+| **TOTAL** | **3880** | **3880** | **0** | **0** | **0** | **0** | **100.0%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
 own README). Replaced an earlier hand-rolled `pest` grammar; see git
@@ -246,14 +242,11 @@ variants (not `Int`/`String` reused): `Date`, `Duration`, `LocalTime`,
 - Named timezones for `Time` (only `DateTime`)
 - Alternate ISO-8601 combined date-time duration syntax
   (`duration('P2012-02-02T14:37:21.545')`)
-- Dates outside `chrono`'s representable range (`'-999999999-01-01'`) —
-  `chrono::NaiveDate` caps around ±262,000 years internally, and MarsDB's
-  own `PropertyValue::Date(i32)` epoch-day storage caps around ±5.8
-  million years, both far short of the ±999,999,999 the TCK's `Temporal10
-  [9]`/`[10]` scenarios need. Fixing this needs a breaking storage-format
-  change (`i32` → `i64` epoch-day) plus hand-rolled proleptic-Gregorian
-  calendar arithmetic bypassing `chrono` for the extreme range —
-  deliberately left as-is.
+- (Dates now cover Cypher's full `±999,999,999`-year range: epoch days
+  are `i64` and the calendar math is hand-rolled proleptic-Gregorian
+  integer arithmetic — `chrono` remains only for `now()` capture and
+  named-IANA-zone resolution, which is inherently bounded by the IANA
+  database's own applicability.)
 
 See `marsdb-query/src/temporal.rs`'s module doc comment for the same list
 in code.

@@ -39,7 +39,7 @@ fn pv_to_string(pv: &PropertyValue) -> String {
         PropertyValue::String(s) => s.clone(),
         PropertyValue::Date(days) => {
             // epoch-day -> ISO date, no chrono needed for the export
-            let epoch = *days as i64;
+            let epoch = *days;
             let mut y = 1970i64;
             let mut d = epoch;
             loop {

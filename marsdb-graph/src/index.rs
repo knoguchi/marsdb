@@ -74,7 +74,7 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
         }
         PropertyValue::Date(days) => {
             let mut out = vec![0x05];
-            out.extend_from_slice(&((*days as i64 as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+            out.extend_from_slice(&((*days as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
             out
         }
         PropertyValue::Duration {
