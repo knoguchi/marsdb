@@ -297,10 +297,6 @@ pub(crate) fn edge_header(bytes: &[u8]) -> Result<(u32, u64, u64), GraphError> {
 }
 
 /// Edge counterpart of `node_prop_raw`.
-// Wired up by v1.5 step 1b (per-property executor read path) -- kept
-// alongside `node_prop_raw` now so the two formats' accessors ship and
-// get tested together.
-#[allow(dead_code)]
 pub(crate) fn edge_prop_raw(bytes: &[u8], prop_id: u32) -> Result<Option<&[u8]>, GraphError> {
     if bytes.len() < EDGE_HEADER {
         return Err(corrupt("edge header"));

@@ -430,6 +430,16 @@ pub struct Executor<'a> {
     /// inserting past N entries, keep serving existing hits).
     node_cache: RefCell<HashMap<NodeId, Rc<Node>>>,
     node_cache_enabled: Cell<bool>,
+    /// Prop-name -> interned-id memo for the per-property read path
+    /// (`lookup_prop`), sharing `node_cache`'s exact lifecycle and
+    /// enable-gating: cleared at every statement entry point, consulted
+    /// only for read-only statements. A write statement can intern a new
+    /// property name mid-statement (`CREATE (n {fresh: 1})` then a later
+    /// clause reading `c.fresh`), so a memoized "never interned" would go
+    /// stale within that same statement -- write statements look the id up
+    /// fresh per access instead (a single table get, and the write path
+    /// was never the hot case this memo exists for).
+    prop_id_memo: RefCell<HashMap<String, Option<u32>>>,
 }
 
 impl<'a> Executor<'a> {
@@ -439,6 +449,7 @@ impl<'a> Executor<'a> {
             now: Cell::new(None),
             node_cache: RefCell::new(HashMap::new()),
             node_cache_enabled: Cell::new(false),
+            prop_id_memo: RefCell::new(HashMap::new()),
         }
     }
 
@@ -508,6 +519,7 @@ impl<'a> Executor<'a> {
         // cache that outlived one statement would return stale records
         // for a node a *later* statement mutated.
         self.node_cache.borrow_mut().clear();
+        self.prop_id_memo.borrow_mut().clear();
         self.node_cache_enabled.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Never opens a WriteTransaction, regardless of what `inner`
@@ -619,6 +631,7 @@ impl<'a> Executor<'a> {
         // -- skipping the reset here left the flag/map from whatever this
         // `Executor` last did through the *other* entry point in effect.
         self.node_cache.borrow_mut().clear();
+        self.prop_id_memo.borrow_mut().clear();
         self.node_cache_enabled.set(is_read_only(stmt));
         if let Statement::Explain(inner) = stmt {
             // Same "never mutates" contract as the top-level path -- opens
@@ -3948,6 +3961,23 @@ impl<'a> Executor<'a> {
         })
     }
 
+    /// Prop name -> interned id, memoized per statement for read-only
+    /// statements only -- see `prop_id_memo`'s docs for why write
+    /// statements bypass the memo (mid-statement interning would make a
+    /// cached `None` stale within the same statement).
+    fn prop_id_for(&self, txn: Txn, name: &str) -> Result<Option<u32>, QueryError> {
+        if self.node_cache_enabled.get() {
+            if let Some(cached) = self.prop_id_memo.borrow().get(name) {
+                return Ok(*cached);
+            }
+        }
+        let id = GraphStore::lookup_prop_id_in_txn(txn, name)?;
+        if self.node_cache_enabled.get() {
+            self.prop_id_memo.borrow_mut().insert(name.to_string(), id);
+        }
+        Ok(id)
+    }
+
     fn lookup_prop(
         &self,
         txn: Txn,
@@ -3965,14 +3995,45 @@ impl<'a> Executor<'a> {
             // error (`MATCH (n) DELETE n RETURN n.num` -- TCK's Return2
             // scenario [15]), not a silent null. These are two different
             // kinds of "missing" and must not be collapsed into one.
+            //
+            // Per-property read path (v1.5 step 1b): a node already
+            // materialized in this statement's cache answers from the map;
+            // otherwise this reads ONE directory entry from the stored
+            // record -- no full decode, no name resolution, no cache
+            // population (repeat per-prop reads are ~a point lookup each,
+            // cheaper than materializing a whole record to answer one of
+            // them). The nested Option from `get_node_prop_in_txn`
+            // preserves the deleted-vs-absent split above.
             Binding::Node(id) => {
-                let node = deleted_entity_access(self.get_node_cached(txn, *id)?)?;
-                Ok(node.props.get(&pa.prop).cloned())
+                if self.node_cache_enabled.get() {
+                    if let Some(cached) = self.node_cache.borrow().get(id) {
+                        return Ok(cached.props.get(&pa.prop).cloned());
+                    }
+                }
+                match self.prop_id_for(txn, &pa.prop)? {
+                    Some(prop_id) => Ok(deleted_entity_access(GraphStore::get_node_prop_in_txn(
+                        txn, *id, prop_id,
+                    )?)?),
+                    // Name never interned anywhere: absent on every record
+                    // by construction -- but a deleted node must still
+                    // error, so existence is checked without any decode.
+                    None => {
+                        deleted_entity_access(
+                            GraphStore::node_exists_in_txn(txn, *id)?.then_some(()),
+                        )?;
+                        Ok(None)
+                    }
+                }
             }
-            Binding::Edge(id) => {
-                let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
-                Ok(edge.props.get(&pa.prop).cloned())
-            }
+            Binding::Edge(id) => match self.prop_id_for(txn, &pa.prop)? {
+                Some(prop_id) => Ok(deleted_entity_access(GraphStore::get_edge_prop_in_txn(
+                    txn, *id, prop_id,
+                )?)?),
+                None => {
+                    deleted_entity_access(GraphStore::edge_exists_in_txn(txn, *id)?.then_some(()))?;
+                    Ok(None)
+                }
+            },
             // A WITH-projected scalar (or list/map) has no scalar `.prop`
             // to access via this path — e.g. `WITH message.id AS
             // messageId` then `messageId.foo` isn't meaningful. Treat as

@@ -371,6 +371,73 @@ impl GraphStore {
         }))
     }
 
+    /// The id interned for a property name, if any -- `None` means the
+    /// name has never been written anywhere, so no record can hold it.
+    /// Exposed for the query layer's per-property read path: names resolve
+    /// to ids once per statement there, then every row access goes through
+    /// `get_node_prop_in_txn`/`get_edge_prop_in_txn` by id.
+    pub fn lookup_prop_id_in_txn(txn: Txn, prop: &str) -> Result<Option<u32>, GraphError> {
+        crate::props::lookup_prop_id(txn, prop)
+    }
+
+    /// One property of one node, by interned prop id, without decoding the
+    /// rest of the record or resolving any names — a directory binary
+    /// search plus one value decode (the v1.5 read fast path; the codec
+    /// mechanism measured 79x over whole-record decode at 1-of-20 props).
+    ///
+    /// Nested `Option` distinguishes the two kinds of missing the executor
+    /// must not collapse (`lookup_prop`'s own docs): outer `None` = the
+    /// node record doesn't exist (deleted-entity error at the call site),
+    /// inner `None` = node exists, property absent (legal null).
+    pub fn get_node_prop_in_txn(
+        txn: Txn,
+        id: NodeId,
+        prop_id: u32,
+    ) -> Result<Option<Option<PropertyValue>>, GraphError> {
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        let Some(guard) = nodes.get(id.0)? else {
+            return Ok(None);
+        };
+        match crate::encode::node_prop_raw(guard.value(), prop_id)? {
+            Some(raw) => Ok(Some(Some(crate::encode::decode_value(raw)?))),
+            None => Ok(Some(None)),
+        }
+    }
+
+    /// Edge counterpart of `get_node_prop_in_txn`, same nested-`Option`
+    /// contract.
+    pub fn get_edge_prop_in_txn(
+        txn: Txn,
+        id: EdgeId,
+        prop_id: u32,
+    ) -> Result<Option<Option<PropertyValue>>, GraphError> {
+        let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
+        let Some(guard) = edges.get(id.0)? else {
+            return Ok(None);
+        };
+        match crate::encode::edge_prop_raw(guard.value(), prop_id)? {
+            Some(raw) => Ok(Some(Some(crate::encode::decode_value(raw)?))),
+            None => Ok(Some(None)),
+        }
+    }
+
+    /// Record-existence check without any decoding — for the per-property
+    /// read path when the property name was never interned (the value is
+    /// necessarily absent on every record, but a *deleted* node must still
+    /// error, not read as null).
+    pub fn node_exists_in_txn(txn: Txn, id: NodeId) -> Result<bool, GraphError> {
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        let exists = nodes.get(id.0)?.is_some();
+        Ok(exists)
+    }
+
+    /// Edge counterpart of `node_exists_in_txn`.
+    pub fn edge_exists_in_txn(txn: Txn, id: EdgeId) -> Result<bool, GraphError> {
+        let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
+        let exists = edges.get(id.0)?.is_some();
+        Ok(exists)
+    }
+
     pub fn create_edge(
         &self,
         label: &str,

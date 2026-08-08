@@ -3985,6 +3985,60 @@ fn node_cache_is_disabled_within_a_single_write_statement() {
     }
 }
 
+/// A write statement can intern a brand-new property name mid-statement
+/// and then read it back in a later clause of that SAME statement -- the
+/// per-property read path's name->id memo (`Executor::prop_id_memo`) must
+/// not serve a stale "never interned" for it. This is the exact scenario
+/// that forces the memo to be gated to read-only statements (see the
+/// field's docs): an earlier clause probes `fresh` before any node has it
+/// (memoizing `None` would be tempting), a middle clause creates the
+/// first node carrying it, and a later clause filters on it and must
+/// match.
+#[test]
+fn property_interned_mid_statement_is_visible_to_later_clauses_of_the_same_statement() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Seed {n: 1})");
+
+    let result = run(
+        &store,
+        "MATCH (s:Seed) WHERE s.fresh IS NULL \
+         CREATE (:Made {fresh: 42}) \
+         WITH s MATCH (m:Made) WHERE m.fresh = 42 RETURN m.fresh",
+    );
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "the mid-statement write must be visible"
+    );
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::Int(v)) => assert_eq!(*v, 42),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+/// A property name that has never been interned anywhere takes the
+/// per-property path's shortcut (no record decode at all) -- but the two
+/// "missing" kinds must still be distinguished: absent-on-a-live-node is
+/// null, while accessing any property of a node deleted earlier in the
+/// statement is an error, even a never-interned one.
+#[test]
+fn never_interned_property_is_null_on_live_nodes_but_still_errors_on_deleted_ones() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Item {present: 1})");
+
+    let result = run(&store, "MATCH (n:Item) RETURN n.no_such_prop_ever");
+    assert_eq!(result.rows.len(), 1);
+    assert!(matches!(result.rows[0][0], Value::Null));
+
+    let executor = Executor::new(&store);
+    let stmt = parse("MATCH (n:Item) DELETE n RETURN n.no_such_prop_ever").unwrap();
+    let err = executor.execute(&stmt).unwrap_err();
+    assert!(
+        matches!(err, marsdb_query::QueryError::UnboundVariable(_)),
+        "deleted-entity access must error, not read as null: {err}"
+    );
+}
+
 /// The node cache's reset (clear + enable/disable based on
 /// `is_read_only`) must happen on *every* statement-execution entry
 /// point, not just `execute`/`execute_with_options` -- `Executor` has a
