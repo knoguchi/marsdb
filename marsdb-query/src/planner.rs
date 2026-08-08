@@ -529,6 +529,139 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
         .collect()
 }
 
+/// Start-point selection: decide whether the pattern's traversal should
+/// begin from its *last* endpoint instead of its first, and if so return
+/// the reversed pattern (each hop's direction flipped, node order
+/// reversed) for `build_match_plan` to compile as usual. `MATCH
+/// (a:Common)-->(b:Rare {id: 1}) ...` written from the `Common` side
+/// otherwise scans every `Common` node and expands, when starting from
+/// the one indexed `Rare` node and expanding backwards touches only the
+/// matching rows — the plan is direction-symmetric (`ADJ_IN` mirrors
+/// `ADJ_OUT`), so which endpoint seeds the traversal is a pure cost
+/// choice with identical results.
+///
+/// The comparison is the same cheap-cardinality machinery
+/// `apply_index_seeks` already uses, extended with per-label and
+/// whole-table counts (all O(1), see `label_count_in_txn`/
+/// `node_count_in_txn`): an endpoint's start cost is 0 if it's already
+/// bound (a `Seed`), else the smallest of its label count and any
+/// indexed literal-equality candidate's match count (inline pattern
+/// props and WHERE conjuncts both, since `build_match_plan` pushes
+/// start-only conjuncts down to the start scan where
+/// `apply_index_seeks` can fuse them). Reversal fires only when the far
+/// endpoint is strictly cheaper — ties keep written order, both for
+/// determinism and because reversal is never free to reason about.
+///
+/// Deliberately conservative, same stance as every other planner pass:
+/// only all-fixed-hop patterns are considered. A variable-length hop's
+/// own relationship-list binding (`[r*1..3]`) and named-path capture
+/// both expose traversal *order* to the user, which reversal would flip;
+/// rather than distinguishing the observable cases, any `hop_range` in
+/// the pattern disqualifies it. Callers additionally skip named-path
+/// (`p = ...`) and `shortestPath` clauses for the same reason.
+pub fn plan_reversed_pattern(
+    pattern: &Pattern,
+    where_clause: &Option<Expr>,
+    carried_vars: &HashSet<String>,
+    txn: Txn,
+) -> Result<Option<Pattern>, QueryError> {
+    if pattern.hops.is_empty() {
+        return Ok(None);
+    }
+    if pattern.hops.iter().any(|(rel, _)| rel.hop_range.is_some()) {
+        return Ok(None);
+    }
+    let mut conjuncts = Vec::new();
+    if let Some(expr) = where_clause {
+        push_conjuncts(expr.clone(), &mut conjuncts);
+    }
+    let end = &pattern.hops.last().expect("hops checked non-empty").1;
+    let start_cost = endpoint_start_cost(&pattern.start, &conjuncts, carried_vars, txn)?;
+    let end_cost = endpoint_start_cost(end, &conjuncts, carried_vars, txn)?;
+    if end_cost < start_cost {
+        Ok(Some(reverse_pattern(pattern)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Rows the leaf scan would produce if the pattern started at `node` —
+/// see `plan_reversed_pattern`. 0 for an already-bound variable (a
+/// `Seed` reads no storage at all), else label count narrowed by the
+/// best indexed literal-equality candidate (the same candidates
+/// `apply_index_seeks` would fuse into an `IndexSeek` once this endpoint
+/// actually is the start).
+fn endpoint_start_cost(
+    node: &NodePattern,
+    conjuncts: &[Expr],
+    carried_vars: &HashSet<String>,
+    txn: Txn,
+) -> Result<u64, QueryError> {
+    if node.var.as_ref().is_some_and(|v| carried_vars.contains(v)) {
+        return Ok(0);
+    }
+    let Some(label) = node.labels.first() else {
+        return Ok(GraphStore::node_count_in_txn(txn)?);
+    };
+    let mut cost = GraphStore::label_count_in_txn(txn, label)?;
+    let mut consider = |prop: &str, lit: &Literal| -> Result<(), QueryError> {
+        if matches!(lit, Literal::Param(_)) {
+            return Ok(());
+        }
+        if GraphStore::index_def_in_txn(txn, label, prop)?.is_some() {
+            let count =
+                GraphStore::index_match_count_in_txn(txn, label, prop, &literal_to_value(lit))?;
+            cost = cost.min(count);
+        }
+        Ok(())
+    };
+    for (key, expr) in &node.props {
+        if let ReturnExpr::Lit(lit) = expr {
+            consider(key, lit)?;
+        }
+    }
+    if let Some(var) = &node.var {
+        for c in conjuncts {
+            if let Expr::Compare(pa, CompareOp::Eq, lit) = c {
+                if pa.var == *var {
+                    consider(&pa.prop, lit)?;
+                }
+            }
+        }
+    }
+    Ok(cost)
+}
+
+/// The same pattern walked from its other end: node order reversed, each
+/// hop's direction flipped (`Either` stays). Only called for all-fixed-
+/// hop patterns (see `plan_reversed_pattern`'s guards), so none of the
+/// variable-length-only `RelPattern` fields need adjusting.
+fn reverse_pattern(pattern: &Pattern) -> Pattern {
+    let nodes: Vec<&NodePattern> = std::iter::once(&pattern.start)
+        .chain(pattern.hops.iter().map(|(_, node)| node))
+        .collect();
+    let start = (*nodes.last().expect("nodes is never empty")).clone();
+    let hops = pattern
+        .hops
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, (rel, _))| {
+            let mut rel = rel.clone();
+            rel.direction = match rel.direction {
+                RelDirection::Right => RelDirection::Left,
+                RelDirection::Left => RelDirection::Right,
+                RelDirection::Either => RelDirection::Either,
+            };
+            // `nodes[i]` is the node on the near side of hop `i` in the
+            // written pattern — the far side once the hop is walked
+            // backwards.
+            (rel, nodes[i].clone())
+        })
+        .collect();
+    Pattern { start, hops }
+}
+
 /// Post-processing pass over an already-built plan: fuses a
 /// `Filter(Compare(var.prop = literal))` sitting directly over a
 /// `NodeByLabelScan{var, label}` into a single `IndexSeek`, if a real
@@ -872,6 +1005,143 @@ mod tests {
             }
             other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),
         }
+    }
+
+    fn seed_people(store: &GraphStore, common: usize, rare: usize) {
+        for i in 0..common {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), PropertyValue::Int(i as i64));
+            store.create_node(&["Common"], props).unwrap();
+        }
+        for i in 0..rare {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), PropertyValue::Int(i as i64));
+            store.create_node(&["Rare"], props).unwrap();
+        }
+    }
+
+    #[test]
+    fn reverses_when_the_far_endpoint_label_is_smaller() {
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 1);
+        let pattern = pattern_from("MATCH (a:Common)-[:R]->(b:Rare) RETURN a");
+
+        let write = store.begin_write().unwrap();
+        let reversed =
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .expect("expected reversal toward the 1-node Rare label");
+
+        assert_eq!(reversed.start.var.as_deref(), Some("b"));
+        assert_eq!(reversed.start.labels, vec!["Rare"]);
+        let (rel, node) = &reversed.hops[0];
+        // The written `->` walked backwards is `<-`.
+        assert_eq!(rel.direction, RelDirection::Left);
+        assert_eq!(rel.rel_types, vec!["R"]);
+        assert_eq!(node.var.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn keeps_written_order_when_the_start_is_already_cheapest_or_tied() {
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 1, 20);
+        let write = store.begin_write().unwrap();
+
+        let cheaper_start = pattern_from("MATCH (a:Common)-[:R]->(b:Rare) RETURN a");
+        assert!(plan_reversed_pattern(
+            &cheaper_start,
+            &None,
+            &Default::default(),
+            Txn::Write(&write)
+        )
+        .unwrap()
+        .is_none());
+
+        // Tie (same label both ends) keeps written order for determinism.
+        let tied = pattern_from("MATCH (a:Rare)-[:R]->(b:Rare) RETURN a");
+        assert!(
+            plan_reversed_pattern(&tied, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reverses_toward_an_indexed_where_equality_on_the_far_endpoint() {
+        // Both labels are the same size; only the WHERE equality on `b`
+        // (backed by an index) distinguishes them -- the conjunct-based
+        // half of endpoint_start_cost.
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 20);
+        store.create_index("Rare", "id", false).unwrap();
+        let part = part_from("MATCH (a:Rare)-[:R]->(b:Rare) WHERE b.id = 7 RETURN a");
+
+        let write = store.begin_write().unwrap();
+        let reversed = plan_reversed_pattern(
+            &part.pattern,
+            &part.where_clause,
+            &Default::default(),
+            Txn::Write(&write),
+        )
+        .unwrap()
+        .expect("expected reversal toward the indexed b.id = 7");
+        assert_eq!(reversed.start.var.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn reverses_toward_a_carried_far_endpoint() {
+        // `WITH p MATCH (a:Common)-->(p)` -- `p` is already bound, so
+        // starting there is a Seed (cost 0) instead of scanning Common.
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 1);
+        let pattern = pattern_from("MATCH (a:Common)-[:R]->(p) RETURN a");
+        let carried: HashSet<String> = ["p".to_string()].into();
+
+        let write = store.begin_write().unwrap();
+        let reversed = plan_reversed_pattern(&pattern, &None, &carried, Txn::Write(&write))
+            .unwrap()
+            .expect("expected reversal toward the carried p");
+        assert_eq!(reversed.start.var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn never_reverses_a_pattern_containing_a_variable_length_hop() {
+        // `[r*1..2]` binds a relationship *list* in pattern order --
+        // user-visible, so reversal is disqualified outright.
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 1);
+        let pattern = pattern_from("MATCH (a:Common)-[:R*1..2]->(b:Rare) RETURN a");
+
+        let write = store.begin_write().unwrap();
+        assert!(
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_hop_reversal_flips_every_hop_and_keeps_inner_nodes_in_order() {
+        let store = GraphStore::open_memory().unwrap();
+        seed_people(&store, 20, 1);
+        let pattern = pattern_from("MATCH (a:Common)-[:X]->(m)<-[:Y]-(b:Rare) RETURN a");
+
+        let write = store.begin_write().unwrap();
+        let reversed =
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .expect("expected reversal toward Rare");
+
+        assert_eq!(reversed.start.var.as_deref(), Some("b"));
+        assert_eq!(reversed.hops.len(), 2);
+        // Written `<-[:Y]-` from b's side becomes `-[:Y]->` into m...
+        assert_eq!(reversed.hops[0].0.rel_types, vec!["Y"]);
+        assert_eq!(reversed.hops[0].0.direction, RelDirection::Right);
+        assert_eq!(reversed.hops[0].1.var.as_deref(), Some("m"));
+        // ...and the written `-[:X]->` becomes `<-[:X]-` into a.
+        assert_eq!(reversed.hops[1].0.rel_types, vec!["X"]);
+        assert_eq!(reversed.hops[1].0.direction, RelDirection::Left);
+        assert_eq!(reversed.hops[1].1.var.as_deref(), Some("a"));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::borrow::Borrow;
 use redb::{
     AccessGuard, Key, MultimapRange, MultimapTable, MultimapTableDefinition, MultimapValue, Range,
     ReadOnlyMultimapTable, ReadOnlyTable, ReadTransaction, ReadableMultimapTable, ReadableTable,
-    Table, TableDefinition, Value, WriteTransaction,
+    ReadableTableMetadata, Table, TableDefinition, Value, WriteTransaction,
 };
 
 use crate::error::StorageError;
@@ -73,6 +73,21 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
         Ok(match self {
             TableHandle::Write(t) => t.iter()?,
             TableHandle::Read(t) => t.iter()?,
+        })
+    }
+
+    /// Total entry count — O(1), redb tracks it per table. Added for the
+    /// planner's start-point cardinality comparisons (an `AllNodesScan`
+    /// candidate's cost is exactly this count for `NODES`), same
+    /// "cheap count, never walk the entries" contract as
+    /// `MultimapValue::len()` in `index::match_count`.
+    // Fallible len can't back a conventional is_empty; no caller wants
+    // one (the planner compares counts, never emptiness).
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> Result<u64, StorageError> {
+        Ok(match self {
+            TableHandle::Write(t) => t.len()?,
+            TableHandle::Read(t) => t.len()?,
         })
     }
 

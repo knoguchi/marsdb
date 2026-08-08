@@ -933,6 +933,27 @@ impl GraphStore {
         Ok(true)
     }
 
+    /// Total node count — O(1) (redb tracks table entry counts). For the
+    /// query planner's start-point cardinality comparison: the cost of an
+    /// `AllNodesScan` leaf, never for fetching anything.
+    pub fn node_count_in_txn(txn: Txn) -> Result<u64, GraphError> {
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        Ok(nodes.len()?)
+    }
+
+    /// Number of nodes carrying `label` — O(1) via the label index's
+    /// per-key entry count (same mechanism as `index_match_count_in_txn`).
+    /// An unknown label reads as 0, same as everywhere else. Planner
+    /// cardinality use only, like `node_count_in_txn`.
+    pub fn label_count_in_txn(txn: Txn, label: &str) -> Result<u64, GraphError> {
+        let Some(label_id) = lookup_label_id(txn, label)? else {
+            return Ok(0);
+        };
+        let index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        let count = index.get(label_id)?.len();
+        Ok(count)
+    }
+
     /// Full scan of all nodes, optionally filtered by label. v1 has no
     /// secondary index on label, so this is a linear scan of the table.
     pub fn all_nodes(&self, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {

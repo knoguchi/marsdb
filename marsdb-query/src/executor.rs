@@ -22,7 +22,9 @@ use crate::ast::{
 use crate::error::QueryError;
 use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::parse_helpers::validate_named_path_pattern;
-use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars};
+use crate::planner::{
+    apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars, plan_reversed_pattern,
+};
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
 use crate::result::QueryResult;
 use crate::temporal;
@@ -1482,8 +1484,20 @@ impl<'a> Executor<'a> {
                         }
                         rows
                     } else {
+                        // Start-point selection: walk the pattern from its
+                        // cheaper endpoint (see `plan_reversed_pattern`).
+                        // Only this plain branch — a named path or
+                        // shortestPath exposes traversal order, and MERGE's
+                        // match phase stays as-written.
+                        let reversed = plan_reversed_pattern(
+                            &part.pattern,
+                            &part.where_clause,
+                            &carried_vars,
+                            txn,
+                        )?;
+                        let pattern = reversed.as_ref().unwrap_or(&part.pattern);
                         let plan = apply_index_seeks(
-                            build_match_plan(&part.pattern, &part.where_clause, &carried_vars)?,
+                            build_match_plan(pattern, &part.where_clause, &carried_vars)?,
                             txn,
                         )?;
                         if part.optional {
