@@ -1292,6 +1292,64 @@ fn explain_keeps_a_rand_equality_as_a_filter_despite_an_index() {
     );
 }
 
+/// Start-point selection: a pattern written from the big side must plan
+/// (and EXPLAIN) from the small side, with identical results.
+#[test]
+fn start_point_selection_walks_the_pattern_from_the_smaller_endpoint() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Rare {name: 'hub'})");
+    for i in 0..50 {
+        run(
+            &store,
+            &format!("MATCH (b:Rare {{name: 'hub'}}) CREATE (:Common {{id: {i}}})-[:R]->(b)"),
+        );
+    }
+
+    let explained = run(
+        &store,
+        "EXPLAIN MATCH (a:Common)-[:R]->(b:Rare) RETURN a.id",
+    );
+    let lines = plan_lines(&explained);
+    assert!(
+        lines.iter().any(|l| l.contains("NodeByLabelScan(b:Rare")),
+        "expected the plan to start from Rare, got: {lines:?}"
+    );
+
+    // Both written directions return the identical row set.
+    let forward = run(
+        &store,
+        "MATCH (a:Common)-[:R]->(b:Rare) RETURN a.id ORDER BY a.id",
+    );
+    let backward = run(
+        &store,
+        "MATCH (b:Rare)<-[:R]-(a:Common) RETURN a.id ORDER BY a.id",
+    );
+    let ids = |result: &marsdb_query::QueryResult| -> Vec<i64> {
+        result.rows.iter().map(|row| int_value(&row[0])).collect()
+    };
+    assert_eq!(ids(&forward), (0..50).collect::<Vec<i64>>());
+    assert_eq!(ids(&forward), ids(&backward));
+}
+
+/// The carried-endpoint case: `WITH b MATCH (a:Common)-->(b)` starts from
+/// the already-bound `b` (a Seed) rather than scanning every Common node.
+#[test]
+fn start_point_selection_prefers_a_carried_endpoint() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:Rare {name: 'hub'})");
+    for i in 0..10 {
+        run(
+            &store,
+            &format!("MATCH (b:Rare {{name: 'hub'}}) CREATE (:Common {{id: {i}}})-[:R]->(b)"),
+        );
+    }
+    let result = run(
+        &store,
+        "MATCH (b:Rare {name: 'hub'}) WITH b MATCH (a:Common)-[:R]->(b) RETURN count(a)",
+    );
+    assert_eq!(int_value(&result.rows[0][0]), 10);
+}
+
 #[test]
 fn explain_falls_back_to_scan_when_no_index_declared() {
     let store = GraphStore::open_memory().unwrap();

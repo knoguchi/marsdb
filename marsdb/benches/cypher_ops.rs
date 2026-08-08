@@ -74,11 +74,49 @@ fn bench_execute_scan_limit_pushdown(c: &mut Criterion) {
     group.finish();
 }
 
+/// Start-point selection: the pattern is deliberately written from the
+/// big side (`Common`, N nodes) toward the small side (one `Rare` hub),
+/// with only a fixed 100 of the N actually connected to the hub. Written
+/// order scans all N `Common` nodes and probes each one's adjacency;
+/// starting from the hub touches only the 100 matching rows — so time
+/// should stay ~flat as N grows once the planner picks the hub side.
+fn bench_execute_match_start_selectivity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("execute_match_start_selectivity_by_dataset_size");
+    for n in [1_000usize, 10_000, 100_000] {
+        let db = Database::in_memory().unwrap();
+        db.execute("CREATE (:Rare {name: 'hub'})").unwrap();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+            let create = chunk
+                .iter()
+                .map(|i| format!("(:Common {{idx: {i}}})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            db.execute(&format!("CREATE {create}")).unwrap();
+        }
+        // Only the first 100 Common nodes link to the hub.
+        db.execute(
+            "MATCH (b:Rare {name: 'hub'}) WITH b \
+             MATCH (a:Common) WHERE a.idx < 100 CREATE (a)-[:R]->(b)",
+        )
+        .unwrap();
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                black_box(
+                    db.execute("MATCH (a:Common)-[:R]->(b:Rare) RETURN count(a)")
+                        .unwrap(),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_only,
     bench_execute_create,
     bench_execute_match_1hop,
     bench_execute_scan_limit_pushdown,
+    bench_execute_match_start_selectivity,
 );
 criterion_main!(benches);

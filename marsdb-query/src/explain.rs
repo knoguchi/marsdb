@@ -26,7 +26,9 @@ use crate::ast::{
 use crate::error::QueryError;
 use crate::executor::with_item_output_name;
 use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
-use crate::planner::{apply_index_seeks, build_match_plan, pattern_all_vars};
+use crate::planner::{
+    apply_index_seeks, build_match_plan, pattern_all_vars, plan_reversed_pattern,
+};
 
 pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, QueryError> {
     match stmt {
@@ -198,8 +200,17 @@ fn explain_match_part(
             if part.optional { "OPTIONAL " } else { "" }
         ));
     } else {
+        // Mirrors the executor's own start-point selection exactly (plain
+        // MATCH only, never a named path) so the described plan is the
+        // executed plan.
+        let reversed = if part.path_var.is_none() {
+            plan_reversed_pattern(&part.pattern, &part.where_clause, carried_vars, txn)?
+        } else {
+            None
+        };
+        let pattern = reversed.as_ref().unwrap_or(&part.pattern);
         let plan = apply_index_seeks(
-            build_match_plan(&part.pattern, &part.where_clause, carried_vars)?,
+            build_match_plan(pattern, &part.where_clause, carried_vars)?,
             txn,
         )?;
         let header = match (&part.path_var, part.optional) {
