@@ -3238,53 +3238,37 @@ impl<'a> Executor<'a> {
                 rel_labels,
                 direction,
             } => {
-                let mut input = self.stream_plan(txn, input, seed, guard, None);
-                let mut current: Option<(BindingRow, std::vec::IntoIter<AdjEntry>)> = None;
-                let mut done = false;
-                let stream = std::iter::from_fn(move || loop {
-                    if done {
-                        return None;
-                    }
-                    if let Some((row, entries)) = &mut current {
-                        if let Some(entry) = entries.next() {
-                            if let Err(error) = guard.relationship_expansion() {
-                                done = true;
-                                return Some(Err(error));
-                            }
-                            let mut new_row = row.clone();
-                            new_row.insert(to_var.clone(), Binding::Node(entry.other));
-                            if let Some(rel_var) = rel_var {
-                                new_row.insert(rel_var.clone(), Binding::Edge(entry.edge_id));
-                            }
-                            return Some(Ok(new_row));
-                        }
-                        current = None;
-                    }
-
-                    let row = match input.next()? {
+                let input = self.stream_plan(txn, input, seed, guard, None);
+                let stream = input.flat_map(move |res| -> RowStream<'s> {
+                    let row = match res {
                         Ok(row) => row,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                        Err(error) => return Box::new(std::iter::once(Err(error))),
                     };
                     let from_id = match row.get(from_var) {
                         Some(Binding::Node(id)) => *id,
                         // A null binding has no neighbors and contributes
                         // no rows. Missing or structurally invalid bindings
                         // remain errors.
-                        Some(Binding::Value(PropertyValue::Null)) => continue,
+                        Some(Binding::Value(PropertyValue::Null)) => {
+                            return Box::new(std::iter::empty())
+                        }
                         _ => {
-                            done = true;
-                            return Some(Err(QueryError::UnboundVariable(from_var.clone())));
+                            return Box::new(std::iter::once(Err(QueryError::UnboundVariable(
+                                from_var.clone(),
+                            ))))
                         }
                     };
                     match neighbors_for_direction(txn, from_id, *direction, rel_labels) {
-                        Ok(entries) => current = Some((row, entries.into_iter())),
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                        Ok(entries) => Box::new(entries.into_iter().map(move |entry| {
+                            guard.relationship_expansion()?;
+                            let mut new_row = row.clone();
+                            new_row.insert(to_var.clone(), Binding::Node(entry.other));
+                            if let Some(rel_var) = rel_var {
+                                new_row.insert(rel_var.clone(), Binding::Edge(entry.edge_id));
+                            }
+                            Ok(new_row)
+                        })),
+                        Err(error) => Box::new(std::iter::once(Err(error))),
                     }
                 });
                 Self::count_stream(Box::new(stream), guard)
@@ -3304,47 +3288,32 @@ impl<'a> Executor<'a> {
                 rel_list_var,
                 rel_props,
             } => {
-                let mut input = self.stream_plan(txn, input, seed, guard, None);
-                let mut pending = Vec::new().into_iter();
-                let mut done = false;
-                let stream = std::iter::from_fn(move || loop {
-                    if done {
-                        return None;
-                    }
-                    if let Some(row) = pending.next() {
-                        return Some(Ok(row));
-                    }
-                    let row = match input.next()? {
-                        Ok(row) => row,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
-                    };
-                    match self.expand_variable_row(
-                        txn,
-                        row,
-                        VarExpandSpec {
-                            from_var,
-                            to_var,
-                            rel_labels,
-                            direction: *direction,
-                            min_hops: *min_hops,
-                            max_hops: *max_hops,
-                            exclude_edge_vars,
-                            exclude_edge_sets,
-                            exclude_edge_var,
-                            path_segment_var: path_segment_var.as_deref(),
-                            rel_list_var: rel_list_var.as_deref(),
-                            rel_props,
-                        },
-                        guard,
-                    ) {
-                        Ok(rows) => pending = rows.into_iter(),
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                let input = self.stream_plan(txn, input, seed, guard, None);
+                let stream = input.flat_map(move |res| {
+                    let rows = res.and_then(|row| {
+                        self.expand_variable_row(
+                            txn,
+                            row,
+                            VarExpandSpec {
+                                from_var,
+                                to_var,
+                                rel_labels,
+                                direction: *direction,
+                                min_hops: *min_hops,
+                                max_hops: *max_hops,
+                                exclude_edge_vars,
+                                exclude_edge_sets,
+                                exclude_edge_var,
+                                path_segment_var: path_segment_var.as_deref(),
+                                rel_list_var: rel_list_var.as_deref(),
+                                rel_props,
+                            },
+                            guard,
+                        )
+                    });
+                    match rows {
+                        Ok(rows) => Box::new(rows.into_iter().map(Ok)) as RowStream<'s>,
+                        Err(error) => Box::new(std::iter::once(Err(error))),
                     }
                 });
                 Self::count_stream(Box::new(stream), guard)
@@ -3359,20 +3328,13 @@ impl<'a> Executor<'a> {
                 min_hops,
                 max_hops,
             } => {
-                let mut input = self.stream_plan(txn, input, seed, guard, None);
-                let mut done = false;
-                let stream = std::iter::from_fn(move || loop {
-                    if done {
-                        return None;
-                    }
-                    let row = match input.next()? {
+                let input = self.stream_plan(txn, input, seed, guard, None);
+                let stream = input.filter_map(move |res| {
+                    let row = match res {
                         Ok(row) => row,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                        Err(error) => return Some(Err(error)),
                     };
-                    match self.match_bound_rel_list_row(
+                    self.match_bound_rel_list_row(
                         row,
                         MatchRelListSpec {
                             from_var,
@@ -3383,42 +3345,25 @@ impl<'a> Executor<'a> {
                             min_hops: *min_hops,
                             max_hops: *max_hops,
                         },
-                    ) {
-                        Ok(Some(row)) => return Some(Ok(row)),
-                        Ok(None) => continue,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
-                    }
+                    )
+                    .transpose()
                 });
                 Self::count_stream(Box::new(stream), guard)
             }
             LogicalPlan::Filter { input, predicate } => {
-                let mut input = self.stream_plan(txn, input, seed, guard, None);
-                let mut done = false;
-                let stream = std::iter::from_fn(move || loop {
-                    if done {
-                        return None;
-                    }
-                    let row = match input.next()? {
+                let input = self.stream_plan(txn, input, seed, guard, None);
+                let stream = input.filter_map(move |res| {
+                    let row = match res {
                         Ok(row) => row,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                        Err(error) => return Some(Err(error)),
                     };
                     if let Err(error) = guard.checkpoint() {
-                        done = true;
                         return Some(Err(error));
                     }
                     match self.eval_expr(txn, predicate, &row, guard) {
-                        Ok(Some(true)) => return Some(Ok(row)),
-                        Ok(_) => continue,
-                        Err(error) => {
-                            done = true;
-                            return Some(Err(error));
-                        }
+                        Ok(Some(true)) => Some(Ok(row)),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
                     }
                 });
                 Self::count_stream(Box::new(stream), guard)
@@ -3426,6 +3371,13 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Wraps every `stream_plan` operator's output: counts produced rows
+    /// against the guard's intermediate-row limit, and FUSES the stream
+    /// after the first `Err` — `next()` returns `None` from then on, so
+    /// the erroring operator (and everything beneath it) is never polled
+    /// again. The operator closures in `stream_plan` rely on this instead
+    /// of each tracking its own post-error `done` flag: after they emit an
+    /// `Err`, this wrapper guarantees they're not resumed.
     fn count_stream<'s>(mut stream: RowStream<'s>, guard: &'s ExecutionGuard<'_>) -> RowStream<'s> {
         let mut produced = 0usize;
         let mut done = false;
