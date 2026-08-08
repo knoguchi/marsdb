@@ -540,33 +540,48 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 /// `ADJ_OUT`), so which endpoint seeds the traversal is a pure cost
 /// choice with identical results.
 ///
-/// The comparison is the same cheap-cardinality machinery
-/// `apply_index_seeks` already uses, extended with per-label and
-/// whole-table counts (all O(1), see `label_count_in_txn`/
-/// `node_count_in_txn`): an endpoint's start cost is 0 if it's already
-/// bound (a `Seed`), else the smallest of its label count and any
-/// indexed literal-equality candidate's match count (inline pattern
-/// props and WHERE conjuncts both, since `build_match_plan` pushes
-/// start-only conjuncts down to the start scan where
-/// `apply_index_seeks` can fuse them). Reversal fires only when the far
-/// endpoint is strictly cheaper — ties keep written order, both for
-/// determinism and because reversal is never free to reason about.
+/// The decision is a two-sided cost estimate, all O(1) statistics
+/// (`label_count_in_txn`/`node_count_in_txn`/`rel_type_count_in_txn`):
 ///
-/// One more guard on top of the row comparison: reversal is declined
-/// when the written start has pushable filtering work its row estimate
-/// gives no credit for (`EndpointCost::filtered` — an unindexed or
-/// non-equality conjunct, e.g. `CONTAINS`), *unless* the far endpoint's
-/// estimate is seek-backed (`EndpointCost::seek_backed` — a bound Seed
-/// or a measured indexed-equality count, not merely a smaller label).
-/// Anchoring at the filtered endpoint prunes rows *before* any edge is
-/// expanded; reversal strands that filter above the first Expand, which
-/// then walks every edge its unfiltered side touches. The label-count
-/// comparison can't see either effect (it has no edge statistics and no
-/// selectivity estimate for a non-equality predicate), so a label-only
-/// advantage isn't trusted against a stranded filter — the benchmark
-/// query that surfaced this (`MATCH (m:Movie)<-[:RATED]-(u:User) WHERE
-/// m.title CONTAINS '...'`, 671 users vs 9125 movies but only 3 title
-/// matches) ran ~9x slower reversed than in written order.
+/// ```text
+/// cost(anchor A, other B) = rows_A · (1 + filtered_A)
+///                         + E_A    · (1 + filtered_B)
+/// E_A = E · rows_A / label_rows_A
+/// ```
+///
+/// where `rows` is the anchor's leaf-scan estimate (0 for a bound Seed,
+/// else label count narrowed by the best indexed literal-equality
+/// candidate — the same candidates `apply_index_seeks` would fuse),
+/// `E` is the live edge count of the anchor-adjacent hop's relationship
+/// type(s), and `filtered` marks pushable predicate work the row
+/// estimate gives no credit for (a `CONTAINS`, a range, an unindexed or
+/// `$param` equality). The terms are the traversal's real work items:
+/// scan `rows_A` leaf rows; evaluate the anchor's own filter once per
+/// scanned row (`rows_A · filtered_A` — pushed below the Expand by
+/// `build_match_plan`, this is what anchoring *at* the filtered side
+/// buys); walk `E_A` edges, the type's total prorated by how much the
+/// anchor's index narrowed its label (uniform-degree assumption, and
+/// selectivity 1 for uncredited filters — deliberately conservative,
+/// an unindexed predicate's selectivity is unknowable here); evaluate
+/// the *other* endpoint's stranded filter once per walked edge
+/// (`E_A · filtered_B`). Row scans, filter evaluations, and edge walks
+/// are weighted equally — measured on the recommendations dataset at
+/// ~0.66µs and ~0.65µs per item for the filter-eval and edge-walk
+/// halves, same order.
+///
+/// With no filters anywhere the model degenerates to the old plain row
+/// comparison (both sides carry the same full `E`). The benchmark query
+/// that motivated the `filtered` term (`MATCH (m:Movie)<-[:RATED]-
+/// (u:User) WHERE m.title CONTAINS '...'`, 671 users vs 9,125 movies,
+/// 100k RATED edges, 3 title matches) prices as 118k written vs 200k
+/// reversed — written order, the measured-9x-faster answer. The shape
+/// the interim always-decline rule got wrong — a huge filtered label
+/// against a tiny far endpoint with few edges — now reverses, because a
+/// small `E` caps how much the stranded filter can cost.
+///
+/// Reversal fires only when the far endpoint prices strictly cheaper —
+/// ties keep written order, both for determinism and because reversal
+/// is never free to reason about.
 ///
 /// Deliberately conservative, same stance as every other planner pass:
 /// only all-fixed-hop patterns are considered. A variable-length hop's
@@ -591,33 +606,77 @@ pub fn plan_reversed_pattern(
     if let Some(expr) = where_clause {
         push_conjuncts(expr.clone(), &mut conjuncts);
     }
-    let end = &pattern.hops.last().expect("hops checked non-empty").1;
+    let (first_rel, _) = &pattern.hops[0];
+    let (last_rel, end) = pattern.hops.last().expect("hops checked non-empty");
     let start_cost = endpoint_start_cost(&pattern.start, &conjuncts, carried_vars, txn)?;
     let end_cost = endpoint_start_cost(end, &conjuncts, carried_vars, txn)?;
-    if end_cost.rows < start_cost.rows && (!start_cost.filtered || end_cost.seek_backed) {
+    // Each side's expand term uses its own adjacent hop's edge count —
+    // for a single-hop pattern they're the same hop; for multi-hop, the
+    // hop the anchor would walk first (later hops are unmodeled, the
+    // same first-hop-dominates approximation the rest of this pass
+    // already makes).
+    let start_edges = rel_types_edge_count(txn, &first_rel.rel_types)?;
+    let end_edges = rel_types_edge_count(txn, &last_rel.rel_types)?;
+    if anchor_cost(&end_cost, &start_cost, end_edges)
+        < anchor_cost(&start_cost, &end_cost, start_edges)
+    {
         Ok(Some(reverse_pattern(pattern)))
     } else {
         Ok(None)
     }
 }
 
+/// Live edge count for one hop's relationship-type list: sum of the
+/// per-type counts, or the whole-table edge count for an untyped hop
+/// (`-->`). All O(1) reads.
+fn rel_types_edge_count(txn: Txn, rel_types: &[String]) -> Result<u64, QueryError> {
+    if rel_types.is_empty() {
+        return Ok(GraphStore::edge_count_in_txn(txn)?);
+    }
+    let mut total: u64 = 0;
+    for rel_type in rel_types {
+        total = total.saturating_add(GraphStore::rel_type_count_in_txn(txn, rel_type)?);
+    }
+    Ok(total)
+}
+
+/// One side of `plan_reversed_pattern`'s comparison — see its docs for
+/// the model. Saturating u64 throughout: the counts are real table
+/// sizes, but `rows · 2 + E · 2` on a pathological database shouldn't
+/// wrap into a nonsense comparison.
+fn anchor_cost(anchor: &EndpointCost, other: &EndpointCost, edges: u64) -> u64 {
+    let scan_and_filter = anchor.rows.saturating_mul(1 + u64::from(anchor.filtered));
+    // Prorate the type's edges by how much the anchor's own narrowing
+    // (index seek, or a Seed's zero rows) shrank its label.
+    let walked = if anchor.label_rows == 0 {
+        0
+    } else {
+        u64::try_from(u128::from(edges) * u128::from(anchor.rows) / u128::from(anchor.label_rows))
+            .unwrap_or(u64::MAX)
+    };
+    let expand_and_stranded = walked.saturating_mul(1 + u64::from(other.filtered));
+    scan_and_filter.saturating_add(expand_and_stranded)
+}
+
 /// What `endpoint_start_cost` knows about starting a traversal at one
-/// endpoint — see `plan_reversed_pattern` for how the three fields
-/// combine into the reversal decision.
+/// endpoint — the inputs to `anchor_cost`, see `plan_reversed_pattern`
+/// for the model.
 struct EndpointCost {
     /// Rows the leaf scan would produce: 0 for a bound `Seed`, else the
     /// label count narrowed by the best indexed literal-equality
     /// candidate.
     rows: u64,
-    /// `rows` is a *measured* narrow figure — a bound `Seed` (reads no
-    /// storage at all) or an index's per-key entry count — rather than a
-    /// whole-label count.
-    seek_backed: bool,
+    /// The unnarrowed size of the endpoint's scan domain — its label
+    /// count, or the whole node table when unlabeled. `rows /
+    /// label_rows` is the fraction of the label the anchor actually
+    /// visits, which is what prorates the edge-walk estimate.
+    label_rows: u64,
     /// The endpoint has pushable filtering work `rows` gives no credit
     /// for: a non-equality conjunct (`CONTAINS`, a range, ...), an
     /// equality with no index behind it, or a `$param` equality whose
-    /// value is unknown at plan time. Anchoring here would prune before
-    /// the first Expand; anchoring elsewhere strands the filter above it.
+    /// value is unknown at plan time. Anchoring here evaluates it once
+    /// per scanned row, below the Expand; anchoring at the other side
+    /// strands it above, once per walked edge.
     filtered: bool,
 }
 
@@ -642,19 +701,18 @@ fn endpoint_start_cost(
     if node.var.as_ref().is_some_and(|v| carried_vars.contains(v)) {
         return Ok(EndpointCost {
             rows: 0,
-            seek_backed: true,
+            label_rows: 0,
             filtered: false,
         });
     }
     let label = node.labels.first();
-    let mut rows = match label {
+    let label_rows = match label {
         Some(label) => GraphStore::label_count_in_txn(txn, label)?,
         None => GraphStore::node_count_in_txn(txn)?,
     };
-    let mut seek_backed = false;
+    let mut rows = label_rows;
     let mut filtered = false;
     let consider = |rows: &mut u64,
-                    seek_backed: &mut bool,
                     filtered: &mut bool,
                     prop: &str,
                     lit: &Literal|
@@ -669,7 +727,6 @@ fn endpoint_start_cost(
                         &literal_to_value(lit),
                     )?;
                     *rows = (*rows).min(count);
-                    *seek_backed = true;
                     return Ok(());
                 }
             }
@@ -679,7 +736,7 @@ fn endpoint_start_cost(
     };
     for (key, expr) in &node.props {
         if let ReturnExpr::Lit(lit) = expr {
-            consider(&mut rows, &mut seek_backed, &mut filtered, key, lit)?;
+            consider(&mut rows, &mut filtered, key, lit)?;
         } else {
             filtered = true;
         }
@@ -691,7 +748,7 @@ fn endpoint_start_cost(
             }
             match c {
                 Expr::Compare(pa, CompareOp::Eq, lit) => {
-                    consider(&mut rows, &mut seek_backed, &mut filtered, &pa.prop, lit)?
+                    consider(&mut rows, &mut filtered, &pa.prop, lit)?
                 }
                 Expr::HasLabel(..) => {}
                 _ => filtered = true,
@@ -700,7 +757,7 @@ fn endpoint_start_cost(
     }
     Ok(EndpointCost {
         rows,
-        seek_backed,
+        label_rows,
         filtered,
     })
 }
@@ -1080,17 +1137,19 @@ mod tests {
         }
     }
 
-    fn seed_people(store: &GraphStore, common: usize, rare: usize) {
+    fn seed_people(store: &GraphStore, common: usize, rare: usize) -> Vec<marsdb_graph::NodeId> {
+        let mut common_ids = Vec::with_capacity(common);
         for i in 0..common {
             let mut props = BTreeMap::new();
             props.insert("id".to_string(), PropertyValue::Int(i as i64));
-            store.create_node(&["Common"], props).unwrap();
+            common_ids.push(store.create_node(&["Common"], props).unwrap());
         }
         for i in 0..rare {
             let mut props = BTreeMap::new();
             props.insert("id".to_string(), PropertyValue::Int(i as i64));
             store.create_node(&["Rare"], props).unwrap();
         }
+        common_ids
     }
 
     #[test]
@@ -1165,13 +1224,21 @@ mod tests {
     fn keeps_written_order_when_reversal_would_strand_a_start_filter() {
         // `WHERE a.id > 5` is pushable to a's scan but has no index and
         // isn't an equality, so a's row estimate gets no credit for it
-        // (`EndpointCost::filtered`). Reversing toward the smaller Rare
-        // label would strand that filter above the Expand -- label count
-        // alone isn't trusted against a stranded filter, so written
-        // order stands. This is the shape of the recommendations
-        // benchmark's `m.title CONTAINS 'Matrix'` regression (9x).
+        // (`EndpointCost::filtered`). With a real edge population (40 R
+        // edges, all incident to the single Rare node -- the shape of
+        // the recommendations benchmark's `m.title CONTAINS 'Matrix'`
+        // regression, where every RATED edge touches the small label),
+        // reversing toward the smaller Rare label strands that filter
+        // above an Expand that walks all 40 edges: 1 + 2*40 = 81
+        // reversed vs 2*20 + 40 = 80 written -- written order stands.
         let store = GraphStore::open_memory().unwrap();
-        seed_people(&store, 20, 1);
+        let common = seed_people(&store, 20, 0);
+        let rare = store.create_node(&["Rare"], BTreeMap::new()).unwrap();
+        for id in &common {
+            for _ in 0..2 {
+                store.create_edge("R", *id, rare, BTreeMap::new()).unwrap();
+            }
+        }
         let part = part_from("MATCH (a:Common)-[:R]->(b:Rare) WHERE a.id > 5 RETURN a");
 
         let write = store.begin_write().unwrap();
@@ -1183,6 +1250,34 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn reverses_a_filtered_start_when_the_edge_population_is_small() {
+        // The shape the interim always-decline rule got wrong: a big
+        // filtered label against a tiny far endpoint with few edges.
+        // Expanding from the one Rare node walks 2 edges total no matter
+        // how unselective a's filter is -- 1 + 2*2 = 5 reversed vs
+        // 2*200 + 2 = 402 written. A small live-edge count caps what
+        // the stranded filter can cost, so reversal wins.
+        let store = GraphStore::open_memory().unwrap();
+        let common = seed_people(&store, 200, 0);
+        let rare = store.create_node(&["Rare"], BTreeMap::new()).unwrap();
+        for id in common.iter().take(2) {
+            store.create_edge("R", *id, rare, BTreeMap::new()).unwrap();
+        }
+        let part = part_from("MATCH (a:Common)-[:R]->(b:Rare) WHERE a.id > 5 RETURN a");
+
+        let write = store.begin_write().unwrap();
+        let reversed = plan_reversed_pattern(
+            &part.pattern,
+            &part.where_clause,
+            &Default::default(),
+            Txn::Write(&write),
+        )
+        .unwrap()
+        .expect("expected reversal toward the tiny edge population");
+        assert_eq!(reversed.start.var.as_deref(), Some("b"));
     }
 
     #[test]

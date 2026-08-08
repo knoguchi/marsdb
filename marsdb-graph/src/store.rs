@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use marsdb_storage::{
-    ReadTransaction, ReadableMultimapTable, ReadableTable, StorageEngine, Txn, WriteTransaction,
+    ReadTransaction, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, StorageEngine,
+    Txn, WriteTransaction,
 };
 
 use crate::encode::{
@@ -33,15 +34,56 @@ pub struct IntegrityReport {
 
 impl GraphStore {
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, GraphError> {
-        Ok(Self {
+        let store = Self {
             storage: StorageEngine::open_file(path)?,
-        })
+        };
+        store.backfill_rel_type_counts()?;
+        Ok(store)
     }
 
     pub fn open_memory() -> Result<Self, GraphError> {
         Ok(Self {
             storage: StorageEngine::open_memory()?,
         })
+    }
+
+    /// One-time `REL_TYPE_COUNTS` rebuild for a file written by a build
+    /// that predates the table: counts empty while `EDGES` isn't can only
+    /// mean the maintaining writes never ran, so scan every edge header
+    /// once (no property decode) and commit the tallies. A fresh or
+    /// up-to-date file exits on the first check without writing anything.
+    /// A file this build writes and an *older* build later mutates would
+    /// go stale with no way to detect it here -- tolerable by
+    /// construction, since the table is a planner statistic that can cost
+    /// a suboptimal plan but never a wrong result (see its definition).
+    fn backfill_rel_type_counts(&self) -> Result<(), GraphError> {
+        let write_txn = self.begin_write()?;
+        let up_to_date = {
+            let counts = write_txn.open_table(marsdb_storage::tables::REL_TYPE_COUNTS)?;
+            let edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
+            !counts.is_empty()? || edges.is_empty()?
+        };
+        if up_to_date {
+            write_txn.abort()?;
+            return Ok(());
+        }
+        let mut tallies: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        {
+            let edges = write_txn.open_table(marsdb_storage::tables::EDGES)?;
+            for entry in edges.iter()? {
+                let (_, value) = entry?;
+                let (label_id, _, _) = edge_header(value.value())?;
+                *tallies.entry(label_id).or_insert(0) += 1;
+            }
+        }
+        {
+            let mut counts = write_txn.open_table(marsdb_storage::tables::REL_TYPE_COUNTS)?;
+            for (label_id, count) in tallies {
+                counts.insert(label_id, count)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), GraphError> {
@@ -502,7 +544,26 @@ impl GraphStore {
             .insert(crate::model::adj_key(src.0, label_id, id), dst.0)?;
         ctx.adj_in()?
             .insert(crate::model::adj_key(dst.0, label_id, id), src.0)?;
+        Self::bump_rel_type_count(ctx, label_id, 1)?;
         Ok(EdgeId(id))
+    }
+
+    /// Adjust `REL_TYPE_COUNTS` for one edge born (`+1`) or dying (`-1`)
+    /// -- called from the only two such places, `create_edge_ctx` and
+    /// `delete_edge_ctx`. Saturating on the way down: a file written by
+    /// a build that predates the table (or the backfill racing nothing
+    /// -- see `backfill_rel_type_counts`) must degrade to a wrong
+    /// *estimate*, never an underflow panic.
+    fn bump_rel_type_count(
+        ctx: &mut WriteCtx,
+        label_id: u32,
+        delta: i64,
+    ) -> Result<(), GraphError> {
+        let table = ctx.rel_type_counts()?;
+        let current = table.get(label_id)?.map(|g| g.value()).unwrap_or(0);
+        let next = current.saturating_add_signed(delta);
+        table.insert(label_id, next)?;
+        Ok(())
     }
 
     pub fn get_edge(&self, id: EdgeId) -> Result<Option<Edge>, GraphError> {
@@ -664,6 +725,7 @@ impl GraphStore {
             .remove(crate::model::adj_key(src, label_id, id.0))?;
         ctx.adj_in()?
             .remove(crate::model::adj_key(dst, label_id, id.0))?;
+        Self::bump_rel_type_count(ctx, label_id, -1)?;
         Ok(Some(label_id))
     }
 
@@ -998,6 +1060,27 @@ impl GraphStore {
         };
         let index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
         let count = index.get(label_id)?.len();
+        Ok(count)
+    }
+
+    /// Total edge count — O(1) (redb tracks table entry counts), the
+    /// edge counterpart of `node_count_in_txn`. Planner cardinality use
+    /// only.
+    pub fn edge_count_in_txn(txn: Txn) -> Result<u64, GraphError> {
+        let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
+        Ok(edges.len()?)
+    }
+
+    /// Number of live edges of relationship type `rel_type` — O(1) via
+    /// `REL_TYPE_COUNTS` (see its definition in `tables.rs` for the
+    /// maintenance/backfill story). An unknown type reads as 0, same as
+    /// `label_count_in_txn`. Planner cardinality use only.
+    pub fn rel_type_count_in_txn(txn: Txn, rel_type: &str) -> Result<u64, GraphError> {
+        let Some(label_id) = lookup_label_id(txn, rel_type)? else {
+            return Ok(0);
+        };
+        let counts = txn.open_table(marsdb_storage::tables::REL_TYPE_COUNTS)?;
+        let count = counts.get(label_id)?.map(|g| g.value()).unwrap_or(0);
         Ok(count)
     }
 

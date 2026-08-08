@@ -49,6 +49,7 @@ pub(crate) struct WriteCtx<'txn> {
     edges: Option<Table<'txn, u64, &'static [u8]>>,
     adj_out: Option<Table<'txn, (u64, u32, u64), u64>>,
     adj_in: Option<Table<'txn, (u64, u32, u64), u64>>,
+    rel_type_counts: Option<Table<'txn, u32, u64>>,
     node_label_index: Option<MultimapTable<'txn, u32, u64>>,
     prop_to_id: Option<Table<'txn, &'static str, u32>>,
     id_to_prop: Option<Table<'txn, u32, &'static str>>,
@@ -89,6 +90,7 @@ impl<'txn> WriteCtx<'txn> {
             edges: None,
             adj_out: None,
             adj_in: None,
+            rel_type_counts: None,
             node_label_index: None,
             prop_to_id: None,
             id_to_prop: None,
@@ -123,6 +125,12 @@ impl<'txn> WriteCtx<'txn> {
         adj_in,
         marsdb_storage::tables::ADJ_IN,
         Table<(u64, u32, u64), u64>
+    );
+    table_accessor!(
+        rel_type_counts,
+        rel_type_counts,
+        marsdb_storage::tables::REL_TYPE_COUNTS,
+        Table<u32, u64>
     );
     multimap_accessor!(node_label_index, node_label_index, marsdb_storage::tables::NODE_LABEL_INDEX, MultimapTable<u32, u64>);
     table_accessor!(
