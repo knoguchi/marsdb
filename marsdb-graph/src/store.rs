@@ -210,7 +210,7 @@ impl GraphStore {
 
     fn check_adjacency(
         read: &ReadTransaction,
-        definition: marsdb_storage::TableDefinition<&[u8], u64>,
+        definition: marsdb_storage::TableDefinition<(u64, u32, u64), u64>,
         nodes: &BTreeMap<u64, Vec<u32>>,
         edges: &BTreeMap<u64, (u32, u64, u64)>,
         outgoing: bool,
@@ -219,7 +219,7 @@ impl GraphStore {
         let mut found = BTreeSet::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            let (owner, key_label_id, edge_id) = crate::model::parse_adj_key(key.value())?;
+            let (owner, key_label_id, edge_id) = key.value();
             let other = value.value();
             if !nodes.contains_key(&owner) {
                 return Err(GraphError::CorruptData(format!(
@@ -474,10 +474,10 @@ impl GraphStore {
         let bytes = encode_edge(&record, |name| intern_prop(ctx, name))?;
         ctx.edges()?.insert(id, bytes.as_slice())?;
 
-        let out_key = crate::model::adj_key(src.0, label_id, id);
-        let in_key = crate::model::adj_key(dst.0, label_id, id);
-        ctx.adj_out()?.insert(out_key.as_slice(), dst.0)?;
-        ctx.adj_in()?.insert(in_key.as_slice(), src.0)?;
+        ctx.adj_out()?
+            .insert(crate::model::adj_key(src.0, label_id, id), dst.0)?;
+        ctx.adj_in()?
+            .insert(crate::model::adj_key(dst.0, label_id, id), src.0)?;
         Ok(EdgeId(id))
     }
 
@@ -545,9 +545,9 @@ impl GraphStore {
             Direction::In => marsdb_storage::tables::ADJ_IN,
         };
         let table = txn.open_table(table_def)?;
-        for item in table.range(&lo[..]..=&hi[..])? {
+        for item in table.range(lo..=hi)? {
             let (key, value) = item?;
-            let (_, label_id, edge_id) = crate::model::parse_adj_key(key.value())?;
+            let (_, label_id, edge_id) = key.value();
             result.push(AdjEntry {
                 edge_id: EdgeId(edge_id),
                 other: NodeId(value.value()),
@@ -589,10 +589,10 @@ impl GraphStore {
         // Header-only read: adjacency cleanup needs (label, src, dst),
         // never the edge's properties -- skips every prop-name resolution.
         let (label_id, src, dst) = edge_header(&record_bytes)?;
-        let out_key = crate::model::adj_key(src, label_id, id.0);
-        let in_key = crate::model::adj_key(dst, label_id, id.0);
-        ctx.adj_out()?.remove(out_key.as_slice())?;
-        ctx.adj_in()?.remove(in_key.as_slice())?;
+        ctx.adj_out()?
+            .remove(crate::model::adj_key(src, label_id, id.0))?;
+        ctx.adj_in()?
+            .remove(crate::model::adj_key(dst, label_id, id.0))?;
         Ok(true)
     }
 
@@ -613,14 +613,14 @@ impl GraphStore {
         let mut ctx = WriteCtx::open(write_txn);
         let mut incident: Vec<EdgeId> = Vec::new();
         let (lo, hi) = crate::model::adj_node_bounds(id.0);
-        for item in ctx.adj_out()?.range(&lo[..]..=&hi[..])? {
+        for item in ctx.adj_out()?.range(lo..=hi)? {
             let (key, _) = item?;
-            let (_, _, edge_id) = crate::model::parse_adj_key(key.value())?;
+            let (_, _, edge_id) = key.value();
             incident.push(EdgeId(edge_id));
         }
-        for item in ctx.adj_in()?.range(&lo[..]..=&hi[..])? {
+        for item in ctx.adj_in()?.range(lo..=hi)? {
             let (key, _) = item?;
-            let (_, _, edge_id) = crate::model::parse_adj_key(key.value())?;
+            let (_, _, edge_id) = key.value();
             incident.push(EdgeId(edge_id));
         }
         if !incident.is_empty() && !detach {
@@ -1083,11 +1083,10 @@ mod tests {
         let node = store.create_node(&[], BTreeMap::new()).unwrap();
 
         let write = store.begin_write().unwrap();
-        let key = crate::model::adj_key(node.0, 0, 999);
         write
             .open_table(marsdb_storage::tables::ADJ_OUT)
             .unwrap()
-            .insert(key.as_slice(), node.0)
+            .insert(crate::model::adj_key(node.0, 0, 999), node.0)
             .unwrap();
         write.commit().unwrap();
 

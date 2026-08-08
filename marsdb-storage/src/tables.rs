@@ -16,20 +16,22 @@ pub const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 pub const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 
 /// Outgoing adjacency as a composite-key plain table (v1.5 step 2):
-/// `src_node_id(8B BE) ++ label_id(4B BE) ++ edge_id(8B BE)` -> dst
-/// node_id. B-tree key order clusters one node's edges together and,
-/// within a node, groups them by label — so a typed expansion
-/// (`-[:KNOWS]->`) is a prefix `range()` over `node ++ label`, touching
-/// only matching entries (`O(matching degree)`), and an untyped expansion
-/// is the wider `node ++ *` prefix. The composite-key-on-sorted-KV shape
-/// is the industry-standard pattern-B layout for exactly this. Replaces a
+/// `(src_node_id, label_id, edge_id)` -> dst node_id. redb tuple keys are
+/// FIXED-WIDTH (mars-am7: erasing fixed-width keys to `&[u8]` measured
+/// +34% file size on this exact codebase — a first cut of this change
+/// repeated that mistake with byte-packed keys and doubled the db file;
+/// tuples keep redb's fixed-slot packing) and order component-wise, so
+/// one node's edges cluster together grouped by label: a typed expansion
+/// (`-[:KNOWS]->`) is a `range()` over the `(node, label, *)` prefix,
+/// touching only matching entries (`O(matching degree)`), and an untyped
+/// expansion is the wider `(node, *, *)` prefix. Replaces a
 /// `node_id -> {20-byte AdjEntry}` multimap whose per-node entries were
 /// ordered by edge id, forcing every typed expansion to decode and
 /// label-check the node's entire entry set (`O(total degree)`).
-pub const ADJ_OUT: TableDefinition<&[u8], u64> = TableDefinition::new("adj_out");
+pub const ADJ_OUT: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new("adj_out");
 
 /// Incoming mirror of `ADJ_OUT`: `dst ++ label ++ edge` -> src node_id.
-pub const ADJ_IN: TableDefinition<&[u8], u64> = TableDefinition::new("adj_in");
+pub const ADJ_IN: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new("adj_in");
 
 /// label_id -> set of node_ids carrying that label. Secondary index so a
 /// label-filtered scan (`NodeByLabelScan`) can look up matching nodes
