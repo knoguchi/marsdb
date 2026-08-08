@@ -29,6 +29,11 @@ type Scope = HashMap<String, Kind>;
 
 pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
     match statement {
+        // Session-level statements bind nothing and reference nothing --
+        // whether one is *valid right now* (e.g. `COMMIT` with no open
+        // transaction) is session state, which is `marsdb::Database`'s
+        // to check, not a static property of the statement.
+        Statement::Begin | Statement::Commit | Statement::Rollback => Ok(()),
         Statement::Create(patterns) => {
             let mut scope = Scope::new();
             for pattern in patterns {

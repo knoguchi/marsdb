@@ -32,6 +32,9 @@ use crate::planner::{
 
 pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, QueryError> {
     match stmt {
+        Statement::Begin | Statement::Commit | Statement::Rollback => Err(QueryError::Semantic(
+            "BEGIN/COMMIT/ROLLBACK have no query plan to explain".into(),
+        )),
         Statement::Create(_) => Ok(vec![
             "(no query plan -- CREATE has no traversal/filter plan, it only constructs rows)"
                 .to_string(),

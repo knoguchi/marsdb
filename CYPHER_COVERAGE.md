@@ -267,6 +267,35 @@ in code.
 
 Not yet supported: `CREATE CONSTRAINT`, composite indexes, range scans.
 
+## Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` as statements — a MarsDB extension
+(openCypher has no transaction statements; real deployments do this at
+the protocol/session layer). One session per `Database` handle: `BEGIN`
+opens a write transaction, every subsequent statement (reads included —
+they see the transaction's own uncommitted writes) runs inside it, and
+`COMMIT`/`ROLLBACK` end it. A statement that fails at *execution* time
+aborts the whole transaction (its partial effects must never be
+committable); a parse/`$param` error leaves it open (nothing ran).
+Works identically fed one statement at a time (the CLI REPL) or inside
+one `;`-separated batch: `BEGIN; CREATE (a); CREATE (b); COMMIT` is one
+atomic unit. Not valid inside a caller-owned `Database::begin_transaction`
+handle (that API has its own `commit()`/`rollback()` methods) or
+`execute_batch_grouped` (whose grouping is its own transaction policy).
+
+An open session transaction holds the storage engine's single writer, so
+an abandoned one blocks every other writer in the process.
+`Database::set_session_transaction_timeout` (off by default, like the
+equivalent knobs real deployments ship) mitigates: a session transaction
+idle past the limit is rolled back by the next statement to arrive, which
+gets an explicit `SessionTransactionTimedOut` error rather than a
+misleading "no open transaction".
+
+Isolation: read-only statements outside a transaction run on MVCC
+snapshots (snapshot isolation, non-blocking, parallel); writers are
+serialized by the storage engine's single-writer lock. Single writer +
+snapshot readers = serializable — there is no weaker level to configure.
+
 ## Error taxonomy
 
 `QueryError` is typed, not one flat string:

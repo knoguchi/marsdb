@@ -841,6 +841,18 @@ pub enum QueryClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `BEGIN` / `COMMIT` / `ROLLBACK` — MarsDB's session-transaction
+    /// extension (issue #142; not openCypher, which has no transaction
+    /// statements at all — real deployments do this at the protocol/
+    /// session layer). Recognized textually by `parse` before the ANTLR
+    /// grammar ever runs (single bare keywords, nothing for a grammar to
+    /// disambiguate — same out-of-grammar precedent as `;`-separated
+    /// batches, see grammar/README.md), and handled entirely by
+    /// `marsdb::Database`'s session layer; the executor rejects them
+    /// with a pointer there, since it has no session to act on.
+    Begin,
+    Commit,
+    Rollback,
     Create(Vec<Pattern>),
     /// `CREATE INDEX ON :Label(prop)`, optionally `UNIQUE`.
     CreateIndex {

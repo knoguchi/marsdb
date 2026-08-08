@@ -10,7 +10,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
+
+use marsdb_query::Statement;
 
 pub use marsdb_graph::IntegrityReport;
 pub use marsdb_graph::PropertyValue;
@@ -29,10 +32,55 @@ pub enum Error {
     Query(#[from] marsdb_query::QueryError),
     #[error("transaction is no longer active")]
     TransactionClosed,
+    #[error(
+        "session transaction was idle for {idle:?} (limit {limit:?}) and has been rolled back"
+    )]
+    SessionTransactionTimedOut {
+        idle: std::time::Duration,
+        limit: std::time::Duration,
+    },
 }
 
 pub struct Database {
     store: marsdb_graph::GraphStore,
+    /// The Cypher-level session transaction (`BEGIN`/`COMMIT`/`ROLLBACK`
+    /// statements, issue #142 — MarsDB extension, openCypher has no
+    /// transaction statements). `BEGIN` opens it, every subsequent
+    /// `execute`/`execute_batch` statement runs inside it (reads included,
+    /// so they see the transaction's own writes), `COMMIT`/`ROLLBACK`
+    /// close it. One per `Database` handle — the handle *is* the session;
+    /// callers that need independent concurrent units of work should use
+    /// [`Database::begin_transaction`]'s caller-owned handles instead.
+    ///
+    /// Same abort-on-error stance as [`Transaction`] for *execution*
+    /// errors (a failed statement's partial effects must not be
+    /// committable), but a statement that never ran at all — parse or
+    /// `$param`-substitution failure — leaves the transaction open:
+    /// nothing was applied, and killing an interactive session's
+    /// transaction over a typo helps nobody.
+    ///
+    /// An open session transaction holds redb's single writer, so an
+    /// abandoned one blocks every other writer in the process — caller-
+    /// owned [`Database::begin_transaction`] handles and
+    /// [`Database::execute_batch_grouped`] groups included — *forever*
+    /// (redb's `begin_write` blocks, it doesn't error). The optional
+    /// idle timeout ([`Database::set_session_transaction_timeout`]) is
+    /// the mitigation: expiry is checked lazily, by whatever statement
+    /// next comes through the session layer.
+    session_txn: Mutex<Option<OpenSessionTxn>>,
+    /// See [`Database::set_session_transaction_timeout`]. Behind its own
+    /// lock (not folded into `session_txn`'s) so reconfiguring never
+    /// waits on a statement executing inside an open transaction.
+    session_txn_timeout: Mutex<Option<std::time::Duration>>,
+}
+
+/// An open Cypher-level session transaction — see `Database::session_txn`.
+struct OpenSessionTxn {
+    txn: marsdb_graph::WriteTransaction,
+    /// Refreshed after every statement that runs inside the transaction
+    /// (including the `BEGIN` that opened it); what the idle timeout
+    /// measures against.
+    last_used: Instant,
 }
 
 impl Database {
@@ -40,6 +88,8 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         Ok(Self {
             store: marsdb_graph::GraphStore::open_file(path)?,
+            session_txn: Mutex::new(None),
+            session_txn_timeout: Mutex::new(None),
         })
     }
 
@@ -47,6 +97,8 @@ impl Database {
     pub fn in_memory() -> Result<Self, Error> {
         Ok(Self {
             store: marsdb_graph::GraphStore::open_memory()?,
+            session_txn: Mutex::new(None),
+            session_txn_timeout: Mutex::new(None),
         })
     }
 
@@ -105,9 +157,134 @@ impl Database {
     ) -> Result<QueryResult, Error> {
         let stmt = prepare_statement(cypher, params, options)?;
         let options = with_call_params(options, params);
-        let result =
-            marsdb_query::Executor::new(&self.store).execute_with_options(&stmt, &options)?;
-        Ok(result)
+        self.execute_prepared(&stmt, &options)
+    }
+
+    /// One already-parsed statement, session-aware: `BEGIN`/`COMMIT`/
+    /// `ROLLBACK` act on `session_txn` (see its docs for the whole
+    /// model), anything else runs inside the open session transaction
+    /// when there is one, else autocommits exactly as before the session
+    /// layer existed. The session lock is held across a statement only
+    /// when a transaction is actually open (statements inside one
+    /// transaction are sequential by definition); the no-session path
+    /// releases it before executing, so concurrent readers on one
+    /// `Database` handle still run in parallel.
+    fn execute_prepared(
+        &self,
+        stmt: &Statement,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        let empty = || QueryResult {
+            columns: vec![],
+            rows: vec![],
+        };
+        {
+            let mut session = self
+                .session_txn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Idle expiry, checked lazily by whatever statement comes
+            // through next -- BEGIN/COMMIT/ROLLBACK included. The
+            // discovering statement gets the explicit timeout error (a
+            // later COMMIT reporting a generic "no open transaction"
+            // would read as "so my writes autocommitted?" -- exactly
+            // wrong); the state is cleared, so the statement *after* the
+            // error runs normally. Aborting here is also what releases
+            // redb's single writer for anything blocked on it.
+            if let Some(open) = session.as_ref() {
+                let limit = *self
+                    .session_txn_timeout
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(limit) = limit {
+                    let idle = open.last_used.elapsed();
+                    if idle > limit {
+                        let open = session.take().expect("checked is_some");
+                        let _ = marsdb_graph::GraphStore::abort(open.txn);
+                        return Err(Error::SessionTransactionTimedOut { idle, limit });
+                    }
+                }
+            }
+            match stmt {
+                Statement::Begin => {
+                    return if session.is_some() {
+                        Err(marsdb_query::QueryError::Semantic(
+                            "BEGIN: this session already has an open transaction".into(),
+                        )
+                        .into())
+                    } else {
+                        *session = Some(OpenSessionTxn {
+                            txn: self.store.begin_write()?,
+                            last_used: Instant::now(),
+                        });
+                        Ok(empty())
+                    }
+                }
+                Statement::Commit => {
+                    return match session.take() {
+                        Some(open) => {
+                            marsdb_graph::GraphStore::commit(open.txn)?;
+                            Ok(empty())
+                        }
+                        None => Err(marsdb_query::QueryError::Semantic(
+                            "COMMIT: this session has no open transaction".into(),
+                        )
+                        .into()),
+                    }
+                }
+                Statement::Rollback => {
+                    return match session.take() {
+                        Some(open) => {
+                            marsdb_graph::GraphStore::abort(open.txn)?;
+                            Ok(empty())
+                        }
+                        None => Err(marsdb_query::QueryError::Semantic(
+                            "ROLLBACK: this session has no open transaction".into(),
+                        )
+                        .into()),
+                    }
+                }
+                _ => {
+                    if let Some(open) = session.as_mut() {
+                        let result = marsdb_query::Executor::new(&self.store)
+                            .execute_in_write_transaction_with_options(stmt, &open.txn, options);
+                        // Same stance as `Transaction`: an execution error
+                        // may have applied partial effects, which must
+                        // never be committable -- abort the whole session
+                        // transaction, keep the original error.
+                        if result.is_err() {
+                            if let Some(open) = session.take() {
+                                let _ = marsdb_graph::GraphStore::abort(open.txn);
+                            }
+                        } else {
+                            open.last_used = Instant::now();
+                        }
+                        return Ok(result?);
+                    }
+                }
+            }
+        }
+        Ok(marsdb_query::Executor::new(&self.store).execute_with_options(stmt, options)?)
+    }
+
+    /// Idle limit for the Cypher-level session transaction
+    /// (`BEGIN`/`COMMIT`/`ROLLBACK` -- see `session_txn`'s docs). `None`
+    /// (the default, matching what real deployments ship for their
+    /// equivalent knobs) disables it. When set, a session transaction
+    /// idle longer than `limit` is rolled back by the next statement to
+    /// arrive, which returns [`Error::SessionTransactionTimedOut`];
+    /// statements after that run normally. There is no background timer
+    /// -- an abandoned transaction with *no* further traffic on this
+    /// handle keeps holding redb's single writer, so an embedder mixing
+    /// session transactions with caller-owned
+    /// [`Database::begin_transaction`] handles across threads should set
+    /// this AND expect the reclaim to happen on the next session-layer
+    /// statement, not on a clock.
+    pub fn set_session_transaction_timeout(&self, limit: Option<std::time::Duration>) {
+        *self
+            .session_txn_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = limit;
     }
 
     /// Runs a `;`-separated batch of statements (e.g.
@@ -117,16 +294,20 @@ impl Database {
     /// The whole batch is parsed up front — a syntax error anywhere in it
     /// means nothing runs at all. Execution, though, is one transaction
     /// per statement (same crash-safety model as a single `execute()`
-    /// call): if a statement fails at *run* time (e.g. an unbound
-    /// variable), every statement before it in the batch is already
-    /// committed and stays that way — this returns `Err` immediately
-    /// rather than continuing, but doesn't roll anything back.
+    /// call) — unless the batch itself opens one: `BEGIN`/`COMMIT`/
+    /// `ROLLBACK` statements work in a batch exactly as they do fed one
+    /// at a time (`session_txn`'s docs), so `"BEGIN; CREATE (a);
+    /// CREATE (b); COMMIT"` is one atomic unit. If a statement fails at
+    /// *run* time (e.g. an unbound variable), this returns `Err`
+    /// immediately rather than continuing: outside a transaction every
+    /// statement before it is already committed and stays that way;
+    /// inside one, the whole open transaction is aborted.
     pub fn execute_batch(&self, cypher: &str) -> Result<Vec<QueryResult>, Error> {
         let stmts = marsdb_query::parse_many(cypher)?;
-        let executor = marsdb_query::Executor::new(&self.store);
+        let options = ExecutionOptions::default();
         stmts
             .iter()
-            .map(|stmt| Ok(executor.execute(stmt)?))
+            .map(|stmt| self.execute_prepared(stmt, &options))
             .collect()
     }
 
