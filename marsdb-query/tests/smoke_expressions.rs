@@ -1238,6 +1238,60 @@ fn explain_shows_index_seek_and_residual_filter() {
     assert!(lines.iter().any(|l| l.contains("Filter n.age > 20")));
 }
 
+/// A var-free function-call equality (`n.joined = date('2020-01-10')`,
+/// the shape a `$param`-substituted temporal lookup takes) must use a
+/// declared index, not fall back to a per-row label-scan filter -- and
+/// must return the same rows either way.
+#[test]
+fn explain_shows_index_seek_for_a_literal_arg_call_equality() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE INDEX ON :Event(joined)");
+    run(
+        &store,
+        "CREATE (:Event {name: 'a', joined: date('2020-01-10')}), \
+                (:Event {name: 'b', joined: date('2021-03-04')})",
+    );
+
+    let explained = run(
+        &store,
+        "EXPLAIN MATCH (n:Event) WHERE n.joined = date('2020-01-10') RETURN n.name",
+    );
+    let lines = plan_lines(&explained);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("IndexSeek(n:Event") && l.contains("joined")),
+        "expected an IndexSeek, got plan: {lines:?}"
+    );
+
+    let result = run(
+        &store,
+        "MATCH (n:Event) WHERE n.joined = date('2020-01-10') RETURN n.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(str_value(&result.rows[0][0]), "a");
+}
+
+/// rand() must never be hoisted into an IndexSeek value -- it has to
+/// evaluate per candidate row (fresh number each call), so the equality
+/// stays a Filter over the scan even with an index declared.
+#[test]
+fn explain_keeps_a_rand_equality_as_a_filter_despite_an_index() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE INDEX ON :Event(score)");
+    run(&store, "CREATE (:Event {score: 0.5})");
+
+    let explained = run(
+        &store,
+        "EXPLAIN MATCH (n:Event) WHERE n.score = rand() RETURN n",
+    );
+    let lines = plan_lines(&explained);
+    assert!(
+        !lines.iter().any(|l| l.contains("IndexSeek")),
+        "rand() must not become an IndexSeek, got plan: {lines:?}"
+    );
+}
+
 #[test]
 fn explain_falls_back_to_scan_when_no_index_declared() {
     let store = GraphStore::open_memory().unwrap();
