@@ -2637,6 +2637,26 @@ impl AstBuilder {
 /// pest-based `parser.rs`/`cypher.pest` this replaced are gone (see
 /// `grammar/README.md`).
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
+    // Session-transaction extension (`Statement::Begin`'s docs):
+    // recognized before the grammar runs. A whole statement that is
+    // exactly one of these keywords (case-insensitive, optional trailing
+    // `;` -- `script : query SEMI? EOF` tolerates one the same way) can
+    // never be valid Cypher otherwise, so this can't shadow anything the
+    // grammar would have accepted.
+    let trimmed = input.trim();
+    let trimmed = trimmed
+        .strip_suffix(';')
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
+    if trimmed.eq_ignore_ascii_case("BEGIN") {
+        return Ok(Statement::Begin);
+    }
+    if trimmed.eq_ignore_ascii_case("COMMIT") {
+        return Ok(Statement::Commit);
+    }
+    if trimmed.eq_ignore_ascii_case("ROLLBACK") {
+        return Ok(Statement::Rollback);
+    }
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};
     use antlr4rust::common_token_stream::CommonTokenStream;

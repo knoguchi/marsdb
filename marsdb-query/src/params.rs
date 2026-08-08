@@ -18,6 +18,8 @@ pub fn substitute_params(
     params: &HashMap<String, PropertyValue>,
 ) -> Result<(), QueryError> {
     match stmt {
+        // Bare keywords, nothing to substitute into.
+        Statement::Begin | Statement::Commit | Statement::Rollback => {}
         Statement::Create(patterns) => {
             for pattern in patterns {
                 substitute_pattern(pattern, params)?;

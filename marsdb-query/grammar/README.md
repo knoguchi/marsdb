@@ -69,6 +69,11 @@ MarsDB supports them:
 - **`;`-separated multi-statement batches** — `CREATE (a); CREATE (b);` as
   one textual submission (`parse_many`). Not a Cypher concept; needed for
   this crate's own multi-statement API.
+- **`BEGIN` / `COMMIT` / `ROLLBACK`** — session-transaction statements
+  (issue #142). Not in the grammar at all: recognized textually by
+  `parse_antlr` before ANTLR runs (a whole statement that is exactly one
+  of these keywords can never be valid Cypher otherwise), same
+  out-of-grammar approach as the `;`-batch splitting above.
 
 ## Why ANTLR (and this specific fork)
 

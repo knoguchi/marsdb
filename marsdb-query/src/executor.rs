@@ -722,6 +722,21 @@ impl<'a> Executor<'a> {
         guard: &ExecutionGuard<'_>,
     ) -> Result<QueryResult, QueryError> {
         match stmt {
+            // Session statements never reach a correctly-wired call path:
+            // `marsdb::Database` intercepts them before any executor entry
+            // point. Reachable only through a caller with its own
+            // transaction handling (`marsdb::Transaction::execute`, the
+            // group-commit loop, or direct `Executor` use) -- where a
+            // nested BEGIN/COMMIT/ROLLBACK has no session to act on and
+            // must be a real error, not a silent no-op.
+            Statement::Begin | Statement::Commit | Statement::Rollback => {
+                Err(QueryError::Semantic(
+                    "BEGIN/COMMIT/ROLLBACK are session statements -- valid only through \
+                     Database::execute/execute_batch, not inside an explicit Transaction \
+                     or a grouped batch"
+                        .into(),
+                ))
+            }
             Statement::Create(patterns) => {
                 guard.checkpoint()?;
                 self.execute_create(write_txn, patterns, guard)

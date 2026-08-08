@@ -267,6 +267,22 @@ in code.
 
 Not yet supported: `CREATE CONSTRAINT`, composite indexes, range scans.
 
+## Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` as statements — a MarsDB extension
+(openCypher has no transaction statements; real deployments do this at
+the protocol/session layer). One session per `Database` handle: `BEGIN`
+opens a write transaction, every subsequent statement (reads included —
+they see the transaction's own uncommitted writes) runs inside it, and
+`COMMIT`/`ROLLBACK` end it. A statement that fails at *execution* time
+aborts the whole transaction (its partial effects must never be
+committable); a parse/`$param` error leaves it open (nothing ran).
+Works identically fed one statement at a time (the CLI REPL) or inside
+one `;`-separated batch: `BEGIN; CREATE (a); CREATE (b); COMMIT` is one
+atomic unit. Not valid inside a caller-owned `Database::begin_transaction`
+handle (that API has its own `commit()`/`rollback()` methods) or
+`execute_batch_grouped` (whose grouping is its own transaction policy).
+
 ## Error taxonomy
 
 `QueryError` is typed, not one flat string:
