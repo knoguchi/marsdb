@@ -5,6 +5,27 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- **On-disk format version 1 → 2** (v1.5). Old files are rejected with a
+  clear error; migration path is export from a v1 build, reimport here.
+  Two format changes, one break:
+  - **Directory record format**: node/edge records store properties as a
+    sorted `(interned prop-id, offset)` directory with individually
+    postcard-encoded values, replacing the whole-blob string-keyed map.
+    Property names no longer appear in records. Single-property access
+    reads one directory entry (no full-record decode, no name
+    resolution); the executor's property lookups use this path, with
+    prop names resolved to ids once per statement. Codec mechanism
+    measured 79x at 1-of-20 properties touched, 7x even at full
+    materialization; end-to-end on the recommendations read suite: 1.16x
+    at size parity (see BENCHMARKS.md for why those differ).
+  - **Composite-key adjacency**: `adj_out`/`adj_in` are plain tables
+    keyed `(owner node, label, edge)` as fixed-width redb tuples, so a
+    typed expansion narrows to a key prefix range — O(matching degree)
+    instead of decoding a node's entire entry set. Edge deletion becomes
+    two exact-key removes. `TableHandle`/`Txn` gain `range()`, which
+    also readies `PROPERTY_INDEX` for future range predicates.
+
 ### Added
 - `Database::execute_batch_grouped(cypher, group_size)`: commits once
   every `group_size` statements instead of once per statement like

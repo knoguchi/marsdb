@@ -17,6 +17,30 @@ pub(crate) fn intern_prop(ctx: &mut WriteCtx, prop: &str) -> Result<u32, GraphEr
     Ok(id)
 }
 
+/// A prop-id -> name resolver over one pre-opened `ID_TO_PROP` handle —
+/// for record decode (`encode::decode_node`/`decode_edge`), which resolves
+/// one id per property per record. Opening the table once here instead of
+/// per resolution matters because table opens were themselves a measured
+/// hot cost (mars-3va, 23.67% of a bulk load) — a resolver that re-opened
+/// per prop would reintroduce exactly that.
+///
+/// Only for read paths that hold no `WriteCtx` — inside a `WriteCtx`-based
+/// write method, `ID_TO_PROP` may already be open on the same transaction
+/// and a second handle is redb's `TableAlreadyOpen` error; those paths use
+/// `index::resolve_prop_ctx` instead.
+pub(crate) fn prop_resolver(
+    txn: Txn<'_>,
+) -> Result<impl FnMut(u32) -> Result<String, GraphError> + '_, GraphError> {
+    let i2p = txn.open_table(marsdb_storage::tables::ID_TO_PROP)?;
+    Ok(move |prop_id: u32| {
+        i2p.get(prop_id)?
+            .map(|g| g.value().to_string())
+            .ok_or_else(|| {
+                GraphError::CorruptData(format!("prop id {prop_id} has no interned string"))
+            })
+    })
+}
+
 /// Look up the id for `prop` without allocating one. `None` means `prop`
 /// has never been interned, so it can't be indexed/declared yet.
 ///

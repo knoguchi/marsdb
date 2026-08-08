@@ -357,3 +357,34 @@ scan it should filter) — both already landed, see `CHANGELOG.md`.
   `WITH`-chaining query above, but not measured standalone.
 - No benchmarks for `REMOVE`, `SET`-label, or the `STARTS WITH`/`ENDS
   WITH`/`CONTAINS` string predicates yet.
+
+## v1.5 format changes: end-to-end gate (recommendations dataset, 2026-08-08)
+
+Real 28,863-node / recommendations dataset (marsdb-demo), 9,771-statement
+parameterized load via group commit (`group_size=1000`), 100x
+`queries.cypher` via `run_named_queries`. Same machine, same run session,
+main (`0ea4c19`) vs the v1.5 branch (directory record format + interned
+prop-id per-property reads + composite-tuple-key adjacency). Two query
+runs per side, both reported.
+
+| | main | v1.5 |
+|---|---|---|
+| load (param replay, 9,771 stmts) | 5.34s | 5.60-6.41s |
+| 100x read queries | 12.81s / 12.57s | 10.99s / 10.91s (**1.16x**) |
+| database file | 73.4MB | 74.7MB (+1.7%) |
+
+Notes, measured not asserted:
+
+- Read win is 1.16x, not the 1.5-2.5x projected from the pre-#157
+  flamegraph — that projection used a stale denominator (the 40% decode
+  share was measured *before* the node decode cache shipped and absorbed
+  the repeat-decode portion). No post-#157 read flamegraph existed when
+  the projection was made.
+- Load is slightly slower (property-name interning adds table writes on
+  every create). Acceptable; group commit still dominates.
+- File size: first cut of the composite adjacency key byte-packed it as
+  `&[u8]` and measured a **2x database file** (145.9MB) — the same
+  fixed-width-erasure tax measured on the v2 abstraction branch
+  (mars-am7, +34%) — fixed by switching to redb tuple keys
+  `(u64, u32, u64)` before merge. Recorded because it's the second time
+  this exact mistake was made in this codebase.

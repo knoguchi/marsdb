@@ -47,12 +47,12 @@ impl<'a> Txn<'a> {
     }
 }
 
-/// Deliberately exposes only `get`/`iter` as plain inherent methods, not a
-/// full `redb::ReadableTable` trait impl — every read-only call site in
-/// this codebase today only ever calls those two (no `.range()`/
-/// `.first()`/`.last()` anywhere), so matching the full trait (including
-/// its lifetime-heavy generic `range`) would be boilerplate for methods
-/// nothing calls.
+/// Exposes `get`/`iter`/`range` as plain inherent methods, not a full
+/// `redb::ReadableTable` trait impl — matching the whole trait (`first`/
+/// `last`/...) would be boilerplate for methods nothing calls. `range`
+/// was deliberately left out until a real call site needed it; v1.5's
+/// composite-key adjacency (prefix scans over `ADJ_OUT`/`ADJ_IN`) is that
+/// call site.
 pub enum TableHandle<'a, K: Key + 'static, V: Value + 'static> {
     Write(Table<'a, K, V>),
     Read(ReadOnlyTable<K, V>),
@@ -73,6 +73,21 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
         Ok(match self {
             TableHandle::Write(t) => t.iter()?,
             TableHandle::Read(t) => t.iter()?,
+        })
+    }
+
+    /// Key-ordered scan over a sub-range — the primitive behind composite-
+    /// key prefix reads (`ADJ_OUT`/`ADJ_IN`'s `node ++ label` expansion)
+    /// and, eventually, indexed range predicates over `PROPERTY_INDEX`
+    /// (whose order-preserving value encoding has been range-ready since
+    /// it was written).
+    pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
+        &self,
+        range: impl std::ops::RangeBounds<KR> + 'k,
+    ) -> Result<Range<'_, K, V>, StorageError> {
+        Ok(match self {
+            TableHandle::Write(t) => t.range(range)?,
+            TableHandle::Read(t) => t.range(range)?,
         })
     }
 }
