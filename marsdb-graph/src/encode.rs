@@ -1,4 +1,4 @@
-//! On-disk record encoding: directory format (v1.5, format version 2).
+//! On-disk record encoding: directory format (v2, format version 2).
 //!
 //! Replaces the v1 whole-blob postcard encoding (`BTreeMap<String,
 //! PropertyValue>` serialized as one unit) with a directory layout using
@@ -142,7 +142,7 @@ fn value_slice<'a>(
 
 /// Binary-search the tail for one property's raw (still postcard-encoded)
 /// value bytes, without resolving any names or touching other values —
-/// the per-property fast path (v1.5 step 1b's `get_node_prop_in_txn`).
+/// the per-property fast path (v2 step 1b's `get_node_prop_in_txn`).
 fn prop_raw_in(bytes: &[u8], prop_id: u32) -> Result<Option<&[u8]>, GraphError> {
     let count = u16::from_le_bytes(
         bytes

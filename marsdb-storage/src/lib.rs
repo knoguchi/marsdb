@@ -1,6 +1,8 @@
 //! Thin trait boundary over redb. `marsdb-graph` talks to this crate, never to
-//! `redb` directly, so the underlying embedded KV engine can be swapped later
-//! (see plan v2: hand-rolled storage engine) without touching graph/query code.
+//! `redb` directly, so the underlying embedded KV engine could be swapped
+//! without touching graph/query code. (A hand-rolled replacement engine was
+//! prototyped and abandoned -- redb stays; the boundary remains because it
+//! costs nothing and keeps the dependency surface honest.)
 
 pub mod tables;
 
