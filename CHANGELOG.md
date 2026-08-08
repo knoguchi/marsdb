@@ -3,10 +3,10 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.8.0] - 2026-08-08
 
 ### Changed
-- **On-disk format version 1 → 2** (v2). Old files are rejected with a
+- **On-disk format version 1 → 2**. Old files are rejected with a
   clear error; migration path is export from a v1 build, reimport here.
   Two format changes, one break:
   - **Directory record format**: node/edge records store properties as a
@@ -27,6 +27,17 @@ All notable changes to MarsDB are documented here. Format loosely follows
     also readies `PROPERTY_INDEX` for future range predicates.
 
 ### Added
+- **openCypher TCK conformance: 3880/3880 (100%)**, up from 3878. The
+  last 2 scenarios needed dates at year ±999,999,999 (`Temporal10
+  [9]`/`[10]`): `PropertyValue::Date` widened `i32` → `i64` epoch days
+  (wire-compatible — postcard varints don't encode width, and the index
+  key encoding was already 8-byte), the calendar core rewritten as
+  hand-rolled proleptic-Gregorian integer math (chrono's `NaiveDate`
+  caps at ±262k years; it remains only for `now()` capture and named
+  IANA-zone resolution), and `duration.between` totals moved to i128
+  nanoseconds. Parser/formatter round-trip ISO 8601 expanded years
+  (`'+999999999-12-31'`); `localdatetime('<date-only>')` reads as
+  midnight.
 - `Database::execute_batch_grouped(cypher, group_size)`: commits once
   every `group_size` statements instead of once per statement like
   `execute_batch` does. Every commit fsyncs, so bulk loads were
@@ -75,7 +86,41 @@ All notable changes to MarsDB are documented here. Format loosely follows
   the most repeated node reads (`crimson_tide_collaborative_filtering`,
   `inception_genre_similarity`) each dropped from ~65-70ms to ~39ms.
 
+- Aggregating-expansion fast path: a `MATCH` of one or two typed
+  `Expand` hops feeding a `WITH <node>, count(*)` (and/or
+  `collect(<mid>.prop)`) now runs as a tight counting loop over the
+  adjacency tables instead of materializing a binding row per
+  intermediate path — the 2-hop count shape measured ~25x end-to-end on
+  the recommendations suite, where row machinery (not storage) was ~99%
+  of query time. Also covers filtered-scan leaves via direct seed
+  enumeration, group-by-origin, and single-key ORDER BY + LIMIT
+  pre-truncation. Conservative: any unrecognized shape falls back to the
+  generic pipeline.
+- Planner start-point selection: a `MATCH` pattern now starts traversal
+  from its cheaper endpoint instead of always the written-first one,
+  compared by O(1) cardinality (label counts, indexed-equality match
+  counts, already-bound Seeds; new `TableHandle::len`/
+  `GraphStore::node_count_in_txn`/`label_count_in_txn`). Written from
+  the big side toward a small/indexed/carried endpoint, measured on a
+  100-of-N selectivity benchmark: 1.17ms → 181µs at 1k nodes, 10.5ms →
+  179µs at 10k, 102ms → 183µs at 100k — flat in dataset size, cost
+  follows matches. Fixed-hop patterns only; named paths, shortestPath,
+  and MERGE keep written order; EXPLAIN shows the executed choice.
+- `IndexSeek` now fires for a var-free function-call equality
+  (`WHERE n.joined = date('2020-01-10')` — the shape a `$param`-
+  substituted temporal lookup takes after parameter substitution),
+  instead of falling back to a per-row label scan. `rand()` is
+  excluded (must evaluate per candidate row); the temporal
+  now-functions are not (pinned to one per-statement snapshot).
+
 ### Fixed
+- Opening a pre-versioning v1-era file (data tables present, no
+  `schema_version` marker in `META`) now fails cleanly as an unsupported
+  format-1 file instead of silently stamping it with the current format
+  version — which would have made its old-encoding records decode as
+  garbage on first access. A genuinely fresh file (no tables at all) is
+  still stamped normally; table setup and the version marker commit
+  atomically, so no half-initialized state can exist.
 - `backup_to`/`StorageEngine::open_*` were missing four tables (`prop_to_id`,
   `id_to_prop`, `index_defs`, `property_index`) from the set they eagerly
   create/copy. Node and relationship data survived a backup intact, but

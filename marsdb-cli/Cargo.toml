@@ -17,9 +17,9 @@ name = "marsdb"
 path = "src/main.rs"
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.7.1" }
-marsdb-graph = { path = "../marsdb-graph", version = "0.7.1" }
-marsdb-nl2cypher = { path = "../marsdb-nl2cypher", version = "0.7.1" }
+marsdb = { path = "../marsdb", version = "0.8.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.8.0" }
+marsdb-nl2cypher = { path = "../marsdb-nl2cypher", version = "0.8.0" }
 clap.workspace = true
 rustyline.workspace = true
 ureq = { version = "3", features = ["json"] }
