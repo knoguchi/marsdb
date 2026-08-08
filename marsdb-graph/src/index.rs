@@ -204,9 +204,12 @@ pub(crate) fn create_index(
         let Some(guard) = ctx.nodes()?.get(*node_id)? else {
             continue;
         };
-        let record: crate::encode::NodeRecord = crate::encode::decode(guard.value())?;
-        if let Some(value) = record.props.get(prop) {
-            entries.push((index_key(label_id, prop_id, value), *node_id));
+        // Directory-format fast path: `prop_id` is already interned above,
+        // so the backfill reads exactly the one indexed property per node —
+        // no full-record decode, no name resolution at all.
+        if let Some(raw) = crate::encode::node_prop_raw(guard.value(), prop_id)? {
+            let value = crate::encode::decode_value(raw)?;
+            entries.push((index_key(label_id, prop_id, &value), *node_id));
         }
     }
     if unique {
@@ -377,14 +380,14 @@ fn indexes_for_labels(
 /// `TableAlreadyOpen`). Small deliberate duplication, not a shared helper
 /// with the `Txn`-based versions -- those stay untouched for the read
 /// path (see `WriteCtx`'s own docs).
-fn resolve_label_ctx(ctx: &mut WriteCtx, label_id: u32) -> Result<String, GraphError> {
+pub(crate) fn resolve_label_ctx(ctx: &mut WriteCtx, label_id: u32) -> Result<String, GraphError> {
     let value = ctx.id_to_label()?.get(label_id)?.ok_or_else(|| {
         GraphError::CorruptData(format!("label id {label_id} has no interned string"))
     })?;
     Ok(value.value().to_string())
 }
 
-fn resolve_prop_ctx(ctx: &mut WriteCtx, prop_id: u32) -> Result<String, GraphError> {
+pub(crate) fn resolve_prop_ctx(ctx: &mut WriteCtx, prop_id: u32) -> Result<String, GraphError> {
     let value = ctx.id_to_prop()?.get(prop_id)?.ok_or_else(|| {
         GraphError::CorruptData(format!("prop id {prop_id} has no interned string"))
     })?;

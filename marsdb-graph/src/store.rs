@@ -5,11 +5,15 @@ use marsdb_storage::{
     ReadTransaction, ReadableMultimapTable, ReadableTable, StorageEngine, Txn, WriteTransaction,
 };
 
-use crate::encode::{decode, encode, EdgeRecord, NodeRecord};
+use crate::encode::{
+    decode_edge, decode_node, edge_header, encode_edge, encode_node, node_label_ids, EdgeRecord,
+    NodeRecord,
+};
 use crate::error::GraphError;
 use crate::id::next_id;
 use crate::labels::{intern_label, lookup_label_id, resolve_label};
 use crate::model::{AdjEntry, Direction, Edge, EdgeId, Node, NodeId, PropertyValue};
+use crate::props::{intern_prop, prop_resolver};
 use crate::write_ctx::WriteCtx;
 
 pub struct GraphStore {
@@ -85,8 +89,10 @@ impl GraphStore {
             let table = read.open_table(marsdb_storage::tables::NODES)?;
             for entry in table.iter()? {
                 let (id, value) = entry?;
-                let record: NodeRecord = decode(value.value())?;
-                for label_id in &record.label_ids {
+                // Header-only read -- integrity checks node labels here,
+                // never properties, so the directory stays untouched.
+                let label_ids = node_label_ids(value.value())?;
+                for label_id in &label_ids {
                     if !labels_by_id.contains_key(label_id) {
                         return Err(GraphError::CorruptData(format!(
                             "node {} references unknown label {}",
@@ -95,7 +101,7 @@ impl GraphStore {
                         )));
                     }
                 }
-                nodes.insert(id.value(), record.label_ids);
+                nodes.insert(id.value(), label_ids);
             }
         }
 
@@ -141,23 +147,24 @@ impl GraphStore {
             let table = read.open_table(marsdb_storage::tables::EDGES)?;
             for entry in table.iter()? {
                 let (id, value) = entry?;
-                let record: EdgeRecord = decode(value.value())?;
-                if !labels_by_id.contains_key(&record.label_id) {
+                // Header-only, same reasoning as the node loop above.
+                let (label_id, src, dst) = edge_header(value.value())?;
+                if !labels_by_id.contains_key(&label_id) {
                     return Err(GraphError::CorruptData(format!(
                         "edge {} references unknown label {}",
                         id.value(),
-                        record.label_id
+                        label_id
                     )));
                 }
-                if !nodes.contains_key(&record.src) || !nodes.contains_key(&record.dst) {
+                if !nodes.contains_key(&src) || !nodes.contains_key(&dst) {
                     return Err(GraphError::CorruptData(format!(
                         "edge {} references missing endpoint {} -> {}",
                         id.value(),
-                        record.src,
-                        record.dst
+                        src,
+                        dst
                     )));
                 }
-                edges.insert(id.value(), (record.label_id, record.src, record.dst));
+                edges.insert(id.value(), (label_id, src, dst));
             }
         }
 
@@ -323,7 +330,7 @@ impl GraphStore {
             label_ids: label_ids.clone(),
             props,
         };
-        let bytes = encode(&record)?;
+        let bytes = encode_node(&record, |name| intern_prop(ctx, name))?;
         ctx.nodes()?.insert(id, bytes.as_slice())?;
         for &label_id in &label_ids {
             ctx.node_label_index()?.insert(label_id, id)?;
@@ -341,7 +348,10 @@ impl GraphStore {
         let record: Option<NodeRecord> = {
             let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
             let found = match nodes.get(id.0)? {
-                Some(guard) => Some(decode(guard.value())?),
+                Some(guard) => {
+                    let mut resolve = prop_resolver(txn)?;
+                    Some(decode_node(guard.value(), &mut resolve)?)
+                }
                 None => None,
             };
             found
@@ -406,7 +416,7 @@ impl GraphStore {
             dst: dst.0,
             props,
         };
-        let bytes = encode(&record)?;
+        let bytes = encode_edge(&record, |name| intern_prop(ctx, name))?;
         ctx.edges()?.insert(id, bytes.as_slice())?;
 
         let out_entry = AdjEntry {
@@ -435,7 +445,10 @@ impl GraphStore {
         let record: Option<EdgeRecord> = {
             let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
             let found = match edges.get(id.0)? {
-                Some(guard) => Some(decode(guard.value())?),
+                Some(guard) => {
+                    let mut resolve = prop_resolver(txn)?;
+                    Some(decode_edge(guard.value(), &mut resolve)?)
+                }
                 None => None,
             };
             found
@@ -522,21 +535,23 @@ impl GraphStore {
         else {
             return Ok(false);
         };
-        let record: EdgeRecord = decode(&record_bytes)?;
+        // Header-only read: adjacency cleanup needs (label, src, dst),
+        // never the edge's properties -- skips every prop-name resolution.
+        let (label_id, src, dst) = edge_header(&record_bytes)?;
         let out_entry = AdjEntry {
             edge_id: id,
-            other: NodeId(record.dst),
-            label_id: record.label_id,
+            other: NodeId(dst),
+            label_id,
         }
         .encode();
         let in_entry = AdjEntry {
             edge_id: id,
-            other: NodeId(record.src),
-            label_id: record.label_id,
+            other: NodeId(src),
+            label_id,
         }
         .encode();
-        ctx.adj_out()?.remove(record.src, out_entry.as_slice())?;
-        ctx.adj_in()?.remove(record.dst, in_entry.as_slice())?;
+        ctx.adj_out()?.remove(src, out_entry.as_slice())?;
+        ctx.adj_in()?.remove(dst, in_entry.as_slice())?;
         Ok(true)
     }
 
@@ -575,7 +590,9 @@ impl GraphStore {
         else {
             return Ok(false);
         };
-        let record: NodeRecord = decode(&removed_bytes)?;
+        let record = decode_node(&removed_bytes, |pid| {
+            crate::index::resolve_prop_ctx(&mut ctx, pid)
+        })?;
         for &label_id in &record.label_ids {
             ctx.node_label_index()?.remove(label_id, id.0)?;
         }
@@ -705,9 +722,9 @@ impl GraphStore {
         let Some(bytes) = ctx.nodes()?.get(id.0)?.map(|g| g.value().to_vec()) else {
             return Ok(false);
         };
-        let mut record: NodeRecord = decode(&bytes)?;
+        let mut record = decode_node(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         let old_value = record.props.insert(key.to_string(), value.clone());
-        let new_bytes = encode(&record)?;
+        let new_bytes = encode_node(&record, |name| intern_prop(&mut ctx, name))?;
         ctx.nodes()?.insert(id.0, new_bytes.as_slice())?;
         crate::index::on_node_prop_changed(
             &mut ctx,
@@ -746,9 +763,9 @@ impl GraphStore {
         let Some(bytes) = ctx.edges()?.get(id.0)?.map(|g| g.value().to_vec()) else {
             return Ok(false);
         };
-        let mut record: EdgeRecord = decode(&bytes)?;
+        let mut record = decode_edge(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         record.props.insert(key.to_string(), value);
-        let new_bytes = encode(&record)?;
+        let new_bytes = encode_edge(&record, |name| intern_prop(&mut ctx, name))?;
         ctx.edges()?.insert(id.0, new_bytes.as_slice())?;
         Ok(true)
     }
@@ -762,9 +779,9 @@ impl GraphStore {
         let Some(bytes) = ctx.nodes()?.get(id.0)?.map(|g| g.value().to_vec()) else {
             return Ok(false);
         };
-        let mut record: NodeRecord = decode(&bytes)?;
+        let mut record = decode_node(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         let old_value = record.props.remove(key);
-        let new_bytes = encode(&record)?;
+        let new_bytes = encode_node(&record, |name| intern_prop(&mut ctx, name))?;
         ctx.nodes()?.insert(id.0, new_bytes.as_slice())?;
         crate::index::on_node_prop_changed(
             &mut ctx,
@@ -786,9 +803,9 @@ impl GraphStore {
         let Some(bytes) = ctx.edges()?.get(id.0)?.map(|g| g.value().to_vec()) else {
             return Ok(false);
         };
-        let mut record: EdgeRecord = decode(&bytes)?;
+        let mut record = decode_edge(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         record.props.remove(key);
-        let new_bytes = encode(&record)?;
+        let new_bytes = encode_edge(&record, |name| intern_prop(&mut ctx, name))?;
         ctx.edges()?.insert(id.0, new_bytes.as_slice())?;
         Ok(true)
     }
@@ -805,11 +822,11 @@ impl GraphStore {
         let Some(bytes) = ctx.nodes()?.get(id.0)?.map(|g| g.value().to_vec()) else {
             return Ok(false);
         };
-        let mut record: NodeRecord = decode(&bytes)?;
+        let mut record = decode_node(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         let label_id = intern_label(&mut ctx, label)?;
         if !record.label_ids.contains(&label_id) {
             record.label_ids.push(label_id);
-            let new_bytes = encode(&record)?;
+            let new_bytes = encode_node(&record, |name| intern_prop(&mut ctx, name))?;
             ctx.nodes()?.insert(id.0, new_bytes.as_slice())?;
             ctx.node_label_index()?.insert(label_id, id.0)?;
             crate::index::on_node_created(&mut ctx, id.0, &[label_id], &record.props)?;
@@ -835,10 +852,10 @@ impl GraphStore {
         let Some(label_id) = ctx.label_to_id()?.get(label)?.map(|g| g.value()) else {
             return Ok(true);
         };
-        let mut record: NodeRecord = decode(&bytes)?;
+        let mut record = decode_node(&bytes, |pid| crate::index::resolve_prop_ctx(&mut ctx, pid))?;
         if let Some(pos) = record.label_ids.iter().position(|&l| l == label_id) {
             record.label_ids.remove(pos);
-            let new_bytes = encode(&record)?;
+            let new_bytes = encode_node(&record, |name| intern_prop(&mut ctx, name))?;
             ctx.nodes()?.insert(id.0, new_bytes.as_slice())?;
             ctx.node_label_index()?.remove(label_id, id.0)?;
             crate::index::on_node_deleted(&mut ctx, id.0, &[label_id], &record.props)?;
@@ -918,12 +935,16 @@ impl GraphStore {
         let Some(label_filter) = label_filter else {
             let mut result = Vec::new();
             let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+            // Resolver hoisted out of the loop: one ID_TO_PROP open for the
+            // whole scan, not one per record (table opens were themselves a
+            // measured hot cost -- mars-3va).
+            let mut resolve = prop_resolver(txn)?;
             for item in nodes.iter()? {
                 if result.len() >= limit {
                     break;
                 }
                 let (key, value) = item?;
-                let record: NodeRecord = decode(value.value())?;
+                let record = decode_node(value.value(), &mut resolve)?;
                 let labels = record
                     .label_ids
                     .iter()
@@ -957,11 +978,13 @@ impl GraphStore {
         };
         let mut result = Vec::with_capacity(node_ids.len());
         let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        // Same loop-hoisted resolver as the unfiltered scan above.
+        let mut resolve = prop_resolver(txn)?;
         for id in node_ids {
             let guard = nodes.get(id)?.ok_or_else(|| {
                 GraphError::CorruptData(format!("node label index references missing node {}", id))
             })?;
-            let record: NodeRecord = decode(guard.value())?;
+            let record = decode_node(guard.value(), &mut resolve)?;
             drop(guard);
             let labels = record
                 .label_ids

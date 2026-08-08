@@ -22,8 +22,12 @@ use std::path::Path;
 
 /// Version of the MarsDB-owned tables and record encodings. This is separate
 /// from redb's own file-format version.
-pub const CURRENT_FORMAT_VERSION: u64 = 1;
-pub const OLDEST_SUPPORTED_FORMAT_VERSION: u64 = 1;
+// v2 (2026-08): directory record format — interned u32 prop-id keys with
+// per-property offsets replace the v1 whole-blob postcard map (see
+// marsdb-graph/src/encode.rs). v1 files are rejected cleanly; the
+// documented path is export from a v1 build, reimport here.
+pub const CURRENT_FORMAT_VERSION: u64 = 2;
+pub const OLDEST_SUPPORTED_FORMAT_VERSION: u64 = 2;
 
 pub struct StorageEngine {
     db: redb::Database,
