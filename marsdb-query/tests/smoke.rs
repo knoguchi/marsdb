@@ -4262,6 +4262,41 @@ fn fast_path_tail_order_skip_limit_matches_generic() {
     }
 }
 
+/// Seed enumeration's direct-predicate route (leaf = simple
+/// `var.prop <op> literal` filters over a scan, e.g. matrix's `title
+/// CONTAINS`) must match the generic pipeline — including a predicate on
+/// a property some nodes lack (absent -> filtered out, not an error).
+#[test]
+fn fast_path_contains_leaf_matches_generic() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (m1:Movie {title: 'The Matrix'}), (m2:Movie {title: 'The Matrix Reloaded'}), \
+         (m3:Movie {title: 'Speed'}), (m4:Movie), (u:User {name: 'u'})",
+    );
+    for title in ["The Matrix", "The Matrix Reloaded", "Speed"] {
+        run(
+            &store,
+            &format!(
+                "MATCH (u:User {{name:'u'}}), (m:Movie {{title:'{title}'}}) \
+                 CREATE (u)-[:RATED]->(m)"
+            ),
+        );
+    }
+    let fast = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WHERE m.title CONTAINS 'Matrix' \
+         WITH m, count(*) AS reviews RETURN m.title, reviews ORDER BY reviews DESC LIMIT 5",
+    );
+    let generic = run(
+        &store,
+        "MATCH (m:Movie)<-[:RATED]-(u:User) WHERE m.title CONTAINS 'Matrix' AND u.name <> '\u{0}n' \
+         WITH m, count(*) AS reviews RETURN m.title, reviews ORDER BY reviews DESC LIMIT 5",
+    );
+    assert_eq!(format!("{:?}", fast.rows), format!("{:?}", generic.rows));
+    assert_eq!(fast.rows.len(), 2, "only the two Matrix titles qualify");
+}
+
 #[test]
 fn node_cache_resets_across_the_write_transaction_entry_point_too() {
     let store = GraphStore::open_memory().unwrap();

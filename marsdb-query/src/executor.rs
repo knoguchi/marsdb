@@ -3729,12 +3729,94 @@ impl<'a> Executor<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        // Seed nodes from the generic stream over the leaf.
+        // Seed nodes. For a filtered scan/seek leaf, enumerate candidate
+        // ids directly and evaluate the leaf's predicates against ONE
+        // reused row buffer -- the generic stream builds a fresh
+        // `HashMap` row per candidate, which for an unindexed predicate
+        // over a big label (matrix_review_counts: `title CONTAINS` over
+        // 9k movies) was the query's remaining cost. Any leaf shape this
+        // doesn't cover falls back to the generic stream.
         let mut seeds = Vec::new();
-        for row in self.eval_plan(txn, leaf, current_rows, guard)? {
-            match row.get(stages[0].from) {
-                Some(Binding::Node(id)) => seeds.push(*id),
-                _ => return Ok(None),
+        let mut leaf_preds = Vec::new();
+        let leaf_base = peel(leaf, &mut leaf_preds);
+        let leaf_candidates: Option<Vec<NodeId>> = match leaf_base {
+            LogicalPlan::AllNodesScan { var } if var == stages[0].from => Some(
+                GraphStore::all_node_ids_limited_in_txn(txn, None, usize::MAX)?,
+            ),
+            LogicalPlan::NodeByLabelScan { var, label } if var == stages[0].from => Some(
+                GraphStore::all_node_ids_limited_in_txn(txn, Some(label), usize::MAX)?,
+            ),
+            LogicalPlan::IndexSeek {
+                var,
+                label,
+                prop,
+                value: crate::ir::IndexSeekValue::Fixed(value),
+            } if var == stages[0].from => {
+                Some(GraphStore::lookup_by_index_in_txn(txn, label, prop, value)?)
+            }
+            _ => None,
+        };
+        match leaf_candidates {
+            Some(candidates) => {
+                // All-simple-predicate leaves (`var.prop <op> literal`,
+                // matrix's `title CONTAINS ...`) evaluate through one
+                // pre-opened NODES handle and the shared `compare` --
+                // no per-candidate table open, no probe row, no
+                // `eval_expr` dispatch. Anything else keeps the probe-row
+                // route below.
+                let simple: Option<Vec<(&PropAccess, CompareOp, &Literal)>> = leaf_preds
+                    .iter()
+                    .map(|pred| match pred {
+                        Expr::Compare(pa, op, lit) if pa.var == stages[0].from => {
+                            Some((pa, *op, lit))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(simple) = simple {
+                    let pred_ids: Vec<Option<u32>> = simple
+                        .iter()
+                        .map(|(pa, _, _)| self.prop_id_for(txn, &pa.prop))
+                        .collect::<Result<_, _>>()?;
+                    let mut read_prop = GraphStore::node_prop_reader(txn)?;
+                    'cand: for id in candidates {
+                        guard.checkpoint()?;
+                        for ((_, op, lit), prop_id) in simple.iter().zip(&pred_ids) {
+                            let value = match prop_id {
+                                Some(pid) => read_prop(id, *pid)?.flatten(),
+                                None => None,
+                            };
+                            if compare(&value, *op, lit) != Some(true) {
+                                continue 'cand;
+                            }
+                        }
+                        seeds.push(id);
+                    }
+                } else {
+                    let mut probe = BindingRow::new();
+                    for id in candidates {
+                        guard.checkpoint()?;
+                        probe.insert(stages[0].from.to_string(), Binding::Node(id));
+                        let mut pass = true;
+                        for pred in &leaf_preds {
+                            if self.eval_expr(txn, pred, &probe, guard)? != Some(true) {
+                                pass = false;
+                                break;
+                            }
+                        }
+                        if pass {
+                            seeds.push(id);
+                        }
+                    }
+                }
+            }
+            None => {
+                for row in self.eval_plan(txn, leaf, current_rows, guard)? {
+                    match row.get(stages[0].from) {
+                        Some(Binding::Node(id)) => seeds.push(*id),
+                        _ => return Ok(None),
+                    }
+                }
             }
         }
 
