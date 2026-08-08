@@ -50,7 +50,7 @@ impl<'a> Txn<'a> {
 /// Exposes `get`/`iter`/`range` as plain inherent methods, not a full
 /// `redb::ReadableTable` trait impl — matching the whole trait (`first`/
 /// `last`/...) would be boilerplate for methods nothing calls. `range`
-/// was deliberately left out until a real call site needed it; v1.5's
+/// was deliberately left out until a real call site needed it; v2's
 /// composite-key adjacency (prefix scans over `ADJ_OUT`/`ADJ_IN`) is that
 /// call site.
 pub enum TableHandle<'a, K: Key + 'static, V: Value + 'static> {

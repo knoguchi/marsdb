@@ -370,7 +370,7 @@ impl GraphStore {
 
     /// One property of one node, by interned prop id, without decoding the
     /// rest of the record or resolving any names — a directory binary
-    /// search plus one value decode (the v1.5 read fast path; the codec
+    /// search plus one value decode (the v2 read fast path; the codec
     /// mechanism measured 79x over whole-record decode at 1-of-20 props).
     ///
     /// Nested `Option` distinguishes the two kinds of missing the executor

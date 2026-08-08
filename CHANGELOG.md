@@ -6,7 +6,7 @@ All notable changes to MarsDB are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Changed
-- **On-disk format version 1 → 2** (v1.5). Old files are rejected with a
+- **On-disk format version 1 → 2** (v2). Old files are rejected with a
   clear error; migration path is export from a v1 build, reimport here.
   Two format changes, one break:
   - **Directory record format**: node/edge records store properties as a
