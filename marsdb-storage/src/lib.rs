@@ -55,15 +55,37 @@ impl StorageEngine {
     /// new, still-empty database" as an error.
     fn from_db(db: redb::Database) -> Result<Self, StorageError> {
         let write_txn = db.begin_write()?;
+        // Distinguishes "brand-new file" (no tables at all -- `from_db`
+        // commits table setup and the version marker atomically, so a
+        // crash can't produce a half-initialized state) from a
+        // pre-versioning v1-era file (has data tables, but no
+        // `schema_version` key). The latter used to be silently adopted
+        // and stamped with the current version -- correct when the marker
+        // was introduced (the layouts were identical then), but wrong
+        // ever since format 2 changed the record encoding: stamping a
+        // real v1 file as 2 makes its records decode as garbage later
+        // instead of failing cleanly at open.
+        let is_fresh = write_txn.list_tables()?.next().is_none()
+            && write_txn.list_multimap_tables()?.next().is_none();
         {
             let mut meta = write_txn.open_table(tables::META)?;
             let stored_version = meta.get("schema_version")?.map(|value| value.value());
             match stored_version {
-                // Databases created before explicit versioning used the same
-                // v1 table and postcard layouts, so adopting them is the v1
-                // migration. Persist the marker atomically with table setup.
-                None => {
+                None if is_fresh => {
                     meta.insert("schema_version", CURRENT_FORMAT_VERSION)?;
+                }
+                // An existing database with no version marker predates
+                // explicit versioning -- format 1 by construction (the
+                // marker shipped before format 2 existed, so every
+                // format-2 file has one).
+                None => {
+                    drop(meta);
+                    write_txn.abort()?;
+                    return Err(StorageError::UnsupportedFormat {
+                        found: 1,
+                        oldest_supported: OLDEST_SUPPORTED_FORMAT_VERSION,
+                        current: CURRENT_FORMAT_VERSION,
+                    });
                 }
                 Some(found)
                     if !(OLDEST_SUPPORTED_FORMAT_VERSION..=CURRENT_FORMAT_VERSION)
@@ -190,6 +212,54 @@ mod tests {
             meta.get("schema_version").unwrap().unwrap().value(),
             CURRENT_FORMAT_VERSION
         );
+    }
+
+    /// A pre-versioning v1-era file (data tables present, no
+    /// `schema_version` marker) must be rejected as format 1, not
+    /// silently stamped as the current version -- its records are in the
+    /// old whole-blob encoding and would decode as garbage.
+    #[test]
+    fn unversioned_v1_era_database_is_rejected_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-era.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                // A v1-era file always has data tables; META may exist
+                // too (it held the id counters) -- just no
+                // schema_version key.
+                write
+                    .open_table(tables::NODES)
+                    .unwrap()
+                    .insert(1, &[0u8][..])
+                    .unwrap();
+                write
+                    .open_table(tables::META)
+                    .unwrap()
+                    .insert("next_node_id", 1)
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let err = match StorageEngine::open_file(&path) {
+            Ok(_) => panic!("unversioned v1-era database unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            StorageError::UnsupportedFormat { found: 1, .. }
+        ));
+        // Rejection must not have stamped a version into the file.
+        let db = redb::Database::create(&path).unwrap();
+        let read = db.begin_read().unwrap();
+        assert!(read
+            .open_table(tables::META)
+            .unwrap()
+            .get("schema_version")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
