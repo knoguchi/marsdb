@@ -62,6 +62,23 @@ fn keywords_are_case_insensitive_and_tolerate_a_trailing_semicolon() {
 }
 
 #[test]
+fn begin_transaction_is_an_alias_for_begin() {
+    let db = Database::in_memory().unwrap();
+    db.execute("BEGIN TRANSACTION").unwrap();
+    db.execute("CREATE (:N)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(count(&db), 0);
+    db.execute("  begin   transaction ; ").unwrap();
+    db.execute("CREATE (:N)").unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count(&db), 1);
+    // Only the exact two-word form -- anything longer (e.g. a READ ONLY
+    // qualifier MarsDB doesn't have) still goes to the real parser and
+    // fails there.
+    assert!(db.execute("BEGIN TRANSACTION READ ONLY").is_err());
+}
+
+#[test]
 fn commit_and_rollback_without_an_open_transaction_error() {
     let db = Database::in_memory().unwrap();
     assert!(db.execute("COMMIT").is_err());
