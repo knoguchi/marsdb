@@ -4,7 +4,12 @@ Go bindings for [MarsDB](https://github.com/knoguchi/marsdb), an embeddable
 property-graph database with an openCypher query subset. Unlike
 [`marsdb-python`](../marsdb-python) (PyO3, in-process), Go has no
 equivalent in-process FFI story with Rust, so this binding goes through a
-small C ABI crate, [`marsdb-capi`](../marsdb-capi), via cgo.
+small C ABI crate, [`marsdb-capi`](../marsdb-capi), via cgo. Results
+travel over the C ABI's binary batch lane — one cgo crossing per query
+returns the whole result as a compact blob (interned names, varint
+ints; format spec in `marsdb.h`), decoded by a pure-Go stdlib-only
+decoder — so the per-call cgo tax is paid once per query, not once per
+value.
 
 **Not published anywhere yet** — no `go get`-able module path, no tagged
 release. Use it by cloning this repo and building both pieces locally.
@@ -120,10 +125,12 @@ rows, err := db.ExecuteWithParams(
 )
 ```
 
-Values may be nil, bool, any integer/float type, string, or nested
-`[]any`/`map[string]any`. `int64` values keep their full range end to
-end; a `uint64` above `int64`'s range errors instead of silently
-rounding.
+Values may be nil, bool, any integer/float type, string, or a FLAT
+`[]any` of those (`WHERE x IN $list`). Nested lists and
+`map[string]any` as parameter *values* are not supported through the
+typed C ABI (map-shaped and nested data still round-trips fine in
+results). `int64` values keep their full range end to end; a `uint64`
+above `int64`'s range errors instead of silently rounding.
 =======
 ## Transactions
 

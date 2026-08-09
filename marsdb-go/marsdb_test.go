@@ -284,15 +284,14 @@ func TestExecuteWithParams(t *testing.T) {
 		t.Fatalf("unexpected score: %v", rows[0]["score"])
 	}
 
-	// Map-valued param.
-	rows, err = db.ExecuteWithParams("RETURN $m.city AS city", map[string]any{
+	// Map-valued params are not supported through the typed C ABI
+	// (documented limitation of the v2 binding; flat lists cover the
+	// real IN $list uses). Must error clearly, never silently coerce.
+	_, err = db.ExecuteWithParams("RETURN $m.city AS city", map[string]any{
 		"m": map[string]any{"city": "Kyoto"},
 	})
-	if err != nil {
-		t.Fatalf("map param: %v", err)
-	}
-	if rows[0]["city"] != "Kyoto" {
-		t.Fatalf("unexpected city: %v", rows[0]["city"])
+	if err == nil || !strings.Contains(err.Error(), "unsupported type") {
+		t.Fatalf("expected unsupported-type error for a map param, got %v", err)
 	}
 
 	// A uint64 above int64's range must error, never silently round.

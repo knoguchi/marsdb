@@ -884,7 +884,7 @@ name = "marsdb-capi"
 version = "0.8.0"
 dependencies = [
  "marsdb",
- "serde_json",
+ "marsdb-graph",
 ]
 
 [[package]]
