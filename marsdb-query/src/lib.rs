@@ -21,7 +21,7 @@ pub use ast::{Literal, Statement};
 pub use error::QueryError;
 pub use executor::{
     is_read_only, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
-    ExecutionOutcome, Executor,
+    ExecutionOutcome, Executor, RowSink,
 };
 pub use params::substitute_params;
 pub use procedure::{ProcedureProvider, ProcedureSignature, Procedures};

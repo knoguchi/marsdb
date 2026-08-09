@@ -119,6 +119,100 @@ impl Database {
         stats.set_item("labels_removed", s.labels_removed)?;
         Ok((rows_to_py(py, &result)?, stats))
     }
+
+    /// Stream a read-only statement's rows to `on_row` instead of
+    /// materializing a list — bounded memory no matter how many rows
+    /// match; the bulk-export path. `on_row` receives one dict per row
+    /// (same shape as an `execute` row); return `False` to stop the
+    /// scan early. Accepts exactly the streamable shape (one plain
+    /// `MATCH ... RETURN`, `SKIP`/`LIMIT` fine) and raises
+    /// `ProgrammingError` — never silently materializes — for ORDER
+    /// BY/aggregation/DISTINCT/WITH/write statements.
+    #[pyo3(signature = (cypher, on_row, params = None, max_rows = None, timeout_ms = None))]
+    fn execute_streaming<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: &str,
+        on_row: &Bound<'py, PyAny>,
+        params: Option<&Bound<'py, PyDict>>,
+        max_rows: Option<usize>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<()> {
+        if !on_row.is_callable() {
+            return Err(ProgrammingError::new_err("on_row must be callable"));
+        }
+        let mut converted = std::collections::HashMap::new();
+        if let Some(dict) = params {
+            for (key, value) in dict.iter() {
+                let name: String = key
+                    .extract()
+                    .map_err(|_| ProgrammingError::new_err("parameter names must be strings"))?;
+                let prop = py_to_property(&value)
+                    .map_err(|e| DataError::new_err(format!("parameter '{name}': {e}")))?;
+                converted.insert(name, prop);
+            }
+        }
+        let mut options = ::marsdb::ExecutionOptions::default();
+        options.max_result_rows = max_rows;
+        options.timeout = timeout_ms.map(std::time::Duration::from_millis);
+
+        struct PySink<'a, 'py> {
+            py: Python<'py>,
+            on_row: &'a Bound<'py, PyAny>,
+            columns: Vec<String>,
+            failure: Option<PyErr>,
+        }
+        impl ::marsdb::RowSink for PySink<'_, '_> {
+            fn columns(&mut self, columns: &[String]) {
+                self.columns = columns.to_vec();
+            }
+            fn row(&mut self, row: Vec<::marsdb::Value>) -> std::ops::ControlFlow<()> {
+                let build = || -> PyResult<Bound<'_, PyDict>> {
+                    let dict = PyDict::new(self.py);
+                    for (col, value) in self.columns.iter().zip(row.iter()) {
+                        dict.set_item(col, value_to_py(self.py, value)?)?;
+                    }
+                    Ok(dict)
+                };
+                let dict = match build() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.failure = Some(e);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                };
+                match self.on_row.call1((dict,)) {
+                    // Only an explicit `False` stops the scan -- `None`
+                    // (a bare callback with no return) keeps going.
+                    Ok(value) => {
+                        if matches!(value.extract::<bool>(), Ok(false)) {
+                            std::ops::ControlFlow::Break(())
+                        } else {
+                            std::ops::ControlFlow::Continue(())
+                        }
+                    }
+                    Err(e) => {
+                        self.failure = Some(e);
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+            }
+        }
+
+        let mut sink = PySink {
+            py,
+            on_row,
+            columns: vec![],
+            failure: None,
+        };
+        self.inner
+            .execute_streaming(cypher, &converted, &options, &mut sink)
+            .map_err(to_py_err)?;
+        match sink.failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Database {

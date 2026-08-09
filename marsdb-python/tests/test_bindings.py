@@ -152,6 +152,31 @@ class DatabaseTests(unittest.TestCase):
         _, stats = db.execute_with_stats("MATCH (n) RETURN n")
         self.assertTrue(all(v == 0 for v in stats.values()))
 
+
+    def test_execute_streaming(self):
+        db = marsdb.Database.in_memory()
+        for i in range(20):
+            db.execute("CREATE (:N {i: $i})", {"i": i})
+        rows = []
+        db.execute_streaming(
+            "MATCH (n:N) RETURN n.i AS i SKIP 2 LIMIT 5",
+            lambda row: rows.append(row),
+        )
+        self.assertEqual(len(rows), 5)
+        # Returning False stops the scan early.
+        stopped = []
+        db.execute_streaming(
+            "MATCH (n:N) RETURN n.i AS i",
+            lambda row: (stopped.append(row), len(stopped) < 3)[1],
+        )
+        self.assertEqual(len(stopped), 3)
+        # Non-streamable shapes raise instead of materializing.
+        with self.assertRaises(marsdb.ProgrammingError):
+            db.execute_streaming("MATCH (n:N) RETURN count(n)", lambda row: None)
+        # A callback exception propagates as itself.
+        with self.assertRaises(ZeroDivisionError):
+            db.execute_streaming("MATCH (n:N) RETURN n.i", lambda row: 1 / 0)
+
     def test_list_valued_node_property_round_trips(self):
         # A stored PropertyValue::List (real Cypher/Neo4j's own
         # "homogeneous array property" shape), not the query-layer-only

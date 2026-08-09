@@ -22,7 +22,7 @@ pub use marsdb_graph::TzId;
 pub use marsdb_query::{
     temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Literal, PathElem, ProcedureProvider, ProcedureSignature, Procedures,
-    QueryError, QueryResult, QueryStats, Value,
+    QueryError, QueryResult, QueryStats, RowSink, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -283,6 +283,42 @@ impl Database {
             .session_txn_timeout
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = limit;
+    }
+
+    /// Stream a read-only statement's rows to `sink` instead of
+    /// materializing them — bounded memory no matter how many rows
+    /// match; the bulk-export path. Accepts exactly the streamable
+    /// shape (one plain `MATCH ... RETURN`, `SKIP`/`LIMIT` fine, no
+    /// ORDER BY/aggregation/DISTINCT/WITH) and errors — never silently
+    /// materializes — on anything else; see
+    /// `Executor::execute_streaming_with_options` for the full contract.
+    /// Not available while this session has an open `BEGIN` transaction
+    /// (a stream holds a read snapshot for caller-controlled time; the
+    /// session's write transaction is not that snapshot).
+    pub fn execute_streaming(
+        &self,
+        cypher: &str,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+        sink: &mut dyn RowSink,
+    ) -> Result<(), Error> {
+        {
+            let session = self
+                .session_txn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if session.is_some() {
+                return Err(marsdb_query::QueryError::Semantic(
+                    "execute_streaming is not available inside an open session transaction".into(),
+                )
+                .into());
+            }
+        }
+        let stmt = prepare_statement(cypher, params, options)?;
+        let options = with_call_params(options, params);
+        marsdb_query::Executor::new(&self.store)
+            .execute_streaming_with_options(&stmt, &options, sink)?;
+        Ok(())
     }
 
     /// Runs a `;`-separated batch of statements (e.g.
