@@ -66,6 +66,21 @@ pub enum LogicalPlan {
         prop: String,
         value: IndexSeekValue,
     },
+    /// Bounded scan over one indexed `(label, prop)`'s order-preserving
+    /// key space — `WHERE n.year > 2000 [AND n.year < 2010]` with an
+    /// index on `(Label, year)`. Each bound is `(value, inclusive)`.
+    /// The storage lookup returns a SUPERSET for numeric bounds (both
+    /// int/float type regions, lossy conversions widened outward), so
+    /// the planner always keeps the originating conjuncts as a residual
+    /// `Filter` above this node — this seek narrows the candidate set,
+    /// the filter stays the source of truth.
+    IndexRangeSeek {
+        var: String,
+        label: String,
+        prop: String,
+        lo: Option<(PropertyValue, bool)>,
+        hi: Option<(PropertyValue, bool)>,
+    },
     /// "Start from the rows already bound coming into this statement" —
     /// used when a `QueryPart`'s pattern start-variable was already bound
     /// by a prior part's `WITH` output, instead of a fresh

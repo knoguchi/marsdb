@@ -846,6 +846,35 @@ impl GraphStore {
     /// Same as `lookup_by_index_in_txn`, but stops once `limit` nodes are
     /// found — the storage-level end of `LIMIT` push-down through an
     /// `IndexSeek` (see `marsdb_query::planner`/`executor::stream_index_seek`).
+    /// Range counterpart of `lookup_by_index_in_txn` — every node whose
+    /// indexed value falls within the bounds (`(value, inclusive)` per
+    /// side, either side open). Returns a SUPERSET for numeric bounds
+    /// (int/float regions both scanned, lossy conversions widened
+    /// outward) — callers must re-check the original predicate; see
+    /// `index::lookup_range`.
+    pub fn lookup_by_index_range_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        lo: Option<(&PropertyValue, bool)>,
+        hi: Option<(&PropertyValue, bool)>,
+        limit: Option<usize>,
+    ) -> Result<Vec<NodeId>, GraphError> {
+        crate::index::lookup_range(txn, label, prop, lo, hi, limit)
+    }
+
+    /// Resumable form of `lookup_by_index_range_in_txn` — see
+    /// `index::IndexRangeCursor` for the demand-driven contract.
+    pub fn index_range_cursor_in_txn(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        lo: Option<(&PropertyValue, bool)>,
+        hi: Option<(&PropertyValue, bool)>,
+    ) -> Result<Option<crate::index::IndexRangeCursor>, GraphError> {
+        crate::index::IndexRangeCursor::new(txn, label, prop, lo, hi)
+    }
+
     pub fn lookup_by_index_limited_in_txn(
         txn: Txn,
         label: &str,
