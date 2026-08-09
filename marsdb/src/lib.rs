@@ -13,16 +13,14 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use marsdb_query::Statement;
-
 pub use marsdb_graph::GraphError;
 pub use marsdb_graph::IntegrityReport;
 pub use marsdb_graph::PropertyValue;
 pub use marsdb_graph::TzId;
 pub use marsdb_query::{
-    temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
+    parse, temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Literal, PathElem, ProcedureProvider, ProcedureSignature, Procedures,
-    QueryError, QueryResult, QueryStats, RowSink, Value,
+    QueryError, QueryResult, QueryStats, RowSink, Statement, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +155,25 @@ impl Database {
         options: &ExecutionOptions,
     ) -> Result<QueryResult, Error> {
         let stmt = prepare_statement(cypher, params, options)?;
+        let options = with_call_params(options, params);
+        self.execute_prepared(&stmt, &options)
+    }
+
+    /// Execute an already-parsed statement (`marsdb::parse`) — the
+    /// parse-once half of a prepared-statement API. The AST is cloned
+    /// per execution (parameter substitution mutates it in place), so
+    /// one parsed statement can be executed many times with different
+    /// `params`. Runs through the same session-aware path as
+    /// `execute_with_params_and_options` — BEGIN/COMMIT/ROLLBACK
+    /// statements and open session transactions behave identically.
+    pub fn execute_prepared_statement(
+        &self,
+        stmt: &Statement,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        let mut stmt = stmt.clone();
+        marsdb_query::substitute_params(&mut stmt, params)?;
         let options = with_call_params(options, params);
         self.execute_prepared(&stmt, &options)
     }
@@ -315,6 +332,37 @@ impl Database {
             }
         }
         let stmt = prepare_statement(cypher, params, options)?;
+        let options = with_call_params(options, params);
+        marsdb_query::Executor::new(&self.store)
+            .execute_streaming_with_options(&stmt, &options, sink)?;
+        Ok(())
+    }
+
+    /// `execute_streaming` for an already-parsed statement — the
+    /// prepared-statement counterpart, same streamable-shape contract
+    /// and session-transaction restriction. The AST is cloned per call
+    /// (parameter substitution mutates in place).
+    pub fn execute_streaming_prepared(
+        &self,
+        stmt: &Statement,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+        sink: &mut dyn RowSink,
+    ) -> Result<(), Error> {
+        {
+            let session = self
+                .session_txn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if session.is_some() {
+                return Err(marsdb_query::QueryError::Semantic(
+                    "execute_streaming is not available inside an open session transaction".into(),
+                )
+                .into());
+            }
+        }
+        let mut stmt = stmt.clone();
+        marsdb_query::substitute_params(&mut stmt, params)?;
         let options = with_call_params(options, params);
         marsdb_query::Executor::new(&self.store)
             .execute_streaming_with_options(&stmt, &options, sink)?;

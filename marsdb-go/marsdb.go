@@ -3,6 +3,13 @@
 // against the marsdb-capi cdylib/staticlib (../marsdb-capi) via cgo — see
 // this package's README for the two-step build (build the Rust crate,
 // then `go build`/`go test` here).
+//
+// Results travel over marsdb-capi's binary batch lane: one cgo crossing
+// per query returns the whole result as a compact self-describing blob
+// (interned names, varint ints — see marsdb.h's format spec), decoded by
+// the pure-Go stdlib-only decoder in batch.go. Parameters go through
+// typed prepared-statement binds — scalars and flat lists; nested
+// list/map parameter values are not supported through the C ABI.
 package marsdb
 
 /*
@@ -14,10 +21,8 @@ package marsdb
 import "C"
 
 import (
-	"encoding/json"
 	"errors"
-	"strconv"
-	"strings"
+	"fmt"
 	"sync"
 	"time"
 	"unsafe"
@@ -29,6 +34,28 @@ import (
 type Database struct {
 	mu  sync.RWMutex
 	ptr *C.MarsdbDatabase
+}
+
+// Stats reports what a write statement changed — all zero for reads.
+// PropertiesSet counts removals too (removing a property is setting it
+// away); label changes are their own pair.
+type Stats struct {
+	NodesCreated         uint64
+	NodesDeleted         uint64
+	RelationshipsCreated uint64
+	RelationshipsDeleted uint64
+	PropertiesSet        uint64
+	LabelsAdded          uint64
+	LabelsRemoved        uint64
+}
+
+// Options bounds a statement's execution: MaxRows caps the result row
+// count and Timeout caps wall time, both checked during evaluation — a
+// runaway query fails at the bound instead of materializing an
+// unbounded result first. Zero values mean unlimited.
+type Options struct {
+	MaxRows uint64
+	Timeout time.Duration
 }
 
 // Open opens (creating if absent) a single-file, on-disk database.
@@ -52,8 +79,8 @@ func InMemory() (*Database, error) {
 	return &Database{ptr: ptr}, nil
 }
 
-// Close releases the underlying database handle. It is safe to call more than
-// once and waits for concurrent Execute calls to finish.
+// Close releases the underlying database handle. It is safe to call more
+// than once and waits for concurrent calls to finish.
 func (db *Database) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -65,26 +92,8 @@ func (db *Database) Close() error {
 	return nil
 }
 
-// row is the wire shape marsdb-capi's marsdb_execute produces: parallel
-// columns/rows, decoded here into one map[string]any per row (keyed by
-// column name) to match marsdb-python's dict-per-row shape.
-type queryResult struct {
-	Columns []string `json:"columns"`
-	Rows    [][]any  `json:"rows"`
-	Stats   Stats    `json:"stats"`
-}
-
-// Stats reports what a write statement changed — all zero for reads.
-// properties_set counts removals too (removing a property is setting it
-// away); label changes are their own pair.
-type Stats struct {
-	NodesCreated         uint64 `json:"nodes_created"`
-	NodesDeleted         uint64 `json:"nodes_deleted"`
-	RelationshipsCreated uint64 `json:"relationships_created"`
-	RelationshipsDeleted uint64 `json:"relationships_deleted"`
-	PropertiesSet        uint64 `json:"properties_set"`
-	LabelsAdded          uint64 `json:"labels_added"`
-	LabelsRemoved        uint64 `json:"labels_removed"`
+func (db *Database) lastError() error {
+	return errors.New("marsdb: " + C.GoString(C.marsdb_last_error(db.ptr)))
 }
 
 // Execute runs one Cypher statement, returning one map[string]any per
@@ -92,203 +101,225 @@ type Stats struct {
 // return an empty slice.
 //
 // Nodes decode as map[string]any{"__type": "node", "id": ..., "labels":
-// [...]any, "props": map[string]any{...}}; edges similarly with
-// "__type": "edge" plus "src"/"dst". JSON integers decode as int64 (or
-// uint64 when they exceed int64's range), while values containing a decimal
-// point or exponent decode as float64. Dates and durations decode as their
-// canonical ISO-8601 strings.
+// []any, "props": map[string]any{...}}; edges similarly with
+// "__type": "edge" plus "src"/"dst". Integer properties and IDs retain
+// full precision as int64 (uint64 for an ID above int64's range);
+// fractional values are float64. Dates and durations are canonical
+// ISO-8601 strings.
 func (db *Database) Execute(cypher string) ([]map[string]any, error) {
-	return db.execute(cypher, nil)
+	rows, _, err := db.executeBatch(cypher, nil, Options{})
+	return rows, err
 }
 
 // ExecuteWithParams runs one Cypher statement with $name placeholders
-// resolved from params. Values may be nil, bool, any Go integer or float
-// type, string, or (arbitrarily nested) []any / map[string]any of those
-// — anything encoding/json can marshal to null/bool/number/string/array/
-// object. Go int64 values keep their full range end to end (params cross
-// the C ABI as a JSON object, and integral JSON numbers are parsed as
-// i64 on the Rust side); a uint64 above int64's range is rejected there
-// rather than silently rounded.
+// resolved from params. Values may be nil, bool, any Go integer or
+// float type, string, or a FLAT []any of those (`WHERE x IN $list`).
+// Nested lists/maps as parameter VALUES are not supported through the
+// C ABI (map-shaped and nested data still round-trips fine in
+// results). int64 values keep their full range end to end.
 func (db *Database) ExecuteWithParams(cypher string, params map[string]any) ([]map[string]any, error) {
-	if params == nil {
-		return db.execute(cypher, nil)
-	}
-	encoded, err := json.Marshal(params)
-	if err != nil {
-		return nil, errors.New("marsdb: params not JSON-encodable: " + err.Error())
-	}
-	return db.execute(cypher, encoded)
-}
-
-// Options bounds a statement's execution: MaxRows caps the result row
-// count and Timeout caps wall time, both checked during evaluation — a
-// runaway query fails at the bound instead of materializing an
-// unbounded result first. Zero values mean unlimited.
-type Options struct {
-	MaxRows uint64
-	Timeout time.Duration
-}
-
-// ExecuteStats is Execute plus the statement's write counters — the
-// answer to "how many did my DELETE delete".
-func (db *Database) ExecuteStats(cypher string, params map[string]any) ([]map[string]any, Stats, error) {
-	var encoded []byte
-	if params != nil {
-		var err error
-		encoded, err = json.Marshal(params)
-		if err != nil {
-			return nil, Stats{}, errors.New("marsdb: params not JSON-encodable: " + err.Error())
-		}
-	}
-	rows, stats, err := db.executeDecodeStats(cypher, encoded)
-	return rows, stats, err
+	rows, _, err := db.executeBatch(cypher, params, Options{})
+	return rows, err
 }
 
 // ExecuteWithOptions runs one Cypher statement with $name parameters
 // (nil for none — same value rules as ExecuteWithParams) under the
 // given execution bounds.
 func (db *Database) ExecuteWithOptions(cypher string, params map[string]any, opts Options) ([]map[string]any, error) {
-	var encoded []byte
-	if params != nil {
-		var err error
-		encoded, err = json.Marshal(params)
-		if err != nil {
-			return nil, errors.New("marsdb: params not JSON-encodable: " + err.Error())
+	rows, _, err := db.executeBatch(cypher, params, opts)
+	return rows, err
+}
+
+// ExecuteStats is Execute plus the statement's write counters — the
+// answer to "how many did my DELETE delete".
+func (db *Database) ExecuteStats(cypher string, params map[string]any) ([]map[string]any, Stats, error) {
+	return db.executeBatch(cypher, params, Options{})
+}
+
+// prepared wraps a live C statement handle; callers must destroy() it.
+type prepared struct {
+	ptr *C.MarsdbStatement
+}
+
+func (db *Database) prepare(cypher string, params map[string]any, opts Options) (*prepared, error) {
+	cCypher := C.CString(cypher)
+	defer C.free(unsafe.Pointer(cCypher))
+	var stmt *C.MarsdbStatement
+	if C.marsdb_prepare(db.ptr, cCypher, &stmt) != C.MARSDB_OK {
+		return nil, db.lastError()
+	}
+	p := &prepared{ptr: stmt}
+	if opts.MaxRows > 0 {
+		C.marsdb_stmt_set_max_rows(stmt, C.uint64_t(opts.MaxRows))
+	}
+	if opts.Timeout > 0 {
+		C.marsdb_stmt_set_timeout_ms(stmt, C.uint64_t(opts.Timeout/time.Millisecond))
+	}
+	for name, value := range params {
+		if err := p.bind(name, value); err != nil {
+			p.destroy()
+			return nil, err
 		}
 	}
-	return db.executeOpts(cypher, encoded, opts)
+	return p, nil
 }
 
-func (db *Database) execute(cypher string, paramsJSON []byte) ([]map[string]any, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.ptr == nil {
-		return nil, errors.New("marsdb: database is closed")
-	}
-	cCypher := C.CString(cypher)
-	defer C.free(unsafe.Pointer(cCypher))
-
-	var result C.MarsdbResult
-	if paramsJSON == nil {
-		result = C.marsdb_execute(db.ptr, cCypher)
-	} else {
-		cParams := C.CString(string(paramsJSON))
-		defer C.free(unsafe.Pointer(cParams))
-		result = C.marsdb_execute_with_params(db.ptr, cCypher, cParams)
-	}
-	return db.decode(result)
+func (p *prepared) destroy() {
+	C.marsdb_stmt_destroy(p.ptr)
 }
 
-func (db *Database) executeOpts(cypher string, paramsJSON []byte, opts Options) ([]map[string]any, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.ptr == nil {
-		return nil, errors.New("marsdb: database is closed")
+func (p *prepared) bind(name string, value any) error {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	switch v := value.(type) {
+	case nil:
+		C.marsdb_bind_null(p.ptr, cName)
+	case bool:
+		b := C.int(0)
+		if v {
+			b = 1
+		}
+		C.marsdb_bind_bool(p.ptr, cName, b)
+	case int:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case int8:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case int16:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case int32:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case int64:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case uint, uint8, uint16, uint32:
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(toUint64(v)))
+	case uint64:
+		if v > 1<<63-1 {
+			return fmt.Errorf("marsdb: parameter %q: uint64 %d exceeds int64 range", name, v)
+		}
+		C.marsdb_bind_int64(p.ptr, cName, C.int64_t(v))
+	case float32:
+		C.marsdb_bind_double(p.ptr, cName, C.double(v))
+	case float64:
+		C.marsdb_bind_double(p.ptr, cName, C.double(v))
+	case string:
+		cValue := C.CString(v)
+		defer C.free(unsafe.Pointer(cValue))
+		C.marsdb_bind_string(p.ptr, cName, cValue)
+	case []any:
+		return p.bindList(name, cName, v)
+	default:
+		return fmt.Errorf(
+			"marsdb: parameter %q: unsupported type %T -- use nil/bool/int/float/string or a flat []any of those",
+			name, value)
 	}
-	cCypher := C.CString(cypher)
-	defer C.free(unsafe.Pointer(cCypher))
-
-	var cParams *C.char
-	if paramsJSON != nil {
-		cParams = C.CString(string(paramsJSON))
-		defer C.free(unsafe.Pointer(cParams))
-	}
-	result := C.marsdb_execute_ex(db.ptr, cCypher, cParams,
-		C.uint64_t(opts.MaxRows), C.uint64_t(opts.Timeout/time.Millisecond))
-	return db.decode(result)
+	return nil
 }
 
-func (db *Database) executeDecodeStats(cypher string, paramsJSON []byte) ([]map[string]any, Stats, error) {
+func toUint64(v any) uint64 {
+	switch v := v.(type) {
+	case uint:
+		return uint64(v)
+	case uint8:
+		return uint64(v)
+	case uint16:
+		return uint64(v)
+	case uint32:
+		return uint64(v)
+	default:
+		return 0
+	}
+}
+
+// Flat lists bind through the typed list binds; a heterogeneous or
+// nested list is rejected rather than silently coerced.
+func (p *prepared) bindList(name string, cName *C.char, items []any) error {
+	if len(items) == 0 {
+		C.marsdb_bind_int64_list(p.ptr, cName, nil, 0)
+		return nil
+	}
+	switch items[0].(type) {
+	case int, int8, int16, int32, int64:
+		values := make([]C.int64_t, len(items))
+		for i, item := range items {
+			switch n := item.(type) {
+			case int:
+				values[i] = C.int64_t(n)
+			case int8:
+				values[i] = C.int64_t(n)
+			case int16:
+				values[i] = C.int64_t(n)
+			case int32:
+				values[i] = C.int64_t(n)
+			case int64:
+				values[i] = C.int64_t(n)
+			default:
+				return fmt.Errorf("marsdb: parameter %q: mixed-type list not supported", name)
+			}
+		}
+		C.marsdb_bind_int64_list(p.ptr, cName, &values[0], C.size_t(len(values)))
+	case float32, float64:
+		values := make([]C.double, len(items))
+		for i, item := range items {
+			switch f := item.(type) {
+			case float32:
+				values[i] = C.double(f)
+			case float64:
+				values[i] = C.double(f)
+			default:
+				return fmt.Errorf("marsdb: parameter %q: mixed-type list not supported", name)
+			}
+		}
+		C.marsdb_bind_double_list(p.ptr, cName, &values[0], C.size_t(len(values)))
+	case string:
+		cStrings := make([]*C.char, len(items))
+		defer func() {
+			for _, s := range cStrings {
+				if s != nil {
+					C.free(unsafe.Pointer(s))
+				}
+			}
+		}()
+		for i, item := range items {
+			s, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("marsdb: parameter %q: mixed-type list not supported", name)
+			}
+			cStrings[i] = C.CString(s)
+		}
+		C.marsdb_bind_string_list(p.ptr, cName, &cStrings[0], C.size_t(len(cStrings)))
+	default:
+		return fmt.Errorf(
+			"marsdb: parameter %q: unsupported list element type %T (flat int/float/string lists only)",
+			name, items[0])
+	}
+	return nil
+}
+
+func (db *Database) executeBatch(cypher string, params map[string]any, opts Options) ([]map[string]any, Stats, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.ptr == nil {
 		return nil, Stats{}, errors.New("marsdb: database is closed")
 	}
-	cCypher := C.CString(cypher)
-	defer C.free(unsafe.Pointer(cCypher))
 
-	var cParams *C.char
-	if paramsJSON != nil {
-		cParams = C.CString(string(paramsJSON))
-		defer C.free(unsafe.Pointer(cParams))
-	}
-	result := C.marsdb_execute_with_params(db.ptr, cCypher, cParams)
-	return db.decodeStats(result)
-}
-
-func (db *Database) decode(result C.MarsdbResult) ([]map[string]any, error) {
-	rows, _, err := db.decodeStats(result)
-	return rows, err
-}
-
-func (db *Database) decodeStats(result C.MarsdbResult) ([]map[string]any, Stats, error) {
-	if result.error != nil {
-		defer C.marsdb_free_string(result.error)
-		return nil, Stats{}, errors.New("marsdb: " + C.GoString(result.error))
-	}
-	defer C.marsdb_free_string(result.json)
-
-	raw := C.GoString(result.json)
-	var qr queryResult
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&qr); err != nil {
-		return nil, Stats{}, errors.New("marsdb: malformed result JSON: " + err.Error())
-	}
-
-	rows := make([]map[string]any, len(qr.Rows))
-	for i, row := range qr.Rows {
-		m := make(map[string]any, len(qr.Columns))
-		for j, col := range qr.Columns {
-			if j < len(row) {
-				value, err := normalizeJSONNumbers(row[j])
-				if err != nil {
-					return nil, Stats{}, errors.New("marsdb: malformed result number: " + err.Error())
-				}
-				m[col] = value
-			}
+	var buffer C.MarsdbBuffer
+	if len(params) == 0 && opts == (Options{}) {
+		cCypher := C.CString(cypher)
+		defer C.free(unsafe.Pointer(cCypher))
+		if C.marsdb_query_batch(db.ptr, cCypher, &buffer) != C.MARSDB_OK {
+			return nil, Stats{}, db.lastError()
 		}
-		rows[i] = m
-	}
-	return rows, qr.Stats, nil
-}
-
-// normalizeJSONNumbers recursively converts the json.Number values produced
-// by Decoder.UseNumber. This preserves all MarsDB i64 property values and u64
-// graph IDs exactly instead of silently rounding them through float64.
-func normalizeJSONNumbers(value any) (any, error) {
-	switch value := value.(type) {
-	case json.Number:
-		if strings.ContainsAny(value.String(), ".eE") {
-			return value.Float64()
-		}
-		if i, err := value.Int64(); err == nil {
-			return i, nil
-		}
-		u, err := strconv.ParseUint(value.String(), 10, 64)
+	} else {
+		p, err := db.prepare(cypher, params, opts)
 		if err != nil {
-			return nil, err
+			return nil, Stats{}, err
 		}
-		return u, nil
-	case []any:
-		for i, item := range value {
-			normalized, err := normalizeJSONNumbers(item)
-			if err != nil {
-				return nil, err
-			}
-			value[i] = normalized
+		defer p.destroy()
+		if C.marsdb_stmt_execute_batch(p.ptr, &buffer) != C.MARSDB_OK {
+			return nil, Stats{}, db.lastError()
 		}
-		return value, nil
-	case map[string]any:
-		for key, item := range value {
-			normalized, err := normalizeJSONNumbers(item)
-			if err != nil {
-				return nil, err
-			}
-			value[key] = normalized
-		}
-		return value, nil
-	default:
-		return value, nil
 	}
+	defer C.marsdb_buffer_free(buffer)
+	bytes := C.GoBytes(unsafe.Pointer(buffer.data), C.int(buffer.len))
+	return decodeBatch(bytes)
 }
