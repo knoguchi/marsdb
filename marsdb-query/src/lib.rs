@@ -1,6 +1,7 @@
 mod aggregate;
 mod antlr_visitor;
 mod ast;
+mod builtin_procedures;
 mod error;
 mod executor;
 mod explain;

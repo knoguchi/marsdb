@@ -906,6 +906,16 @@ impl<'a> Executor<'a> {
         row: &BindingRow,
         guard: &ExecutionGuard<'_>,
     ) -> Result<(ProcedureSignature, Vec<Vec<Value>>), QueryError> {
+        // Built-in `db.*` procedures resolve first and are not
+        // shadowable by an embedder provider -- see
+        // `builtin_procedures`'s module docs. Args are still evaluated
+        // (and thereby arity-checked against the empty input list) so
+        // `CALL db.labels('x')` errors the same way any procedure would.
+        if let Some(sig) = crate::builtin_procedures::signature(&call.name) {
+            self.eval_call_args(txn, call, &sig, row, guard)?;
+            let rows = crate::builtin_procedures::call(txn, &call.name)?;
+            return Ok((sig, rows));
+        }
         let provider = guard.procedure_provider().ok_or_else(|| {
             QueryError::Semantic(format!(
                 "procedure '{}' not found -- no procedure provider is configured",
