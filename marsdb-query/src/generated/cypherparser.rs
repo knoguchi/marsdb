@@ -3184,11 +3184,11 @@ where
                 recog.base.set_state(302);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 37) & !0x3f) == 0 && ((1usize << (_la - 37)) & 99) != 0) {
+                if (((_la - 37) & !0x3f) == 0 && ((1u64 << (_la - 37)) & 99) != 0) {
                     {
                         recog.base.set_state(301);
                         _la = recog.base.input.la(1);
-                        if { !(((_la - 37) & !0x3f) == 0 && ((1usize << (_la - 37)) & 99) != 0) } {
+                        if { !(((_la - 37) & !0x3f) == 0 && ((1u64 << (_la - 37)) & 99) != 0) } {
                             recog.err_handler.recover_inline(&mut recog.base)?;
                         } else {
                             if recog.base.input.la(1) == TOKEN_EOF {
@@ -3510,7 +3510,7 @@ where
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
                 while _la == CypherParser_CALL
-                    || (((_la - 48) & !0x3f) == 0 && ((1usize << (_la - 48)) & 4105) != 0)
+                    || (((_la - 48) & !0x3f) == 0 && ((1u64 << (_la - 48)) & 4105) != 0)
                 {
                     {
                         {
@@ -3552,7 +3552,7 @@ where
                                 recog.err_handler.sync(&mut recog.base)?;
                                 _la = recog.base.input.la(1);
                                 if !(((_la - 40) & !0x3f) == 0
-                                    && ((1usize << (_la - 40)) & 41491) != 0)
+                                    && ((1u64 << (_la - 40)) & 41491) != 0)
                                 {
                                     break;
                                 }
@@ -3747,7 +3747,7 @@ where
                                 _la = recog.base.input.la(1);
                                 while _la == CypherParser_CALL
                                     || (((_la - 40) & !0x3f) == 0
-                                        && ((1usize << (_la - 40)) & 1092371) != 0)
+                                        && ((1u64 << (_la - 40)) & 1092371) != 0)
                                 {
                                     {
                                         recog.base.set_state(339);
@@ -5185,9 +5185,9 @@ where
                 recog.base.set_state(404);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                    || (((_la - 32) & !0x3f) == 0 && ((1usize << (_la - 32)) & 8223) != 0)
-                    || (((_la - 69) & !0x3f) == 0 && ((1usize << (_la - 69)) & 260186337) != 0)
+                if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                    || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
+                    || (((_la - 69) & !0x3f) == 0 && ((1u64 << (_la - 69)) & 260186337) != 0)
                 {
                     {
                         /*InvokeRule expressionChain*/
@@ -7586,7 +7586,7 @@ where
                 recog.base.set_state(522);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                while (((_la) & !0x3f) == 0 && ((1usize << _la) & 250) != 0) {
+                while (((_la) & !0x3f) == 0 && ((1u64 << _la) & 250) != 0) {
                     {
                         {
                             /*InvokeRule comparisonSigns*/
@@ -8095,7 +8095,7 @@ where
             {
                 recog.base.set_state(534);
                 _la = recog.base.input.la(1);
-                if { !(((_la) & !0x3f) == 0 && ((1usize << _la) & 250) != 0) } {
+                if { !(((_la) & !0x3f) == 0 && ((1u64 << _la) & 250) != 0) } {
                     recog.err_handler.recover_inline(&mut recog.base)?;
                 } else {
                     if recog.base.input.la(1) == TOKEN_EOF {
@@ -8458,12 +8458,12 @@ where
                 recog.base.set_state(549);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                while (((_la) & !0x3f) == 0 && ((1usize << _la) & 11534336) != 0) {
+                while (((_la) & !0x3f) == 0 && ((1u64 << _la) & 11534336) != 0) {
                     {
                         {
                             recog.base.set_state(545);
                             _la = recog.base.input.la(1);
-                            if { !(((_la) & !0x3f) == 0 && ((1usize << _la) & 11534336) != 0) } {
+                            if { !(((_la) & !0x3f) == 0 && ((1u64 << _la) & 11534336) != 0) } {
                                 recog.err_handler.recover_inline(&mut recog.base)?;
                             } else {
                                 if recog.base.input.la(1) == TOKEN_EOF {
@@ -9092,11 +9092,10 @@ where
                             recog.base.set_state(574);
                             recog.err_handler.sync(&mut recog.base)?;
                             _la = recog.base.input.la(1);
-                            if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                                || (((_la - 32) & !0x3f) == 0
-                                    && ((1usize << (_la - 32)) & 8223) != 0)
+                            if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                                || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
                                 || (((_la - 69) & !0x3f) == 0
-                                    && ((1usize << (_la - 69)) & 260186337) != 0)
+                                    && ((1u64 << (_la - 69)) & 260186337) != 0)
                             {
                                 {
                                     /*InvokeRule expression*/
@@ -9113,11 +9112,10 @@ where
                             recog.base.set_state(578);
                             recog.err_handler.sync(&mut recog.base)?;
                             _la = recog.base.input.la(1);
-                            if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                                || (((_la - 32) & !0x3f) == 0
-                                    && ((1usize << (_la - 32)) & 8223) != 0)
+                            if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                                || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
                                 || (((_la - 69) & !0x3f) == 0
-                                    && ((1usize << (_la - 69)) & 260186337) != 0)
+                                    && ((1u64 << (_la - 69)) & 260186337) != 0)
                             {
                                 {
                                     /*InvokeRule expression*/
@@ -10036,8 +10034,8 @@ where
                 recog.base.set_state(616);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 63) != 0)
-                    || (((_la - 86) & !0x3f) == 0 && ((1usize << (_la - 86)) & 193) != 0)
+                if (((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 63) != 0)
+                    || (((_la - 86) & !0x3f) == 0 && ((1u64 << (_la - 86)) & 193) != 0)
                 {
                     {
                         /*InvokeRule symbol*/
@@ -10400,7 +10398,7 @@ where
                         recog.base.set_state(632);
                         recog.err_handler.sync(&mut recog.base)?;
                         _la = recog.base.input.la(1);
-                        while (((_la) & !0x3f) == 0 && ((1usize << _la) & 266304) != 0) {
+                        while (((_la) & !0x3f) == 0 && ((1u64 << _la) & 266304) != 0) {
                             {
                                 recog.base.set_state(630);
                                 recog.err_handler.sync(&mut recog.base)?;
@@ -10453,7 +10451,7 @@ where
                         recog.base.set_state(639);
                         recog.err_handler.sync(&mut recog.base)?;
                         _la = recog.base.input.la(1);
-                        if (((_la) & !0x3f) == 0 && ((1usize << _la) & 8929280) != 0) {
+                        if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 8929280) != 0) {
                             {
                                 /*InvokeRule qppQuantifier*/
                                 recog.base.set_state(638);
@@ -11444,8 +11442,8 @@ where
                 recog.base.set_state(687);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 63) != 0)
-                    || (((_la - 86) & !0x3f) == 0 && ((1usize << (_la - 86)) & 193) != 0)
+                if (((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 63) != 0)
+                    || (((_la - 86) & !0x3f) == 0 && ((1u64 << (_la - 86)) & 193) != 0)
                 {
                     {
                         /*InvokeRule symbol*/
@@ -12265,8 +12263,8 @@ where
                 recog.base.set_state(735);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 63) != 0)
-                    || (((_la - 86) & !0x3f) == 0 && ((1usize << (_la - 86)) & 193) != 0)
+                if (((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 63) != 0)
+                    || (((_la - 86) & !0x3f) == 0 && ((1u64 << (_la - 86)) & 193) != 0)
                 {
                     {
                         /*InvokeRule symbol*/
@@ -13168,9 +13166,9 @@ where
                 recog.base.set_state(788);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                    || (((_la - 32) & !0x3f) == 0 && ((1usize << (_la - 32)) & 8223) != 0)
-                    || (((_la - 69) & !0x3f) == 0 && ((1usize << (_la - 69)) & 260186337) != 0)
+                if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                    || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
+                    || (((_la - 69) & !0x3f) == 0 && ((1u64 << (_la - 69)) & 260186337) != 0)
                 {
                     {
                         /*InvokeRule expressionChain*/
@@ -13486,7 +13484,7 @@ where
             {
                 recog.base.set_state(796);
                 _la = recog.base.input.la(1);
-                if { !(((_la - 33) & !0x3f) == 0 && ((1usize << (_la - 33)) & 15) != 0) } {
+                if { !(((_la - 33) & !0x3f) == 0 && ((1u64 << (_la - 33)) & 15) != 0) } {
                     recog.err_handler.recover_inline(&mut recog.base)?;
                 } else {
                     if recog.base.input.la(1) == TOKEN_EOF {
@@ -13673,8 +13671,8 @@ where
                 recog.base.set_state(803);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 63) != 0)
-                    || (((_la - 86) & !0x3f) == 0 && ((1usize << (_la - 86)) & 193) != 0)
+                if (((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 63) != 0)
+                    || (((_la - 86) & !0x3f) == 0 && ((1u64 << (_la - 86)) & 193) != 0)
                 {
                     {
                         /*InvokeRule lhs*/
@@ -14687,9 +14685,9 @@ where
                 recog.base.set_state(848);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                    || (((_la - 32) & !0x3f) == 0 && ((1usize << (_la - 32)) & 8223) != 0)
-                    || (((_la - 69) & !0x3f) == 0 && ((1usize << (_la - 69)) & 260186337) != 0)
+                if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                    || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
+                    || (((_la - 69) & !0x3f) == 0 && ((1u64 << (_la - 69)) & 260186337) != 0)
                 {
                     {
                         /*InvokeRule expression*/
@@ -15874,9 +15872,9 @@ where
                 recog.base.set_state(899);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la) & !0x3f) == 0 && ((1usize << _la) & 3356315648) != 0)
-                    || (((_la - 32) & !0x3f) == 0 && ((1usize << (_la - 32)) & 8223) != 0)
-                    || (((_la - 69) & !0x3f) == 0 && ((1usize << (_la - 69)) & 260186337) != 0)
+                if (((_la) & !0x3f) == 0 && ((1u64 << _la) & 3356315648) != 0)
+                    || (((_la - 32) & !0x3f) == 0 && ((1u64 << (_la - 32)) & 8223) != 0)
+                    || (((_la - 69) & !0x3f) == 0 && ((1u64 << (_la - 69)) & 260186337) != 0)
                 {
                     {
                         /*InvokeRule expressionChain*/
@@ -16039,8 +16037,8 @@ where
                 recog.base.set_state(912);
                 recog.err_handler.sync(&mut recog.base)?;
                 _la = recog.base.input.la(1);
-                if (((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 4294967295) != 0)
-                    || (((_la - 62) & !0x3f) == 0 && ((1usize << (_la - 62)) & 4294967295) != 0)
+                if (((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 4294967295) != 0)
+                    || (((_la - 62) & !0x3f) == 0 && ((1u64 << (_la - 62)) & 4294967295) != 0)
                 {
                     {
                         /*InvokeRule mapPair*/
@@ -16573,8 +16571,8 @@ where
                 recog.base.set_state(924);
                 _la = recog.base.input.la(1);
                 if {
-                    !((((_la - 30) & !0x3f) == 0 && ((1usize << (_la - 30)) & 63) != 0)
-                        || (((_la - 86) & !0x3f) == 0 && ((1usize << (_la - 86)) & 193) != 0))
+                    !((((_la - 30) & !0x3f) == 0 && ((1u64 << (_la - 30)) & 63) != 0)
+                        || (((_la - 86) & !0x3f) == 0 && ((1u64 << (_la - 86)) & 193) != 0))
                 } {
                     recog.err_handler.recover_inline(&mut recog.base)?;
                 } else {
@@ -17129,8 +17127,8 @@ where
                 recog.base.set_state(926);
                 _la = recog.base.input.la(1);
                 if {
-                    !((((_la - 36) & !0x3f) == 0 && ((1usize << (_la - 36)) & 4294967295) != 0)
-                        || (((_la - 68) & !0x3f) == 0 && ((1usize << (_la - 68)) & 16515071) != 0))
+                    !((((_la - 36) & !0x3f) == 0 && ((1u64 << (_la - 36)) & 4294967295) != 0)
+                        || (((_la - 68) & !0x3f) == 0 && ((1u64 << (_la - 68)) & 16515071) != 0))
                 } {
                     recog.err_handler.recover_inline(&mut recog.base)?;
                 } else {

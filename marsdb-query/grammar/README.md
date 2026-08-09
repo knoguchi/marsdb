@@ -117,6 +117,14 @@ cp /tmp/antlr-gen/*.rs /tmp/antlr-gen/*.tokens /tmp/antlr-gen/*.interp \
 # ANTLR's output formatting doesn't match rustfmt; CI's fmt check will
 # fail on freshly generated output otherwise.
 cargo fmt -p marsdb-query
+
+# REQUIRED post-processing: the Rust codegen emits `1usize <<` for its
+# 64-bit token bitmasks. On 32-bit targets (wasm32) usize shifts wrap
+# mod 32, corrupting set-membership tests -- observed as the parser
+# mis-predicting exactly the two-word keywords (ORDER BY, DETACH
+# DELETE) under wasm while passing natively. Widen to u64 until the
+# upstream template is fixed:
+perl -pi -e 's/1usize <</1u64 <</g'   marsdb-query/src/generated/cypherparser.rs   marsdb-query/src/generated/cypherlexer.rs
 ```
 
 Commit the resulting `marsdb-query/src/generated/*.rs` alongside the `.g4`
