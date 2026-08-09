@@ -2639,23 +2639,36 @@ impl AstBuilder {
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     // Session-transaction extension (`Statement::Begin`'s docs):
     // recognized before the grammar runs. A whole statement that is
-    // exactly one of these keywords (case-insensitive, optional trailing
-    // `;` -- `script : query SEMI? EOF` tolerates one the same way) can
-    // never be valid Cypher otherwise, so this can't shadow anything the
-    // grammar would have accepted.
+    // exactly one of these keyword forms (case-insensitive, any
+    // whitespace between words, optional trailing `;` -- `script :
+    // query SEMI? EOF` tolerates one the same way) can never be valid
+    // Cypher otherwise, so this can't shadow anything the grammar would
+    // have accepted. `BEGIN TRANSACTION` is an accepted alias for
+    // `BEGIN` -- the two-word form is what other embedded graph
+    // engines' Cypher dialects use, and rejecting it over one word
+    // would be pure friction. (No `READ ONLY` variant: MarsDB has no
+    // read-only session transactions -- reads outside a transaction
+    // already run on their own snapshots.)
     let trimmed = input.trim();
     let trimmed = trimmed
         .strip_suffix(';')
         .map(str::trim_end)
         .unwrap_or(trimmed);
-    if trimmed.eq_ignore_ascii_case("BEGIN") {
-        return Ok(Statement::Begin);
-    }
-    if trimmed.eq_ignore_ascii_case("COMMIT") {
-        return Ok(Statement::Commit);
-    }
-    if trimmed.eq_ignore_ascii_case("ROLLBACK") {
-        return Ok(Statement::Rollback);
+    let mut words = trimmed.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some(begin), rest, None)
+            if begin.eq_ignore_ascii_case("BEGIN")
+                && rest.is_none_or(|w| w.eq_ignore_ascii_case("TRANSACTION")) =>
+        {
+            return Ok(Statement::Begin);
+        }
+        (Some(commit), None, None) if commit.eq_ignore_ascii_case("COMMIT") => {
+            return Ok(Statement::Commit);
+        }
+        (Some(rollback), None, None) if rollback.eq_ignore_ascii_case("ROLLBACK") => {
+            return Ok(Statement::Rollback);
+        }
+        _ => {}
     }
     use crate::generated::cypherlexer::CypherLexer;
     use crate::generated::cypherparser::{CypherParser, ScriptContextAttrs};

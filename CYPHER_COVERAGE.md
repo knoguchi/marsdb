@@ -269,7 +269,7 @@ Not yet supported: `CREATE CONSTRAINT`, composite indexes, range scans.
 
 ## Transactions
 
-`BEGIN` / `COMMIT` / `ROLLBACK` as statements — a MarsDB extension
+`BEGIN` (alias: `BEGIN TRANSACTION`) / `COMMIT` / `ROLLBACK` as statements — a MarsDB extension
 (openCypher has no transaction statements; real deployments do this at
 the protocol/session layer). One session per `Database` handle: `BEGIN`
 opens a write transaction, every subsequent statement (reads included —
