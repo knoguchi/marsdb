@@ -164,3 +164,63 @@ func TestExecuteErrorSurfacesAsGoError(t *testing.T) {
 		t.Fatal("expected an error for integer overflow, got nil")
 	}
 }
+
+func TestExecuteWithParams(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecuteWithParams(
+		"CREATE (:Person {name: $name, age: $age, score: $score, tags: $tags})",
+		map[string]any{
+			"name":  `O'Hara "Ada"`,
+			"age":   int64(9223372036854775807),
+			"score": 1.5,
+			"tags":  []any{int64(1), int64(2)},
+		},
+	); err != nil {
+		t.Fatalf("ExecuteWithParams(create): %v", err)
+	}
+
+	rows, err := db.ExecuteWithParams(
+		"MATCH (p:Person {name: $name}) RETURN p.age AS age, p.score AS score, p.tags AS tags",
+		map[string]any{"name": `O'Hara "Ada"`},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteWithParams(match): %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0]["age"] != int64(9223372036854775807) {
+		t.Fatalf("age lost precision: %T(%v)", rows[0]["age"], rows[0]["age"])
+	}
+	if rows[0]["score"] != float64(1.5) {
+		t.Fatalf("unexpected score: %v", rows[0]["score"])
+	}
+
+	// Map-valued param.
+	rows, err = db.ExecuteWithParams("RETURN $m.city AS city", map[string]any{
+		"m": map[string]any{"city": "Kyoto"},
+	})
+	if err != nil {
+		t.Fatalf("map param: %v", err)
+	}
+	if rows[0]["city"] != "Kyoto" {
+		t.Fatalf("unexpected city: %v", rows[0]["city"])
+	}
+
+	// A uint64 above int64's range must error, never silently round.
+	if _, err := db.ExecuteWithParams("RETURN $x AS x", map[string]any{
+		"x": uint64(18446744073709551615),
+	}); err == nil {
+		t.Fatal("expected an error for uint64 above i64 range, got nil")
+	}
+
+	// Missing parameter surfaces the engine's error.
+	if _, err := db.ExecuteWithParams("RETURN $missing AS m", map[string]any{}); err == nil {
+		t.Fatal("expected an error for a missing parameter, got nil")
+	}
+}

@@ -107,12 +107,27 @@ their full precision as `int64` (or `uint64` for an ID above `int64`'s range),
 while fractional values are `float64`. Dates and durations are returned as
 canonical ISO-8601 strings such as `"1984-10-11"` and `"P1M2D"`.
 
+## Parameterized queries
+
+`ExecuteWithParams` resolves `$name` placeholders — no string
+concatenation, no escaping bugs:
+
+```go
+rows, err := db.ExecuteWithParams(
+	"MATCH (p:Person {name: $name}) RETURN p.age AS age",
+	map[string]any{"name": `O'Hara "Ada"`},
+)
+```
+
+Values may be nil, bool, any integer/float type, string, or nested
+`[]any`/`map[string]any`. `int64` values keep their full range end to
+end; a `uint64` above `int64`'s range errors instead of silently
+rounding.
+
 ## What's not here yet
 
-Only `Open`/`InMemory`/`Execute`/`Close` — `execute_batch` (multi-statement,
-one transaction each) and `execute_with_params` (`$param` substitution)
-exist on the Rust/C ABI side's natural extension points but aren't wired
-through `marsdb-capi` or this package yet.
+`execute_batch` (multi-statement, one transaction each) exists on the
+Rust side but isn't wired through `marsdb-capi` or this package yet.
 
 ## License
 

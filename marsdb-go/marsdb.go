@@ -83,6 +83,29 @@ type queryResult struct {
 // point or exponent decode as float64. Dates and durations decode as their
 // canonical ISO-8601 strings.
 func (db *Database) Execute(cypher string) ([]map[string]any, error) {
+	return db.execute(cypher, nil)
+}
+
+// ExecuteWithParams runs one Cypher statement with $name placeholders
+// resolved from params. Values may be nil, bool, any Go integer or float
+// type, string, or (arbitrarily nested) []any / map[string]any of those
+// — anything encoding/json can marshal to null/bool/number/string/array/
+// object. Go int64 values keep their full range end to end (params cross
+// the C ABI as a JSON object, and integral JSON numbers are parsed as
+// i64 on the Rust side); a uint64 above int64's range is rejected there
+// rather than silently rounded.
+func (db *Database) ExecuteWithParams(cypher string, params map[string]any) ([]map[string]any, error) {
+	if params == nil {
+		return db.execute(cypher, nil)
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return nil, errors.New("marsdb: params not JSON-encodable: " + err.Error())
+	}
+	return db.execute(cypher, encoded)
+}
+
+func (db *Database) execute(cypher string, paramsJSON []byte) ([]map[string]any, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.ptr == nil {
@@ -91,7 +114,14 @@ func (db *Database) Execute(cypher string) ([]map[string]any, error) {
 	cCypher := C.CString(cypher)
 	defer C.free(unsafe.Pointer(cCypher))
 
-	result := C.marsdb_execute(db.ptr, cCypher)
+	var result C.MarsdbResult
+	if paramsJSON == nil {
+		result = C.marsdb_execute(db.ptr, cCypher)
+	} else {
+		cParams := C.CString(string(paramsJSON))
+		defer C.free(unsafe.Pointer(cParams))
+		result = C.marsdb_execute_with_params(db.ptr, cCypher, cParams)
+	}
 	if result.error != nil {
 		defer C.marsdb_free_string(result.error)
 		return nil, errors.New("marsdb: " + C.GoString(result.error))
