@@ -177,6 +177,61 @@ pub unsafe extern "C" fn marsdb_execute_with_params(
     }
 }
 
+/// `marsdb_execute_with_params` plus execution bounds: `max_rows`
+/// caps the result row count and `timeout_ms` caps wall time, both
+/// checked *during* evaluation (a runaway query fails at the bound
+/// instead of materializing an unbounded result first). 0 means
+/// unlimited for either. Exceeding a bound returns an error whose
+/// message begins with "query error: query resource limit exceeded"
+/// (max_rows) or "query error: query timed out" (timeout_ms).
+///
+/// # Safety
+/// Same contract as `marsdb_execute_with_params`.
+#[no_mangle]
+pub unsafe extern "C" fn marsdb_execute_ex(
+    db: *mut MarsdbDatabase,
+    cypher: *const c_char,
+    params_json: *const c_char,
+    max_rows: u64,
+    timeout_ms: u64,
+) -> MarsdbResult {
+    if db.is_null() || cypher.is_null() {
+        return MarsdbResult::err("null db or cypher pointer");
+    }
+    let cypher = match unsafe { CStr::from_ptr(cypher) }.to_str() {
+        Ok(c) => c,
+        Err(e) => return MarsdbResult::err(format!("cypher is not valid UTF-8: {e}")),
+    };
+    let params = if params_json.is_null() {
+        std::collections::HashMap::new()
+    } else {
+        let raw = match unsafe { CStr::from_ptr(params_json) }.to_str() {
+            Ok(p) => p,
+            Err(e) => return MarsdbResult::err(format!("params is not valid UTF-8: {e}")),
+        };
+        match parse_params(raw) {
+            Ok(p) => p,
+            Err(e) => return MarsdbResult::err(e),
+        }
+    };
+    let mut options = marsdb::ExecutionOptions::default();
+    if max_rows > 0 {
+        options.max_result_rows = Some(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    }
+    if timeout_ms > 0 {
+        options.timeout = Some(std::time::Duration::from_millis(timeout_ms));
+    }
+    let db = unsafe { &*db };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.inner
+            .execute_with_params_and_options(cypher, &params, &options)
+    })) {
+        Ok(Ok(result)) => MarsdbResult::ok(result_to_json(&result)),
+        Ok(Err(e)) => MarsdbResult::err(e),
+        Err(_) => MarsdbResult::err("internal panic while executing query"),
+    }
+}
+
 fn parse_params(raw: &str) -> Result<std::collections::HashMap<String, PropertyValue>, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("params is not valid JSON: {e}"))?;
@@ -584,6 +639,30 @@ mod tests {
         let result = unsafe { marsdb_execute_with_params(db, cypher.as_ptr(), std::ptr::null()) };
         assert!(result.json.is_null());
         assert!(!result.error.is_null());
+        unsafe {
+            marsdb_free_string(result.error);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn execute_ex_bounds_rows() {
+        let db = marsdb_open_in_memory();
+        let seed = CString::new("CREATE (:N), (:N), (:N)").unwrap();
+        let result = unsafe { marsdb_execute(db, seed.as_ptr()) };
+        assert!(result.error.is_null());
+        unsafe { marsdb_free_string(result.json) };
+
+        let cypher = CString::new("MATCH (n:N) RETURN n").unwrap();
+        // At the bound: fine (params NULL, timeout unlimited).
+        let result = unsafe { marsdb_execute_ex(db, cypher.as_ptr(), std::ptr::null(), 3, 0) };
+        assert!(result.error.is_null());
+        unsafe { marsdb_free_string(result.json) };
+        // Over the bound: resource-limit error, checked during evaluation.
+        let result = unsafe { marsdb_execute_ex(db, cypher.as_ptr(), std::ptr::null(), 2, 0) };
+        assert!(result.json.is_null());
+        let message = unsafe { CStr::from_ptr(result.error) }.to_str().unwrap();
+        assert!(message.contains("resource limit"), "{message}");
         unsafe {
             marsdb_free_string(result.error);
             marsdb_close(db);

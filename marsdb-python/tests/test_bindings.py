@@ -89,16 +89,48 @@ class DatabaseTests(unittest.TestCase):
 
     def test_param_errors(self):
         db = marsdb.Database.in_memory()
-        # Missing param -> engine error, not a crash.
-        with self.assertRaises(RuntimeError):
+        # Missing param is the query's fault.
+        with self.assertRaises(marsdb.ProgrammingError):
             db.execute("RETURN $missing")
         # Int beyond i64 must raise, never silently truncate.
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(marsdb.DataError):
             db.execute("RETURN $x", {"x": 2**63})
         # Unsupported value type named in the error.
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(marsdb.DataError) as ctx:
             db.execute("RETURN $x", {"x": object()})
         self.assertIn("unsupported parameter type", str(ctx.exception))
+
+    def test_exception_taxonomy(self):
+        db = marsdb.Database.in_memory()
+        with self.assertRaises(marsdb.ProgrammingError):
+            db.execute("NOT CYPHER (((")
+        with self.assertRaises(marsdb.DataError):
+            db.execute("RETURN 1 + 'x'")
+        db.execute("CREATE INDEX ON :U(email) UNIQUE")
+        db.execute("CREATE (:U {email: 'a@x'})")
+        with self.assertRaises(marsdb.IntegrityError):
+            db.execute("CREATE (:U {email: 'a@x'})")
+        db.execute("CREATE (a:P)-[:R]->(b:P)")
+        with self.assertRaises(marsdb.IntegrityError):
+            db.execute("MATCH (p:P) DELETE p")
+        with self.assertRaises(marsdb.ProgrammingError):
+            db.execute("COMMIT")
+        # Everything derives from marsdb.Error.
+        with self.assertRaises(marsdb.Error):
+            db.execute("garbage")
+
+    def test_max_rows_bounds_the_result(self):
+        db = marsdb.Database.in_memory()
+        for i in range(10):
+            db.execute("CREATE (:N {i: $i})", {"i": i})
+        # Under the limit: fine.
+        self.assertEqual(len(db.execute("MATCH (n:N) RETURN n", max_rows=10)), 10)
+        # Over: OperationalError during evaluation, catchable as base too.
+        with self.assertRaises(marsdb.OperationalError):
+            db.execute("MATCH (n:N) RETURN n", max_rows=5)
+        # LIMIT inside the query composes with the bound.
+        rows = db.execute("MATCH (n:N) RETURN n LIMIT 3", max_rows=5)
+        self.assertEqual(len(rows), 3)
 
     def test_map_valued_param(self):
         db = marsdb.Database.in_memory()

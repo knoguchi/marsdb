@@ -4,6 +4,8 @@
 #ifndef MARSDB_CAPI_H
 #define MARSDB_CAPI_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,6 +49,14 @@ MarsdbResult marsdb_execute(MarsdbDatabase *db, const char *cypher);
  * list/map parameter values. */
 MarsdbResult marsdb_execute_with_params(MarsdbDatabase *db, const char *cypher,
                                         const char *params_json);
+
+/* marsdb_execute_with_params plus execution bounds, both checked DURING
+ * evaluation (a runaway query fails at the bound instead of
+ * materializing an unbounded result first). max_rows caps result rows,
+ * timeout_ms caps wall time; 0 means unlimited for either. */
+MarsdbResult marsdb_execute_ex(MarsdbDatabase *db, const char *cypher,
+                               const char *params_json, uint64_t max_rows,
+                               uint64_t timeout_ms);
 
 /* Frees a string returned in MarsdbResult.json or MarsdbResult.error.
  * Required — these are allocated by Rust's global allocator, not malloc. */

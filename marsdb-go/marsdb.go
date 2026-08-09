@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -105,6 +106,30 @@ func (db *Database) ExecuteWithParams(cypher string, params map[string]any) ([]m
 	return db.execute(cypher, encoded)
 }
 
+// Options bounds a statement's execution: MaxRows caps the result row
+// count and Timeout caps wall time, both checked during evaluation — a
+// runaway query fails at the bound instead of materializing an
+// unbounded result first. Zero values mean unlimited.
+type Options struct {
+	MaxRows uint64
+	Timeout time.Duration
+}
+
+// ExecuteWithOptions runs one Cypher statement with $name parameters
+// (nil for none — same value rules as ExecuteWithParams) under the
+// given execution bounds.
+func (db *Database) ExecuteWithOptions(cypher string, params map[string]any, opts Options) ([]map[string]any, error) {
+	var encoded []byte
+	if params != nil {
+		var err error
+		encoded, err = json.Marshal(params)
+		if err != nil {
+			return nil, errors.New("marsdb: params not JSON-encodable: " + err.Error())
+		}
+	}
+	return db.executeOpts(cypher, encoded, opts)
+}
+
 func (db *Database) execute(cypher string, paramsJSON []byte) ([]map[string]any, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -122,6 +147,29 @@ func (db *Database) execute(cypher string, paramsJSON []byte) ([]map[string]any,
 		defer C.free(unsafe.Pointer(cParams))
 		result = C.marsdb_execute_with_params(db.ptr, cCypher, cParams)
 	}
+	return db.decode(result)
+}
+
+func (db *Database) executeOpts(cypher string, paramsJSON []byte, opts Options) ([]map[string]any, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.ptr == nil {
+		return nil, errors.New("marsdb: database is closed")
+	}
+	cCypher := C.CString(cypher)
+	defer C.free(unsafe.Pointer(cCypher))
+
+	var cParams *C.char
+	if paramsJSON != nil {
+		cParams = C.CString(string(paramsJSON))
+		defer C.free(unsafe.Pointer(cParams))
+	}
+	result := C.marsdb_execute_ex(db.ptr, cCypher, cParams,
+		C.uint64_t(opts.MaxRows), C.uint64_t(opts.Timeout/time.Millisecond))
+	return db.decode(result)
+}
+
+func (db *Database) decode(result C.MarsdbResult) ([]map[string]any, error) {
 	if result.error != nil {
 		defer C.marsdb_free_string(result.error)
 		return nil, errors.New("marsdb: " + C.GoString(result.error))

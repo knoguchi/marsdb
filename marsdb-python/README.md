@@ -45,6 +45,29 @@ Values may be `None`/`bool`/`int`/`float`/`str`, or nested `list`/`dict`
 of those. Ints keep their full 64-bit range; an int outside i64 raises
 instead of truncating. Map-valued params work (`$m.city`).
 
+## Errors
+
+Everything raised derives from `marsdb.Error`; subclasses expose the
+engine's own taxonomy so programs catch selectively instead of
+string-matching:
+
+| Exception | Raised for |
+|---|---|
+| `ProgrammingError` | syntax/semantic errors, unbound variables, missing `$params`, stray `COMMIT` |
+| `DataError` | type errors, integer overflow, unstorable parameter values |
+| `IntegrityError` | unique-index violations, deleting a connected node without `DETACH` |
+| `OperationalError` | timeout, cancellation, `max_rows` exceeded, storage failures |
+
+## Execution bounds
+
+```python
+db.execute("MATCH (n) RETURN n", max_rows=100_000, timeout_ms=5_000)
+```
+
+Both are checked *during* evaluation — a runaway query raises
+`OperationalError` at the bound instead of materializing an unbounded
+result first, so it can't OOM the process.
+
 ## Value mapping
 
 | Cypher | Python |

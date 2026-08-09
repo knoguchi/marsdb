@@ -151,6 +151,16 @@ rows, _ = db.Execute("CALL db.indexes()")           // label, property, unique
 ```
 >>>>>>> origin/main
 
+## Execution bounds
+
+```go
+rows, err := db.ExecuteWithOptions("MATCH (n) RETURN n", nil,
+	marsdb.Options{MaxRows: 100000, Timeout: 5 * time.Second})
+```
+
+Both bounds are checked during evaluation — a runaway query errors at
+the bound instead of materializing an unbounded result first.
+
 ## What's not here yet
 
 `execute_batch` (multi-statement, one transaction each) exists on the
