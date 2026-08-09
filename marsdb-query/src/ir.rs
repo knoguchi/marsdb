@@ -74,6 +74,26 @@ pub enum LogicalPlan {
     /// the planner always keeps the originating conjuncts as a residual
     /// `Filter` above this node — this seek narrows the candidate set,
     /// the filter stays the source of truth.
+    /// Full `EDGES`-table sweep binding an entire single-hop pattern at
+    /// once — chosen by the planner (cost-gated on the O(1) edge count)
+    /// for relationship-predicate bulk shapes where anchoring at either
+    /// endpoint would walk more adjacency entries with per-edge storage
+    /// gets than one sequential sweep costs. Type membership, the
+    /// pushed-down `rel_predicate` (conjuncts on `rel_var` only,
+    /// evaluated from the swept record's in-hand bytes — no per-edge
+    /// storage access), and endpoint label checks (via the statement
+    /// node cache) all happen in-scan; anything else stays in a
+    /// residual `Filter` above.
+    EdgeTypeScan {
+        src_var: String,
+        rel_var: String,
+        dst_var: String,
+        /// Empty = any relationship type.
+        rel_types: Vec<String>,
+        src_label: Option<String>,
+        dst_label: Option<String>,
+        rel_predicate: Option<Expr>,
+    },
     IndexRangeSeek {
         var: String,
         label: String,

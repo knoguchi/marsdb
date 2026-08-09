@@ -23,7 +23,8 @@ use crate::error::QueryError;
 use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::parse_helpers::validate_named_path_pattern;
 use crate::planner::{
-    apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars, plan_reversed_pattern,
+    apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars, plan_edge_scan,
+    plan_reversed_pattern,
 };
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
 use crate::result::{QueryResult, QueryStats};
@@ -407,6 +408,76 @@ type BindingRow = HashMap<String, Binding>;
 type FastCountResult = (Vec<BindingRow>, HashSet<String>);
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
+/// Borrowed field bundle for `stream_edge_type_scan` (clippy's
+/// too-many-arguments, structured).
+struct EdgeTypeScanSpec<'s> {
+    src_var: &'s str,
+    rel_var: &'s str,
+    dst_var: &'s str,
+    rel_types: &'s [String],
+    src_label: Option<&'s str>,
+    dst_label: Option<&'s str>,
+    rel_predicate: Option<&'s Expr>,
+}
+
+/// `None` = untyped hop (any edge matches); `Some(ids)` = the interned
+/// ids of the named types, names never interned simply absent (an
+/// all-unknown list yields `Some(vec![])` -- matches nothing).
+fn resolve_type_ids(txn: Txn, rel_types: &[String]) -> Result<Option<Vec<u32>>, QueryError> {
+    if rel_types.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::with_capacity(rel_types.len());
+    for name in rel_types {
+        if let Some(id) = GraphStore::label_id_for(txn, name)? {
+            ids.push(id);
+        }
+    }
+    Ok(Some(ids))
+}
+
+/// The definite-answer predicate evaluator over raw edge-record bytes
+/// -- exactly the shapes `planner::edge_scan_evaluable` admits, with
+/// `value_cmp::compare`'s three-valued semantics collapsed the same
+/// way the generic Filter collapses them (unknown => not-true). `Not`
+/// only ever wraps `IS NULL` here (a definite value), so the collapse
+/// never flips an unknown.
+fn eval_scan_predicate(
+    bytes: &[u8],
+    pred: &Expr,
+    prop_ids: &HashMap<String, Option<u32>>,
+) -> Result<bool, QueryError> {
+    let lookup = |prop: &str| -> Result<Option<PropertyValue>, QueryError> {
+        match prop_ids.get(prop).copied().flatten() {
+            Some(id) => Ok(GraphStore::edge_record_prop(bytes, id)?),
+            None => Ok(None),
+        }
+    };
+    Ok(match pred {
+        Expr::And(l, r) => {
+            eval_scan_predicate(bytes, l, prop_ids)? && eval_scan_predicate(bytes, r, prop_ids)?
+        }
+        Expr::Compare(pa, op, lit) => {
+            let value = lookup(&pa.prop)?;
+            compare(&value, *op, lit) == Some(true)
+        }
+        Expr::IsNull(pa) => matches!(lookup(&pa.prop)?, None | Some(PropertyValue::Null)),
+        Expr::Not(inner) => match inner.as_ref() {
+            Expr::IsNull(pa) => !matches!(lookup(&pa.prop)?, None | Some(PropertyValue::Null)),
+            other => {
+                return Err(QueryError::Semantic(format!(
+                    "internal: non-scan-evaluable NOT reached EdgeTypeScan: {other:?}"
+                )))
+            }
+        },
+        other => {
+            return Err(QueryError::Semantic(format!(
+                "internal: non-scan-evaluable predicate reached EdgeTypeScan: {other:?}"
+            )))
+        }
+    })
+}
+
 /// Receiver for `Executor::execute_streaming_with_options` — rows are
 /// pushed one at a time, never materialized as a whole result.
 /// `columns` is called exactly once, before the first row. Returning
@@ -711,13 +782,18 @@ impl<'a> Executor<'a> {
             .map(|l| l.max(0) as usize);
 
         let carried_vars = HashSet::new();
-        let reversed =
-            plan_reversed_pattern(&part.pattern, &part.where_clause, &carried_vars, txn)?;
-        let pattern = reversed.as_ref().unwrap_or(&part.pattern);
-        let plan = apply_index_seeks(
-            build_match_plan(pattern, &part.where_clause, &carried_vars)?,
-            txn,
-        )?;
+        let plan = match plan_edge_scan(&part.pattern, &part.where_clause, &carried_vars, txn)? {
+            Some(plan) => plan,
+            None => {
+                let reversed =
+                    plan_reversed_pattern(&part.pattern, &part.where_clause, &carried_vars, txn)?;
+                let pattern = reversed.as_ref().unwrap_or(&part.pattern);
+                apply_index_seeks(
+                    build_match_plan(pattern, &part.where_clause, &carried_vars)?,
+                    txn,
+                )?
+            }
+        };
 
         let columns: Vec<String> = items
             .iter()
@@ -1678,6 +1754,18 @@ impl<'a> Executor<'a> {
                             rows = filtered;
                         }
                         rows
+                    } else if let Some(plan) = if part.optional {
+                        // OPTIONAL MATCH needs eval_optional_part's
+                        // null-padding semantics -- never the sweep.
+                        None
+                    } else {
+                        plan_edge_scan(&part.pattern, &part.where_clause, &carried_vars, txn)?
+                    } {
+                        // Whole single-hop pattern bound by one sequential
+                        // EDGES sweep -- see plan_edge_scan's cost gate.
+                        // No fast-path/tail-hint interplay: the sweep is
+                        // already the fast path for this shape.
+                        self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
                     } else {
                         // Start-point selection: walk the pattern from its
                         // cheaper endpoint (see `plan_reversed_pattern`).
@@ -3435,6 +3523,28 @@ impl<'a> Executor<'a> {
                 lo,
                 hi,
             } => self.stream_index_range_seek(txn, var, label, prop, lo, hi, seed, guard),
+            LogicalPlan::EdgeTypeScan {
+                src_var,
+                rel_var,
+                dst_var,
+                rel_types,
+                src_label,
+                dst_label,
+                rel_predicate,
+            } => self.stream_edge_type_scan(
+                txn,
+                EdgeTypeScanSpec {
+                    src_var,
+                    rel_var,
+                    dst_var,
+                    rel_types,
+                    src_label: src_label.as_deref(),
+                    dst_label: dst_label.as_deref(),
+                    rel_predicate: rel_predicate.as_ref(),
+                },
+                seed,
+                guard,
+            ),
             LogicalPlan::IndexSeek {
                 var,
                 label,
@@ -4229,6 +4339,201 @@ impl<'a> Executor<'a> {
     /// planner keeps above this node applies the exact predicate; this
     /// stream only narrows candidates.
     #[allow(clippy::too_many_arguments)]
+    /// `EdgeTypeScan` evaluation: a demand-driven sequential sweep of
+    /// the whole `EDGES` table (chunked `EdgeScanCursor`, raw record
+    /// bytes in hand), binding the full single-hop pattern per matching
+    /// edge. Rejection order is cheapest-first: type id, then the
+    /// pushed-down relationship predicate straight off the record bytes
+    /// (no storage get), then endpoint label checks through the
+    /// statement node cache. Matches accumulate so later seed rows
+    /// replay them (same cross-join contract as every other leaf).
+    fn stream_edge_type_scan<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        spec: EdgeTypeScanSpec<'s>,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+    ) -> RowStream<'s> {
+        const CHUNK: usize = 512;
+        /// One-time per-scan resolutions, done lazily on first pull.
+        struct ScanPrep {
+            /// `None` = untyped hop (any edge).
+            type_ids: Option<Vec<u32>>,
+            prop_ids: HashMap<String, Option<u32>>,
+        }
+        let mut prepared: Option<ScanPrep> = None;
+        let mut cursor = GraphStore::edge_scan_cursor();
+        let mut matched: Vec<(u64, u64, u64)> = Vec::new(); // (edge, src, dst)
+        let mut exhausted = false;
+        let mut seed_index = 0usize;
+        let mut match_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            loop {
+                if prepared.is_none() {
+                    let type_ids = match resolve_type_ids(txn, spec.rel_types) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    };
+                    let mut prop_ids = HashMap::new();
+                    if let Some(pred) = spec.rel_predicate {
+                        if let Err(error) = self.collect_scan_prop_ids(txn, pred, &mut prop_ids) {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    }
+                    prepared = Some(ScanPrep { type_ids, prop_ids });
+                }
+                let ScanPrep { type_ids, prop_ids } = prepared.as_ref().expect("set above");
+                // An impossible type list (a name never interned) can
+                // never match anything.
+                if type_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
+                    return None;
+                }
+
+                if !exhausted && match_index >= matched.len() && seed_index == 0 {
+                    let chunk = match cursor.next_chunk(txn, CHUNK) {
+                        Ok(c) => c,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error.into()));
+                        }
+                    };
+                    if chunk.len() < CHUNK {
+                        exhausted = true;
+                    }
+                    for (id, bytes) in chunk {
+                        if let Err(error) = guard.checkpoint() {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                        let (label_id, src, dst) = match GraphStore::edge_record_header(&bytes) {
+                            Ok(h) => h,
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error.into()));
+                            }
+                        };
+                        if type_ids
+                            .as_ref()
+                            .is_some_and(|ids| !ids.contains(&label_id))
+                        {
+                            continue;
+                        }
+                        if let Some(pred) = spec.rel_predicate {
+                            match eval_scan_predicate(&bytes, pred, prop_ids) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => {
+                                    done = true;
+                                    return Some(Err(error));
+                                }
+                            }
+                        }
+                        match self.scan_endpoints_pass(
+                            txn,
+                            src,
+                            dst,
+                            spec.src_label,
+                            spec.dst_label,
+                        ) {
+                            Ok(true) => matched.push((id, src, dst)),
+                            Ok(false) => {}
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if match_index >= matched.len() {
+                    if exhausted {
+                        seed_index += 1;
+                        match_index = 0;
+                        if seed_index >= seed.len() || matched.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if let Err(error) = guard.checkpoint() {
+                    done = true;
+                    return Some(Err(error));
+                }
+                let (edge, src, dst) = matched[match_index];
+                match_index += 1;
+                let mut row = seed[seed_index].clone();
+                row.insert(spec.src_var.to_string(), Binding::Node(NodeId(src)));
+                row.insert(spec.rel_var.to_string(), Binding::Edge(EdgeId(edge)));
+                row.insert(spec.dst_var.to_string(), Binding::Node(NodeId(dst)));
+                return Some(Ok(row));
+            }
+        });
+        Self::count_stream(Box::new(stream), guard)
+    }
+
+    /// Both endpoints exist (swept-edge invariant; a miss means
+    /// corruption and is treated as non-match rather than a panic) and
+    /// carry the required labels. Node-cache-backed: one decode per
+    /// distinct node per statement.
+    fn scan_endpoints_pass(
+        &self,
+        txn: Txn,
+        src: u64,
+        dst: u64,
+        src_label: Option<&str>,
+        dst_label: Option<&str>,
+    ) -> Result<bool, QueryError> {
+        for (id, wanted) in [(src, src_label), (dst, dst_label)] {
+            let Some(label) = wanted else { continue };
+            let Some(node) = self.get_node_cached(txn, NodeId(id))? else {
+                return Ok(false);
+            };
+            if !node.labels.iter().any(|l| l == label) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Interned ids for every prop the scan predicate references --
+    /// resolved once per scan through the statement memo. A name never
+    /// interned maps to `None` (absent on every record by construction).
+    fn collect_scan_prop_ids(
+        &self,
+        txn: Txn,
+        pred: &Expr,
+        out: &mut HashMap<String, Option<u32>>,
+    ) -> Result<(), QueryError> {
+        match pred {
+            Expr::And(l, r) => {
+                self.collect_scan_prop_ids(txn, l, out)?;
+                self.collect_scan_prop_ids(txn, r, out)?;
+            }
+            Expr::Not(inner) => self.collect_scan_prop_ids(txn, inner, out)?,
+            Expr::Compare(pa, _, _) | Expr::IsNull(pa) => {
+                if !out.contains_key(&pa.prop) {
+                    let id = self.prop_id_for(txn, &pa.prop)?;
+                    out.insert(pa.prop.clone(), id);
+                }
+            }
+            other => {
+                return Err(QueryError::Semantic(format!(
+                    "internal: non-scan-evaluable predicate reached EdgeTypeScan: {other:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
+
     /// `IndexRangeSeek` evaluation: a demand-driven bounded index scan
     /// (chunked refills through `IndexRangeCursor`, O(log n) re-seek per
     /// refill), cross-joined with every seed row -- same join shape as
@@ -6558,6 +6863,7 @@ fn plan_contains_expansion(plan: &LogicalPlan) -> bool {
         LogicalPlan::Expand { .. }
         | LogicalPlan::VarExpand { .. }
         | LogicalPlan::MatchRelList { .. }
+        | LogicalPlan::EdgeTypeScan { .. }
         | LogicalPlan::Seed { .. } => true,
         LogicalPlan::Filter { input, .. } => plan_contains_expansion(input),
         LogicalPlan::IndexRangeSeek { .. }

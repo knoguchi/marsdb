@@ -626,6 +626,146 @@ pub fn plan_reversed_pattern(
     }
 }
 
+/// Third start strategy alongside written/reversed order: bind the
+/// whole single-hop pattern from one sequential `EDGES`-table sweep
+/// (`LogicalPlan::EdgeTypeScan`) instead of scanning an endpoint and
+/// expanding adjacency. Wins when a relationship-property predicate
+/// exists (evaluable from the swept record's own bytes -- the whole
+/// point: no per-edge storage get) and the O(1) total edge count is
+/// smaller than the best anchored estimate. Measured basis: a warm
+/// sequential sweep of 166k edge records incl. per-record predicate
+/// decode costs ~5-6ms, vs ~110ms for the same edges through
+/// per-edge adjacency gets (the recommendations bulk-delete shape).
+///
+/// Eligibility is deliberately narrow (same conservatism as reversal):
+/// exactly one fixed hop, a written direction (`Either`'s dedup
+/// semantics excluded), all three variables named and fresh (no
+/// carried vars, no self-reference), no inline endpoint props, at most
+/// one label per endpoint, and at least one scan-evaluable conjunct on
+/// the relationship variable (`Compare` vs a non-param literal,
+/// `IS NULL`, `IS NOT NULL` -- exactly the shapes the executor
+/// evaluates from raw bytes with `value_cmp::compare` semantics).
+/// Everything else stays in the residual `Filter` the returned plan is
+/// wrapped in.
+pub fn plan_edge_scan(
+    pattern: &Pattern,
+    where_clause: &Option<Expr>,
+    carried_vars: &HashSet<String>,
+    txn: Txn,
+) -> Result<Option<LogicalPlan>, QueryError> {
+    if pattern.hops.len() != 1 {
+        return Ok(None);
+    }
+    let (rel, end) = &pattern.hops[0];
+    if rel.hop_range.is_some() {
+        return Ok(None);
+    }
+    let (Some(start_var), Some(rel_var), Some(end_var)) = (
+        pattern.start.var.as_ref(),
+        rel.var.as_ref(),
+        end.var.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    if start_var == end_var
+        || rel_var == start_var
+        || rel_var == end_var
+        || carried_vars.contains(start_var)
+        || carried_vars.contains(rel_var)
+        || carried_vars.contains(end_var)
+    {
+        return Ok(None);
+    }
+    if !pattern.start.props.is_empty() || !end.props.is_empty() {
+        return Ok(None);
+    }
+    if pattern.start.labels.len() > 1 || end.labels.len() > 1 {
+        return Ok(None);
+    }
+    let (src_var, dst_var, src_label, dst_label) = match rel.direction {
+        RelDirection::Right => (
+            start_var,
+            end_var,
+            pattern.start.labels.first(),
+            end.labels.first(),
+        ),
+        RelDirection::Left => (
+            end_var,
+            start_var,
+            end.labels.first(),
+            pattern.start.labels.first(),
+        ),
+        RelDirection::Either => return Ok(None),
+    };
+
+    let mut conjuncts = Vec::new();
+    if let Some(expr) = where_clause {
+        push_conjuncts(expr.clone(), &mut conjuncts);
+    }
+    let (scan_preds, residual): (Vec<Expr>, Vec<Expr>) = conjuncts
+        .clone()
+        .into_iter()
+        .partition(|c| edge_scan_evaluable(c, rel_var));
+    if scan_preds.is_empty() {
+        return Ok(None);
+    }
+
+    // Cost gate. The two sides' units are NOT equal work: a sweep unit
+    // is one sequential record visit with the predicate read off bytes
+    // already in hand (measured ~35ns/record: 166k records in ~5.8ms,
+    // warm, release), while an anchored unit is a random adjacency walk
+    // whose predicate needs a per-edge storage get (measured ~1.1us:
+    // the same shape's ~110ms match phase over 100k edges) -- roughly
+    // 30x apart on the reference dataset. Gated at a conservative 8x
+    // (understating the sweep's advantage several-fold) so the sweep
+    // only fires where the measured gap can't plausibly invert;
+    // strictly-less keeps ties on the tried-and-true path.
+    const SWEEP_UNIT_ADVANTAGE: u64 = 8;
+    let e_total = GraphStore::edge_count_in_txn(txn)?;
+    let start_cost = endpoint_start_cost(&pattern.start, &conjuncts, carried_vars, txn)?;
+    let end_cost = endpoint_start_cost(end, &conjuncts, carried_vars, txn)?;
+    let edges = rel_types_edge_count(txn, &rel.rel_types)?;
+    let anchored =
+        anchor_cost(&start_cost, &end_cost, edges).min(anchor_cost(&end_cost, &start_cost, edges));
+    if e_total >= anchored.saturating_mul(SWEEP_UNIT_ADVANTAGE) {
+        return Ok(None);
+    }
+
+    let leaf = LogicalPlan::EdgeTypeScan {
+        src_var: src_var.clone(),
+        rel_var: rel_var.clone(),
+        dst_var: dst_var.clone(),
+        rel_types: rel.rel_types.clone(),
+        src_label: src_label.cloned(),
+        dst_label: dst_label.cloned(),
+        rel_predicate: rebuild_and(scan_preds),
+    };
+    Ok(Some(match rebuild_and(residual) {
+        Some(predicate) => LogicalPlan::Filter {
+            input: Box::new(leaf),
+            predicate,
+        },
+        None => leaf,
+    }))
+}
+
+/// Which conjuncts the `EdgeTypeScan` stream can decide from the raw
+/// record: definite-answer shapes only (`Not` is admitted solely over
+/// `IS NULL` -- negating a three-valued `Compare` whose unknown
+/// collapses to false would flip unknowns to true, which Cypher
+/// forbids).
+fn edge_scan_evaluable(conjunct: &Expr, rel_var: &str) -> bool {
+    if conjunct_sole_var(conjunct) != Some(rel_var) {
+        return false;
+    }
+    match conjunct {
+        Expr::Compare(_, _, lit) => !matches!(lit, Literal::Param(_)),
+        Expr::IsNull(_) => true,
+        Expr::Not(inner) => matches!(inner.as_ref(), Expr::IsNull(_)),
+        _ => false,
+    }
+}
+
 /// Live edge count for one hop's relationship-type list: sum of the
 /// per-type counts, or the whole-table edge count for an untyped hop
 /// (`-->`). All O(1) reads.
@@ -1064,7 +1204,8 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
         | LogicalPlan::NodeByLabelScan { .. }
         | LogicalPlan::Seed { .. }
         | LogicalPlan::IndexSeek { .. }
-        | LogicalPlan::IndexRangeSeek { .. }) => leaf,
+        | LogicalPlan::IndexRangeSeek { .. }
+        | LogicalPlan::EdgeTypeScan { .. }) => leaf,
     })
 }
 
