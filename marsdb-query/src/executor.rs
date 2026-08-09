@@ -3428,6 +3428,13 @@ impl<'a> Executor<'a> {
             LogicalPlan::NodeByLabelScan { var, label } => {
                 self.stream_scan(txn, var, Some(label), seed, guard, scan_limit)
             }
+            LogicalPlan::IndexRangeSeek {
+                var,
+                label,
+                prop,
+                lo,
+                hi,
+            } => self.stream_index_range_seek(txn, var, label, prop, lo, hi, seed, guard),
             LogicalPlan::IndexSeek {
                 var,
                 label,
@@ -4216,6 +4223,112 @@ impl<'a> Executor<'a> {
     /// recognized a literal-valued equality, never a per-row one) -- an
     /// O(label size) scan repeated per incoming row, the exact pattern a
     /// bulk import's relationship-creation pass hits hardest.
+    /// `IndexRangeSeek` evaluation: one bounded index scan, reused
+    /// across every seed row (same cross-join shape as
+    /// `stream_index_seek`'s `Fixed` arm). The residual `Filter` the
+    /// planner keeps above this node applies the exact predicate; this
+    /// stream only narrows candidates.
+    #[allow(clippy::too_many_arguments)]
+    /// `IndexRangeSeek` evaluation: a demand-driven bounded index scan
+    /// (chunked refills through `IndexRangeCursor`, O(log n) re-seek per
+    /// refill), cross-joined with every seed row -- same join shape as
+    /// `stream_index_seek`'s `Fixed` arm, but the ids are pulled as
+    /// consumed instead of collected up front, so a `LIMIT`ed consumer
+    /// that stops early never pays for the rest of the range. The
+    /// residual `Filter` the planner keeps above this node applies the
+    /// exact predicate; this stream only narrows candidates.
+    ///
+    /// Multi-seed note: the chunk buffer grows to the full match set
+    /// only when several seed rows each need the whole range (the
+    /// cross-join semantics require it); the single-seed case -- every
+    /// top-level `MATCH (n:L) WHERE n.p > x` -- stays incremental.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_index_range_seek<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        var: &'s str,
+        label: &'s str,
+        prop: &'s str,
+        lo: &'s Option<(PropertyValue, bool)>,
+        hi: &'s Option<(PropertyValue, bool)>,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+    ) -> RowStream<'s> {
+        const CHUNK: usize = 512;
+        let mut cursor: Option<Option<marsdb_graph::IndexRangeCursor>> = None;
+        let mut ids: Vec<NodeId> = Vec::new();
+        let mut exhausted = false;
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            loop {
+                // Refill when the consumer has caught up with what's
+                // fetched (only the first seed row drives fetching; later
+                // seed rows replay the accumulated ids).
+                if !exhausted && node_index >= ids.len() && seed_index == 0 {
+                    let cur = match &mut cursor {
+                        Some(c) => c,
+                        None => {
+                            let created = GraphStore::index_range_cursor_in_txn(
+                                txn,
+                                label,
+                                prop,
+                                lo.as_ref().map(|(v, incl)| (v, *incl)),
+                                hi.as_ref().map(|(v, incl)| (v, *incl)),
+                            );
+                            match created {
+                                Ok(c) => cursor.insert(c),
+                                Err(error) => {
+                                    done = true;
+                                    return Some(Err(error.into()));
+                                }
+                            }
+                        }
+                    };
+                    match cur {
+                        None => exhausted = true,
+                        Some(c) => match c.next_chunk(txn, CHUNK) {
+                            Ok(chunk) => {
+                                if chunk.len() < CHUNK {
+                                    exhausted = true;
+                                }
+                                ids.extend(chunk);
+                            }
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error.into()));
+                            }
+                        },
+                    }
+                }
+                if node_index >= ids.len() {
+                    if exhausted {
+                        seed_index += 1;
+                        node_index = 0;
+                        if seed_index >= seed.len() || ids.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if let Err(error) = guard.checkpoint() {
+                    done = true;
+                    return Some(Err(error));
+                }
+                let mut row = seed[seed_index].clone();
+                row.insert(var.to_string(), Binding::Node(ids[node_index]));
+                node_index += 1;
+                return Some(Ok(row));
+            }
+        });
+        Self::count_stream(Box::new(stream), guard)
+    }
+
     fn stream_index_seek<'s>(
         &'s self,
         txn: Txn<'s>,
@@ -6447,7 +6560,8 @@ fn plan_contains_expansion(plan: &LogicalPlan) -> bool {
         | LogicalPlan::MatchRelList { .. }
         | LogicalPlan::Seed { .. } => true,
         LogicalPlan::Filter { input, .. } => plan_contains_expansion(input),
-        LogicalPlan::AllNodesScan { .. }
+        LogicalPlan::IndexRangeSeek { .. }
+        | LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }
         | LogicalPlan::IndexSeek { .. } => false,
     }

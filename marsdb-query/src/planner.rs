@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use marsdb_graph::{GraphStore, Txn};
+use marsdb_graph::{GraphStore, PropertyValue, Txn};
 
 use crate::ast::{
     CompareOp, Expr, Literal, NodePattern, Pattern, PropAccess, RelDirection, ReturnExpr,
@@ -923,6 +923,71 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                         });
                     }
                 }
+
+                // No equality seek fired -- try a RANGE seek: `var.prop`
+                // inequality conjuncts (`>`, `>=`, `<`, `<=`) against
+                // literals, on a prop with a declared index. Bounds on
+                // the same prop combine into one bounded scan (`year >
+                // 2000 AND year < 2010`). Unlike the equality fusion,
+                // the originating conjuncts are KEPT in the residual
+                // filter: the storage scan is a deliberate superset for
+                // numeric bounds (int/float type regions, widened lossy
+                // conversions -- see `lookup_range`), so the filter
+                // stays the source of truth and the seek only shrinks
+                // the candidate set. First indexed prop encountered
+                // wins (no O(1) range-cardinality statistic exists to
+                // rank candidates by).
+                let mut range_prop: Option<String> = None;
+                let mut lo: Option<(PropertyValue, bool)> = None;
+                let mut hi: Option<(PropertyValue, bool)> = None;
+                for c in &candidates {
+                    let Expr::Compare(pa, op, lit) = c else {
+                        continue;
+                    };
+                    if pa.var != *var || matches!(lit, Literal::Param(_)) {
+                        continue;
+                    }
+                    let (is_lo, inclusive) = match op {
+                        CompareOp::Gt => (true, false),
+                        CompareOp::Ge => (true, true),
+                        CompareOp::Lt => (false, false),
+                        CompareOp::Le => (false, true),
+                        _ => continue,
+                    };
+                    if range_prop.as_deref().is_some_and(|p| p != pa.prop) {
+                        continue;
+                    }
+                    if range_prop.is_none() {
+                        if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_none() {
+                            continue;
+                        }
+                        range_prop = Some(pa.prop.clone());
+                    }
+                    let value = literal_to_value(lit);
+                    // Two bounds on the same side keep the first -- the
+                    // residual filter enforces the tighter one anyway.
+                    if is_lo && lo.is_none() {
+                        lo = Some((value, inclusive));
+                    } else if !is_lo && hi.is_none() {
+                        hi = Some((value, inclusive));
+                    }
+                }
+                if let Some(prop) = range_prop {
+                    let seek = LogicalPlan::IndexRangeSeek {
+                        var: var.clone(),
+                        label: label.clone(),
+                        prop,
+                        lo,
+                        hi,
+                    };
+                    return Ok(match rebuild_and(candidates) {
+                        Some(predicate) => LogicalPlan::Filter {
+                            input: Box::new(seek),
+                            predicate,
+                        },
+                        None => seek,
+                    });
+                }
             }
             match rebuild_and(candidates) {
                 Some(predicate) => LogicalPlan::Filter {
@@ -998,7 +1063,8 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
         leaf @ (LogicalPlan::AllNodesScan { .. }
         | LogicalPlan::NodeByLabelScan { .. }
         | LogicalPlan::Seed { .. }
-        | LogicalPlan::IndexSeek { .. }) => leaf,
+        | LogicalPlan::IndexSeek { .. }
+        | LogicalPlan::IndexRangeSeek { .. }) => leaf,
     })
 }
 

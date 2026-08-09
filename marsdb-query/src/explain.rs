@@ -398,6 +398,27 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::NodeByLabelScan { var, label } => {
             out.push(format!("{pad}NodeByLabelScan({var}:{label})"))
         }
+        LogicalPlan::IndexRangeSeek {
+            var,
+            label,
+            prop,
+            lo,
+            hi,
+        } => {
+            let bound =
+                |side: &Option<(marsdb_graph::PropertyValue, bool)>, op_in: &str, op_ex: &str| {
+                    side.as_ref()
+                        .map(|(v, inclusive)| {
+                            format!(" {} {v:?}", if *inclusive { op_in } else { op_ex })
+                        })
+                        .unwrap_or_default()
+                };
+            out.push(format!(
+                "{pad}IndexRangeSeek({var}:{label}.{prop}{}{})",
+                bound(lo, ">=", ">"),
+                bound(hi, "<=", "<"),
+            ));
+        }
         LogicalPlan::IndexSeek {
             var,
             label,

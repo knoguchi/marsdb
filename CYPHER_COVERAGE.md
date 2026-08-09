@@ -265,7 +265,17 @@ in code.
 - `EXPLAIN <statement>` prints the compiled plan without running it,
   always against a read-only snapshot
 
-Not yet supported: `CREATE CONSTRAINT`, composite indexes, range scans.
+- A range predicate against an indexed `(label, prop)` — `WHERE n.year >
+  2000`, `>=`/`<`/`<=`, both bounds combining (`> 2000 AND < 2010`) —
+  compiles to a bounded `IndexRangeSeek` over the index's
+  order-preserving key encoding, pulled in chunks on demand (a `LIMIT`ed
+  consumer never pays for the rest of the range — the keyset-pagination
+  page shape `WHERE n.seq > $last ... LIMIT k` costs O(log n + k)).
+  Numeric bounds scan both the int and float key regions (Cypher
+  compares them cross-type) as a deliberate superset, with the original
+  predicate kept as a residual filter for exactness.
+
+Not yet supported: `CREATE CONSTRAINT`, composite indexes.
 
 ## Schema introspection
 

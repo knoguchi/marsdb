@@ -130,4 +130,18 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle<'a, K, V> {
             MultimapTableHandle::Read(t) => t.iter()?,
         })
     }
+
+    /// Key-ordered scan over a sub-range of keys — the multimap
+    /// counterpart of `TableHandle::range`, backing `PROPERTY_INDEX`
+    /// range predicates (the order-preserving value encoding has been
+    /// range-ready since it was written).
+    pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
+        &self,
+        range: impl std::ops::RangeBounds<KR> + 'k,
+    ) -> Result<MultimapRange<'_, K, V>, StorageError> {
+        Ok(match self {
+            MultimapTableHandle::Write(t) => t.range(range)?,
+            MultimapTableHandle::Read(t) => t.range(range)?,
+        })
+    }
 }

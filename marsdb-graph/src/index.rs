@@ -265,6 +265,262 @@ pub fn lookup_index_def(txn: Txn, label: &str, prop: &str) -> Result<Option<Inde
 /// `NODE_LABEL_INDEX` (see `GraphStore::all_nodes_limited_in_txn`'s
 /// history): truncating *after* `collect()` would still walk every
 /// matching entry first, defeating the point of a `LIMIT` push-down.
+/// Range lookup over one indexed `(label, prop)`: every node whose
+/// stored value falls inside `[lo, hi]` (each side optional, each
+/// independently inclusive/exclusive), in index order. The result is a
+/// deliberate SUPERSET for numeric bounds: Cypher compares ints and
+/// floats cross-type, and the index stores them in two adjacent
+/// type-tagged regions, so a numeric bound scans BOTH regions with the
+/// bound converted per region — widened outward where the i64<->f64
+/// conversion is lossy (|v| > 2^53), never narrowed. Callers keep the
+/// original predicate as a residual filter for exactness; this
+/// function's job is to shrink the candidate set from "whole label" to
+/// "roughly the range", not to be the final answer. Non-numeric bounds
+/// scan their single type region (cross-type comparison is null in
+/// Cypher, so same-type is already the complete answer; the residual
+/// filter still runs).
+pub fn lookup_range(
+    txn: Txn,
+    label: &str,
+    prop: &str,
+    lo: Option<(&PropertyValue, bool)>,
+    hi: Option<(&PropertyValue, bool)>,
+    limit: Option<usize>,
+) -> Result<Vec<NodeId>, GraphError> {
+    let Some(mut cursor) = IndexRangeCursor::new(txn, label, prop, lo, hi)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    loop {
+        let want = match limit {
+            Some(l) => {
+                if out.len() >= l {
+                    return Ok(out);
+                }
+                l - out.len()
+            }
+            None => usize::MAX,
+        };
+        let chunk = cursor.next_chunk(txn, want.min(4096))?;
+        if chunk.is_empty() {
+            return Ok(out);
+        }
+        out.extend(chunk);
+    }
+}
+
+/// Resumable cursor over one indexed range — the demand-driven form of
+/// `lookup_range`: each `next_chunk` re-seeks past the last `(key,
+/// node)` it returned (O(log n) per refill) and pulls at most
+/// `chunk_size` more ids, so a `LIMIT`ed consumer that stops early
+/// never pays for the rest of the range. Region semantics (numeric
+/// superset, widening) are `range_regions`'s — see `lookup_range`.
+/// One scan region over full `PROPERTY_INDEX` keys — `(start, end)`.
+type KeyRegion = (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>);
+
+pub struct IndexRangeCursor {
+    regions: Vec<KeyRegion>,
+    region_index: usize,
+    /// Resume point within the current region: the last emitted index
+    /// key and node id. The next refill scans from `Excluded`-ish this
+    /// position — same key's remaining values first, then later keys.
+    resume: Option<(Vec<u8>, u64)>,
+}
+
+impl IndexRangeCursor {
+    /// `None` when the label/prop was never interned (nothing indexed).
+    pub fn new(
+        txn: Txn,
+        label: &str,
+        prop: &str,
+        lo: Option<(&PropertyValue, bool)>,
+        hi: Option<(&PropertyValue, bool)>,
+    ) -> Result<Option<Self>, GraphError> {
+        let Some(label_id) = lookup_label_id(txn, label)? else {
+            return Ok(None);
+        };
+        let Some(prop_id) = lookup_prop_id(txn, prop)? else {
+            return Ok(None);
+        };
+        let prefix = index_prefix(label_id, prop_id);
+        Ok(Some(Self {
+            regions: range_regions(&prefix, lo, hi),
+            region_index: 0,
+            resume: None,
+        }))
+    }
+
+    pub fn next_chunk(&mut self, txn: Txn, chunk_size: usize) -> Result<Vec<NodeId>, GraphError> {
+        use std::ops::Bound;
+        if chunk_size == 0 {
+            return Ok(Vec::new());
+        }
+        let index = txn.open_multimap_table(marsdb_storage::tables::PROPERTY_INDEX)?;
+        let mut out = Vec::new();
+        while self.region_index < self.regions.len() {
+            let (region_start, region_end) = &self.regions[self.region_index];
+            // Resume from just past the last emitted key (inclusive of
+            // the key itself -- its remaining values are skipped by the
+            // value filter below), else the region's own start.
+            let start_owned;
+            let start_bound: Bound<&[u8]> = match &self.resume {
+                Some((key, _)) => {
+                    start_owned = key.clone();
+                    Bound::Included(start_owned.as_slice())
+                }
+                None => match region_start {
+                    Bound::Included(k) => Bound::Included(k.as_slice()),
+                    Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+                    Bound::Unbounded => Bound::Unbounded,
+                },
+            };
+            let end_bound: Bound<&[u8]> = match region_end {
+                Bound::Included(k) => Bound::Included(k.as_slice()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            for entry in index.range::<&[u8]>((start_bound, end_bound))? {
+                let (key, values) = entry?;
+                let key_bytes = key.value().to_vec();
+                let skip_through = match &self.resume {
+                    Some((resume_key, resume_val)) if *resume_key == key_bytes => Some(*resume_val),
+                    _ => None,
+                };
+                for value in values {
+                    let node = value?.value();
+                    if skip_through.is_some_and(|last| node <= last) {
+                        continue;
+                    }
+                    out.push(NodeId(node));
+                    self.resume = Some((key_bytes.clone(), node));
+                    if out.len() >= chunk_size {
+                        return Ok(out);
+                    }
+                }
+            }
+            // Region exhausted.
+            self.region_index += 1;
+            self.resume = None;
+        }
+        Ok(out)
+    }
+}
+
+/// The byte-range regions `lookup_range` scans — one per relevant type
+/// tag, each a `(start, end)` bound pair over full `PROPERTY_INDEX`
+/// keys. See `lookup_range` for the superset/widening contract.
+fn range_regions(
+    prefix: &[u8],
+    lo: Option<(&PropertyValue, bool)>,
+    hi: Option<(&PropertyValue, bool)>,
+) -> Vec<KeyRegion> {
+    use std::ops::Bound;
+    let key = |value: &PropertyValue| {
+        let mut k = prefix.to_vec();
+        k.extend_from_slice(&encode_index_value(value));
+        k
+    };
+    let tag_start = |tag: u8| {
+        let mut k = prefix.to_vec();
+        k.push(tag);
+        Bound::Included(k)
+    };
+    let tag_end = |tag: u8| {
+        let mut k = prefix.to_vec();
+        k.push(tag + 1);
+        Bound::Excluded(k)
+    };
+    let numeric = |v: &PropertyValue| matches!(v, PropertyValue::Int(_) | PropertyValue::Float(_));
+
+    let is_numeric = lo.map(|(v, _)| numeric(v)).unwrap_or(true)
+        && hi.map(|(v, _)| numeric(v)).unwrap_or(true)
+        && (lo.is_some() || hi.is_some())
+        && (lo.is_some_and(|(v, _)| numeric(v)) || hi.is_some_and(|(v, _)| numeric(v)));
+    if is_numeric {
+        // Int region (tag 0x02): a float bound widens outward to the
+        // enclosing ints. Float region (tag 0x03): an int bound converts
+        // through f64, nudged one ulp outward to cover the lossy range.
+        let int_bound = |side_lo: bool, bound: Option<(&PropertyValue, bool)>| match bound {
+            None => {
+                if side_lo {
+                    tag_start(0x02)
+                } else {
+                    tag_end(0x02)
+                }
+            }
+            Some((PropertyValue::Int(i), inclusive)) => {
+                let k = key(&PropertyValue::Int(*i));
+                if inclusive {
+                    Bound::Included(k)
+                } else {
+                    Bound::Excluded(k)
+                }
+            }
+            Some((PropertyValue::Float(f), _)) => {
+                // Superset: floor for a lower bound, ceil for an upper,
+                // both inclusive.
+                let widened = if side_lo { f.floor() } else { f.ceil() };
+                let clamped = widened.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+                Bound::Included(key(&PropertyValue::Int(clamped)))
+            }
+            Some(_) => unreachable!("numeric region only built for numeric bounds"),
+        };
+        let float_bound = |side_lo: bool, bound: Option<(&PropertyValue, bool)>| match bound {
+            None => {
+                if side_lo {
+                    tag_start(0x03)
+                } else {
+                    tag_end(0x03)
+                }
+            }
+            Some((PropertyValue::Float(f), inclusive)) => {
+                let k = key(&PropertyValue::Float(*f));
+                if inclusive {
+                    Bound::Included(k)
+                } else {
+                    Bound::Excluded(k)
+                }
+            }
+            Some((PropertyValue::Int(i), _)) => {
+                // Superset: widen outward by a couple of ulps (relative
+                // epsilon) to cover |i| > 2^53 conversion lossiness --
+                // overshooting is harmless, the residual filter is
+                // exact. (`f64::next_down`/`next_up` say this directly
+                // but are stable only since 1.86; MSRV is 1.82.)
+                let f = *i as f64;
+                let step = f.abs() * (2.0 * f64::EPSILON) + f64::MIN_POSITIVE;
+                let widened = if side_lo { f - step } else { f + step };
+                Bound::Included(key(&PropertyValue::Float(widened)))
+            }
+            Some(_) => unreachable!("numeric region only built for numeric bounds"),
+        };
+        return vec![
+            (int_bound(true, lo), int_bound(false, hi)),
+            (float_bound(true, lo), float_bound(false, hi)),
+        ];
+    }
+
+    // Non-numeric: one region, the type tag of whichever bound exists
+    // (both same-type when both exist -- a mixed-type non-numeric range
+    // matches nothing in Cypher, and the residual filter enforces that;
+    // scanning the lo-side region is a harmless superset).
+    let tag = lo
+        .or(hi)
+        .map(|(v, _)| encode_index_value(v)[0])
+        .unwrap_or(0x00);
+    let start = match lo {
+        None => tag_start(tag),
+        Some((v, true)) => Bound::Included(key(v)),
+        Some((v, false)) => Bound::Excluded(key(v)),
+    };
+    let end = match hi {
+        None => tag_end(tag),
+        Some((v, true)) => Bound::Included(key(v)),
+        Some((v, false)) => Bound::Excluded(key(v)),
+    };
+    vec![(start, end)]
+}
+
 pub fn lookup_exact(
     txn: Txn,
     label: &str,
