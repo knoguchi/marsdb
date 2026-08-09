@@ -137,6 +137,21 @@ class DatabaseTests(unittest.TestCase):
         rows = db.execute("RETURN $m.city AS city", {"m": {"city": "Kyoto"}})
         self.assertEqual(rows, [{"city": "Kyoto"}])
 
+
+    def test_execute_with_stats(self):
+        db = marsdb.Database.in_memory()
+        rows, stats = db.execute_with_stats("CREATE (a:P {x: 1})-[:R]->(b:P)")
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["nodes_created"], 2)
+        self.assertEqual(stats["relationships_created"], 1)
+        _, stats = db.execute_with_stats("MATCH (n:P) SET n.seen = true")
+        self.assertEqual(stats["properties_set"], 2)
+        _, stats = db.execute_with_stats("MATCH (a:P) DETACH DELETE a")
+        self.assertEqual(stats["nodes_deleted"], 2)
+        self.assertEqual(stats["relationships_deleted"], 1)
+        _, stats = db.execute_with_stats("MATCH (n) RETURN n")
+        self.assertTrue(all(v == 0 for v in stats.values()))
+
     def test_list_valued_node_property_round_trips(self):
         # A stored PropertyValue::List (real Cypher/Neo4j's own
         # "homogeneous array property" shape), not the query-layer-only

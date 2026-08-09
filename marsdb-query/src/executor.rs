@@ -26,7 +26,7 @@ use crate::planner::{
     apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars, plan_reversed_pattern,
 };
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
-use crate::result::QueryResult;
+use crate::result::{QueryResult, QueryStats};
 use crate::temporal;
 use crate::value::{PathElem, Value};
 
@@ -462,6 +462,11 @@ pub struct Executor<'a> {
     /// (`lookup_prop`), cleared at every statement entry point alongside
     /// `node_cache`. See `read_only_stmt` for the `None`-entry gating.
     prop_id_memo: RefCell<HashMap<String, Option<u32>>>,
+    /// Per-statement write counters (`QueryResult::stats`), accumulated
+    /// at every mutation site, reset at both statement entry points
+    /// (same lifecycle as `node_cache`), and taken into the returned
+    /// `QueryResult` on the way out.
+    stats: RefCell<QueryStats>,
 }
 
 impl<'a> Executor<'a> {
@@ -472,7 +477,13 @@ impl<'a> Executor<'a> {
             node_cache: RefCell::new(HashMap::new()),
             read_only_stmt: Cell::new(false),
             prop_id_memo: RefCell::new(HashMap::new()),
+            stats: RefCell::new(QueryStats::default()),
         }
+    }
+
+    /// Bump one statement-stats counter — the single mutation-site hook.
+    fn count(&self, bump: impl FnOnce(&mut QueryStats)) {
+        bump(&mut self.stats.borrow_mut());
     }
 
     /// Cached equivalent of `GraphStore::get_node_in_txn` -- see
@@ -554,6 +565,7 @@ impl<'a> Executor<'a> {
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(is_read_only(stmt));
+        *self.stats.borrow_mut() = QueryStats::default();
         if let Statement::Explain(inner) = stmt {
             // Never opens a WriteTransaction, regardless of what `inner`
             // itself would otherwise mutate -- EXPLAIN describes a plan,
@@ -605,8 +617,9 @@ impl<'a> Executor<'a> {
         let write_txn = self.store.begin_write()?;
         let outcome = self.execute_in_write_transaction_validated(stmt, &write_txn, guard);
         match outcome {
-            Ok(result) => {
+            Ok(mut result) => {
                 GraphStore::commit(write_txn)?;
+                result.stats = std::mem::take(&mut self.stats.borrow_mut());
                 Ok(result)
             }
             Err(e) => {
@@ -666,6 +679,7 @@ impl<'a> Executor<'a> {
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(is_read_only(stmt));
+        *self.stats.borrow_mut() = QueryStats::default();
         if let Statement::Explain(inner) = stmt {
             // Same "never mutates" contract as the top-level path -- opens
             // its own ReadTransaction rather than touching the caller's
@@ -673,7 +687,9 @@ impl<'a> Executor<'a> {
             // explicit multi-statement transaction.
             return self.execute_explain(inner);
         }
-        self.execute_in_write_transaction_validated(stmt, write_txn, guard)
+        let mut result = self.execute_in_write_transaction_validated(stmt, write_txn, guard)?;
+        result.stats = std::mem::take(&mut self.stats.borrow_mut());
+        Ok(result)
     }
 
     /// `EXPLAIN <statement>` — always opens its own `ReadTransaction`
@@ -689,6 +705,7 @@ impl<'a> Executor<'a> {
                 .into_iter()
                 .map(|line| vec![Value::Literal(Literal::String(line))])
                 .collect(),
+            stats: QueryStats::default(),
         })
     }
 
@@ -751,6 +768,7 @@ impl<'a> Executor<'a> {
                 Ok(QueryResult {
                     columns: vec![],
                     rows: vec![],
+                    stats: QueryStats::default(),
                 })
             }
             Statement::Match {
@@ -888,7 +906,11 @@ impl<'a> Executor<'a> {
             }
             rows = filtered;
         }
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult {
+            columns,
+            rows,
+            stats: QueryStats::default(),
+        })
     }
 
     /// Shared by `eval_standalone_call` and `QueryClause::Call`'s own
@@ -1001,6 +1023,7 @@ impl<'a> Executor<'a> {
         Ok(QueryResult {
             columns: vec![],
             rows: vec![],
+            stats: QueryStats::default(),
         })
     }
 
@@ -1067,6 +1090,7 @@ impl<'a> Executor<'a> {
                     };
                     let edge_id =
                         GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+                    self.count(|s| s.relationships_created += 1);
                     if let Some(var) = &rel.var {
                         row.insert(var.clone(), Binding::Edge(edge_id));
                     }
@@ -1108,7 +1132,9 @@ impl<'a> Executor<'a> {
         }
         let labels: Vec<&str> = node.labels.iter().map(String::as_str).collect();
         let props = self.eval_props_to_values(Txn::Write(write_txn), &node.props, row, guard)?;
-        Ok(GraphStore::create_node_in_txn(write_txn, &labels, props)?)
+        let id = GraphStore::create_node_in_txn(write_txn, &labels, props)?;
+        self.count(|s| s.nodes_created += 1);
+        Ok(id)
     }
 
     /// Evaluates a CREATE pattern's `{...}` prop map -- each value is any
@@ -1342,6 +1368,7 @@ impl<'a> Executor<'a> {
             };
             let edge_id =
                 GraphStore::create_edge_in_txn(write_txn, &rel_label, src, dst, rel_props)?;
+            self.count(|s| s.relationships_created += 1);
             if let Some(var) = &rel.var {
                 new_row.insert(var.clone(), Binding::Edge(edge_id));
             }
@@ -1772,6 +1799,7 @@ impl<'a> Executor<'a> {
             None => QueryResult {
                 columns: vec![],
                 rows: vec![],
+                stats: QueryStats::default(),
             },
             Some(Tail::Return(items, distinct)) => {
                 if let Some(ob) = order_by {
@@ -1858,6 +1886,7 @@ impl<'a> Executor<'a> {
                     None => QueryResult {
                         columns: vec![],
                         rows: vec![],
+                        stats: QueryStats::default(),
                     },
                 }
             }
@@ -2479,7 +2508,7 @@ impl<'a> Executor<'a> {
         skip: Option<i64>,
         limit: Option<i64>,
     ) -> Result<QueryResult, QueryError> {
-        let QueryResult { columns, rows } = result;
+        let QueryResult { columns, rows, .. } = result;
         let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
         for (binding_row, row) in binding_rows.iter().zip(rows) {
             let mut value_map = self.binding_row_to_value_map(txn, binding_row)?;
@@ -2496,7 +2525,11 @@ impl<'a> Executor<'a> {
             .into_iter()
             .map(|(_, row)| row)
             .collect();
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult {
+            columns,
+            rows,
+            stats: QueryStats::default(),
+        })
     }
 
     fn binding_row_to_value_map(
@@ -4734,6 +4767,7 @@ impl<'a> Executor<'a> {
         Ok(QueryResult {
             columns,
             rows: out_rows,
+            stats: QueryStats::default(),
         })
     }
 
@@ -4833,7 +4867,11 @@ impl<'a> Executor<'a> {
             .into_iter()
             .map(|(_, row)| row)
             .collect();
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult {
+            columns,
+            rows,
+            stats: QueryStats::default(),
+        })
     }
 
     /// `SKIP`/`LIMIT` accept any expression, not just a literal integer
@@ -5280,6 +5318,7 @@ impl<'a> Executor<'a> {
                 }
             }
             for (id, label) in GraphStore::delete_edges_in_txn(write_txn, &edge_ids)? {
+                self.count(|s| s.relationships_deleted += 1);
                 guard.record_deleted_edge_type(id, label);
             }
         } else {
@@ -5304,6 +5343,7 @@ impl<'a> Executor<'a> {
                             .get(name)
                             .ok_or_else(|| QueryError::UnboundVariable(name.clone()))?;
                         delete_binding(
+                            self,
                             txn,
                             binding,
                             write_txn,
@@ -5314,6 +5354,7 @@ impl<'a> Executor<'a> {
                     } else {
                         let value = self.eval_return_expr(txn, target, row, guard)?;
                         delete_value(
+                            self,
                             &value,
                             write_txn,
                             &mut deleted_edges,
@@ -5326,7 +5367,12 @@ impl<'a> Executor<'a> {
         }
         for id in pending_nodes {
             self.uncache_node(id);
-            GraphStore::delete_node_in_txn(write_txn, id, detach)?;
+            if let Some(detached_edges) = GraphStore::delete_node_in_txn(write_txn, id, detach)? {
+                self.count(|s| {
+                    s.nodes_deleted += 1;
+                    s.relationships_deleted += detached_edges;
+                });
+            }
         }
         Ok(())
     }
@@ -5359,6 +5405,7 @@ impl<'a> Executor<'a> {
             None => QueryResult {
                 columns: vec![],
                 rows: vec![],
+                stats: QueryStats::default(),
             },
         };
         Ok(result)
@@ -5383,6 +5430,7 @@ impl<'a> Executor<'a> {
             None => Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
+                stats: QueryStats::default(),
             }),
         }
     }
@@ -5406,6 +5454,7 @@ impl<'a> Executor<'a> {
             None => Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
+                stats: QueryStats::default(),
             }),
         }
     }
@@ -5537,9 +5586,11 @@ impl<'a> Executor<'a> {
                 if matches!(value, Value::Null) {
                     if let Some(id) = node_id {
                         GraphStore::remove_node_prop_in_txn(write_txn, id, &pa.prop)?;
+                        self.count(|s| s.properties_set += 1);
                     }
                     if let Some(id) = edge_id {
                         GraphStore::remove_edge_prop_in_txn(write_txn, id, &pa.prop)?;
+                        self.count(|s| s.properties_set += 1);
                     }
                 } else {
                     let pv = value_to_storable_property(&value).ok_or_else(|| {
@@ -5552,9 +5603,11 @@ impl<'a> Executor<'a> {
                 })?;
                     if let Some(id) = node_id {
                         GraphStore::set_node_prop_in_txn(write_txn, id, &pa.prop, pv.clone())?;
+                        self.count(|s| s.properties_set += 1);
                     }
                     if let Some(id) = edge_id {
                         GraphStore::set_edge_prop_in_txn(write_txn, id, &pa.prop, pv)?;
+                        self.count(|s| s.properties_set += 1);
                     }
                 }
             }
@@ -5567,6 +5620,7 @@ impl<'a> Executor<'a> {
                         self.uncache_node(*id);
                         for label in labels {
                             GraphStore::add_node_label_in_txn(write_txn, *id, label)?;
+                            self.count(|s| s.labels_added += 1);
                         }
                     }
                     // Same null-is-a-no-op rule as the property arm above.
@@ -5652,9 +5706,11 @@ impl<'a> Executor<'a> {
                     for key in existing_keys {
                         if let Some(id) = node_id {
                             GraphStore::remove_node_prop_in_txn(write_txn, id, &key)?;
+                            self.count(|s| s.properties_set += 1);
                         }
                         if let Some(id) = edge_id {
                             GraphStore::remove_edge_prop_in_txn(write_txn, id, &key)?;
+                            self.count(|s| s.properties_set += 1);
                         }
                     }
                 }
@@ -5666,9 +5722,11 @@ impl<'a> Executor<'a> {
                     if matches!(entry_value, Value::Null) {
                         if let Some(id) = node_id {
                             GraphStore::remove_node_prop_in_txn(write_txn, id, &key)?;
+                            self.count(|s| s.properties_set += 1);
                         }
                         if let Some(id) = edge_id {
                             GraphStore::remove_edge_prop_in_txn(write_txn, id, &key)?;
+                            self.count(|s| s.properties_set += 1);
                         }
                         continue;
                     }
@@ -5681,9 +5739,11 @@ impl<'a> Executor<'a> {
                     })?;
                     if let Some(id) = node_id {
                         GraphStore::set_node_prop_in_txn(write_txn, id, &key, pv.clone())?;
+                        self.count(|s| s.properties_set += 1);
                     }
                     if let Some(id) = edge_id {
                         GraphStore::set_edge_prop_in_txn(write_txn, id, &key, pv)?;
+                        self.count(|s| s.properties_set += 1);
                     }
                 }
             }
@@ -5707,6 +5767,7 @@ impl<'a> Executor<'a> {
 /// transaction, so its record is still there to fetch (deletion hasn't
 /// happened yet -- that's the very next line).
 fn record_and_delete_edge(
+    executor: &Executor<'_>,
     txn: Txn,
     write_txn: &WriteTransaction,
     id: EdgeId,
@@ -5715,7 +5776,9 @@ fn record_and_delete_edge(
     if let Some(edge) = GraphStore::get_edge_in_txn(txn, id)? {
         guard.record_deleted_edge_type(id, edge.label);
     }
-    GraphStore::delete_edge_in_txn(write_txn, id)?;
+    if GraphStore::delete_edge_in_txn(write_txn, id)? {
+        executor.count(|s| s.relationships_deleted += 1);
+    }
     Ok(())
 }
 
@@ -5769,6 +5832,7 @@ fn collect_delete_binding(
 }
 
 fn delete_binding(
+    executor: &Executor<'_>,
     txn: Txn,
     binding: &Binding,
     write_txn: &WriteTransaction,
@@ -5782,14 +5846,14 @@ fn delete_binding(
         }
         Binding::Edge(id) => {
             if deleted_edges.insert(*id) {
-                record_and_delete_edge(txn, write_txn, *id, guard)?;
+                record_and_delete_edge(executor, txn, write_txn, *id, guard)?;
             }
         }
         Binding::Path(elems) => {
             for elem in elems {
                 if let PathBinding::Edge(id) = elem {
                     if deleted_edges.insert(*id) {
-                        record_and_delete_edge(txn, write_txn, *id, guard)?;
+                        record_and_delete_edge(executor, txn, write_txn, *id, guard)?;
                     }
                 }
             }
@@ -5823,6 +5887,7 @@ fn delete_binding(
 /// its own second pass, after every target across every row has had a
 /// chance to delete its own edges first (see its own docs for why).
 fn delete_value(
+    executor: &Executor<'_>,
     value: &Value,
     write_txn: &WriteTransaction,
     deleted_edges: &mut HashSet<EdgeId>,
@@ -5836,7 +5901,9 @@ fn delete_value(
         Value::Edge(e) => {
             if deleted_edges.insert(e.id) {
                 guard.record_deleted_edge_type(e.id, e.label.clone());
-                GraphStore::delete_edge_in_txn(write_txn, e.id)?;
+                if GraphStore::delete_edge_in_txn(write_txn, e.id)? {
+                    executor.count(|s| s.relationships_deleted += 1);
+                }
             }
         }
         Value::Path(elems) => {
@@ -5844,7 +5911,9 @@ fn delete_value(
                 if let PathElem::Edge(e) = elem {
                     if deleted_edges.insert(e.id) {
                         guard.record_deleted_edge_type(e.id, e.label.clone());
-                        GraphStore::delete_edge_in_txn(write_txn, e.id)?;
+                        if GraphStore::delete_edge_in_txn(write_txn, e.id)? {
+                            executor.count(|s| s.relationships_deleted += 1);
+                        }
                     }
                 }
             }
@@ -5879,9 +5948,11 @@ fn apply_remove_item(
                 Binding::Node(id) => {
                     executor.uncache_node(*id);
                     GraphStore::remove_node_prop_in_txn(write_txn, *id, &pa.prop)?;
+                    executor.count(|s| s.properties_set += 1);
                 }
                 Binding::Edge(id) => {
                     GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
+                    executor.count(|s| s.properties_set += 1);
                 }
                 // Same null-is-a-no-op rule DELETE already follows (found
                 // via TCK's Remove1 "Ignore null when removing property"
@@ -5904,6 +5975,7 @@ fn apply_remove_item(
                     executor.uncache_node(*id);
                     for label in labels {
                         GraphStore::remove_node_label_in_txn(write_txn, *id, label)?;
+                        executor.count(|s| s.labels_removed += 1);
                     }
                 }
                 // Same null-is-a-no-op rule as the property arm above

@@ -345,3 +345,36 @@ func TestExecuteWithOptionsBoundsRows(t *testing.T) {
 		t.Fatalf("expected 3 rows, got %d", len(rows))
 	}
 }
+
+func TestExecuteStats(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	_, stats, err := db.ExecuteStats("CREATE (a:P)-[:R]->(b:P)", nil)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if stats.NodesCreated != 2 || stats.RelationshipsCreated != 1 {
+		t.Fatalf("unexpected create stats: %+v", stats)
+	}
+
+	_, stats, err = db.ExecuteStats("MATCH (a:P) DETACH DELETE a", nil)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if stats.NodesDeleted != 2 || stats.RelationshipsDeleted != 1 {
+		t.Fatalf("unexpected delete stats: %+v", stats)
+	}
+
+	// Reads: all zero.
+	_, stats, err = db.ExecuteStats("MATCH (n) RETURN n", nil)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if stats != (Stats{}) {
+		t.Fatalf("expected zero stats for a read, got %+v", stats)
+	}
+}

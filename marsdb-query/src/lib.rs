@@ -25,6 +25,6 @@ pub use executor::{
 };
 pub use params::substitute_params;
 pub use procedure::{ProcedureProvider, ProcedureSignature, Procedures};
-pub use result::QueryResult;
+pub use result::{QueryResult, QueryStats};
 pub use semantic::validate_statement;
 pub use value::{PathElem, Value};

@@ -2,6 +2,7 @@ use marsdb::{Literal, PathElem, Value};
 use marsdb_graph::PropertyValue;
 
 pub fn print_table(result: &marsdb::QueryResult) {
+    print_stats(&result.stats);
     if result.columns.is_empty() {
         return; // CREATE / DELETE / SET produce no rows to show.
     }
@@ -121,4 +122,38 @@ fn format_literal(l: &Literal) -> String {
         Literal::Null => "null".to_string(),
         Literal::Param(name) => format!("${name}"),
     }
+}
+
+/// One compact line of write counters after a mutating statement --
+/// `(2 nodes created, 1 relationship deleted)` -- and nothing at all
+/// for reads, so query output stays untouched.
+fn print_stats(stats: &marsdb::QueryStats) {
+    if stats.is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |count: u64, singular: &str, plural: &str| {
+        if count > 0 {
+            parts.push(format!(
+                "{count} {}",
+                if count == 1 { singular } else { plural }
+            ));
+        }
+    };
+    push(stats.nodes_created, "node created", "nodes created");
+    push(stats.nodes_deleted, "node deleted", "nodes deleted");
+    push(
+        stats.relationships_created,
+        "relationship created",
+        "relationships created",
+    );
+    push(
+        stats.relationships_deleted,
+        "relationship deleted",
+        "relationships deleted",
+    );
+    push(stats.properties_set, "property set", "properties set");
+    push(stats.labels_added, "label added", "labels added");
+    push(stats.labels_removed, "label removed", "labels removed");
+    println!("({})", parts.join(", "));
 }

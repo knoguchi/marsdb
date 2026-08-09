@@ -733,16 +733,21 @@ impl GraphStore {
     /// returns `GraphError::NodeHasEdges` instead of deleting anything.
     pub fn delete_node(&self, id: NodeId, detach: bool) -> Result<bool, GraphError> {
         let write_txn = self.begin_write()?;
-        let existed = Self::delete_node_in_txn(&write_txn, id, detach)?;
+        let existed = Self::delete_node_in_txn(&write_txn, id, detach)?.is_some();
         write_txn.commit()?;
         Ok(existed)
     }
 
+    /// Returns `None` when the node didn't exist, else
+    /// `Some(incident edges actually deleted)` — the caller-visible
+    /// count a `DETACH DELETE` needs for its statement stats (a
+    /// self-loop appears in both adjacency directions but deletes
+    /// once, so the count comes from the deletions, not the scan).
     pub fn delete_node_in_txn(
         write_txn: &WriteTransaction,
         id: NodeId,
         detach: bool,
-    ) -> Result<bool, GraphError> {
+    ) -> Result<Option<u64>, GraphError> {
         let mut ctx = WriteCtx::open(write_txn);
         let mut incident: Vec<EdgeId> = Vec::new();
         let (lo, hi) = crate::model::adj_node_bounds(id.0);
@@ -759,15 +764,18 @@ impl GraphStore {
         if !incident.is_empty() && !detach {
             return Err(GraphError::NodeHasEdges(id));
         }
+        let mut edges_deleted: u64 = 0;
         for edge_id in incident {
-            Self::delete_edge_ctx(&mut ctx, edge_id)?;
+            if Self::delete_edge_ctx(&mut ctx, edge_id)?.is_some() {
+                edges_deleted += 1;
+            }
         }
         let Some(removed_bytes) = ctx
             .nodes()?
             .remove(id.0)?
             .map(|guard| guard.value().to_vec())
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let record = decode_node(&removed_bytes, |pid| {
             crate::index::resolve_prop_ctx(&mut ctx, pid)
@@ -776,7 +784,7 @@ impl GraphStore {
             ctx.node_label_index()?.remove(label_id, id.0)?;
         }
         crate::index::on_node_deleted(&mut ctx, id.0, &record.label_ids, &record.props)?;
-        Ok(true)
+        Ok(Some(edges_deleted))
     }
 
     /// Declares an index on `(label, prop)`, backfilling it from every
