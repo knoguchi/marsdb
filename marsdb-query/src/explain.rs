@@ -206,16 +206,26 @@ fn explain_match_part(
         // Mirrors the executor's own start-point selection exactly (plain
         // MATCH only, never a named path) so the described plan is the
         // executed plan.
-        let reversed = if part.path_var.is_none() {
-            plan_reversed_pattern(&part.pattern, &part.where_clause, carried_vars, txn)?
+        let plan = if part.path_var.is_none() && !part.optional {
+            crate::planner::plan_edge_scan(&part.pattern, &part.where_clause, carried_vars, txn)?
         } else {
             None
         };
-        let pattern = reversed.as_ref().unwrap_or(&part.pattern);
-        let plan = apply_index_seeks(
-            build_match_plan(pattern, &part.where_clause, carried_vars)?,
-            txn,
-        )?;
+        let plan = match plan {
+            Some(plan) => plan,
+            None => {
+                let reversed = if part.path_var.is_none() {
+                    plan_reversed_pattern(&part.pattern, &part.where_clause, carried_vars, txn)?
+                } else {
+                    None
+                };
+                let pattern = reversed.as_ref().unwrap_or(&part.pattern);
+                apply_index_seeks(
+                    build_match_plan(pattern, &part.where_clause, carried_vars)?,
+                    txn,
+                )?
+            }
+        };
         let header = match (&part.path_var, part.optional) {
             (Some(p), true) => format!("OPTIONAL MATCH p = {p}"),
             (Some(p), false) => format!("MATCH p = {p}"),
@@ -397,6 +407,32 @@ fn format_plan(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::AllNodesScan { var } => out.push(format!("{pad}AllNodesScan({var})")),
         LogicalPlan::NodeByLabelScan { var, label } => {
             out.push(format!("{pad}NodeByLabelScan({var}:{label})"))
+        }
+        LogicalPlan::EdgeTypeScan {
+            src_var,
+            rel_var,
+            dst_var,
+            rel_types,
+            src_label,
+            dst_label,
+            rel_predicate,
+        } => {
+            let types = if rel_types.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", rel_types.join("|"))
+            };
+            let label =
+                |l: &Option<String>| l.as_ref().map(|l| format!(":{l}")).unwrap_or_default();
+            let pred = rel_predicate
+                .as_ref()
+                .map(|p| format!(" [rel filter: {p:?}]"))
+                .unwrap_or_default();
+            out.push(format!(
+                "{pad}EdgeTypeScan(({src_var}{})-[{rel_var}{types}]->({dst_var}{})){pred}",
+                label(src_label),
+                label(dst_label),
+            ));
         }
         LogicalPlan::IndexRangeSeek {
             var,

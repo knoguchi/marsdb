@@ -1180,6 +1180,42 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Resolve a label/relationship-type name to its interned id —
+    /// `None` if never interned. Scan-support API (`EdgeScanCursor`
+    /// consumers pre-resolve type names once per scan).
+    pub fn label_id_for(txn: Txn, name: &str) -> Result<Option<u32>, GraphError> {
+        lookup_label_id(txn, name)
+    }
+
+    /// Header fields `(label_id, src, dst)` of a raw edge record as
+    /// returned by `EdgeScanCursor` — no property decode.
+    pub fn edge_record_header(bytes: &[u8]) -> Result<(u32, u64, u64), GraphError> {
+        edge_header(bytes)
+    }
+
+    /// One property's value from a raw edge record, by interned prop
+    /// id — a directory-entry read from in-hand bytes, no storage
+    /// access. `Ok(None)` = property absent on this edge.
+    pub fn edge_record_prop(
+        bytes: &[u8],
+        prop_id: u32,
+    ) -> Result<Option<PropertyValue>, GraphError> {
+        match crate::encode::edge_prop_raw(bytes, prop_id)? {
+            Some(raw) => Ok(Some(crate::encode::decode_value(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Resumable chunked sweep over the whole `EDGES` table in id
+    /// order — the sequential-scan primitive behind the planner's
+    /// `EdgeTypeScan`. Same demand-driven shape as `IndexRangeCursor`:
+    /// each `next_chunk` re-seeks past the last returned id (O(log n))
+    /// and copies at most `chunk_size` raw records out, so a `LIMIT`ed
+    /// consumer that stops early never pays for the rest of the table.
+    pub fn edge_scan_cursor() -> EdgeScanCursor {
+        EdgeScanCursor { resume_after: None }
+    }
+
     /// Total edge count — O(1) (redb tracks table entry counts), the
     /// edge counterpart of `node_count_in_txn`. Planner cardinality use
     /// only.
@@ -1336,6 +1372,44 @@ impl GraphStore {
             });
         }
         Ok(result)
+    }
+}
+
+/// See `GraphStore::edge_scan_cursor`.
+pub struct EdgeScanCursor {
+    resume_after: Option<u64>,
+}
+
+impl EdgeScanCursor {
+    /// At most `chunk_size` `(edge_id, raw record bytes)` pairs, id
+    /// order, starting after the previous chunk's last id. Empty vec =
+    /// table exhausted.
+    pub fn next_chunk(
+        &mut self,
+        txn: Txn,
+        chunk_size: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, GraphError> {
+        if chunk_size == 0 {
+            return Ok(Vec::new());
+        }
+        let edges = txn.open_table(marsdb_storage::tables::EDGES)?;
+        let mut out = Vec::with_capacity(chunk_size.min(1024));
+        let iter = match self.resume_after {
+            Some(last) => {
+                edges.range::<u64>((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))?
+            }
+            None => edges.iter()?,
+        };
+        for entry in iter {
+            let (id, value) = entry?;
+            let id = id.value();
+            out.push((id, value.value().to_vec()));
+            self.resume_after = Some(id);
+            if out.len() >= chunk_size {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
