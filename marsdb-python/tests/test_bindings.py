@@ -69,6 +69,42 @@ class DatabaseTests(unittest.TestCase):
             [{"label": "Person", "property": "name", "unique": True}],
         )
 
+
+    def test_execute_with_params(self):
+        db = marsdb.Database.in_memory()
+        db.execute(
+            "CREATE (:Person {name: $name, age: $age, score: $score, active: $active, tags: $tags})",
+            {"name": "O'Hara \"Ada\"", "age": 9223372036854775807,
+             "score": 1.5, "active": True, "tags": [1, 2, 3]},
+        )
+        rows = db.execute(
+            "MATCH (p:Person {name: $name}) RETURN p.age, p.score, p.active, p.tags",
+            {"name": "O'Hara \"Ada\""},
+        )
+        self.assertEqual(
+            rows,
+            [{"p.age": 9223372036854775807, "p.score": 1.5,
+              "p.active": True, "p.tags": [1, 2, 3]}],
+        )
+
+    def test_param_errors(self):
+        db = marsdb.Database.in_memory()
+        # Missing param -> engine error, not a crash.
+        with self.assertRaises(RuntimeError):
+            db.execute("RETURN $missing")
+        # Int beyond i64 must raise, never silently truncate.
+        with self.assertRaises(RuntimeError):
+            db.execute("RETURN $x", {"x": 2**63})
+        # Unsupported value type named in the error.
+        with self.assertRaises(RuntimeError) as ctx:
+            db.execute("RETURN $x", {"x": object()})
+        self.assertIn("unsupported parameter type", str(ctx.exception))
+
+    def test_map_valued_param(self):
+        db = marsdb.Database.in_memory()
+        rows = db.execute("RETURN $m.city AS city", {"m": {"city": "Kyoto"}})
+        self.assertEqual(rows, [{"city": "Kyoto"}])
+
     def test_list_valued_node_property_round_trips(self):
         # A stored PropertyValue::List (real Cypher/Neo4j's own
         # "homogeneous array property" shape), not the query-layer-only

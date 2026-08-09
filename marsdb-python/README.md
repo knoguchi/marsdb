@@ -29,6 +29,22 @@ for row in db.execute("MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name"):
 `execute` runs one Cypher statement and returns a `list` of `dict`s, one
 per result row, keyed by column name.
 
+## Parameterized queries
+
+`execute` takes an optional `params` dict resolving `$name` placeholders
+— no string interpolation, no escaping bugs:
+
+```python
+db.execute(
+    "MATCH (p:Person {name: $name}) RETURN p.age",
+    {"name": "O'Hara"},
+)
+```
+
+Values may be `None`/`bool`/`int`/`float`/`str`, or nested `list`/`dict`
+of those. Ints keep their full 64-bit range; an int outside i64 raises
+instead of truncating. Map-valued params work (`$m.city`).
+
 ## Value mapping
 
 | Cypher | Python |

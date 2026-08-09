@@ -37,6 +37,17 @@ void marsdb_close(MarsdbDatabase *db);
  */
 MarsdbResult marsdb_execute(MarsdbDatabase *db, const char *cypher);
 
+/* Run one Cypher statement with $name placeholders resolved from
+ * params_json, a JSON object mapping parameter names to values:
+ *   {"name": "Alice", "age": 42, "tags": [1, 2]}
+ * Same result contract as marsdb_execute. NULL params_json means no
+ * parameters. JSON numbers: integral -> i64 (full 64-bit range
+ * preserved), fractional -> f64; a number outside both exact ranges is
+ * an error, never a silent precision loss. Arrays/objects become Cypher
+ * list/map parameter values. */
+MarsdbResult marsdb_execute_with_params(MarsdbDatabase *db, const char *cypher,
+                                        const char *params_json);
+
 /* Frees a string returned in MarsdbResult.json or MarsdbResult.error.
  * Required — these are allocated by Rust's global allocator, not malloc. */
 void marsdb_free_string(char *s);

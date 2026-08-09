@@ -27,9 +27,34 @@ impl Database {
 
     /// Run one Cypher statement, returning a list of dicts (column name ->
     /// value) — one dict per matched row. `CREATE`/`DELETE`/`SET`
-    /// statements return an empty list.
-    fn execute<'py>(&self, py: Python<'py>, cypher: &str) -> PyResult<Bound<'py, PyList>> {
-        let result = self.inner.execute(cypher).map_err(to_py_err)?;
+    /// statements return an empty list. `params`, when given, resolves
+    /// `$name` placeholders: values may be None/bool/int/float/str, or
+    /// (arbitrarily nested) lists and dicts of those. Ints keep their
+    /// full 64-bit range; an int outside i64 raises.
+    #[pyo3(signature = (cypher, params = None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: &str,
+        params: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let result = match params {
+            None => self.inner.execute(cypher).map_err(to_py_err)?,
+            Some(dict) => {
+                let mut converted = std::collections::HashMap::new();
+                for (key, value) in dict.iter() {
+                    let name: String = key.extract().map_err(|_| {
+                        PyRuntimeError::new_err("parameter names must be strings")
+                    })?;
+                    let prop = py_to_property(&value)
+                        .map_err(|e| PyRuntimeError::new_err(format!("parameter '{name}': {e}")))?;
+                    converted.insert(name, prop);
+                }
+                self.inner
+                    .execute_with_params(cypher, &converted)
+                    .map_err(to_py_err)?
+            }
+        };
         let rows = PyList::empty(py);
         for row in &result.rows {
             let dict = PyDict::new(py);
@@ -40,6 +65,56 @@ impl Database {
         }
         Ok(rows)
     }
+}
+
+/// Python -> `PropertyValue` for `$param` values — the inverse of the
+/// output mapping (`property_to_py`), minus temporal types (pass those
+/// as ISO strings and construct with `date($p)`/`duration($p)` in the
+/// query). `bool` is checked before `int`: Python's `bool` IS an `int`
+/// subclass, and an `extract::<i64>` on `True` would happily produce 1.
+fn py_to_property(value: &Bound<'_, PyAny>) -> Result<::marsdb::PropertyValue, String> {
+    use ::marsdb::PropertyValue;
+    if value.is_none() {
+        return Ok(PropertyValue::Null);
+    }
+    if let Ok(b) = value.extract::<bool>() {
+        return Ok(PropertyValue::Bool(b));
+    }
+    if value.is_instance_of::<pyo3::types::PyInt>() {
+        return value
+            .extract::<i64>()
+            .map(PropertyValue::Int)
+            .map_err(|_| "int is outside the 64-bit signed range".to_string());
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        if value.is_instance_of::<pyo3::types::PyFloat>() {
+            return Ok(PropertyValue::Float(f));
+        }
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(PropertyValue::String(s));
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        let items: Result<Vec<_>, _> = list.iter().map(|item| py_to_property(&item)).collect();
+        return Ok(PropertyValue::List(items?));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut map = std::collections::BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k
+                .extract()
+                .map_err(|_| "map keys must be strings".to_string())?;
+            map.insert(key, py_to_property(&v)?);
+        }
+        return Ok(PropertyValue::Map(map));
+    }
+    Err(format!(
+        "unsupported parameter type {} -- use None/bool/int/float/str or nested list/dict",
+        value.get_type().name().map_or_else(
+            |_| "<unknown>".to_string(),
+            |n| n.to_string()
+        )
+    ))
 }
 
 fn to_py_err(e: ::marsdb::Error) -> PyErr {

@@ -125,6 +125,108 @@ pub unsafe extern "C" fn marsdb_execute(
     }
 }
 
+/// Run one Cypher statement with `$name` placeholders resolved from
+/// `params_json`, a JSON object mapping parameter names to values:
+/// `{"name": "Alice", "age": 42, "tags": [1, 2], "addr": {"city": "..."}}`.
+/// Same result contract as `marsdb_execute`. NULL `params_json` behaves
+/// exactly like `marsdb_execute` (no parameters).
+///
+/// Value mapping: JSON null/bool/string map directly; a number is an i64
+/// when it parses as one (full 64-bit range preserved — emit integers
+/// without a decimal point to keep them integral) and an f64 otherwise;
+/// arrays/objects become Cypher list/map parameter values. A number
+/// outside both i64 and f64 exact ranges (e.g. a u64 above i64::MAX) is
+/// an error rather than a silent precision loss.
+///
+/// # Safety
+/// `db` must be NULL or a live MarsDB handle; `cypher` and `params_json`
+/// must each be NULL or point to a valid NUL-terminated byte string for
+/// the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn marsdb_execute_with_params(
+    db: *mut MarsdbDatabase,
+    cypher: *const c_char,
+    params_json: *const c_char,
+) -> MarsdbResult {
+    if db.is_null() || cypher.is_null() {
+        return MarsdbResult::err("null db or cypher pointer");
+    }
+    let cypher = match unsafe { CStr::from_ptr(cypher) }.to_str() {
+        Ok(c) => c,
+        Err(e) => return MarsdbResult::err(format!("cypher is not valid UTF-8: {e}")),
+    };
+    let params = if params_json.is_null() {
+        std::collections::HashMap::new()
+    } else {
+        let raw = match unsafe { CStr::from_ptr(params_json) }.to_str() {
+            Ok(p) => p,
+            Err(e) => return MarsdbResult::err(format!("params is not valid UTF-8: {e}")),
+        };
+        match parse_params(raw) {
+            Ok(p) => p,
+            Err(e) => return MarsdbResult::err(e),
+        }
+    };
+    let db = unsafe { &*db };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.inner.execute_with_params(cypher, &params)
+    })) {
+        Ok(Ok(result)) => MarsdbResult::ok(result_to_json(&result)),
+        Ok(Err(e)) => MarsdbResult::err(e),
+        Err(_) => MarsdbResult::err("internal panic while executing query"),
+    }
+}
+
+fn parse_params(raw: &str) -> Result<std::collections::HashMap<String, PropertyValue>, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("params is not valid JSON: {e}"))?;
+    let serde_json::Value::Object(object) = parsed else {
+        return Err("params must be a JSON object mapping parameter names to values".into());
+    };
+    object
+        .into_iter()
+        .map(|(name, value)| {
+            let converted =
+                json_to_property(value).map_err(|e| format!("parameter '{name}': {e}"))?;
+            Ok((name, converted))
+        })
+        .collect()
+}
+
+fn json_to_property(value: serde_json::Value) -> Result<PropertyValue, String> {
+    Ok(match value {
+        serde_json::Value::Null => PropertyValue::Null,
+        serde_json::Value::Bool(b) => PropertyValue::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                PropertyValue::Int(i)
+            } else if n.is_u64() {
+                // An integral value above i64::MAX. `as_f64` would happily
+                // hand back a lossy approximation -- checked before the
+                // float branch precisely so that can't happen silently.
+                return Err(format!("integer {n} exceeds the i64 range"));
+            } else if let Some(f) = n.as_f64() {
+                PropertyValue::Float(f)
+            } else {
+                return Err(format!("number {n} is not representable"));
+            }
+        }
+        serde_json::Value::String(s) => PropertyValue::String(s),
+        serde_json::Value::Array(items) => PropertyValue::List(
+            items
+                .into_iter()
+                .map(json_to_property)
+                .collect::<Result<_, _>>()?,
+        ),
+        serde_json::Value::Object(entries) => PropertyValue::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| Ok((k, json_to_property(v)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
+}
+
 /// Frees a string previously returned in `MarsdbResult.json` or
 /// `MarsdbResult.error`. The caller MUST NOT free these with anything
 /// other than this function — they were allocated by Rust's global
@@ -422,6 +524,64 @@ mod tests {
         assert!(!db.is_null());
         let invalid_utf8 = [0xff_u8, 0];
         let result = unsafe { marsdb_execute(db, invalid_utf8.as_ptr().cast()) };
+        assert!(result.json.is_null());
+        assert!(!result.error.is_null());
+        unsafe {
+            marsdb_free_string(result.error);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn execute_with_params_substitutes_and_preserves_types() {
+        let db = marsdb_open_in_memory();
+        let cypher = CString::new(
+            "RETURN $big AS big, $f AS f, $s AS s, $flag AS flag, $nothing AS nothing, \
+             $tags AS tags, $addr AS addr",
+        )
+        .unwrap();
+        let params = CString::new(
+            r#"{"big": 9223372036854775807, "f": 1.5, "s": "it's \"quoted\"", "flag": true,
+                "nothing": null, "tags": [1, 2], "addr": {"city": "Kyoto"}}"#,
+        )
+        .unwrap();
+        let result = unsafe { marsdb_execute_with_params(db, cypher.as_ptr(), params.as_ptr()) };
+        assert!(result.error.is_null());
+        let json = unsafe { CStr::from_ptr(result.json) }.to_str().unwrap();
+        assert!(json.contains("9223372036854775807"), "{json}");
+        assert!(json.contains("1.5"), "{json}");
+        assert!(json.contains(r#""it's \"quoted\"""#), "{json}");
+        assert!(json.contains("true"), "{json}");
+        assert!(json.contains("null"), "{json}");
+        assert!(json.contains("[1,2]"), "{json}");
+        assert!(json.contains(r#"{"city":"Kyoto"}"#), "{json}");
+        unsafe {
+            marsdb_free_string(result.json);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn execute_with_params_rejects_bad_params() {
+        let db = marsdb_open_in_memory();
+        let cypher = CString::new("RETURN $x AS x").unwrap();
+
+        // Not an object.
+        let params = CString::new("[1, 2]").unwrap();
+        let result = unsafe { marsdb_execute_with_params(db, cypher.as_ptr(), params.as_ptr()) };
+        let message = unsafe { CStr::from_ptr(result.error) }.to_str().unwrap();
+        assert!(message.contains("must be a JSON object"), "{message}");
+        unsafe { marsdb_free_string(result.error) };
+
+        // A u64 above i64::MAX must error, not silently lose precision.
+        let params = CString::new(r#"{"x": 18446744073709551615}"#).unwrap();
+        let result = unsafe { marsdb_execute_with_params(db, cypher.as_ptr(), params.as_ptr()) };
+        let message = unsafe { CStr::from_ptr(result.error) }.to_str().unwrap();
+        assert!(message.contains("parameter 'x'"), "{message}");
+        unsafe { marsdb_free_string(result.error) };
+
+        // Missing parameter surfaces the engine's own error.
+        let result = unsafe { marsdb_execute_with_params(db, cypher.as_ptr(), std::ptr::null()) };
         assert!(result.json.is_null());
         assert!(!result.error.is_null());
         unsafe {
