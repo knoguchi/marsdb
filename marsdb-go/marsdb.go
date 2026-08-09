@@ -71,6 +71,20 @@ func (db *Database) Close() error {
 type queryResult struct {
 	Columns []string `json:"columns"`
 	Rows    [][]any  `json:"rows"`
+	Stats   Stats    `json:"stats"`
+}
+
+// Stats reports what a write statement changed — all zero for reads.
+// properties_set counts removals too (removing a property is setting it
+// away); label changes are their own pair.
+type Stats struct {
+	NodesCreated         uint64 `json:"nodes_created"`
+	NodesDeleted         uint64 `json:"nodes_deleted"`
+	RelationshipsCreated uint64 `json:"relationships_created"`
+	RelationshipsDeleted uint64 `json:"relationships_deleted"`
+	PropertiesSet        uint64 `json:"properties_set"`
+	LabelsAdded          uint64 `json:"labels_added"`
+	LabelsRemoved        uint64 `json:"labels_removed"`
 }
 
 // Execute runs one Cypher statement, returning one map[string]any per
@@ -113,6 +127,21 @@ func (db *Database) ExecuteWithParams(cypher string, params map[string]any) ([]m
 type Options struct {
 	MaxRows uint64
 	Timeout time.Duration
+}
+
+// ExecuteStats is Execute plus the statement's write counters — the
+// answer to "how many did my DELETE delete".
+func (db *Database) ExecuteStats(cypher string, params map[string]any) ([]map[string]any, Stats, error) {
+	var encoded []byte
+	if params != nil {
+		var err error
+		encoded, err = json.Marshal(params)
+		if err != nil {
+			return nil, Stats{}, errors.New("marsdb: params not JSON-encodable: " + err.Error())
+		}
+	}
+	rows, stats, err := db.executeDecodeStats(cypher, encoded)
+	return rows, stats, err
 }
 
 // ExecuteWithOptions runs one Cypher statement with $name parameters
@@ -169,10 +198,33 @@ func (db *Database) executeOpts(cypher string, paramsJSON []byte, opts Options) 
 	return db.decode(result)
 }
 
+func (db *Database) executeDecodeStats(cypher string, paramsJSON []byte) ([]map[string]any, Stats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.ptr == nil {
+		return nil, Stats{}, errors.New("marsdb: database is closed")
+	}
+	cCypher := C.CString(cypher)
+	defer C.free(unsafe.Pointer(cCypher))
+
+	var cParams *C.char
+	if paramsJSON != nil {
+		cParams = C.CString(string(paramsJSON))
+		defer C.free(unsafe.Pointer(cParams))
+	}
+	result := C.marsdb_execute_with_params(db.ptr, cCypher, cParams)
+	return db.decodeStats(result)
+}
+
 func (db *Database) decode(result C.MarsdbResult) ([]map[string]any, error) {
+	rows, _, err := db.decodeStats(result)
+	return rows, err
+}
+
+func (db *Database) decodeStats(result C.MarsdbResult) ([]map[string]any, Stats, error) {
 	if result.error != nil {
 		defer C.marsdb_free_string(result.error)
-		return nil, errors.New("marsdb: " + C.GoString(result.error))
+		return nil, Stats{}, errors.New("marsdb: " + C.GoString(result.error))
 	}
 	defer C.marsdb_free_string(result.json)
 
@@ -181,7 +233,7 @@ func (db *Database) decode(result C.MarsdbResult) ([]map[string]any, error) {
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&qr); err != nil {
-		return nil, errors.New("marsdb: malformed result JSON: " + err.Error())
+		return nil, Stats{}, errors.New("marsdb: malformed result JSON: " + err.Error())
 	}
 
 	rows := make([]map[string]any, len(qr.Rows))
@@ -191,14 +243,14 @@ func (db *Database) decode(result C.MarsdbResult) ([]map[string]any, error) {
 			if j < len(row) {
 				value, err := normalizeJSONNumbers(row[j])
 				if err != nil {
-					return nil, errors.New("marsdb: malformed result number: " + err.Error())
+					return nil, Stats{}, errors.New("marsdb: malformed result number: " + err.Error())
 				}
 				m[col] = value
 			}
 		}
 		rows[i] = m
 	}
-	return rows, nil
+	return rows, qr.Stats, nil
 }
 
 // normalizeJSONNumbers recursively converts the json.Number values produced

@@ -22,7 +22,7 @@ pub use marsdb_graph::TzId;
 pub use marsdb_query::{
     temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Literal, PathElem, ProcedureProvider, ProcedureSignature, Procedures,
-    QueryError, QueryResult, Value,
+    QueryError, QueryResult, QueryStats, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -175,10 +175,7 @@ impl Database {
         stmt: &Statement,
         options: &ExecutionOptions,
     ) -> Result<QueryResult, Error> {
-        let empty = || QueryResult {
-            columns: vec![],
-            rows: vec![],
-        };
+        let empty = QueryResult::default;
         {
             let mut session = self
                 .session_txn

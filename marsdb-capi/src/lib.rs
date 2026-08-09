@@ -320,7 +320,23 @@ fn result_to_json(result: &QueryResult) -> String {
         }
         out.push(']');
     }
-    out.push_str("]}");
+    out.push(']');
+    // Write-statement counters -- omitted entirely for pure reads so
+    // read-heavy consumers don't pay for keys that are always zero.
+    let stats = &result.stats;
+    if !stats.is_empty() {
+        out.push_str(&format!(
+            ",\"stats\":{{\"nodes_created\":{},\"nodes_deleted\":{},\"relationships_created\":{},\"relationships_deleted\":{},\"properties_set\":{},\"labels_added\":{},\"labels_removed\":{}}}",
+            stats.nodes_created,
+            stats.nodes_deleted,
+            stats.relationships_created,
+            stats.relationships_deleted,
+            stats.properties_set,
+            stats.labels_added,
+            stats.labels_removed,
+        ));
+    }
+    out.push('}');
     out
 }
 

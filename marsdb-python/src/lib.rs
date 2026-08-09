@@ -88,6 +88,47 @@ impl Database {
         max_rows: Option<usize>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Bound<'py, PyList>> {
+        let result = self.run(cypher, params, max_rows, timeout_ms)?;
+        rows_to_py(py, &result)
+    }
+
+    /// `execute` plus the statement's write counters — the answer to
+    /// "how many did my DELETE delete". Returns `(rows, stats)` where
+    /// `stats` is a dict with `nodes_created`, `nodes_deleted`,
+    /// `relationships_created`, `relationships_deleted`,
+    /// `properties_set`, `labels_added`, `labels_removed` — all zero
+    /// for read-only statements.
+    #[pyo3(signature = (cypher, params = None, max_rows = None, timeout_ms = None))]
+    fn execute_with_stats<'py>(
+        &self,
+        py: Python<'py>,
+        cypher: &str,
+        params: Option<&Bound<'py, PyDict>>,
+        max_rows: Option<usize>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
+        let result = self.run(cypher, params, max_rows, timeout_ms)?;
+        let stats = PyDict::new(py);
+        let s = &result.stats;
+        stats.set_item("nodes_created", s.nodes_created)?;
+        stats.set_item("nodes_deleted", s.nodes_deleted)?;
+        stats.set_item("relationships_created", s.relationships_created)?;
+        stats.set_item("relationships_deleted", s.relationships_deleted)?;
+        stats.set_item("properties_set", s.properties_set)?;
+        stats.set_item("labels_added", s.labels_added)?;
+        stats.set_item("labels_removed", s.labels_removed)?;
+        Ok((rows_to_py(py, &result)?, stats))
+    }
+}
+
+impl Database {
+    fn run(
+        &self,
+        cypher: &str,
+        params: Option<&Bound<'_, PyDict>>,
+        max_rows: Option<usize>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<::marsdb::QueryResult> {
         let mut converted = std::collections::HashMap::new();
         if let Some(dict) = params {
             for (key, value) in dict.iter() {
@@ -102,20 +143,25 @@ impl Database {
         let mut options = ::marsdb::ExecutionOptions::default();
         options.max_result_rows = max_rows;
         options.timeout = timeout_ms.map(std::time::Duration::from_millis);
-        let result = self
-            .inner
+        self.inner
             .execute_with_params_and_options(cypher, &converted, &options)
-            .map_err(to_py_err)?;
-        let rows = PyList::empty(py);
-        for row in &result.rows {
-            let dict = PyDict::new(py);
-            for (col, value) in result.columns.iter().zip(row.iter()) {
-                dict.set_item(col, value_to_py(py, value)?)?;
-            }
-            rows.append(dict)?;
-        }
-        Ok(rows)
+            .map_err(to_py_err)
     }
+}
+
+fn rows_to_py<'py>(
+    py: Python<'py>,
+    result: &::marsdb::QueryResult,
+) -> PyResult<Bound<'py, PyList>> {
+    let rows = PyList::empty(py);
+    for row in &result.rows {
+        let dict = PyDict::new(py);
+        for (col, value) in result.columns.iter().zip(row.iter()) {
+            dict.set_item(col, value_to_py(py, value)?)?;
+        }
+        rows.append(dict)?;
+    }
+    Ok(rows)
 }
 
 /// Python -> `PropertyValue` for `$param` values — the inverse of the
