@@ -34,6 +34,41 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0]["p"]["labels"], ["Person"])
         self.assertEqual(rows[0]["p"]["props"], {"name": "Ada"})
 
+    def test_transaction_statements(self):
+        db = marsdb.Database.in_memory()
+        db.execute("BEGIN")
+        db.execute("CREATE (:N)")
+        # Reads inside the transaction see its own uncommitted writes.
+        self.assertEqual(len(db.execute("MATCH (n:N) RETURN n")), 1)
+        db.execute("ROLLBACK")
+        self.assertEqual(db.execute("MATCH (n:N) RETURN n"), [])
+        db.execute("BEGIN TRANSACTION")
+        db.execute("CREATE (:N)")
+        db.execute("COMMIT")
+        self.assertEqual(len(db.execute("MATCH (n:N) RETURN n")), 1)
+
+    def test_schema_introspection_procedures(self):
+        db = marsdb.Database.in_memory()
+        db.execute("CREATE INDEX ON :Person(name) UNIQUE")
+        db.execute("CREATE (a:Person {name: 'Ada'})-[:KNOWS {since: 1980}]->(b:Person {name: 'Lin'})")
+
+        self.assertEqual(
+            db.execute("CALL db.labels()"),
+            [{"label": "Person", "count": 2}],
+        )
+        self.assertEqual(
+            db.execute("CALL db.relationshipTypes()"),
+            [{"relationshipType": "KNOWS", "count": 1}],
+        )
+        self.assertEqual(
+            db.execute("CALL db.propertyKeys()"),
+            [{"propertyKey": "name"}, {"propertyKey": "since"}],
+        )
+        self.assertEqual(
+            db.execute("CALL db.indexes()"),
+            [{"label": "Person", "property": "name", "unique": True}],
+        )
+
     def test_list_valued_node_property_round_trips(self):
         # A stored PropertyValue::List (real Cypher/Neo4j's own
         # "homogeneous array property" shape), not the query-layer-only

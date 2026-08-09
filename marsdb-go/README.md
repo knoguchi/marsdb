@@ -107,6 +107,31 @@ their full precision as `int64` (or `uint64` for an ID above `int64`'s range),
 while fractional values are `float64`. Dates and durations are returned as
 canonical ISO-8601 strings such as `"1984-10-11"` and `"P1M2D"`.
 
+## Transactions
+
+`BEGIN` / `COMMIT` / `ROLLBACK` are ordinary statements (`BEGIN
+TRANSACTION` also accepted), so they work through `Execute` with nothing
+binding-specific. One session per database handle; reads inside a
+transaction see its own uncommitted writes; a statement that fails at
+execution time rolls the whole transaction back.
+
+```go
+db.Execute("BEGIN")
+db.Execute("CREATE (:Account {id: 1, balance: 100})")
+db.Execute("CREATE (:Account {id: 2, balance: 0})")
+db.Execute("COMMIT") // or ROLLBACK to discard both
+```
+
+## Schema introspection
+
+```go
+rows, _ := db.Execute("CALL db.labels()")
+// [{label: Person, count: 2}]
+rows, _ = db.Execute("CALL db.relationshipTypes()") // relationshipType, count
+rows, _ = db.Execute("CALL db.propertyKeys()")      // propertyKey
+rows, _ = db.Execute("CALL db.indexes()")           // label, property, unique
+```
+
 ## What's not here yet
 
 Only `Open`/`InMemory`/`Execute`/`Close` — `execute_batch` (multi-statement,

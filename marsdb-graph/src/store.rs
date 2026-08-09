@@ -1063,6 +1063,86 @@ impl GraphStore {
         Ok(count)
     }
 
+    /// Every interned name currently carried by at least one node, as
+    /// `(label, node count)` sorted by label — the substance behind
+    /// `CALL db.labels()`. Node labels and relationship types share one
+    /// intern namespace (`intern_label` serves both), so membership here
+    /// is decided by live *use* (a nonzero label-index count), not by
+    /// interning: a name whose nodes were all deleted drops out, same as
+    /// a name only ever used as a relationship type never appears.
+    /// O(interned names), each with an O(1) count read.
+    pub fn list_node_labels_in_txn(txn: Txn) -> Result<Vec<(String, u64)>, GraphError> {
+        let l2i = txn.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
+        let index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
+        let mut out = Vec::new();
+        for entry in l2i.iter()? {
+            let (name, id) = entry?;
+            let count = index.get(id.value())?.len();
+            if count > 0 {
+                out.push((name.value().to_string(), count));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Relationship-type counterpart of `list_node_labels_in_txn`:
+    /// `(type, live edge count)` sorted by type, counts from
+    /// `REL_TYPE_COUNTS`. Same live-use membership rule.
+    pub fn list_rel_types_in_txn(txn: Txn) -> Result<Vec<(String, u64)>, GraphError> {
+        let l2i = txn.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
+        let counts = txn.open_table(marsdb_storage::tables::REL_TYPE_COUNTS)?;
+        let mut out = Vec::new();
+        for entry in l2i.iter()? {
+            let (name, id) = entry?;
+            let count = counts.get(id.value())?.map(|g| g.value()).unwrap_or(0);
+            if count > 0 {
+                out.push((name.value().to_string(), count));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every interned property name, sorted — `CALL db.propertyKeys()`.
+    /// Interning is permanent (there is no un-intern on last use, unlike
+    /// the liveness rule above, which has cheap per-name counts to
+    /// consult), so this lists every key that has ever appeared.
+    pub fn list_property_keys_in_txn(txn: Txn) -> Result<Vec<String>, GraphError> {
+        let p2i = txn.open_table(marsdb_storage::tables::PROP_TO_ID)?;
+        let mut out = Vec::new();
+        for entry in p2i.iter()? {
+            let (name, _) = entry?;
+            out.push(name.value().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Every declared index as `(label, property, unique)` —
+    /// `CALL db.indexes()`. Full `INDEX_DEFS` scan; the number of
+    /// declared indexes is small by nature.
+    pub fn list_indexes_in_txn(txn: Txn) -> Result<Vec<(String, String, bool)>, GraphError> {
+        let mut resolve_prop = prop_resolver(txn)?;
+        let defs = txn.open_table(marsdb_storage::tables::INDEX_DEFS)?;
+        let mut out = Vec::new();
+        for entry in defs.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            let label_id = u32::from_be_bytes(key_bytes[0..4].try_into().map_err(|_| {
+                GraphError::CorruptData("index key prefix shorter than 8 bytes".into())
+            })?);
+            let prop_id = u32::from_be_bytes(key_bytes[4..8].try_into().map_err(|_| {
+                GraphError::CorruptData("index key prefix shorter than 8 bytes".into())
+            })?);
+            let def: crate::IndexDef = postcard::from_bytes(value.value())
+                .map_err(|e| GraphError::CorruptData(format!("undecodable index def: {e}")))?;
+            out.push((
+                resolve_label(txn, label_id)?,
+                resolve_prop(prop_id)?,
+                def.unique,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Total edge count — O(1) (redb tracks table entry counts), the
     /// edge counterpart of `node_count_in_txn`. Planner cardinality use
     /// only.
