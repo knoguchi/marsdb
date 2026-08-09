@@ -16,7 +16,7 @@ pub use txn::{MultimapTableHandle, TableHandle, Txn};
 // dependency of their own.
 pub use redb::{
     MultimapTableDefinition, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
-    ReadableTable, TableDefinition, WriteTransaction,
+    ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
 
 use std::fs::OpenOptions;
@@ -110,6 +110,7 @@ impl StorageEngine {
             write_txn.open_table(tables::EDGES)?;
             write_txn.open_table(tables::ADJ_OUT)?;
             write_txn.open_table(tables::ADJ_IN)?;
+            write_txn.open_table(tables::REL_TYPE_COUNTS)?;
             write_txn.open_multimap_table(tables::NODE_LABEL_INDEX)?;
             write_txn.open_table(tables::PROP_TO_ID)?;
             write_txn.open_table(tables::ID_TO_PROP)?;
@@ -182,6 +183,7 @@ impl StorageEngine {
             copy_table!(tables::EDGES);
             copy_table!(tables::ADJ_OUT);
             copy_table!(tables::ADJ_IN);
+            copy_table!(tables::REL_TYPE_COUNTS);
             copy_multimap!(tables::NODE_LABEL_INDEX);
             copy_table!(tables::PROP_TO_ID);
             copy_table!(tables::ID_TO_PROP);

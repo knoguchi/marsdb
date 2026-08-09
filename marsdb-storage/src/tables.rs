@@ -33,6 +33,16 @@ pub const ADJ_OUT: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new(
 /// Incoming mirror of `ADJ_OUT`: `dst ++ label ++ edge` -> src node_id.
 pub const ADJ_IN: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new("adj_in");
 
+/// label_id -> number of live edges of that relationship type. Planner
+/// statistic only (the expand-cost half of start-point reversal — see
+/// `plan_reversed_pattern`), never consulted to answer a query, so a
+/// wrong value can cost a suboptimal plan but never a wrong result.
+/// Maintained by the only two places an edge is born or dies
+/// (`create_edge_ctx`/`delete_edge_ctx`), and rebuilt from a one-time
+/// `EDGES` scan at open for files that predate the table
+/// (`GraphStore::backfill_rel_type_counts`).
+pub const REL_TYPE_COUNTS: TableDefinition<u32, u64> = TableDefinition::new("rel_type_counts");
+
 /// label_id -> set of node_ids carrying that label. Secondary index so a
 /// label-filtered scan (`NodeByLabelScan`) can look up matching nodes
 /// directly instead of scanning every row in `NODES`.
