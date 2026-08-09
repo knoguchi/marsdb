@@ -5,6 +5,7 @@ use clap::Parser;
 use marsdb::Database;
 
 mod format;
+mod meta;
 mod nl;
 mod repl;
 

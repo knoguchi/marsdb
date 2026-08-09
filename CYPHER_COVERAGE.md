@@ -267,6 +267,23 @@ in code.
 
 Not yet supported: `CREATE CONSTRAINT`, composite indexes, range scans.
 
+## Schema introspection
+
+Built-in procedures (reserved `db.*` names, not shadowable by an
+embedder's `ProcedureProvider`):
+
+- `CALL db.labels()` → `label, count` — node labels carried by ≥1 node
+- `CALL db.relationshipTypes()` → `relationshipType, count` — types with
+  ≥1 live edge
+- `CALL db.propertyKeys()` → `propertyKey` — every key ever interned
+- `CALL db.indexes()` → `label, property, unique`
+
+The `count` columns are a MarsDB extension over the conventional
+single-column shapes (the O(1) statistics behind them make them free);
+`YIELD label` alone still works. The CLI REPL fronts these as sqlite-
+style meta commands: `.schema`, `.labels`, `.types`, `.props`,
+`.indexes`, `.help`.
+
 ## Transactions
 
 `BEGIN` (alias: `BEGIN TRANSACTION`) / `COMMIT` / `ROLLBACK` as statements — a MarsDB extension

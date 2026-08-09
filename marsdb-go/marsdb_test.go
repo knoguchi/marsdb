@@ -165,6 +165,88 @@ func TestExecuteErrorSurfacesAsGoError(t *testing.T) {
 	}
 }
 
+func TestTransactionStatements(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	mustExec := func(cypher string) {
+		t.Helper()
+		if _, err := db.Execute(cypher); err != nil {
+			t.Fatalf("Execute(%q): %v", cypher, err)
+		}
+	}
+	countNodes := func() int {
+		t.Helper()
+		rows, err := db.Execute("MATCH (n:N) RETURN n")
+		if err != nil {
+			t.Fatalf("count query: %v", err)
+		}
+		return len(rows)
+	}
+
+	mustExec("BEGIN")
+	mustExec("CREATE (:N)")
+	// Reads inside the transaction see its own uncommitted writes.
+	if got := countNodes(); got != 1 {
+		t.Fatalf("expected 1 node inside transaction, got %d", got)
+	}
+	mustExec("ROLLBACK")
+	if got := countNodes(); got != 0 {
+		t.Fatalf("expected rollback to discard the node, got %d", got)
+	}
+	mustExec("BEGIN TRANSACTION")
+	mustExec("CREATE (:N)")
+	mustExec("COMMIT")
+	if got := countNodes(); got != 1 {
+		t.Fatalf("expected 1 node after commit, got %d", got)
+	}
+}
+
+func TestSchemaIntrospectionProcedures(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	for _, cypher := range []string{
+		"CREATE INDEX ON :Person(name) UNIQUE",
+		"CREATE (a:Person {name: 'Ada'})-[:KNOWS {since: 1980}]->(b:Person {name: 'Lin'})",
+	} {
+		if _, err := db.Execute(cypher); err != nil {
+			t.Fatalf("Execute(%q): %v", cypher, err)
+		}
+	}
+
+	labels, err := db.Execute("CALL db.labels()")
+	if err != nil {
+		t.Fatalf("db.labels(): %v", err)
+	}
+	if len(labels) != 1 || labels[0]["label"] != "Person" || labels[0]["count"] != int64(2) {
+		t.Fatalf("unexpected labels: %+v", labels)
+	}
+
+	types, err := db.Execute("CALL db.relationshipTypes()")
+	if err != nil {
+		t.Fatalf("db.relationshipTypes(): %v", err)
+	}
+	if len(types) != 1 || types[0]["relationshipType"] != "KNOWS" || types[0]["count"] != int64(1) {
+		t.Fatalf("unexpected relationship types: %+v", types)
+	}
+
+	indexes, err := db.Execute("CALL db.indexes()")
+	if err != nil {
+		t.Fatalf("db.indexes(): %v", err)
+	}
+	if len(indexes) != 1 || indexes[0]["label"] != "Person" ||
+		indexes[0]["property"] != "name" || indexes[0]["unique"] != true {
+		t.Fatalf("unexpected indexes: %+v", indexes)
+	}
+}
+
 func TestExecuteWithParams(t *testing.T) {
 	db, err := InMemory()
 	if err != nil {
