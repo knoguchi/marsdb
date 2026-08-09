@@ -1,6 +1,48 @@
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+
+// PEP 249-inspired exception hierarchy (the useful subset, not the
+// ceremony): everything raised by MarsDB derives from `marsdb.Error`, so
+// `except marsdb.Error` catches all of it, and the subclasses expose the
+// engine's own error taxonomy (`QueryError`/`GraphError` variants) that
+// the old flat RuntimeError threw away — programs can catch selectively
+// instead of string-matching messages.
+pyo3::create_exception!(
+    marsdb,
+    Error,
+    pyo3::exceptions::PyException,
+    "Base class for every MarsDB error."
+);
+pyo3::create_exception!(
+    marsdb,
+    ProgrammingError,
+    Error,
+    "The query itself is at fault: syntax error, semantic error, unbound \
+     variable, missing $parameter, or misuse of an API (e.g. COMMIT with \
+     no open transaction)."
+);
+pyo3::create_exception!(
+    marsdb,
+    DataError,
+    Error,
+    "A value's type or range is at fault: arithmetic on a non-number, \
+     integer overflow, an unstorable parameter value."
+);
+pyo3::create_exception!(
+    marsdb,
+    OperationalError,
+    Error,
+    "The operation failed for runtime reasons outside the query text: \
+     timeout, cancellation, a resource limit (max_rows), storage-level \
+     failure, or a closed/timed-out transaction."
+);
+pyo3::create_exception!(
+    marsdb,
+    IntegrityError,
+    Error,
+    "A graph integrity rule rejected the write: unique-index violation, \
+     or deleting a node that still has relationships without DETACH."
+);
 
 /// A MarsDB database: either a single on-disk file or a transient
 /// in-memory instance.
@@ -31,30 +73,39 @@ impl Database {
     /// `$name` placeholders: values may be None/bool/int/float/str, or
     /// (arbitrarily nested) lists and dicts of those. Ints keep their
     /// full 64-bit range; an int outside i64 raises.
-    #[pyo3(signature = (cypher, params = None))]
+    ///
+    /// `max_rows` bounds the result: exceeding it raises
+    /// `OperationalError` *during* evaluation — the query never
+    /// materializes an unbounded result first, so a runaway query can't
+    /// OOM the process. `timeout_ms` similarly bounds wall time
+    /// (checked cooperatively during evaluation).
+    #[pyo3(signature = (cypher, params = None, max_rows = None, timeout_ms = None))]
     fn execute<'py>(
         &self,
         py: Python<'py>,
         cypher: &str,
         params: Option<&Bound<'py, PyDict>>,
+        max_rows: Option<usize>,
+        timeout_ms: Option<u64>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let result = match params {
-            None => self.inner.execute(cypher).map_err(to_py_err)?,
-            Some(dict) => {
-                let mut converted = std::collections::HashMap::new();
-                for (key, value) in dict.iter() {
-                    let name: String = key.extract().map_err(|_| {
-                        PyRuntimeError::new_err("parameter names must be strings")
-                    })?;
-                    let prop = py_to_property(&value)
-                        .map_err(|e| PyRuntimeError::new_err(format!("parameter '{name}': {e}")))?;
-                    converted.insert(name, prop);
-                }
-                self.inner
-                    .execute_with_params(cypher, &converted)
-                    .map_err(to_py_err)?
+        let mut converted = std::collections::HashMap::new();
+        if let Some(dict) = params {
+            for (key, value) in dict.iter() {
+                let name: String = key
+                    .extract()
+                    .map_err(|_| ProgrammingError::new_err("parameter names must be strings"))?;
+                let prop = py_to_property(&value)
+                    .map_err(|e| DataError::new_err(format!("parameter '{name}': {e}")))?;
+                converted.insert(name, prop);
             }
-        };
+        }
+        let mut options = ::marsdb::ExecutionOptions::default();
+        options.max_result_rows = max_rows;
+        options.timeout = timeout_ms.map(std::time::Duration::from_millis);
+        let result = self
+            .inner
+            .execute_with_params_and_options(cypher, &converted, &options)
+            .map_err(to_py_err)?;
         let rows = PyList::empty(py);
         for row in &result.rows {
             let dict = PyDict::new(py);
@@ -110,15 +161,48 @@ fn py_to_property(value: &Bound<'_, PyAny>) -> Result<::marsdb::PropertyValue, S
     }
     Err(format!(
         "unsupported parameter type {} -- use None/bool/int/float/str or nested list/dict",
-        value.get_type().name().map_or_else(
-            |_| "<unknown>".to_string(),
-            |n| n.to_string()
-        )
+        value
+            .get_type()
+            .name()
+            .map_or_else(|_| "<unknown>".to_string(), |n| n.to_string())
     ))
 }
 
+/// `marsdb::Error` -> the exception hierarchy above. The interesting
+/// mappings: `Type` errors are the value's fault (`DataError`);
+/// syntax/semantic/unbound/missing-param are the query's fault
+/// (`ProgrammingError`); unique-index violations and non-detach deletes
+/// of connected nodes are the graph-integrity analog of a relational
+/// constraint failure (`IntegrityError`); everything environmental —
+/// timeouts, cancellation, resource limits, storage errors, transaction
+/// lifecycle — is `OperationalError`.
 fn to_py_err(e: ::marsdb::Error) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+    use ::marsdb::{Error as E, QueryError as Q};
+    let message = e.to_string();
+    let query_err = |q: &Q, message: String| match q {
+        Q::Syntax(_) | Q::Semantic(_) | Q::UnboundVariable(_) | Q::MissingParam(_) => {
+            ProgrammingError::new_err(message)
+        }
+        Q::Type(_) => DataError::new_err(message),
+        Q::Graph(g) => graph_err(g, message),
+        Q::Cancelled | Q::Timeout | Q::ResourceLimit(_) => OperationalError::new_err(message),
+    };
+    match &e {
+        E::Query(q) => query_err(q, message),
+        E::Graph(g) => graph_err(g, message),
+        E::TransactionClosed => ProgrammingError::new_err(message),
+        E::SessionTransactionTimedOut { .. } => OperationalError::new_err(message),
+    }
+}
+
+fn graph_err(g: &::marsdb::GraphError, message: String) -> PyErr {
+    use ::marsdb::GraphError as G;
+    match g {
+        G::UniqueConstraintViolation { .. } | G::NodeHasEdges(_) => {
+            IntegrityError::new_err(message)
+        }
+        _ => OperationalError::new_err(message),
+    }
 }
 
 fn value_to_py<'py>(py: Python<'py>, value: &::marsdb::Value) -> PyResult<Bound<'py, PyAny>> {
@@ -280,7 +364,12 @@ fn literal_to_py<'py>(py: Python<'py>, l: &::marsdb::Literal) -> PyResult<Bound<
 /// MarsDB: an embeddable property-graph database with an openCypher query
 /// subset.
 #[pymodule]
-fn marsdb(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn marsdb(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    m.add("Error", py.get_type::<Error>())?;
+    m.add("ProgrammingError", py.get_type::<ProgrammingError>())?;
+    m.add("DataError", py.get_type::<DataError>())?;
+    m.add("OperationalError", py.get_type::<OperationalError>())?;
+    m.add("IntegrityError", py.get_type::<IntegrityError>())?;
     Ok(())
 }

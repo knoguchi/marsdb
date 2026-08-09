@@ -2,6 +2,7 @@ package marsdb
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -304,5 +305,43 @@ func TestExecuteWithParams(t *testing.T) {
 	// Missing parameter surfaces the engine's error.
 	if _, err := db.ExecuteWithParams("RETURN $missing AS m", map[string]any{}); err == nil {
 		t.Fatal("expected an error for a missing parameter, got nil")
+	}
+}
+
+func TestExecuteWithOptionsBoundsRows(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 10; i++ {
+		if _, err := db.ExecuteWithParams("CREATE (:N {i: $i})", map[string]any{"i": i}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	rows, err := db.ExecuteWithOptions("MATCH (n:N) RETURN n", nil, Options{MaxRows: 10})
+	if err != nil {
+		t.Fatalf("at the bound: %v", err)
+	}
+	if len(rows) != 10 {
+		t.Fatalf("expected 10 rows, got %d", len(rows))
+	}
+
+	if _, err := db.ExecuteWithOptions("MATCH (n:N) RETURN n", nil, Options{MaxRows: 5}); err == nil {
+		t.Fatal("expected a resource-limit error over the bound, got nil")
+	} else if !strings.Contains(err.Error(), "resource limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Params + options together.
+	rows, err = db.ExecuteWithOptions(
+		"MATCH (n:N) WHERE n.i < $cap RETURN n", map[string]any{"cap": 3}, Options{MaxRows: 5})
+	if err != nil {
+		t.Fatalf("params+options: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
 	}
 }

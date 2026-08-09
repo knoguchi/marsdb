@@ -15,13 +15,14 @@ use std::time::Instant;
 
 use marsdb_query::Statement;
 
+pub use marsdb_graph::GraphError;
 pub use marsdb_graph::IntegrityReport;
 pub use marsdb_graph::PropertyValue;
 pub use marsdb_graph::TzId;
 pub use marsdb_query::{
     temporal, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Literal, PathElem, ProcedureProvider, ProcedureSignature, Procedures,
-    QueryResult, Value,
+    QueryError, QueryResult, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
