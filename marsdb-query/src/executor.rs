@@ -407,6 +407,16 @@ type BindingRow = HashMap<String, Binding>;
 type FastCountResult = (Vec<BindingRow>, HashSet<String>);
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
+/// Receiver for `Executor::execute_streaming_with_options` — rows are
+/// pushed one at a time, never materialized as a whole result.
+/// `columns` is called exactly once, before the first row. Returning
+/// `Break` from `row` stops the scan cleanly (early termination, not an
+/// error).
+pub trait RowSink {
+    fn columns(&mut self, columns: &[String]);
+    fn row(&mut self, row: Vec<Value>) -> std::ops::ControlFlow<()>;
+}
+
 /// Safety cap on unbounded variable-length traversal (`[:TYPE*0..]`) depth.
 /// Hitting it errors rather than silently truncating — see `VarExpand`
 /// evaluation. Expansion uses relationship uniqueness per path: a node may
@@ -628,6 +638,123 @@ impl<'a> Executor<'a> {
                 Err(e)
             }
         }
+    }
+
+    /// Stream a read-only statement's rows to `sink` instead of
+    /// materializing a `QueryResult` — bounded memory no matter how many
+    /// rows match, the bulk-export path. Only the genuinely streamable
+    /// shape is accepted: one `MATCH` clause (no `WITH` pipeline, no
+    /// `OPTIONAL`, no `shortestPath`, no named path) with a plain
+    /// `RETURN` (no aggregation, no `DISTINCT`, no `ORDER BY`; `SKIP`/
+    /// `LIMIT` are fine — they stream naturally). Anything else is a
+    /// `Semantic` error naming the blocker, NOT a silent fall-back to
+    /// materialization — an API that promises bounded memory must never
+    /// quietly break the promise. The sink returning `Break` stops the
+    /// scan cleanly (early termination, `Ok(())`).
+    ///
+    /// `max_result_rows`/`timeout`/cancellation apply per streamed row.
+    pub fn execute_streaming_with_options(
+        &self,
+        stmt: &Statement,
+        options: &ExecutionOptions,
+        sink: &mut dyn RowSink,
+    ) -> Result<(), QueryError> {
+        crate::semantic::validate_statement(stmt)?;
+        let guard = ExecutionGuard::new(options);
+        self.node_cache.borrow_mut().clear();
+        self.prop_id_memo.borrow_mut().clear();
+        self.read_only_stmt.set(true);
+        *self.stats.borrow_mut() = QueryStats::default();
+
+        let not_streamable = |what: &str| {
+            Err(QueryError::Semantic(format!(
+                "statement is not streamable ({what}) -- use execute() instead"
+            )))
+        };
+        if !is_read_only(stmt) {
+            return not_streamable("only read-only statements stream");
+        }
+        let Statement::Match {
+            clauses,
+            tail,
+            order_by,
+            skip,
+            limit,
+        } = stmt
+        else {
+            return not_streamable("UNION does not stream");
+        };
+        if order_by.is_some() {
+            return not_streamable("ORDER BY must see every row before emitting any");
+        }
+        let [QueryClause::Match(part)] = clauses.as_slice() else {
+            return not_streamable("multi-clause pipelines materialize between clauses");
+        };
+        if part.with.is_some() || part.optional || part.shortest_path || part.path_var.is_some() {
+            return not_streamable("WITH/OPTIONAL/shortestPath/named-path forms materialize");
+        }
+        let Some(Tail::Return(items, false)) = tail else {
+            return not_streamable("DISTINCT must see every row to dedup");
+        };
+        if has_aggregate(items) {
+            return not_streamable("aggregation must consume every row before emitting any");
+        }
+
+        let read_txn = self.store.begin_read()?;
+        let txn = Txn::Read(&read_txn);
+        let skip_n = self
+            .resolve_skip_limit(txn, skip.as_deref(), "SKIP", &guard)?
+            .unwrap_or(0)
+            .max(0) as usize;
+        let limit_n = self
+            .resolve_skip_limit(txn, limit.as_deref(), "LIMIT", &guard)?
+            .map(|l| l.max(0) as usize);
+
+        let carried_vars = HashSet::new();
+        let reversed =
+            plan_reversed_pattern(&part.pattern, &part.where_clause, &carried_vars, txn)?;
+        let pattern = reversed.as_ref().unwrap_or(&part.pattern);
+        let plan = apply_index_seeks(
+            build_match_plan(pattern, &part.where_clause, &carried_vars)?,
+            txn,
+        )?;
+
+        let columns: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| default_column_name(&item.expr, i))
+            })
+            .collect();
+        sink.columns(&columns);
+
+        let seed = [BindingRow::new()];
+        let stream_cap = limit_n.map(|l| skip_n + l);
+        let stream = self.stream_plan(txn, &plan, &seed, &guard, stream_cap);
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        for row in stream {
+            let row = row?;
+            if skipped < skip_n {
+                skipped += 1;
+                continue;
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(self.eval_return_expr(txn, &item.expr, &row, &guard)?);
+            }
+            emitted += 1;
+            guard.check_result_rows(emitted)?;
+            if sink.row(out).is_break() {
+                return Ok(());
+            }
+            if limit_n.is_some_and(|l| emitted >= l) {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Execute without committing against a caller-owned write transaction.

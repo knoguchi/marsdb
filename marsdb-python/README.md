@@ -68,6 +68,21 @@ Both are checked *during* evaluation — a runaway query raises
 `OperationalError` at the bound instead of materializing an unbounded
 result first, so it can't OOM the process.
 
+## Streaming (bulk export)
+
+```python
+db.execute_streaming(
+    "MATCH (n:Person) RETURN n.name AS name",
+    lambda row: writer.writerow(row),   # return False to stop early
+)
+```
+
+Rows are pushed one at a time — bounded memory no matter how many rows
+match. Accepts exactly the streamable shape (one plain `MATCH ...
+RETURN`, `SKIP`/`LIMIT` fine) and raises `ProgrammingError` for `ORDER
+BY`/aggregation/`DISTINCT`/`WITH` — those must see all rows before
+emitting any, so streaming them would be pretend; use `execute`.
+
 ## Value mapping
 
 | Cypher | Python |
