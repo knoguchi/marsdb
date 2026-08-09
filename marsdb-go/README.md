@@ -161,6 +161,22 @@ rows, err := db.ExecuteWithOptions("MATCH (n) RETURN n", nil,
 Both bounds are checked during evaluation — a runaway query errors at
 the bound instead of materializing an unbounded result first.
 
+## Streaming (bulk export)
+
+```go
+err := db.ExecuteStreaming("MATCH (n:Person) RETURN n.name AS name", nil, marsdb.Options{},
+	func(row map[string]any) bool {
+		fmt.Println(row["name"])
+		return true // false stops the scan early
+	})
+```
+
+Rows are pushed one at a time — bounded memory no matter how many rows
+match. Accepts exactly the streamable shape (one plain `MATCH ...
+RETURN`, `SKIP`/`LIMIT` fine) and errors for `ORDER BY`/aggregation/
+`DISTINCT`/`WITH` — those must see all rows before emitting any, so
+streaming them would be pretend; use `Execute`.
+
 ## What's not here yet
 
 `execute_batch` (multi-statement, one transaction each) exists on the

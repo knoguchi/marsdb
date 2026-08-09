@@ -58,6 +58,30 @@ MarsdbResult marsdb_execute_ex(MarsdbDatabase *db, const char *cypher,
                                const char *params_json, uint64_t max_rows,
                                uint64_t timeout_ms);
 
+/* Row callback for marsdb_execute_streaming: user_data plus one row as
+ * a JSON array of values (same per-value encoding as marsdb_execute's
+ * result rows). Return 0 to continue, nonzero to stop the scan early
+ * (clean stop, not an error). row_json is valid only during the call. */
+typedef int (*MarsdbRowCallback)(void *user_data, const char *row_json);
+
+/* Called exactly once before the first row, with the column names as a
+ * JSON array of strings. Same pointer-lifetime rule. */
+typedef void (*MarsdbColumnsCallback)(void *user_data, const char *columns_json);
+
+/* Stream a read-only statement's rows through on_row instead of
+ * materializing a result -- bounded memory no matter how many rows
+ * match. Accepts exactly the streamable shape (one plain
+ * MATCH ... RETURN, SKIP/LIMIT fine) and errors -- never silently
+ * materializes -- on ORDER BY/aggregation/DISTINCT/WITH/writes.
+ * params_json/max_rows/timeout_ms behave as in marsdb_execute_ex;
+ * on_columns may be NULL. Returns NULL on success (including an early
+ * stop), else an error string to release with marsdb_free_string. */
+char *marsdb_execute_streaming(MarsdbDatabase *db, const char *cypher,
+                               const char *params_json, uint64_t max_rows,
+                               uint64_t timeout_ms,
+                               MarsdbColumnsCallback on_columns,
+                               MarsdbRowCallback on_row, void *user_data);
+
 /* Frees a string returned in MarsdbResult.json or MarsdbResult.error.
  * Required — these are allocated by Rust's global allocator, not malloc. */
 void marsdb_free_string(char *s);

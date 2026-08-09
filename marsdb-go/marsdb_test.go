@@ -378,3 +378,68 @@ func TestExecuteStats(t *testing.T) {
 		t.Fatalf("expected zero stats for a read, got %+v", stats)
 	}
 }
+
+func TestExecuteStreaming(t *testing.T) {
+	db, err := InMemory()
+	if err != nil {
+		t.Fatalf("InMemory: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 20; i++ {
+		if _, err := db.ExecuteWithParams("CREATE (:N {i: $i})", map[string]any{"i": i}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	var rows []map[string]any
+	err = db.ExecuteStreaming(
+		"MATCH (n:N) RETURN n.i AS i SKIP 2 LIMIT 5", nil, Options{},
+		func(row map[string]any) bool {
+			rows = append(rows, row)
+			return true
+		})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if len(rows) != 5 {
+		t.Fatalf("expected 5 rows, got %d", len(rows))
+	}
+	if _, ok := rows[0]["i"].(int64); !ok {
+		t.Fatalf("expected int64 i, got %T", rows[0]["i"])
+	}
+
+	// Returning false stops the scan early, still success.
+	count := 0
+	err = db.ExecuteStreaming("MATCH (n:N) RETURN n.i AS i", nil, Options{},
+		func(map[string]any) bool {
+			count++
+			return count < 3
+		})
+	if err != nil {
+		t.Fatalf("early stop: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 rows before stop, got %d", count)
+	}
+
+	// Non-streamable shape errors without invoking the callback.
+	called := false
+	err = db.ExecuteStreaming("MATCH (n:N) RETURN count(n)", nil, Options{},
+		func(map[string]any) bool { called = true; return true })
+	if err == nil || !strings.Contains(err.Error(), "not streamable") {
+		t.Fatalf("expected not-streamable error, got %v", err)
+	}
+	if called {
+		t.Fatal("callback invoked for a non-streamable statement")
+	}
+
+	// Params + bounds compose.
+	err = db.ExecuteStreaming(
+		"MATCH (n:N) WHERE n.i < $cap RETURN n.i AS i",
+		map[string]any{"cap": 10}, Options{MaxRows: 5},
+		func(map[string]any) bool { return true })
+	if err == nil || !strings.Contains(err.Error(), "resource limit") {
+		t.Fatalf("expected resource-limit error, got %v", err)
+	}
+}

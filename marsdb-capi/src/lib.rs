@@ -282,6 +282,140 @@ fn json_to_property(value: serde_json::Value) -> Result<PropertyValue, String> {
     })
 }
 
+/// Row callback for `marsdb_execute_streaming`: receives `user_data`
+/// and one row as a JSON array of the row's values (same per-value
+/// encoding as `marsdb_execute`'s result rows). Return 0 to continue,
+/// nonzero to stop the scan early (clean stop, not an error). The
+/// `row_json` pointer is valid only for the duration of the call —
+/// copy it if you keep it.
+pub type MarsdbRowCallback =
+    unsafe extern "C" fn(user_data: *mut std::ffi::c_void, row_json: *const c_char) -> i32;
+
+/// Columns callback for `marsdb_execute_streaming`: called exactly once
+/// before the first row, with the column names as a JSON array of
+/// strings. Same pointer-lifetime rule as `MarsdbRowCallback`.
+pub type MarsdbColumnsCallback =
+    unsafe extern "C" fn(user_data: *mut std::ffi::c_void, columns_json: *const c_char);
+
+/// Stream a read-only statement's rows through `on_row` instead of
+/// materializing a result — bounded memory no matter how many rows
+/// match. Accepts exactly the streamable shape (one plain
+/// `MATCH ... RETURN`, `SKIP`/`LIMIT` fine) and errors — never
+/// silently materializes — on ORDER BY/aggregation/DISTINCT/WITH/
+/// writes. `params_json`/`max_rows`/`timeout_ms` behave exactly as in
+/// `marsdb_execute_ex`. `on_columns` may be NULL.
+///
+/// Returns NULL on success (including an early stop requested by
+/// `on_row`), else an error message to release with
+/// `marsdb_free_string`.
+///
+/// # Safety
+/// `db`/`cypher`/`params_json` as in `marsdb_execute_ex`; `on_row` must
+/// be a valid function pointer for the duration of the call, and
+/// `user_data` whatever it expects.
+#[no_mangle]
+pub unsafe extern "C" fn marsdb_execute_streaming(
+    db: *mut MarsdbDatabase,
+    cypher: *const c_char,
+    params_json: *const c_char,
+    max_rows: u64,
+    timeout_ms: u64,
+    on_columns: Option<MarsdbColumnsCallback>,
+    on_row: MarsdbRowCallback,
+    user_data: *mut std::ffi::c_void,
+) -> *mut c_char {
+    let fail = |msg: String| {
+        CString::new(msg.replace('\0', ""))
+            .unwrap_or_default()
+            .into_raw()
+    };
+    if db.is_null() || cypher.is_null() {
+        return fail("null db or cypher pointer".into());
+    }
+    let cypher = match unsafe { CStr::from_ptr(cypher) }.to_str() {
+        Ok(c) => c,
+        Err(e) => return fail(format!("cypher is not valid UTF-8: {e}")),
+    };
+    let params = if params_json.is_null() {
+        std::collections::HashMap::new()
+    } else {
+        let raw = match unsafe { CStr::from_ptr(params_json) }.to_str() {
+            Ok(p) => p,
+            Err(e) => return fail(format!("params is not valid UTF-8: {e}")),
+        };
+        match parse_params(raw) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        }
+    };
+    let mut options = marsdb::ExecutionOptions::default();
+    if max_rows > 0 {
+        options.max_result_rows = Some(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    }
+    if timeout_ms > 0 {
+        options.timeout = Some(std::time::Duration::from_millis(timeout_ms));
+    }
+
+    struct CallbackSink {
+        on_columns: Option<MarsdbColumnsCallback>,
+        on_row: MarsdbRowCallback,
+        user_data: *mut std::ffi::c_void,
+    }
+    impl marsdb::RowSink for CallbackSink {
+        fn columns(&mut self, columns: &[String]) {
+            let Some(on_columns) = self.on_columns else {
+                return;
+            };
+            let mut out = String::from("[");
+            for (i, col) in columns.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(&mut out, col);
+            }
+            out.push(']');
+            if let Ok(json) = CString::new(out) {
+                unsafe { on_columns(self.user_data, json.as_ptr()) };
+            }
+        }
+        fn row(&mut self, row: Vec<marsdb::Value>) -> std::ops::ControlFlow<()> {
+            let mut out = String::from("[");
+            for (i, value) in row.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_value_json(&mut out, value);
+            }
+            out.push(']');
+            let Ok(json) = CString::new(out) else {
+                // A NUL can only come from a stored string containing
+                // one; stopping is the only safe signal available here.
+                return std::ops::ControlFlow::Break(());
+            };
+            if unsafe { (self.on_row)(self.user_data, json.as_ptr()) } != 0 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let mut sink = CallbackSink {
+        on_columns,
+        on_row,
+        user_data,
+    };
+    let db = unsafe { &*db };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.inner
+            .execute_streaming(cypher, &params, &options, &mut sink)
+    })) {
+        Ok(Ok(())) => std::ptr::null_mut(),
+        Ok(Err(e)) => fail(e.to_string()),
+        Err(_) => fail("internal panic while executing query".into()),
+    }
+}
+
 /// Frees a string previously returned in `MarsdbResult.json` or
 /// `MarsdbResult.error`. The caller MUST NOT free these with anything
 /// other than this function — they were allocated by Rust's global
@@ -681,6 +815,106 @@ mod tests {
         assert!(message.contains("resource limit"), "{message}");
         unsafe {
             marsdb_free_string(result.error);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn execute_streaming_pushes_rows_and_honors_stop() {
+        use std::ffi::c_void;
+        struct State {
+            columns: Option<String>,
+            rows: Vec<String>,
+            stop_after: Option<usize>,
+        }
+        unsafe extern "C" fn on_columns(user_data: *mut c_void, columns_json: *const c_char) {
+            let state = unsafe { &mut *(user_data as *mut State) };
+            state.columns = Some(
+                unsafe { CStr::from_ptr(columns_json) }
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        unsafe extern "C" fn on_row(user_data: *mut c_void, row_json: *const c_char) -> i32 {
+            let state = unsafe { &mut *(user_data as *mut State) };
+            state.rows.push(
+                unsafe { CStr::from_ptr(row_json) }
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            i32::from(state.stop_after.is_some_and(|n| state.rows.len() >= n))
+        }
+
+        let db = marsdb_open_in_memory();
+        let seed = CString::new("CREATE (:N {i: 1}), (:N {i: 2}), (:N {i: 3})").unwrap();
+        let result = unsafe { marsdb_execute(db, seed.as_ptr()) };
+        assert!(result.error.is_null());
+        unsafe { marsdb_free_string(result.json) };
+
+        let cypher = CString::new("MATCH (n:N) RETURN n.i AS i").unwrap();
+        let mut state = State {
+            columns: None,
+            rows: vec![],
+            stop_after: None,
+        };
+        let err = unsafe {
+            marsdb_execute_streaming(
+                db,
+                cypher.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                Some(on_columns),
+                on_row,
+                (&mut state as *mut State).cast(),
+            )
+        };
+        assert!(err.is_null());
+        assert_eq!(state.columns.as_deref(), Some(r#"["i"]"#));
+        assert_eq!(state.rows.len(), 3);
+
+        // Nonzero return stops early, still success.
+        let mut state = State {
+            columns: None,
+            rows: vec![],
+            stop_after: Some(1),
+        };
+        let err = unsafe {
+            marsdb_execute_streaming(
+                db,
+                cypher.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                None,
+                on_row,
+                (&mut state as *mut State).cast(),
+            )
+        };
+        assert!(err.is_null());
+        assert_eq!(state.rows.len(), 1);
+
+        // Non-streamable shape -> error string.
+        let bad = CString::new("MATCH (n:N) RETURN count(n)").unwrap();
+        let err = unsafe {
+            marsdb_execute_streaming(
+                db,
+                bad.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                None,
+                on_row,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!err.is_null());
+        let message = unsafe { CStr::from_ptr(err) }.to_str().unwrap();
+        assert!(message.contains("not streamable"), "{message}");
+        unsafe {
+            marsdb_free_string(err);
             marsdb_close(db);
         }
     }
