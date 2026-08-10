@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyCapsule, PyDict, PyList};
 
 // PEP 249-inspired exception hierarchy (the useful subset, not the
 // ceremony): everything raised by MarsDB derives from `marsdb.Error`, so
@@ -108,16 +108,44 @@ impl Database {
         timeout_ms: Option<u64>,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyDict>)> {
         let result = self.run(cypher, params, max_rows, timeout_ms)?;
-        let stats = PyDict::new(py);
-        let s = &result.stats;
-        stats.set_item("nodes_created", s.nodes_created)?;
-        stats.set_item("nodes_deleted", s.nodes_deleted)?;
-        stats.set_item("relationships_created", s.relationships_created)?;
-        stats.set_item("relationships_deleted", s.relationships_deleted)?;
-        stats.set_item("properties_set", s.properties_set)?;
-        stats.set_item("labels_added", s.labels_added)?;
-        stats.set_item("labels_removed", s.labels_removed)?;
+        let stats = stats_to_py(py, &result.stats)?;
         Ok((rows_to_py(py, &result)?, stats))
+    }
+
+    /// Run one Cypher statement and return the result as Arrow — an
+    /// object implementing the Arrow PyCapsule protocol
+    /// (`__arrow_c_stream__`), accepted directly by pyarrow, polars,
+    /// pandas, and DuckDB with zero per-value conversion:
+    ///
+    ///     table = pyarrow.table(db.query_arrow("MATCH (n) RETURN n.x AS x"))
+    ///
+    /// Column types are inferred strictly, per column over the whole
+    /// result: Int64 (64-bit exact), Float64, string, bool, date32,
+    /// month-day-nano interval for durations, ISO-8601 text for other
+    /// temporals, lists of one element type. A column mixing ints and
+    /// floats raises `DataError` (silent promotion to float would
+    /// corrupt integers beyond 2**53 — cast in the query instead), as
+    /// do node/edge/map/path columns (project scalar properties).
+    ///
+    /// The stream is single-use: hand it to one consumer. `stats`
+    /// carries the statement's write counters. `batch_rows` sets the
+    /// rows per RecordBatch.
+    #[pyo3(signature = (cypher, params = None, max_rows = None, timeout_ms = None, batch_rows = 8192))]
+    fn query_arrow(
+        &self,
+        cypher: &str,
+        params: Option<&Bound<'_, PyDict>>,
+        max_rows: Option<usize>,
+        timeout_ms: Option<u64>,
+        batch_rows: usize,
+    ) -> PyResult<ArrowResult> {
+        let result = self.run(cypher, params, max_rows, timeout_ms)?;
+        let reader =
+            ::marsdb::arrow::ArrowResult::from_result(&result, batch_rows).map_err(to_py_err)?;
+        Ok(ArrowResult {
+            stats: reader.stats,
+            reader: std::sync::Mutex::new(Some(reader)),
+        })
     }
 
     /// Stream a read-only statement's rows to `on_row` instead of
@@ -241,6 +269,64 @@ impl Database {
             .execute_with_params_and_options(cypher, &converted, &options)
             .map_err(to_py_err)
     }
+}
+
+/// A query result as an Arrow stream — the Arrow PyCapsule protocol
+/// object `query_arrow` returns. Pass it to any Arrow consumer
+/// (`pyarrow.table(...)`, `polars.DataFrame(...)`, ...); the buffers
+/// transfer zero-copy through the Arrow C Data Interface. Single-use.
+#[pyclass]
+struct ArrowResult {
+    reader: std::sync::Mutex<Option<::marsdb::arrow::ArrowResult>>,
+    stats: ::marsdb::QueryStats,
+}
+
+#[pymethods]
+impl ArrowResult {
+    /// Arrow PyCapsule protocol: export the result as an
+    /// `ArrowArrayStream` capsule. Schema negotiation
+    /// (`requested_schema`) is not supported and is ignored, as the
+    /// protocol permits.
+    #[pyo3(signature = (requested_schema = None))]
+    fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = requested_schema;
+        let reader = self
+            .reader
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| ProgrammingError::new_err("Arrow stream already consumed"))?;
+        let stream = ::marsdb::arrow::FFI_ArrowArrayStream::new(Box::new(reader));
+        // The capsule owns the stream; if no consumer imports it, the
+        // capsule destructor drops it, which runs the release callback.
+        PyCapsule::new_with_value(py, stream, c"arrow_array_stream")
+    }
+
+    /// The statement's write counters (same shape as
+    /// `execute_with_stats`'s second value) — all zero for reads.
+    #[getter]
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        stats_to_py(py, &self.stats)
+    }
+}
+
+fn stats_to_py<'py>(
+    py: Python<'py>,
+    s: &::marsdb::QueryStats,
+) -> PyResult<Bound<'py, PyDict>> {
+    let stats = PyDict::new(py);
+    stats.set_item("nodes_created", s.nodes_created)?;
+    stats.set_item("nodes_deleted", s.nodes_deleted)?;
+    stats.set_item("relationships_created", s.relationships_created)?;
+    stats.set_item("relationships_deleted", s.relationships_deleted)?;
+    stats.set_item("properties_set", s.properties_set)?;
+    stats.set_item("labels_added", s.labels_added)?;
+    stats.set_item("labels_removed", s.labels_removed)?;
+    Ok(stats)
 }
 
 fn rows_to_py<'py>(
@@ -506,6 +592,7 @@ fn literal_to_py<'py>(py: Python<'py>, l: &::marsdb::Literal) -> PyResult<Bound<
 #[pymodule]
 fn marsdb(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    m.add_class::<ArrowResult>()?;
     m.add("Error", py.get_type::<Error>())?;
     m.add("ProgrammingError", py.get_type::<ProgrammingError>())?;
     m.add("DataError", py.get_type::<DataError>())?;

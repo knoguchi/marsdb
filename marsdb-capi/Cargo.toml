@@ -15,3 +15,9 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 marsdb = { path = "../marsdb" }
 marsdb-graph = { path = "../marsdb-graph" }
+
+[features]
+# Arrow C Data Interface exports (marsdb_query_arrow /
+# marsdb_stmt_execute_arrow). Off by default: pulls arrow-rs into the
+# static/shared library.
+arrow = ["marsdb/arrow"]

@@ -188,5 +188,74 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows, [{"p.tags": [1, 2, 3]}])
 
 
+try:
+    import pyarrow as pa
+
+    HAVE_PYARROW = True
+except ImportError:  # dev-only dependency; the binding itself needs none
+    HAVE_PYARROW = False
+
+
+@unittest.skipUnless(HAVE_PYARROW, "pyarrow not installed")
+class TestArrowExport(unittest.TestCase):
+    def test_pycapsule_protocol_round_trip(self):
+        import datetime
+
+        db = marsdb.Database.in_memory()
+        db.execute(
+            "CREATE (:N {i: 9223372036854775807, f: 1.5, s: 'héllo', b: true, "
+            "d: date('1984-10-11'), tags: [1, 2, 3]})"
+        )
+        db.execute("CREATE (:N {i: 2, f: 2.5, s: 'x', b: false, tags: []})")
+        table = pa.table(
+            db.query_arrow(
+                "MATCH (n:N) RETURN n.i AS i, n.f AS f, n.s AS s, n.b AS b, "
+                "n.d AS d, n.tags AS tags"
+            )
+        )
+        self.assertEqual(table.schema.field("i").type, pa.int64())
+        self.assertEqual(table.schema.field("f").type, pa.float64())
+        self.assertEqual(table.schema.field("s").type, pa.string())
+        self.assertEqual(table.schema.field("b").type, pa.bool_())
+        self.assertEqual(table.schema.field("d").type, pa.date32())
+        self.assertEqual(table.schema.field("tags").type, pa.list_(pa.int64()))
+        # int64 exactness: i64::MAX survives (a float path would corrupt it).
+        self.assertIn(9223372036854775807, table.column("i").to_pylist())
+        self.assertIn(datetime.date(1984, 10, 11), table.column("d").to_pylist())
+        # The node without `d` becomes a null, not a type change.
+        self.assertIn(None, table.column("d").to_pylist())
+
+    def test_stream_is_single_use(self):
+        db = marsdb.Database.in_memory()
+        db.execute("CREATE (:N {i: 1})")
+        res = db.query_arrow("MATCH (n:N) RETURN n.i AS i")
+        pa.table(res)
+        with self.assertRaises(marsdb.ProgrammingError):
+            pa.table(res)
+
+    def test_strict_inference_errors(self):
+        db = marsdb.Database.in_memory()
+        db.execute("CREATE (:P {x: 1}), (:P {x: 2.5})")
+        # Mixed Int/Float raises instead of silently promoting.
+        with self.assertRaises(marsdb.DataError):
+            db.query_arrow("MATCH (p:P) RETURN p.x AS mixed")
+        # Whole entities are not exportable.
+        with self.assertRaises(marsdb.DataError):
+            db.query_arrow("MATCH (p:P) RETURN p")
+
+    def test_batching_stats_and_bounds(self):
+        db = marsdb.Database.in_memory()
+        for i in range(7):
+            db.execute("CREATE (:B {i: $i})", params={"i": i})
+        reader = pa.RecordBatchReader.from_stream(
+            db.query_arrow("MATCH (b:B) RETURN b.i AS i", batch_rows=3)
+        )
+        self.assertEqual([len(b) for b in reader], [3, 3, 1])
+        res = db.query_arrow("CREATE (:M)")
+        self.assertEqual(res.stats["nodes_created"], 1)
+        with self.assertRaises(marsdb.OperationalError):
+            db.query_arrow("MATCH (b:B) RETURN b.i", max_rows=2)
+
+
 if __name__ == "__main__":
     unittest.main()
