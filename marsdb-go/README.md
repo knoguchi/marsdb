@@ -189,6 +189,15 @@ streaming them would be pretend; use `Execute`.
 `execute_batch` (multi-statement, one transaction each) exists on the
 Rust side but isn't wired through `marsdb-capi` or this package yet.
 
+Arrow results: when `marsdb-capi` is built with its `arrow` cargo
+feature, `marsdb_query_arrow` / `marsdb_stmt_execute_arrow` export
+results as a standard `ArrowArrayStream` (declared in `marsdb.h`).
+This package doesn't wrap them — doing it justice means importing the
+stream with `github.com/apache/arrow-go`'s `arrow/cdata` package, a
+heavyweight dependency this zero-dependency binding won't impose. If
+you need columnar results in Go, call the C functions directly and
+import the stream with `cdata.ImportCRecordReader`.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE)

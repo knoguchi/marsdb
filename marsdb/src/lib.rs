@@ -13,6 +13,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[cfg(feature = "arrow")]
+pub mod arrow;
+
 pub use marsdb_graph::GraphError;
 pub use marsdb_graph::IntegrityReport;
 pub use marsdb_graph::PropertyValue;

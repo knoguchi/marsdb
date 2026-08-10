@@ -232,6 +232,87 @@ int marsdb_query_batch(MarsdbDatabase *db, const char *cypher, MarsdbBuffer *out
 int marsdb_stmt_execute_batch(MarsdbStatement *stmt, MarsdbBuffer *out);
 void marsdb_buffer_free(MarsdbBuffer buffer);
 
+/* ---- Arrow C Data Interface -----------------------------------------
+ *
+ * Available when marsdb-capi is built with the `arrow` cargo feature;
+ * otherwise these symbols are absent (link error, not runtime error).
+ *
+ * Results leave as an ArrowArrayStream — the standard columnar ABI.
+ * Import it zero-copy with any Arrow implementation: pyarrow
+ * (RecordBatchReader.import_from_c), arrow-go (arrow/cdata), Arrow
+ * C++/Java/nanoarrow, DuckDB, polars.
+ *
+ * The struct definitions below are the canonical ones vendored verbatim
+ * per the Arrow spec (which blesses exactly this: consumers copy the
+ * header, no Arrow library needed at compile time). Guarded so they
+ * coexist with an Arrow SDK's own headers.
+ *
+ * Ownership: on MARSDB_OK, *out is a fully initialized stream the
+ * caller owns; call out->release(out) when done (importing into an
+ * Arrow library transfers that duty to the library). On MARSDB_ERROR,
+ * *out is untouched and the message is on marsdb_last_error.
+ *
+ * Column typing is strict and per-column over the whole result: Int64,
+ * Float64, Utf8, Boolean, Date32, Interval(MonthDayNano) for
+ * durations, Utf8 ISO text for other temporals, List<child> for
+ * homogeneous lists, Null for all-null columns. Mixed Int/Float
+ * columns and node/edge/map/path columns are errors — project scalar
+ * properties instead.
+ *
+ * batch_rows: rows per RecordBatch; 0 = default (8192). */
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema {
+    const char *format;
+    const char *name;
+    const char *metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema **children;
+    struct ArrowSchema *dictionary;
+    void (*release)(struct ArrowSchema *);
+    void *private_data;
+};
+
+struct ArrowArray {
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void **buffers;
+    struct ArrowArray **children;
+    struct ArrowArray *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
+struct ArrowArrayStream {
+    int (*get_schema)(struct ArrowArrayStream *, struct ArrowSchema *out);
+    int (*get_next)(struct ArrowArrayStream *, struct ArrowArray *out);
+    const char *(*get_last_error)(struct ArrowArrayStream *);
+    void (*release)(struct ArrowArrayStream *);
+    void *private_data;
+};
+
+#endif /* ARROW_C_STREAM_INTERFACE */
+
+int marsdb_query_arrow(MarsdbDatabase *db, const char *cypher,
+                       size_t batch_rows, struct ArrowArrayStream *out);
+int marsdb_stmt_execute_arrow(MarsdbStatement *stmt, size_t batch_rows,
+                              struct ArrowArrayStream *out);
+
 #ifdef __cplusplus
 }
 #endif

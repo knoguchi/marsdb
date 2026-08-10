@@ -32,6 +32,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run Clippy (arrow feature)
+        run: cargo clippy -p marsdb -p marsdb-capi --all-targets --features arrow -- -D warnings
       # marsdb-python is workspace-excluded (see Cargo.toml's own comment
       # on `exclude` -- it only fully builds/links via maturin), so
       # nothing above touches it. `cargo check` stops before linking and
@@ -58,6 +60,10 @@ jobs:
         run: cargo build --workspace --verbose
       - name: Run workspace tests
         run: cargo test --workspace --verbose
+      # The Arrow export is feature-gated off by default (arrow-rs is
+      # heavy); exercise it explicitly on the crates that carry it.
+      - name: Run Arrow feature tests
+        run: cargo test -p marsdb -p marsdb-capi --features arrow --verbose
 
   coverage:
     name: Coverage
@@ -108,7 +114,9 @@ jobs:
       - name: Build and test Python binding
         working-directory: marsdb-python
         run: |
-          python -m pip install maturin
+          # pyarrow is a dev-only dependency: the Arrow tests exercise
+          # the PyCapsule protocol through a real consumer.
+          python -m pip install maturin pyarrow
           maturin build --out dist
           python -m pip install --force-reinstall dist/*.whl
           python -m unittest discover -s tests

@@ -83,6 +83,32 @@ RETURN`, `SKIP`/`LIMIT` fine) and raises `ProgrammingError` for `ORDER
 BY`/aggregation/`DISTINCT`/`WITH` — those must see all rows before
 emitting any, so streaming them would be pretend; use `execute`.
 
+## Arrow (pyarrow / polars / pandas / DuckDB)
+
+`query_arrow` returns the result as an Arrow stream — an object
+implementing the Arrow PyCapsule protocol, accepted directly by any
+Arrow consumer with zero per-value conversion:
+
+```python
+import pyarrow as pa
+
+table = pa.table(db.query_arrow("MATCH (n:Person) RETURN n.name AS name, n.age AS age"))
+df = table.to_pandas()          # or polars.from_arrow(table), duckdb.sql(...)
+```
+
+Column types are inferred strictly, per column over the whole result:
+`int64` (full 64-bit, exact), `float64`, `string`, `bool`, `date32`,
+month-day-nano interval for durations, ISO-8601 text for other
+temporals, lists of one element type. A column mixing ints and floats
+raises `DataError` — silent promotion to float would corrupt integers
+beyond 2⁵³; cast in the query (`toFloat`/`toInteger`) instead. So do
+node/relationship/map/path columns: project scalar properties.
+
+The stream is single-use (hand it to one consumer); `batch_rows`
+(default 8192) sets rows per record batch, and `.stats` carries the
+statement's write counters. `pyarrow` itself is **not** a dependency of
+this package — anything speaking the protocol works.
+
 ## Value mapping
 
 | Cypher | Python |

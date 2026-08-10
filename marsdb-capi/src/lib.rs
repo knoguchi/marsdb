@@ -1480,6 +1480,83 @@ pub unsafe extern "C" fn marsdb_stmt_execute_batch(
     }
 }
 
+/// Arrow C Data Interface exports (feature `arrow`). Results leave as
+/// an `ArrowArrayStream` — the caller-side struct is the ~20-line
+/// definition vendored in marsdb.h per the Arrow spec; consumers
+/// import it zero-copy with any Arrow implementation (pyarrow,
+/// arrow-go's cdata, nanoarrow, ...). The stream owns the result;
+/// releasing it (or importing it) is the only cleanup.
+#[cfg(feature = "arrow")]
+mod arrow_export {
+    use super::*;
+    use marsdb::arrow::{ArrowResult, FFI_ArrowArrayStream};
+
+    /// 0 = the default batch size (8192 rows per RecordBatch).
+    const DEFAULT_BATCH_ROWS: usize = 8192;
+
+    fn export_arrow(
+        db: &MarsdbDatabase,
+        run: impl FnOnce() -> Result<QueryResult, marsdb::Error>,
+        batch_rows: usize,
+        out: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        let batch_rows = if batch_rows == 0 {
+            DEFAULT_BATCH_ROWS
+        } else {
+            batch_rows
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(Ok(result)) => match ArrowResult::from_result(&result, batch_rows) {
+                Ok(reader) => {
+                    unsafe { std::ptr::write(out, FFI_ArrowArrayStream::new(Box::new(reader))) };
+                    MARSDB_OK
+                }
+                Err(e) => db.set_error(e),
+            },
+            Ok(Err(e)) => db.set_error(e),
+            Err(_) => db.set_error("internal panic while executing query"),
+        }
+    }
+
+    /// # Safety
+    /// `db` live; `cypher` valid NUL-terminated; `out` points at an
+    /// uninitialized `struct ArrowArrayStream` the caller owns.
+    #[no_mangle]
+    pub unsafe extern "C" fn marsdb_query_arrow(
+        db: *mut MarsdbDatabase,
+        cypher: *const c_char,
+        batch_rows: usize,
+        out: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        if db.is_null() || cypher.is_null() || out.is_null() {
+            return MARSDB_ERROR;
+        }
+        let db = unsafe { &*db };
+        let cypher = match unsafe { CStr::from_ptr(cypher) }.to_str() {
+            Ok(c) => c,
+            Err(e) => return db.set_error(format!("cypher is not valid UTF-8: {e}")),
+        };
+        export_arrow(db, || db.inner.execute(cypher), batch_rows, out)
+    }
+
+    /// # Safety
+    /// `stmt` live statement (database still live); `out` points at an
+    /// uninitialized `struct ArrowArrayStream` the caller owns.
+    #[no_mangle]
+    pub unsafe extern "C" fn marsdb_stmt_execute_arrow(
+        stmt: *mut MarsdbStatement,
+        batch_rows: usize,
+        out: *mut FFI_ArrowArrayStream,
+    ) -> i32 {
+        if stmt.is_null() || out.is_null() {
+            return MARSDB_ERROR;
+        }
+        let stmt = unsafe { &*stmt };
+        let db = unsafe { &*stmt.db };
+        export_arrow(db, || run_statement(stmt), batch_rows, out)
+    }
+}
+
 /// # Safety
 /// `buffer` must have come from a batch call, freed at most once.
 #[no_mangle]
@@ -1889,6 +1966,99 @@ mod tests {
                 assert_eq!(r.varint(), 0);
             }
             assert_eq!(r.1, bytes.len(), "fully consumed");
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    mod arrow {
+        use super::*;
+        use marsdb::arrow::arrow_array::{Array, Int64Array, RecordBatch};
+        use marsdb::arrow::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+
+        /// Export through the C stream, import back with Arrow -- the
+        /// exact round-trip a pyarrow / arrow-go consumer performs.
+        #[test]
+        fn query_arrow_round_trips_through_c_stream() {
+            unsafe {
+                let db = marsdb_open_in_memory();
+                marsdb_result_destroy(exec(
+                    db,
+                    "CREATE (:N {i: 9223372036854775807}), (:N {i: 2}), (:N)",
+                ));
+
+                let c = cstr("MATCH (n:N) RETURN n.i AS i");
+                let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+                assert_eq!(
+                    arrow_export::marsdb_query_arrow(db, c.as_ptr(), 2, stream.as_mut_ptr()),
+                    MARSDB_OK
+                );
+                let mut stream = stream.assume_init();
+                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
+                // 3 rows at batch_rows=2 -> two batches.
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+                assert_eq!(batches.len(), 2);
+                let first = batches[0].column(0).as_any().downcast_ref::<Int64Array>();
+                let all: Vec<Option<i64>> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                        (0..a.len())
+                            .map(|i| a.is_valid(i).then(|| a.value(i)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert!(first.is_some());
+                assert!(all.contains(&Some(i64::MAX)));
+                assert!(all.contains(&None));
+                marsdb_close(db);
+            }
+        }
+
+        #[test]
+        fn stmt_execute_arrow_and_error_paths() {
+            unsafe {
+                let db = marsdb_open_in_memory();
+                marsdb_result_destroy(exec(db, "CREATE (:N {x: 1}), (:N {x: 2.5})"));
+
+                // Prepared + bound statement export.
+                let c = cstr("RETURN $v AS v");
+                let mut stmt: *mut MarsdbStatement = std::ptr::null_mut();
+                assert_eq!(marsdb_prepare(db, c.as_ptr(), &mut stmt), MARSDB_OK);
+                let name = cstr("v");
+                assert_eq!(marsdb_bind_int64(stmt, name.as_ptr(), 42), MARSDB_OK);
+                let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+                assert_eq!(
+                    arrow_export::marsdb_stmt_execute_arrow(stmt, 0, stream.as_mut_ptr()),
+                    MARSDB_OK
+                );
+                let mut stream = stream.assume_init();
+                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
+                assert_eq!(batches.len(), 1);
+                assert_eq!(
+                    batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    42
+                );
+                marsdb_stmt_destroy(stmt);
+
+                // Strict inference failure reaches marsdb_last_error;
+                // *out is untouched (nothing to release).
+                let bad = cstr("MATCH (n:N) RETURN n.x AS mixed");
+                let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
+                assert_eq!(
+                    arrow_export::marsdb_query_arrow(db, bad.as_ptr(), 0, stream.as_mut_ptr()),
+                    MARSDB_ERROR
+                );
+                let err = last_error(db);
+                assert!(err.contains("'mixed'"), "{err}");
+                marsdb_close(db);
+            }
         }
     }
 }
