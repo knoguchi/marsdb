@@ -112,7 +112,6 @@ their full precision as `int64` (or `uint64` for an ID above `int64`'s range),
 while fractional values are `float64`. Dates and durations are returned as
 canonical ISO-8601 strings such as `"1984-10-11"` and `"P1M2D"`.
 
-<<<<<<< HEAD
 ## Parameterized queries
 
 `ExecuteWithParams` resolves `$name` placeholders — no string
@@ -131,7 +130,7 @@ Values may be nil, bool, any integer/float type, string, or a FLAT
 typed C ABI (map-shaped and nested data still round-trips fine in
 results). `int64` values keep their full range end to end; a `uint64`
 above `int64`'s range errors instead of silently rounding.
-=======
+
 ## Transactions
 
 `BEGIN` / `COMMIT` / `ROLLBACK` are ordinary statements (`BEGIN
@@ -156,7 +155,6 @@ rows, _ = db.Execute("CALL db.relationshipTypes()") // relationshipType, count
 rows, _ = db.Execute("CALL db.propertyKeys()")      // propertyKey
 rows, _ = db.Execute("CALL db.indexes()")           // label, property, unique
 ```
->>>>>>> origin/main
 
 ## Execution bounds
 
@@ -189,14 +187,12 @@ streaming them would be pretend; use `Execute`.
 `execute_batch` (multi-statement, one transaction each) exists on the
 Rust side but isn't wired through `marsdb-capi` or this package yet.
 
-Arrow results: when `marsdb-capi` is built with its `arrow` cargo
-feature, `marsdb_query_arrow` / `marsdb_stmt_execute_arrow` export
-results as a standard `ArrowArrayStream` (declared in `marsdb.h`).
-This package doesn't wrap them — doing it justice means importing the
-stream with `github.com/apache/arrow-go`'s `arrow/cdata` package, a
-heavyweight dependency this zero-dependency binding won't impose. If
-you need columnar results in Go, call the C functions directly and
-import the stream with `cdata.ImportCRecordReader`.
+Arrow results live in the companion module
+[`marsdb-go-arrow`](../marsdb-go-arrow) — a separate Go module so this
+one stays dependency-free (arrow-go is a heavyweight dependency only
+columnar consumers should pay for). It imports the C Data Interface
+stream zero-copy: ~1000x fewer Go-side allocations than the batch lane
+on large results.
 
 ## License
 

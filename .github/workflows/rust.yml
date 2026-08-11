@@ -120,8 +120,17 @@ jobs:
           maturin build --out dist
           python -m pip install --force-reinstall dist/*.whl
           python -m unittest discover -s tests
+      # Rebuilds libmarsdb_capi with the Arrow C functions included (a
+      # superset -- the plain marsdb-go tests link against it fine).
+      - name: Build marsdb-capi with Arrow
+        run: cargo build -p marsdb-capi --features arrow --verbose
       - name: Run Go binding tests
         working-directory: marsdb-go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: go test ./...
+      - name: Run Go Arrow module tests
+        working-directory: marsdb-go-arrow
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
         run: go test ./...

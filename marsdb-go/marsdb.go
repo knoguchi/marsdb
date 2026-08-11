@@ -136,6 +136,40 @@ func (db *Database) ExecuteStats(cypher string, params map[string]any) ([]map[st
 	return db.executeBatch(cypher, params, Options{})
 }
 
+// WithStatementHandle prepares cypher, binds params, applies opts, and
+// hands the raw C statement handle (a *C.MarsdbStatement as
+// unsafe.Pointer) to f, destroying the statement when f returns. It
+// exists so companion modules can reach marsdb-capi result surfaces
+// this package doesn't wrap -- the Arrow module (marsdb-go-arrow) is
+// the intended consumer -- without duplicating parameter binding. f
+// must not retain the pointer past its return.
+func (db *Database) WithStatementHandle(cypher string, params map[string]any, opts Options, f func(stmt unsafe.Pointer) error) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.ptr == nil {
+		return errors.New("marsdb: database is closed")
+	}
+	p, err := db.prepare(cypher, params, opts)
+	if err != nil {
+		return err
+	}
+	defer p.destroy()
+	return f(unsafe.Pointer(p.ptr))
+}
+
+// LastError returns the message recorded by the most recent failing
+// marsdb-capi call on this handle. Intended for companion modules
+// calling capi symbols directly; this package's own methods already
+// return their errors.
+func (db *Database) LastError() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.ptr == nil {
+		return errors.New("marsdb: database is closed")
+	}
+	return db.lastError()
+}
+
 // prepared wraps a live C statement handle; callers must destroy() it.
 type prepared struct {
 	ptr *C.MarsdbStatement
