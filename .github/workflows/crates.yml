@@ -12,6 +12,10 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      # `contents: write` is for the release job's benefit only -- the
+      # publish steps authenticate to crates.io with CARGO_REGISTRY_TOKEN.
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - name: Build and test
@@ -33,3 +37,31 @@ jobs:
         run: cargo publish -p marsdb-nl2cypher
       - name: Publish marsdb-cli
         run: cargo publish -p marsdb-cli
+      # After every crate is up: create the GitHub Release for this tag,
+      # with the tag's own CHANGELOG section as the notes. Runs last so a
+      # Release only ever points at a fully published version; idempotent
+      # (skips if the Release already exists) so a re-run of a partially
+      # failed workflow doesn't error here. Tag-push only -- a
+      # workflow_dispatch run has no tag to release.
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists, skipping"
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          # The tag's section of CHANGELOG.md: lines from its `## [X.Y.Z]`
+          # header (exclusive) to the next `## [` header (exclusive).
+          awk -v ver="$VERSION" '
+            /^## \[/ { in_section = index($0, "[" ver "]") > 0; next }
+            in_section { print }
+          ' CHANGELOG.md > notes.md
+          if ! [ -s notes.md ]; then
+            echo "See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/main/CHANGELOG.md)." > notes.md
+          fi
+          printf '\nInstall: `cargo install marsdb-cli`, `pip install marsdb`, or `brew install knoguchi/marsdb/marsdb`.\n' >> notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md
