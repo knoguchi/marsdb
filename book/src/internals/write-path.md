@@ -33,6 +33,27 @@ transaction and collide with the ones node-deletion already holds. The
 `_ctx` layer exists so compound operations compose *inside* one
 handle set.
 
+```mermaid
+sequenceDiagram
+    participant E as Executor (one txn per statement)
+    participant S as GraphStore::create_edge_in_txn
+    participant C as WriteCtx (lazy handles)
+    participant T as redb tables
+    E->>S: create edge (label, src, dst, props)
+    S->>C: open ctx on the statement's WriteTransaction
+    S->>C: nodes() — endpoint existence check
+    C->>T: NODES.get(src), NODES.get(dst)
+    S->>C: intern label, next edge id
+    C->>T: LABEL_TO_ID / META
+    S->>C: edges().insert(id, record)
+    C->>T: EDGES
+    S->>C: adj_out().insert / adj_in().insert
+    C->>T: ADJ_OUT, ADJ_IN (mirror keys)
+    S->>C: bump REL_TYPE_COUNTS
+    C->>T: REL_TYPE_COUNTS
+    Note over E,T: nothing durable until the statement's single commit
+```
+
 ## `WriteCtx`: lazy handles, measured
 
 `WriteCtx` is a struct of thirteen `Option<Table>` fields with

@@ -91,6 +91,18 @@ GC の圧力は 3 桁減ります。列指向境界の勝ちはアロケーシ�
 プロファイルであり、エンジン自身の時間の取り分が縮むほど大きく
 なります。
 
+```mermaid
+flowchart LR
+    R["行指向の QueryResult"] -->|"転置は一度だけ\n(厳格な列推論)"| B["Arrow RecordBatch 群\n(エンジン所有のバッファ)"]
+    B --> RS["Rust: RecordBatchReader"]
+    B --> C["C ABI: C Data Interface ストリーム\nmarsdb_stmt_execute_arrow"]
+    C --> PY["Python: PyCapsule プロトコル"]
+    C --> GO["Go: arrow-go cdata インポート"]
+    classDef zc stroke-dasharray: 3 3
+    class RS,C,PY,GO zc
+    %% 破線 = ゼロコピー: ポインタの受け渡しのみ、シリアライズなし
+```
+
 列の型付けは厳格で、意図的にそうです。Cypher の列は動的型付けなので、
 エクスポータは列の型を結果全体にわたって推論します — エクスポートが
 最初のバッチを渡す前に実体化するのもそのためです: 推論には全行が

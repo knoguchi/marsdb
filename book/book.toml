@@ -9,6 +9,12 @@ src = "src"
 git-repository-url = "https://github.com/knoguchi/marsdb"
 edit-url-template = "https://github.com/knoguchi/marsdb/edit/main/book/{path}"
 site-url = "/marsdb/"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.search]
 enable = true
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

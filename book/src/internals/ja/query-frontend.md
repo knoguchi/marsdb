@@ -9,6 +9,17 @@ Cypher テキストと、検証済みで実行可能な AST の間にあるす�
 3 つの関数です: `parse`(1 文)、`parse_many`(`;` 区切り
 スクリプト)、`substitute_params`。
 
+```mermaid
+flowchart LR
+    T["Cypher テキスト"] --> L["生成されたレキサ/パーサ\n(ANTLR、コミット済み)"]
+    L --> PT["パースツリー"]
+    PT --> V["visitor\n(antlr_visitor.rs)"]
+    V --> AST["AST\n(ast.rs)"]
+    AST --> P["substitute_params\n$name → Literal、その場で"]
+    P --> SV["validate_statement\n名前 + 構造的種別"]
+    SV --> EX["エグゼキュータ\n($param を決して見ない)"]
+```
+
 ## 文法とパースツリー
 
 文法は手で維持される openCypher サブセットで、慣例どおりレキサと

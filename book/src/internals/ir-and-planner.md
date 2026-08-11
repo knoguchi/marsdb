@@ -97,6 +97,21 @@ different types from interleaving. This is what makes
 `IndexRangeSeek` a contiguous key-range scan rather than a full-index
 walk: `WHERE n.year > 2000` becomes byte bounds.
 
+```mermaid
+flowchart LR
+    subgraph before["Before (storage-free build)"]
+        F1["Filter\nn.name = 'Alice' AND n.age > 30"]
+        S1["NodeByLabelScan\nn : Person"]
+        F1 --> S1
+    end
+    subgraph after["After apply_index_seeks (inside the txn)"]
+        F2["Filter\nn.age > 30   (residual)"]
+        S2["IndexSeek\n(Person, name) = 'Alice'"]
+        F2 --> S2
+    end
+    before ==>|"index on (Person, name) exists"| after
+```
+
 `apply_index_seeks` rewrites `Filter(n.prop = literal)` over
 `NodeByLabelScan(n, Label)` into `IndexSeek` when `INDEX_DEFS` says an
 index exists — and this is why the AST's narrow

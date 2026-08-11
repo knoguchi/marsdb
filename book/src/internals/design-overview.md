@@ -27,6 +27,25 @@ marsdb-graph     property-graph model: records, encoding, indexes, CRUD
 marsdb-storage   thin boundary over the embedded KV engine (redb)
 ```
 
+```mermaid
+flowchart BT
+    storage["marsdb-storage — thin boundary over redb"]
+    graph["marsdb-graph — records, encoding, indexes, CRUD"]
+    query["marsdb-query — Cypher → AST → plan → executor"]
+    core["marsdb — Database, Transaction, sessions"]
+    cli["marsdb-cli — the mars binary"]
+    capi["marsdb-capi — C ABI"]
+    py["marsdb-python — PyO3"]
+    redb[("redb — B-tree file, MVCC")]
+    storage --> redb
+    graph --> storage
+    query --> graph
+    core --> query
+    cli --> core
+    capi --> core
+    py --> core
+```
+
 Two observations about this stack shape most of what follows.
 
 **The storage engine is bought, not built.** `marsdb-storage` wraps
@@ -111,6 +130,25 @@ Everything the database does is reachable from one entry point:
    This all-or-nothing boundary per statement is the database's basic
    crash-safety contract, and it holds for a statement that created
    three thousand nodes just as for one that created one.
+
+```mermaid
+flowchart TD
+    A["Cypher text"] --> B["Parse (ANTLR → AST)"]
+    B -->|syntax error| X1["Error — no transaction ever opened"]
+    B --> C["Substitute $params (structural)"]
+    C -->|missing param| X1
+    C --> D{"Session BEGIN open?"}
+    D -->|yes| E["Run inside session write txn"]
+    D -->|no| F{"Read-only shape?"}
+    F -->|yes| G["Open ReadTransaction (MVCC snapshot)"]
+    F -->|no| H["Open WriteTransaction (the single writer)"]
+    G --> I["Plan (rewrite with indexes + statistics)"]
+    H --> I
+    E --> I
+    I --> J["Evaluate operator tree, apply tail"]
+    J -->|success| K["Commit — atomic, durable"]
+    J -->|execution error| L["Abort — no trace left"]
+```
 
 The important property of this pipeline is where the boundaries sit.
 Parse and parameter errors happen before any transaction exists;

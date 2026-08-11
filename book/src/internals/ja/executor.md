@@ -25,6 +25,17 @@
 されます — `ON CREATE SET` と `ON MATCH SET` が各行の分岐を知る方法
 です。
 
+```mermaid
+flowchart TD
+    scan["NodeByLabelScan a:Person\nノードごとに 1 行"] --> f1["Filter\na.name = 'Alice'"]
+    f1 --> ex["Expand a -[:KNOWS]-> b\nADJ_OUT のプレフィクスレンジ\n入力行ごとに 0..n 後続行"]
+    ex --> f2["Filter\nb.age > 30\n(プロパティは id で必要時取得)"]
+    f2 --> tail["末尾: 射影 / 集約 / 整列 / 書き込み句"]
+    guard["ExecutionGuard\nキャンセル · 期限 · 行と展開の制限"] -.->|全ループ内のチェックポイント| scan
+    guard -.-> ex
+    guard -.-> tail
+```
+
 ## プランを歩く
 
 プラン評価は再帰的ウォークです。スキャンは `NODES`、ラベル

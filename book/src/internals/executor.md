@@ -29,6 +29,17 @@ a `MERGE` row came from the create path or the match path, consumed
 and stripped before the row becomes visible — that is how `ON CREATE
 SET` and `ON MATCH SET` know which branch each row took.
 
+```mermaid
+flowchart TD
+    scan["NodeByLabelScan a:Person\none row per node"] --> f1["Filter\na.name = 'Alice'"]
+    f1 --> ex["Expand a -[:KNOWS]-> b\nprefix range over ADJ_OUT\n0..n successor rows per input row"]
+    ex --> f2["Filter\nb.age > 30\n(property fetched by id, on demand)"]
+    f2 --> tail["Tail: project / aggregate / order / write clauses"]
+    guard["ExecutionGuard\ncancel · deadline · row + expansion limits"] -.->|checkpoints inside every loop| scan
+    guard -.-> ex
+    guard -.-> tail
+```
+
 ## Walking the plan
 
 Plan evaluation is a recursive walk. Scans iterate `NODES`, the label

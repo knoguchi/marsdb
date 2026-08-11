@@ -36,6 +36,35 @@ maintenance, or query — all of that is MarsDB.
 `marsdb-storage/src/tables.rs` declares every table in the file. They
 fall into five groups.
 
+```mermaid
+flowchart LR
+    subgraph identity["Identity & metadata"]
+        META["META\ncounters + format version"]
+    end
+    subgraph interning["Interning"]
+        L2I["LABEL_TO_ID / ID_TO_LABEL"]
+        P2I["PROP_TO_ID / ID_TO_PROP"]
+    end
+    subgraph records["Records"]
+        NODES["NODES\nid → encoded record"]
+        EDGES["EDGES\nid → encoded record"]
+    end
+    subgraph adjacency["Adjacency"]
+        AO["ADJ_OUT\n(src, label, edge) → dst"]
+        AI["ADJ_IN\n(dst, label, edge) → src"]
+        RTC["REL_TYPE_COUNTS\nplanner statistic"]
+    end
+    subgraph indexes["Secondary indexes"]
+        NLI["NODE_LABEL_INDEX\nlabel → node ids"]
+        IDEFS["INDEX_DEFS\ndeclared (label, prop)"]
+        PIDX["PROPERTY_INDEX\nlabel ++ prop ++ value → node ids"]
+    end
+    NODES -.->|label ids| L2I
+    NODES -.->|prop ids| P2I
+    AO -.->|mirror of| AI
+    IDEFS -.->|gates entries in| PIDX
+```
+
 **Identity and metadata.** `META` holds three counters under string
 keys: the next node id, the next edge id, and the file's format
 version. Ids are `u64`s allocated monotonically and never reused. The

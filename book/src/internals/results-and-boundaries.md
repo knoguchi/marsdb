@@ -93,6 +93,18 @@ of magnitude less allocator and GC pressure. The columnar boundary's
 win is the allocation profile, and it grows as the engine's own share
 of the time shrinks.
 
+```mermaid
+flowchart LR
+    R["Row-oriented QueryResult"] -->|"transpose ONCE\n(strict column inference)"| B["Arrow RecordBatches\n(engine-owned buffers)"]
+    B --> RS["Rust: RecordBatchReader"]
+    B --> C["C ABI: C Data Interface stream\nmarsdb_stmt_execute_arrow"]
+    C --> PY["Python: PyCapsule protocol"]
+    C --> GO["Go: arrow-go cdata import"]
+    classDef zc stroke-dasharray: 3 3
+    class RS,C,PY,GO zc
+    %% dashed = zero-copy: pointer handoff, no serialization
+```
+
 Column typing is strict, and deliberately so. Cypher columns are
 dynamically typed, so the exporter infers each column's type over the
 whole result — which is also why the export materializes before the

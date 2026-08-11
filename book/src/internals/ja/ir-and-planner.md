@@ -92,6 +92,21 @@
 全インデックス走査ではなく連続キーレンジのスキャンにするものです:
 `WHERE n.year > 2000` はバイト境界になります。
 
+```mermaid
+flowchart LR
+    subgraph before["書き換え前(ストレージ不要の構築)"]
+        F1["Filter\nn.name = 'Alice' AND n.age > 30"]
+        S1["NodeByLabelScan\nn : Person"]
+        F1 --> S1
+    end
+    subgraph after["apply_index_seeks 後(トランザクション内)"]
+        F2["Filter\nn.age > 30 (残余)"]
+        S2["IndexSeek\n(Person, name) = 'Alice'"]
+        F2 --> S2
+    end
+    before ==>|"(Person, name) にインデックスが存在"| after
+```
+
 `apply_index_seeks` は、`INDEX_DEFS` がインデックスの存在を告げる
 とき、`NodeByLabelScan(n, Label)` 上の `Filter(n.prop = literal)` を
 `IndexSeek` に書き換えます — 第 5 章の AST の狭い

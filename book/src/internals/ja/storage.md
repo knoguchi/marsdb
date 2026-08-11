@@ -37,6 +37,35 @@ redb より上のすべてはこれらをシステムの公理として扱いま
 `marsdb-storage/src/tables.rs` がファイル内の全テーブルを宣言します。
 5 つのグループに分かれます。
 
+```mermaid
+flowchart LR
+    subgraph identity["識別子とメタデータ"]
+        META["META\nカウンタ + フォーマットバージョン"]
+    end
+    subgraph interning["インターニング"]
+        L2I["LABEL_TO_ID / ID_TO_LABEL"]
+        P2I["PROP_TO_ID / ID_TO_PROP"]
+    end
+    subgraph records["レコード"]
+        NODES["NODES\nid → エンコード済みレコード"]
+        EDGES["EDGES\nid → エンコード済みレコード"]
+    end
+    subgraph adjacency["隣接"]
+        AO["ADJ_OUT\n(src, label, edge) → dst"]
+        AI["ADJ_IN\n(dst, label, edge) → src"]
+        RTC["REL_TYPE_COUNTS\nプランナ統計"]
+    end
+    subgraph indexes["セカンダリインデックス"]
+        NLI["NODE_LABEL_INDEX\nlabel → node ids"]
+        IDEFS["INDEX_DEFS\n宣言済み (label, prop)"]
+        PIDX["PROPERTY_INDEX\nlabel ++ prop ++ value → node ids"]
+    end
+    NODES -.->|ラベル id| L2I
+    NODES -.->|プロパティ id| P2I
+    AO -.->|鏡像| AI
+    IDEFS -.->|エントリを制御| PIDX
+```
+
 **識別子とメタデータ。** `META` は文字列キーの下に 3 つのカウンタを
 保持します: 次のノード id、次のエッジ id、ファイルのフォーマット
 バージョン。id は単調に割り当てられる `u64` で、決して再利用され

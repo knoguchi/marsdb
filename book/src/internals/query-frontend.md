@@ -9,6 +9,17 @@ validation pass (`semantic.rs`). The public surface is three
 functions: `parse` (one statement), `parse_many` (a `;`-separated
 script), and `substitute_params`.
 
+```mermaid
+flowchart LR
+    T["Cypher text"] --> L["Generated lexer/parser\n(ANTLR, committed)"]
+    L --> PT["Parse tree"]
+    PT --> V["Visitor\n(antlr_visitor.rs)"]
+    V --> AST["AST\n(ast.rs)"]
+    AST --> P["substitute_params\n$name → Literal, in place"]
+    P --> SV["validate_statement\nnames + structural kinds"]
+    SV --> EX["Executor\n(never sees a $param)"]
+```
+
 ## Grammar and parse tree
 
 The grammar is a hand-maintained openCypher subset split conventionally

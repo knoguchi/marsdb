@@ -33,6 +33,27 @@
 `_ctx` 層は、複合操作が 1 つのハンドル集合の*内側で*合成できるために
 存在します。
 
+```mermaid
+sequenceDiagram
+    participant E as エグゼキュータ(文ごとに 1 トランザクション)
+    participant S as GraphStore::create_edge_in_txn
+    participant C as WriteCtx(遅延ハンドル)
+    participant T as redb テーブル
+    E->>S: エッジ作成 (label, src, dst, props)
+    S->>C: 文の WriteTransaction 上に ctx を開く
+    S->>C: nodes() — 端点の存在確認
+    C->>T: NODES.get(src), NODES.get(dst)
+    S->>C: ラベルをインターン、次のエッジ id
+    C->>T: LABEL_TO_ID / META
+    S->>C: edges().insert(id, record)
+    C->>T: EDGES
+    S->>C: adj_out().insert / adj_in().insert
+    C->>T: ADJ_OUT, ADJ_IN(鏡像キー)
+    S->>C: REL_TYPE_COUNTS を加算
+    C->>T: REL_TYPE_COUNTS
+    Note over E,T: 文の唯一のコミットまで何も永続化されない
+```
+
 ## `WriteCtx`: 遅延ハンドル、計測済み
 
 `WriteCtx` は 13 個の `Option<Table>` フィールドとアクセサメソッドの
