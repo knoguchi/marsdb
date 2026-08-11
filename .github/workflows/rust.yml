@@ -92,7 +92,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   bindings:
-    name: Python and Go bindings
+    name: Python binding
     needs: quality
     runs-on: ubuntu-latest
     steps:
@@ -101,16 +101,14 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: marsdb-go/go.mod
-          # marsdb-go has zero external dependencies (stdlib + cgo only) --
-          # no go.sum ever exists to key module caching against, which
-          # otherwise prints a harmless but noisy "Restore cache failed"
-          # warning on every run.
-          cache: false
       - name: Build Rust workspace
         run: cargo build --workspace --verbose
+      # The Go bindings live in https://github.com/knoguchi/marsdb-go and
+      # link against this crate's C ABI (arrow feature included). Keep the
+      # feature compiling here so a PR can't silently break that repo's CI,
+      # which builds marsdb-capi from this repo's main.
+      - name: Build marsdb-capi with Arrow
+        run: cargo build -p marsdb-capi --features arrow --verbose
       - name: Build and test Python binding
         working-directory: marsdb-python
         run: |
@@ -120,11 +118,6 @@ jobs:
           maturin build --out dist
           python -m pip install --force-reinstall dist/*.whl
           python -m unittest discover -s tests
-      - name: Run Go binding tests
-        working-directory: marsdb-go
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
-        run: go test ./...
 
   security-audit:
     name: Dependency security audit

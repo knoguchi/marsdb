@@ -33,7 +33,7 @@ body:
       options:
         - Rust (marsdb)
         - Python (marsdb-python)
-        - Go (marsdb-go)
+        - Go (github.com/knoguchi/marsdb-go)
         - CLI (marsdb-cli)
         - C API (marsdb-capi)
     validations:
