@@ -1,49 +1,35 @@
 # Go bindings
 
 Unlike [`marsdb-python`](./python.md) (PyO3, in-process), Go has no
-equivalent in-process FFI story with Rust, so [`marsdb-go`](https://github.com/knoguchi/marsdb/tree/main/marsdb-go)
-goes through the small C ABI crate, [`marsdb-capi`](./c-api.md), via cgo.
+equivalent in-process FFI story with Rust, so the Go binding goes
+through the small C ABI crate, [`marsdb-capi`](./c-api.md), via cgo.
+
+The binding lives in its own repository,
+[`marsdb-go`](https://github.com/knoguchi/marsdb-go), as two Go modules:
 
 ```
-go get github.com/knoguchi/marsdb/marsdb-go
+go get github.com/knoguchi/marsdb-go        # core binding, zero deps
+go get github.com/knoguchi/marsdb-go/arrow  # Arrow results (arrow-go dep)
 ```
 
-Go modules resolve straight from the public Git host, no separate
-registry step — this works today even though the module isn't
-semver-tagged yet (resolves to a pseudo-version off `main`). The C ABI
-side still needs building locally either way (cgo can't fetch a
-prebuilt `.dylib`/`.so`), so most users will clone the repo and build
-both pieces as below.
+The split keeps the core module dependency-free — arrow-go is a
+heavyweight dependency only columnar consumers should pay for.
 
 ## Build
 
-Two steps: build the Rust cdylib, then build the Go package against it.
+The C header is vendored in the binding repo; only the library needs
+building here. In a checkout of this repository:
 
 ```
-# 1. Build marsdb-capi (produces target/debug/libmarsdb_capi.dylib on macOS)
-cargo build -p marsdb-capi
+cargo build -p marsdb-capi --features arrow
+```
 
-# 2. Build/test the Go package
-cd marsdb-go
-go build ./...
+(`--features arrow` is required by the arrow module and harmless for the
+core one.) Then, in a `marsdb-go` checkout:
+
+```
+export CGO_LDFLAGS="-L/path/to/marsdb/target/debug"
 go test ./...
-```
-
-`marsdb.go`'s cgo preamble already points `-L`/`-I` at
-`../target/debug`/`../marsdb-capi` relative to this directory via cgo's
-`${SRCDIR}` substitution, so the two commands above work as-is right
-after a debug build on macOS. On Linux, add the shared-library directory
-at runtime:
-
-```
-LD_LIBRARY_PATH="$(pwd)/../target/debug" go test ./...
-```
-
-If you built `marsdb-capi` in release mode instead
-(`cargo build -p marsdb-capi --release`), override the link path:
-
-```
-CGO_LDFLAGS="-L$(pwd)/../target/release -lmarsdb_capi" go build ./...
 ```
 
 ## Usage
@@ -55,7 +41,7 @@ import (
 	"fmt"
 	"log"
 
-	marsdb "github.com/knoguchi/marsdb/marsdb-go"
+	marsdb "github.com/knoguchi/marsdb-go"
 )
 
 func main() {
@@ -81,13 +67,6 @@ func main() {
 }
 ```
 
-A runnable copy lives in [`examples/basic`](https://github.com/knoguchi/marsdb/tree/main/marsdb-go/examples/basic):
-
-```
-cargo build -p marsdb-capi
-cd marsdb-go && go run ./examples/basic
-```
-
 `Execute` returns `[]map[string]any`, one map per matched row keyed by
 column name — the same dict-per-row shape as `marsdb-python`. A returned
 node decodes as `map[string]any{"__type": "node", "id": ..., "labels":
@@ -98,12 +77,7 @@ retain their full precision as `int64` (or `uint64` for an ID above
 durations are returned as canonical ISO-8601 strings such as
 `"1984-10-11"` and `"P1M2D"`.
 
-## What's not here yet
-
-Only `Open`/`InMemory`/`Execute`/`Close` — `execute_batch` (multi-statement,
-one transaction each) and `execute_with_params` (`$param` substitution)
-exist on the Rust/C ABI side's natural extension points but aren't wired
-through `marsdb-capi` or this package yet. Not yet set up to produce a
-redistributable Go binary to a machine without this exact local build
-layout either — see the package README for the exact gap
-(static-linking `libmarsdb_capi.a`, or `@rpath`-relative dylib linking).
+See the [marsdb-go README](https://github.com/knoguchi/marsdb-go) for
+the full API tour — parameterized queries, transactions, streaming,
+execution bounds — platform linking notes, and the Arrow module's
+column-typing rules.

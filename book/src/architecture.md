@@ -8,9 +8,12 @@ marsdb           embeddable public Rust API (Database::open/in_memory/execute)
 marsdb-cli       the `marsdb` binary (REPL + one-shot mode)
 marsdb-python    PyO3 bindings, builds via maturin
 marsdb-capi      C ABI (opaque handle + JSON results), basis for non-Rust bindings
-marsdb-go        Go bindings, via cgo against marsdb-capi
 marsdb-nl2cypher natural-language -> Cypher: schema introspection, prompt building, validate-and-repair
 ```
+
+Go bindings live in a separate repository,
+[knoguchi/marsdb-go](https://github.com/knoguchi/marsdb-go), linking
+against `marsdb-capi` via cgo — see [Go bindings](./go.md).
 
 ## Storage
 
