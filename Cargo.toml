@@ -25,7 +25,7 @@ members = [
 exclude = ["marsdb-python"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 # Verified via clippy's own `incompatible_msrv` lint (not guessed) --
 # `Option::is_none_or` (stable since 1.82.0) is the newest stdlib item
