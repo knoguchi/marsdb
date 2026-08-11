@@ -3,6 +3,82 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] - 2026-08-10
+
+The release that declares the C API stable. Everything a non-Rust
+binding needs — typed values, parameters, streaming, execution bounds,
+transactions, Arrow results — now crosses one settled ABI surface
+(`marsdb-capi/marsdb.h`, the documentation of record), exercised
+end-to-end by the out-of-repo Go binding's CI on every run.
+
+### Changed
+- **C API v2 (breaking)**: typed opaque handles (the SQLite shape) plus
+  a binary batch lane — one FFI crossing returns a whole result as a
+  compact self-describing buffer (interned names, varint ints, format
+  spec in `marsdb.h`). The JSON result channel is removed, not
+  deprecated: every consumer moved to the typed surface.
+- **Go bindings moved out** to
+  [knoguchi/marsdb-go](https://github.com/knoguchi/marsdb-go) — one
+  repo, two Go modules (`marsdb-go` core with zero deps,
+  `marsdb-go/arrow` for columnar results). They consume the C ABI via
+  cgo against a vendored `marsdb.h`; that repo's CI builds this repo's
+  `marsdb-capi` from `main` and drift-checks the header, and this
+  repo's CI keeps `--features arrow` compiling as the reciprocal
+  pre-merge guard.
+
+### Added
+- **Arrow results, zero-copy at every boundary** (`arrow` cargo
+  feature, off by default): `Database::query_arrow` transposes a result
+  to Arrow `RecordBatch`es once, in core; downstream it's pointer
+  handoff only — a Rust `RecordBatchReader`, the Arrow C Data Interface
+  stream through `marsdb-capi` (`marsdb_query_arrow` /
+  `marsdb_stmt_execute_arrow`), the PyCapsule protocol in Python, and
+  arrow-go `cdata` import in Go. Column typing is strict per column
+  over the whole result (`Int64` exact, no silent int→float promotion;
+  node/edge/map/path columns error — project properties instead).
+  Measured on a 200k-row 3-column result in Go: ~1.2M binding-side
+  allocations (83 MB) via the batch lane vs ~900 (83 KB) via Arrow,
+  wall time at parity (engine dominates both).
+- **Streaming reads**: `Database::execute_streaming` pushes rows into a
+  caller-supplied `RowSink` — bounded memory regardless of result size,
+  exposed in Rust, Python, the C ABI (per-row callback), and Go.
+  Accepts exactly the streamable shape (one plain `MATCH ... RETURN`,
+  `SKIP`/`LIMIT` fine) and errors on `ORDER BY`/aggregation/`DISTINCT`/
+  `WITH` rather than silently materializing.
+- **Per-statement write counters**: `QueryResult::stats`
+  (nodes/relationships created and deleted, properties set, labels
+  added/removed) — the answer to "how many did my DELETE delete",
+  surfaced through all bindings and the CLI.
+- **Parameterized queries across the C ABI, Go, and Python**: typed
+  prepared-statement binds (`$name`), scalars and flat lists; `int64`
+  precision preserved end to end.
+- **Execution bounds in all bindings**: row limits, relationship-
+  expansion limit, timeout, cancellation — checked cooperatively during
+  plan evaluation, not after materialization. Python errors are now
+  structured exception classes instead of one flat error type.
+- **Schema introspection procedures**: `CALL db.labels()`,
+  `db.relationshipTypes()`, `db.propertyKeys()`, `db.indexes()`.
+- **Planner: bounded index range scans** — `WHERE n.year > 2000 [AND
+  n.year < 2010]` over an indexed `(label, prop)` compiles to
+  `IndexRangeSeek` over the order-preserving key encoding, with the
+  originating conjuncts kept as a residual filter (the storage lookup
+  returns a superset for numeric bounds by design).
+- **Planner: `EdgeTypeScan`** — relationship-predicate bulk shapes
+  (`MATCH ()-[r:T]->() WHERE r.x ... DELETE r`) compile to one
+  sequential `EDGES` sweep with the predicate evaluated from each
+  record's own bytes, cost-gated against the anchored alternatives.
+  Measured: ~5–6 ms for a warm 166k-record sweep vs ~110 ms for the
+  same edges through per-edge adjacency gets.
+- **Internals book**: a ten-chapter architecture tour
+  (design → storage → encoding → write path → frontend → planner →
+  executor → boundaries → testing → measured-trade-off case studies)
+  in English and Japanese, with Mermaid diagrams, published with the
+  manual.
+
+### Fixed
+- **wasm32**: generated parser token bitmasks widened to `u64` — the
+  grammar compiles and runs on 32-bit targets.
+
 ## [0.8.0] - 2026-08-08
 
 ### Changed

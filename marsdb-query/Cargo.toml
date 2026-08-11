@@ -16,5 +16,5 @@ description = "openCypher query subset parser, planner, and executor used intern
 antlr4rust = "0.5.2"
 chrono.workspace = true
 chrono-tz.workspace = true
-marsdb-graph = { path = "../marsdb-graph", version = "0.8.0" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.9.0" }
 thiserror.workspace = true
