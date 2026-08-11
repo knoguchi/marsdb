@@ -1,6 +1,6 @@
 # MarsDB Internals
 
-> 日本語版は[こちら](./ja/index.md)。
+> [日本語版はこちら](../ja/index.html)。
 
 This part of the book is for a different reader than the chapters before
 it. The earlier chapters tell you how to *use* MarsDB; this part tells

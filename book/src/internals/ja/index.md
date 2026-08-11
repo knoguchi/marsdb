@@ -1,6 +1,6 @@
 # MarsDB 内部構造
 
-> English version is [here](../index.md).
+> [English version](../internals/index.html)
 
 この部は、これまでの章とは異なる読者を対象としています。前半で説明した
 のが MarsDB の「使い方」だとすれば、ここで扱うのは「内部でどのように
