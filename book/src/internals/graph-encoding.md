@@ -17,7 +17,7 @@ before anything reaches storage.
 
 Values serialize with [postcard](https://docs.rs/postcard), a compact
 serde format (varint integers, no field names). That choice carries a
-one-way compatibility rule worth engraving: postcard encodes an enum
+one-way compatibility rule: postcard encodes an enum
 discriminant by *declaration order*, so new `PropertyValue` variants
 append at the end, and existing ones are never reordered or removed —
 otherwise every already-stored property silently decodes as the wrong
@@ -95,8 +95,8 @@ Offsets are relative to the values region, and value *i*'s length is
 values must be packed in directory order: the lengths are implied, not
 stored.
 
-The obvious alternative — serialize the whole name-keyed property map
-as one postcard blob — is simpler and was the natural first
+The simpler alternative — serializing the whole name-keyed property map
+as one postcard blob — was the first
 implementation. The directory earns its complexity on the read path:
 fetching *one* property from a record is a binary search over the
 directory plus one postcard decode of just that value. No map is
@@ -142,8 +142,8 @@ byte-encoded keys — was measured at 2x total database file size.
 
 ## What is *not* here
 
-Deletes are real deletes — records, adjacency entries, and index
-entries are removed in the same transaction, and there is no tombstone
+Deletes remove records, adjacency entries, and index entries in the
+same transaction, and there is no tombstone
 or vacuum machinery; MVCC old versions are redb's concern, reclaimed by
 its copy-on-write B-tree. Ids are never reused, which keeps "dangling
 id" a state that only a bug (not a design feature) can produce — and

@@ -1,7 +1,8 @@
 # Testing and Measurement
 
 A database earns trust two ways: by being unable to give wrong answers,
-and by knowing its own numbers. This chapter covers both machineries —
+and by understanding its own performance. This chapter covers both
+mechanisms —
 the correctness stack (unit suites, conformance, crash safety,
 integrity) and the measurement discipline that the rest of this book
 has been quietly citing.
@@ -41,10 +42,10 @@ machine-checkable spec, and its scenarios reach corners that
 first-principles test-writing does not.
 
 **Crash safety** has its own harness (`marsdb-crash-harness`), and its
-honesty starts in its module docs: this is *level-1* crash safety —
-process death, OS survives, page cache intact — and explicitly not
-power-loss (which loses the page cache and would need real fault
-injection to test). Within that scope the design is worth copying: a
+scope is stated in its module docs: this is *level-1* crash
+safety — process death while the OS survives and the page cache remains
+intact — and explicitly not power loss (which loses the page cache and
+would need fault injection to test). Within that scope, a
 child process commits a random number of single-`CREATE` transactions
 with a monotonically numbered counter; the parent SIGKILLs it at an
 unpredictable moment, reopens the file cold, and asserts a purely
@@ -69,7 +70,7 @@ are as much a part of the engineering culture as any code:
   "expected to be fast." A feature without a benchmark has no
   performance claim — the file has no placeholder rows.
 - **Provenance on every number.** Hardware, date, build profile, and
-  the exact reproduce command (`cargo bench -p ...`, criterion-based)
+  the exact reproduction command (`cargo bench -p ...`, using Criterion)
   accompany each table.
 - **Caveats are stated, not buried.** The concurrent-read scaling
   table (1.26x at 2 threads up to 1.87x at 8, then a plateau) is
@@ -104,4 +105,4 @@ out-of-repo Go binding (its own CI builds this repository's C ABI
 from `main` and would otherwise discover breakage only after merge).
 
 The final chapter collects the measurements that *changed decisions*
-— including the ones that killed their own feature.
+— including those that led to a feature's removal.

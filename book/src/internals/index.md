@@ -11,11 +11,11 @@ behind the design decisions along the way.
 It is written for developers who want to understand or build graph
 databases, using MarsDB as a complete, readable case study. MarsDB is
 small enough to hold in your head — a few crates, one storage engine,
-one query pipeline — but it is a real database: ACID transactions,
+one query pipeline — while still providing ACID transactions,
 crash safety, secondary indexes, a cost-aware planner, streaming
 execution, and zero-copy results across three language boundaries. Every
-performance claim in these chapters is a measured number from this
-repository's benchmark suite, not an estimate.
+performance figures in these chapters come from this repository's
+benchmark suite.
 
 ## Chapters
 

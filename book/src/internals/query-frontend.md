@@ -41,8 +41,8 @@ node kind.
 
 ## The AST encodes planner-relevant shape
 
-`ast.rs` is worth reading as a design artifact, because its `Expr`
-type does something subtle: it distinguishes comparison shapes *by
+`ast.rs` shows how the AST supports planning. Its `Expr` type
+distinguishes comparison shapes *by
 what the planner can later do with them*, not just by what they mean.
 
 - `Compare(prop, op, literal)` — a property against a constant. This
@@ -91,14 +91,14 @@ Second, the executor never sees a parameter. The substitution pass is
 total (a `$name` with no binding is an error here), so the executor's
 literal evaluation treats `Literal::Param` as `unreachable!` — the
 invariant is enforced at the boundary and assumed thereafter, which is
-the same loudness policy the storage layer uses for its own
-invariants.
+the same policy of surfacing invariant violations that the storage
+layer applies to its own invariants.
 
 The walk itself is the mechanical price of this design: every
 expression-bearing position in every clause must be visited, and a new
 AST position means extending the walk. The compiler is the safety net
-— an exhaustive match over `Statement` breaks loudly when a variant is
-added.
+— an exhaustive match over `Statement` fails to compile when a variant
+is added.
 
 ## Semantic validation: what a statement can promise before running
 
@@ -114,8 +114,8 @@ the statement alone:
   expressions, so `MATCH (n)-[r]->() RETURN r.prop + n` fails now,
   not mid-scan.
 
-Just as telling is what it declines to check, with the reasons
-recorded: property *value* types are data-dependent and stay runtime
+Some checks are deliberately deferred: property *value* types are
+data-dependent and stay runtime
 checks (Cypher is dynamically typed at the property level; the same
 `n.age` can be an int on one node and a string on the next). Whether
 `COMMIT` is valid *right now* is session state, owned by the

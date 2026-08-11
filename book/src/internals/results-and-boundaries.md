@@ -54,7 +54,7 @@ For bulk results the ABI offers a **binary batch lane**: one call
 returns an entire result as a compact self-describing buffer —
 interned column and property names, varint integers — that a binding
 decodes in its own language. One boundary crossing per *query* rather
-than per value: the per-call FFI tax (marshalling, error checking,
+than per value: the per-call FFI overhead (marshalling, error checking,
 in some runtimes lock acquisition) is paid once. A streaming callback
 lane covers the opposite shape — unbounded exports under bounded
 memory — pushing one row per callback through the executor's
@@ -69,9 +69,9 @@ and transaction surface.
 
 ## Arrow: the columnar boundary
 
-For analytical consumers — dataframes, columnar compute — the row
-result is the wrong shape, and per-value conversion is the wrong
-cost. MarsDB's answer is a core-owned Arrow export
+For analytical consumers such as dataframes and columnar computation,
+row-oriented results are inconvenient, and per-value conversion is
+unnecessarily expensive. MarsDB therefore provides a core-owned Arrow export
 (`Database::query_arrow`, behind the opt-in `arrow` cargo feature):
 the row-to-column transpose happens exactly once, in the engine, and
 everything downstream of it is zero-copy:

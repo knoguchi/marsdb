@@ -166,7 +166,7 @@ for methods nothing calls. Each method exists because a call site
 demanded it: `range` was left out entirely until the composite-key
 adjacency needed prefix scans; `len` was added when the planner needed
 O(1) cardinalities to compare scan costs. The surface grows only under
-demand, which keeps it honest — reading `txn.rs` tells you exactly
+demand. Reading `txn.rs` therefore tells you exactly
 what the entire upper system asks of storage: point gets, ordered
 iteration, ordered range scans, and counts. Four primitives.
 
@@ -179,7 +179,7 @@ with `create_new` — an existing file is never silently overwritten —
 and a failed backup removes its own partial file (safe precisely
 because `create_new` proved the file was ours). Because the copy is
 driven from a snapshot, it can run while other readers and a writer
-proceed; it is a hot backup for free, courtesy of MVCC.
+proceed, so MVCC also enables online backups.
 
 `check_integrity` layers two checks: redb's own physical validation
 (checksums, allocation), then MarsDB's logical invariants — every

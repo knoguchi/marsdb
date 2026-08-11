@@ -3,14 +3,14 @@
 MarsDB is an embeddable property-graph database: a Rust library that
 runs inside your process, stores an entire graph in a single file (or
 purely in memory), and answers openCypher queries. There is no server,
-no network protocol, and no background thread — every piece of work the
-database does happens inside some caller's function call. If you have
+no network protocol, and no background thread — all database work
+happens within the caller's function call. If you have
 used SQLite, the shape is familiar; MarsDB applies it to the property
 graph model: nodes with labels and properties, directed typed
 relationships with properties, and a query language built around
 pattern matching.
 
-This chapter walks the whole system once at low magnification: the
+This chapter provides a high-level tour of the whole system: the
 crate stack, the life of a single statement, and the transaction model.
 Every later chapter zooms into one region of this map.
 
@@ -48,13 +48,13 @@ flowchart BT
 
 Two observations about this stack shape most of what follows.
 
-**The storage engine is bought, not built.** `marsdb-storage` wraps
+**The storage engine is reused, not rebuilt.** `marsdb-storage` wraps
 [redb](https://github.com/cberner/redb), a pure-Rust single-file
 embedded key-value store with ACID transactions, MVCC snapshots, and a
 B-tree file format. Writing a durable, crash-safe storage engine is a
 multi-year project in its own right, and it is the layer where bugs are
 least acceptable and hardest to find. Building on a proven engine lets
-the interesting graph-database work — encoding, planning, execution —
+the graph-specific work — encoding, planning, and execution —
 sit on a foundation whose fsync discipline someone else has already
 debugged. The cost is accepting redb's constraints, the most important
 being its concurrency model: any number of concurrent readers, but only
@@ -62,12 +62,13 @@ one writer at a time, process-wide. That single-writer rule echoes
 through the entire design, from the session layer down to lock-ordering
 comments in the executor. `marsdb-graph` never imports redb directly;
 it goes through `marsdb-storage`'s small trait boundary, which keeps
-the dependency surface explicit and would localize the damage if the
-engine ever had to change.
+the dependency surface explicit and limits the scope of changes if the
+engine ever needs to be replaced.
 
-**The query language is compiled to an engine-shaped IR, not
-interpreted off the AST.** `marsdb-query` parses Cypher (an ANTLR
-grammar generating a parse tree, visited into an AST), validates it,
+**The query language is compiled into an execution-oriented IR rather
+than interpreted directly from the AST.** `marsdb-query` parses Cypher
+(an ANTLR grammar generates a parse tree, which a visitor converts into
+an AST), validates it,
 and lowers each `MATCH` pattern into a small tree of logical operators
 — `AllNodesScan`, `NodeByLabelScan`, `IndexSeek`, `IndexRangeSeek`,
 `EdgeTypeScan`, `Seed`, `Expand`, `VarExpand`, `Filter` — that the
@@ -186,15 +187,15 @@ from language bindings that only have an "execute string" API. Each
 that subsequent statements run inside until `COMMIT` or `ROLLBACK`.
 The same abort-on-execution-error stance applies, with one carve-out:
 a statement that never *ran* — a parse error, a missing parameter —
-leaves the transaction open, because nothing was applied and killing an
-interactive session's transaction over a typo helps nobody.
+leaves the transaction open because it made no changes that would
+require an abort.
 
-The session form carries a sharp edge that follows directly from the
+Session transactions have an important caveat that follows directly from the
 single-writer rule: an open session transaction *is* the process's one
 write slot, so an abandoned one blocks every other writer forever —
 redb's `begin_write` blocks rather than erroring. MarsDB mitigates
-this with an optional idle timeout, and the mechanism is worth noticing
-because it exemplifies a design rule used throughout: **no background
+this with an optional idle timeout. The mechanism follows a design rule
+used throughout: **no background
 threads**. Expiry is checked lazily by the next statement to arrive on
 the session, not by a reaper thread. The database never does work
 outside a caller's call stack, which keeps the embedding story simple
@@ -208,20 +209,20 @@ syntax error anywhere means nothing runs), one transaction per
 statement — unless the script itself says `BEGIN ... COMMIT`, which
 works exactly as it does interactively. `execute_batch_grouped` trades
 crash-safety granularity for load throughput by committing once per
-group of statements rather than per statement. The trade is real and
-measured: each commit is an fsync, and on a 9,771-statement load
+group of statements rather than per statement. Measurements quantify
+the trade-off: each commit is an fsync, and on a 9,771-statement load
 script, per-statement commits took 69.1 s while groups of 100 took
 13.4 s — and committing the entire script as one group only improved
 that to 12.1 s. Most of the win arrives by a few hundred statements
 per group; the numbers, not intuition, are what capped the recommended
 group size.
 
-## Design principles worth naming
+## Design principles
 
 Three habits recur so often in this codebase that later chapters will
 mostly be showing you instances of them.
 
-**Errors are loud, invariants are enforced by construction.** Where an
+**Errors are explicit, and invariants are enforced by construction.** Where an
 invariant holds by design — an index entry that cannot dangle because
 the only two functions that touch the indexed table maintain the index
 in the same transaction — the code panics if it is ever violated,
@@ -241,8 +242,9 @@ and deleted.
 **The database describes itself.** The planner's choices are
 observable (`EXPLAIN`), the schema is introspectable (`CALL
 db.labels()` and friends), and execution is bounded and observable
-(row limits, timeouts, cancellation, an observer hook). A database you
-cannot interrogate is a database you debug by superstition.
+(row limits, timeouts, cancellation, and an observer hook). These
+interfaces expose the information needed to diagnose planning and
+execution behavior.
 
 With the map established, the next chapter starts at the bottom of the
 stack: what is actually in the file.

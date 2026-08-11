@@ -76,7 +76,7 @@ recognizes the simple leaf shapes whose variable references are
 manifest, and anything it does not recognize stays exactly where it
 was. A pushdown that guesses can change results; one that declines
 merely misses an optimization. The same conservatism repeats
-throughout the planner, and it is a stance worth naming: **every
+throughout the planner: **every
 rewrite must be provably answer-preserving, and when in doubt, the
 plan stays naive.**
 
@@ -85,7 +85,7 @@ plan stays naive.**
 A property index is declared per `(label, property)` pair, optionally
 unique. Its entries live in the shared `PROPERTY_INDEX` table under
 `label_id ++ prop_id ++ encoded_value` keys, and the value encoding is
-where the interesting engineering sits: an **order-preserving byte
+where the key implementation detail appears: an **order-preserving byte
 encoding**, so that lexicographic byte comparison equals real value
 ordering within a type. Signed integers get the standard sign-bit
 flip (mapping two's-complement order onto unsigned big-endian byte
@@ -119,7 +119,7 @@ index exists — and this is why the AST's narrow
 rewrite is a pattern match on exactly that shape. The consumed
 conjunct is removed and the *rest* of the predicate is rebuilt above
 the seek. Range predicates rewrite similarly into `IndexRangeSeek`,
-with one honesty rule: for numeric bounds the storage lookup returns
+with one correctness condition: for numeric bounds the storage lookup returns
 a *superset* (both int and float type regions, lossy conversions
 widened outward), so the originating conjuncts always survive as a
 residual `Filter` — the seek narrows, the filter remains the source
@@ -145,7 +145,7 @@ cost(anchor A, other B) = rows_A · (1 + filtered_A)
 E_A = E · rows_A / label_rows_A
 ```
 
-The terms are the traversal's real work items: scan the anchor's
+The terms approximate the traversal's work: scan the anchor's
 estimated rows; evaluate the anchor's pushed-down filter per row;
 walk the anchor's share of the hop's edges (the type's total,
 prorated by how much an index narrowed the anchor's label, under a
@@ -153,7 +153,7 @@ uniform-degree assumption); evaluate the far endpoint's stranded
 filter once per walked edge. Row scans, filter evaluations, and edge
 walks are weighted equally — not by assumption, but because the two
 non-scan halves were measured at ~0.66 µs and ~0.65 µs per item on a
-real dataset: the same order, so unit weights are honest. The
+real dataset: the same order of magnitude, so unit weights are reasonable. The
 `filtered` flags credit pushable-but-unindexed predicate work
 (a `CONTAINS`, a range, a `$param` equality) whose selectivity is
 unknowable at plan time and is deliberately not guessed at. On the

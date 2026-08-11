@@ -5,7 +5,8 @@ of the thirteen tables: two records, two adjacency mirrors, a
 statistics counter, up to four interning entries, a label-index entry
 per label, and any property-index entries the labels' declared indexes
 require. This chapter is about how `marsdb-graph` keeps all of that
-consistent without ceremony: `store.rs` (the CRUD layer) and
+consistent with a small amount of machinery: `store.rs` (the CRUD layer)
+and
 `write_ctx.rs` (the table-handle cache that every write rides on).
 
 ## Three layers per operation
@@ -24,7 +25,7 @@ creation:
   that needs another operation calls the `_ctx` form directly so both
   share one set of table handles.
 
-The layering answers a real constraint, not a style preference. redb
+The layering addresses a redb constraint. redb
 errors at runtime (`TableAlreadyOpen`) if one write transaction holds
 two live handles to the same table. Deleting a node must delete its
 incident edges; if node-deletion called the public edge-deletion
@@ -61,8 +62,8 @@ accessor methods: first access opens the handle, later accesses reuse
 it. Two decisions here were made by measurement, and both went against
 the initially plausible option:
 
-**Lazy, not eager.** Opening all thirteen handles up front sounds
-tidier. Measured against a real 9,771-statement bulk load it was
+**Lazy, not eager.** Opening all thirteen handles up front is simpler,
+but on a 9,771-statement bulk load it was
 *slower* than the pre-`WriteCtx` code (4.89 s → 6.35 s): most calls
 touch a handful of tables (`set_edge_prop_in_txn` needs exactly one),
 and eagerly opening the other unused handles costs more than the
@@ -121,21 +122,20 @@ one.
 
 **The statistics counter** (`REL_TYPE_COUNTS`) is bumped in exactly
 two places — edge birth and edge death — and *saturates* rather than
-panics on the way down. That asymmetry with the loud-panic policy for
-index invariants is deliberate and principled: the counter is a
+panics on the way down. This differs from the panic-on-violation policy
+for index invariants because the counter is a
 planner statistic, a wrong value costs a suboptimal plan but never a
 wrong answer, so it must degrade to a wrong estimate rather than take
-the database down. Loudness is proportional to what the invariant
-protects.
+the database down.
 
 **Bulk deletion** (`delete_edges_in_txn`) exists for a `DELETE r`
 statement's whole edge set: one `WriteCtx` across every id, label
 names resolved once per distinct type rather than once per edge. It
 measured roughly neutral on wall time — a scattered bulk delete's cost
 lives in the executor's match phase, not here, and a tried
-sort-ids-into-per-table-passes variant moved nothing — so the honest
-justification recorded in its doc comment is API shape and strictly
-less redundant work, not a claimed speedup.
+sort-ids-into-per-table-passes variant moved nothing. Its doc comment
+therefore justifies the API in terms of its interface and strictly less
+redundant work, not a claimed speedup.
 
 ## The integrity checker is the invariant spec
 

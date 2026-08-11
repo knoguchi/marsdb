@@ -6,8 +6,7 @@ comparison) turns a logical plan into rows and applies everything the
 plan does not cover: projection, aggregation, ordering, write clauses,
 and the enforcement of execution bounds. It is the largest component
 in MarsDB, and the reason is not algorithmic sophistication — it is
-that this is where Cypher's semantics actually live, and Cypher has a
-lot of semantics.
+that it implements most of Cypher's detailed semantics.
 
 ## Rows and bindings
 
@@ -79,7 +78,7 @@ of building an unbounded intermediate result first and truncating it
 after the memory damage is done. There is no preemption and no
 watchdog thread — the same no-background-threads rule as everywhere
 else — so bounds are as granular as the checkpoints, which is the
-honest cost of cooperative enforcement.
+inherent cost of cooperative enforcement.
 
 The guard carries one more piece of state with a story: a map of
 deleted edge ids to their type names. Cypher permits `type(r)` to be
@@ -140,11 +139,11 @@ reference a projection alias).
 The streaming lane (`execute_streaming_with_options`) pushes rows one
 at a time into a caller-supplied sink, with bounded memory regardless
 of result size. Its contract is strict by design: it accepts exactly
-the shapes that can genuinely stream — a single plain
+the shapes that can stream without materialization — a single plain
 `MATCH ... RETURN`, `SKIP`/`LIMIT` permitted — and *errors* on
 `ORDER BY`, aggregation, `DISTINCT`, or `WITH`. Those constructs must
-see every row before emitting any; a "streaming" API that silently
-materialized for them would be a lie about memory, and MarsDB
+see every row before emitting any; silently materializing them would
+violate the API's bounded-memory contract, so MarsDB
 prefers a refusal over a lie. Row-count limits double as early
 termination: a sink that returns "stop" ends the scan.
 
