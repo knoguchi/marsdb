@@ -1356,7 +1356,7 @@ impl GraphStore {
         let mut resolve = prop_resolver(txn)?;
         for id in node_ids {
             let guard = nodes.get(id)?.ok_or_else(|| {
-                GraphError::CorruptData(format!("node label index references missing node {}", id))
+                GraphError::CorruptData(format!("node label index references missing node {id}"))
             })?;
             let record = decode_node(guard.value(), &mut resolve)?;
             drop(guard);

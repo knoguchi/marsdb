@@ -1222,3 +1222,49 @@ fn datetime_from_epoch_and_epoch_millis() {
     );
     assert_eq!(temporal_str(&result.rows[0][1]), "1977-07-15T13:34:33.987Z");
 }
+
+/// `time(...)`'s own component accessors (`time_component` in
+/// `temporal_fns.rs`) -- `.timezone`/`.offset` as text and
+/// `.offsetSeconds`/`.offsetMinutes` as integers, plus the shared
+/// `LocalTime` components (`.hour`, `.minute`, ...) it falls back to.
+/// Every other component-access test in this file uses `datetime(...)`
+/// or `localtime(...)`, never a bare `time(...)`.
+#[test]
+fn time_component_accessors() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "WITH time('21:40:32.142+01:00') AS t \
+         RETURN t.hour, t.minute, t.second, t.timezone, t.offset, t.offsetSeconds, t.offsetMinutes",
+    );
+    assert_eq!(int_value(&result.rows[0][0]), 21);
+    assert_eq!(int_value(&result.rows[0][1]), 40);
+    assert_eq!(int_value(&result.rows[0][2]), 32);
+    assert_eq!(str_value(&result.rows[0][3]), "+01:00");
+    assert_eq!(str_value(&result.rows[0][4]), "+01:00");
+    assert_eq!(int_value(&result.rows[0][5]), 3600);
+    assert_eq!(int_value(&result.rows[0][6]), 60);
+}
+
+/// `time.truncate(unit, value, {timezone: ...})` -- an explicit
+/// `timezone` override key in the truncate map, both the accepted fixed-
+/// offset form and the rejected named-zone form (TIME has no calendar
+/// date to resolve a named zone's DST-dependent offset against).
+#[test]
+fn time_truncate_with_explicit_timezone_override() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "RETURN toString(time.truncate('hour', time('12:31:14+01:00'), {timezone: '+02:00'})) AS r",
+    );
+    assert_eq!(temporal_str(&result.rows[0][0]), "12:00+02:00");
+
+    let stmt = marsdb_query::parse(
+        "RETURN time.truncate('hour', time('12:31:14+01:00'), {timezone: 'Europe/Stockholm'})",
+    )
+    .unwrap();
+    let err = marsdb_query::Executor::new(&store)
+        .execute(&stmt)
+        .unwrap_err();
+    assert!(err.to_string().contains("named timezone"));
+}
