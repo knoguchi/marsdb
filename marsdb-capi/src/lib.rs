@@ -2061,4 +2061,196 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn open_file_backed_and_rejects_bad_input() {
+        unsafe {
+            let path = std::env::temp_dir().join(format!(
+                "marsdb_capi_test_{}_{:?}.db",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let path_c = cstr(path.to_str().unwrap());
+            let db = marsdb_open(path_c.as_ptr());
+            assert!(!db.is_null());
+            marsdb_result_destroy(exec(db, "CREATE (:N {i: 1})"));
+            marsdb_close(db);
+
+            // Reopen -- file-backed persistence through the C ABI.
+            let db = marsdb_open(path_c.as_ptr());
+            assert!(!db.is_null());
+            let r = exec(db, "MATCH (n:N) RETURN n.i");
+            assert_eq!(marsdb_next(r), 1);
+            assert_eq!(marsdb_value_int64(marsdb_row_value(r, 0)), 1);
+            marsdb_result_destroy(r);
+            marsdb_close(db);
+            let _ = std::fs::remove_file(&path);
+
+            // NULL path -> NULL handle, not a panic.
+            assert!(marsdb_open(std::ptr::null()).is_null());
+        }
+    }
+
+    #[test]
+    fn every_bind_kind_and_null_string() {
+        unsafe {
+            let db = marsdb_open_in_memory();
+            let cypher =
+                cstr("RETURN $i AS i, $f AS f, $b AS b, $s AS s, $n AS n, $il AS il, $fl AS fl");
+            let mut stmt: *mut MarsdbStatement = std::ptr::null_mut();
+            assert_eq!(marsdb_prepare(db, cypher.as_ptr(), &mut stmt), MARSDB_OK);
+
+            let bind = |n: &str| cstr(n);
+            assert_eq!(marsdb_bind_int64(stmt, bind("i").as_ptr(), 7), MARSDB_OK);
+            assert_eq!(marsdb_bind_double(stmt, bind("f").as_ptr(), 2.5), MARSDB_OK);
+            assert_eq!(marsdb_bind_bool(stmt, bind("b").as_ptr(), 1), MARSDB_OK);
+            let s = cstr("hi");
+            assert_eq!(
+                marsdb_bind_string(stmt, bind("s").as_ptr(), s.as_ptr()),
+                MARSDB_OK
+            );
+            // NULL string pointer binds SQL NULL, not an error.
+            assert_eq!(
+                marsdb_bind_string(stmt, bind("n").as_ptr(), std::ptr::null()),
+                MARSDB_OK
+            );
+            assert_eq!(marsdb_bind_null(stmt, bind("also_n").as_ptr()), MARSDB_OK);
+            let dvals = [1.5f64, 2.5];
+            assert_eq!(
+                marsdb_bind_double_list(stmt, bind("fl").as_ptr(), dvals.as_ptr(), dvals.len()),
+                MARSDB_OK
+            );
+            let ivals = [1i64, 2];
+            assert_eq!(
+                marsdb_bind_int64_list(stmt, bind("il").as_ptr(), ivals.as_ptr(), ivals.len()),
+                MARSDB_OK
+            );
+
+            let mut r: *mut MarsdbResult = std::ptr::null_mut();
+            assert_eq!(marsdb_stmt_execute(stmt, &mut r), MARSDB_OK);
+            assert_eq!(marsdb_next(r), 1);
+            assert_eq!(marsdb_value_int64(marsdb_row_value(r, 0)), 7);
+            assert_eq!(marsdb_value_double(marsdb_row_value(r, 1)), 2.5);
+            assert_eq!(marsdb_value_bool(marsdb_row_value(r, 2)), 1);
+            assert_eq!(
+                CStr::from_ptr(marsdb_value_string(marsdb_row_value(r, 3)))
+                    .to_str()
+                    .unwrap(),
+                "hi"
+            );
+            assert_eq!(marsdb_value_type(marsdb_row_value(r, 4)), MARSDB_TYPE_NULL);
+            let il = marsdb_row_value(r, 5);
+            assert_eq!(marsdb_list_len(il), 2);
+            assert_eq!(marsdb_value_int64(marsdb_list_get(il, 1)), 2);
+            let fl = marsdb_row_value(r, 6);
+            assert_eq!(marsdb_value_double(marsdb_list_get(fl, 1)), 2.5);
+
+            // An int64-typed literal column read through the *double*
+            // accessor -- the `as_literal`/`as_prop` mixed-type fallback
+            // arm (`(_, Some(Literal::Int(i))) => *i as f64`).
+            assert_eq!(marsdb_value_double(marsdb_row_value(r, 0)), 7.0);
+
+            marsdb_result_destroy(r);
+            marsdb_stmt_destroy(stmt);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn edge_properties_and_path_accessors() {
+        unsafe {
+            let db = marsdb_open_in_memory();
+            marsdb_result_destroy(exec(
+                db,
+                "CREATE (:P {name: 'a'})-[:KNOWS {since: 2020}]->(:P {name: 'b'})",
+            ));
+            let r = exec(db, "MATCH p = (:P)-[e:KNOWS]->(:P) RETURN e, p");
+
+            assert_eq!(marsdb_next(r), 1);
+            let edge = marsdb_row_value(r, 0);
+            assert_eq!(marsdb_value_type(edge), MARSDB_TYPE_EDGE);
+            assert_eq!(marsdb_edge_prop_count(edge), 1);
+            assert_eq!(
+                CStr::from_ptr(marsdb_edge_prop_name(edge, 0))
+                    .to_str()
+                    .unwrap(),
+                "since"
+            );
+            assert_eq!(marsdb_value_int64(marsdb_edge_prop_value(edge, 0)), 2020);
+            // Out-of-bounds index -> NULL pointer, not a panic.
+            assert!(marsdb_edge_prop_value(edge, 99).is_null());
+
+            let path = marsdb_row_value(r, 1);
+            assert_eq!(marsdb_value_type(path), MARSDB_TYPE_PATH);
+            assert_eq!(marsdb_path_len(path), 3);
+            assert_eq!(
+                marsdb_value_type(marsdb_path_get(path, 0)),
+                MARSDB_TYPE_NODE
+            );
+            assert_eq!(
+                marsdb_value_type(marsdb_path_get(path, 1)),
+                MARSDB_TYPE_EDGE
+            );
+            assert!(marsdb_path_get(path, 99).is_null());
+
+            marsdb_result_destroy(r);
+            marsdb_close(db);
+        }
+    }
+
+    #[test]
+    fn batch_encoding_covers_every_value_shape() {
+        unsafe {
+            let db = marsdb_open_in_memory();
+            marsdb_result_destroy(exec(
+                db,
+                "CREATE (:P {name: 'a', tags: ['x', 'y'], since: date('2020-01-01'), \
+                 span: duration('P1D')})-[:KNOWS {n: 1}]->(:P {name: 'b'})",
+            ));
+
+            // `marsdb_query_batch` -- node/edge/list/date/duration
+            // properties, plus a map literal and a path, all through the
+            // binary batch encoder in one query.
+            let cypher = cstr(
+                "MATCH p = (a:P)-[e:KNOWS]->(b:P) \
+                 RETURN a, e, p, a.tags, a.since, a.span, {x: 1, y: 'z'} AS m",
+            );
+            let mut buffer = MarsdbBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+            };
+            assert_eq!(
+                marsdb_query_batch(db, cypher.as_ptr(), &mut buffer),
+                MARSDB_OK
+            );
+            assert!(buffer.len > 0);
+            marsdb_buffer_free(buffer);
+
+            // Same query through `marsdb_stmt_execute_batch` (prepared
+            // statement path).
+            let mut stmt: *mut MarsdbStatement = std::ptr::null_mut();
+            assert_eq!(marsdb_prepare(db, cypher.as_ptr(), &mut stmt), MARSDB_OK);
+            let mut buffer2 = MarsdbBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+            };
+            assert_eq!(marsdb_stmt_execute_batch(stmt, &mut buffer2), MARSDB_OK);
+            assert!(buffer2.len > 0);
+            marsdb_buffer_free(buffer2);
+            marsdb_stmt_destroy(stmt);
+
+            // NULL args -> ERROR, not a panic.
+            let mut buffer3 = MarsdbBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+            };
+            assert_eq!(
+                marsdb_query_batch(db, std::ptr::null(), &mut buffer3),
+                MARSDB_ERROR
+            );
+
+            marsdb_close(db);
+        }
+    }
 }

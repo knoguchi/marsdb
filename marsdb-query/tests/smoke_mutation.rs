@@ -1514,3 +1514,25 @@ fn type_of_a_deleted_relationship_still_works() {
     let stmt = parse("MATCH ()-[r]->() DELETE r RETURN r.num").unwrap();
     assert!(Executor::new(&store).execute(&stmt).is_err());
 }
+
+/// `SET r.prop = x` / `REMOVE r.prop` on a *relationship* variable --
+/// every other SET/REMOVE test in this crate's suite targets a node
+/// (`GraphStore::set_edge_prop_in_txn`/`remove_edge_prop_in_txn` were
+/// otherwise only ever reached in theory, never by any test).
+#[test]
+fn set_and_remove_relationship_properties() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE ()-[:KNOWS]->()");
+
+    let result = run(
+        &store,
+        "MATCH ()-[r:KNOWS]->() SET r.since = 2020 RETURN r.since",
+    );
+    assert_eq!(int_value(&result.rows[0][0]), 2020);
+
+    let result = run(
+        &store,
+        "MATCH ()-[r:KNOWS]->() REMOVE r.since RETURN r.since",
+    );
+    assert!(matches!(result.rows[0][0], Value::Null));
+}

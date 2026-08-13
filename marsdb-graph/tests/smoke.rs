@@ -151,3 +151,44 @@ fn date_and_duration_properties_round_trip_through_storage() {
         })
     );
 }
+
+/// `all_nodes(None)` -- the unfiltered full-scan path (as opposed to
+/// every other `all_nodes` call in this crate's test suite, which always
+/// passes a label filter and so only exercises the `NODE_LABEL_INDEX`
+/// path).
+#[test]
+fn all_nodes_with_no_label_filter_scans_every_node() {
+    let store = GraphStore::open_memory().unwrap();
+    store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    store.create_node(&["Dog"], BTreeMap::new()).unwrap();
+    store.create_node(&[], BTreeMap::new()).unwrap();
+
+    let all = store.all_nodes(None).unwrap();
+    assert_eq!(all.len(), 3);
+}
+
+/// `set_edge_prop` -- the standalone (own-transaction) convenience
+/// wrapper, distinct from `set_edge_prop_in_txn` (used internally by the
+/// Cypher executor within its own already-open write transaction).
+#[test]
+fn set_edge_prop_updates_a_relationship_directly() {
+    let store = GraphStore::open_memory().unwrap();
+    let a = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let b = store.create_node(&["Person"], BTreeMap::new()).unwrap();
+    let edge = store.create_edge("KNOWS", a, b, BTreeMap::new()).unwrap();
+
+    let updated = store
+        .set_edge_prop(edge, "since", PropertyValue::Int(2020))
+        .unwrap();
+    assert!(updated);
+
+    // A nonexistent edge id reports `false`, not an error.
+    let missing = store
+        .set_edge_prop(
+            marsdb_graph::EdgeId(999_999),
+            "since",
+            PropertyValue::Int(1),
+        )
+        .unwrap();
+    assert!(!missing);
+}
