@@ -3,6 +3,17 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- Start-point selection prices unindexed literal-equality filters
+  correctly: the endpoint's emitted-row estimate gets a default 1/10
+  equality selectivity (its physical scan cost stays full), instead of
+  the filter only doubling that endpoint's cost and inverting the
+  anchor choice. Measured on the LDBC-style SF 0.1 workload without
+  indexes: 33.9ms → 5.6ms (point lookup + hop) and 650ms → 9.6ms (the
+  unlabeled-far-endpoint shape that anchored an AllNodesScan) (#208).
+
 ## [0.9.1] - 2026-08-26
 
 ### Added

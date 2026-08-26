@@ -589,30 +589,44 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 /// (`label_count_in_txn`/`node_count_in_txn`/`rel_type_count_in_txn`):
 ///
 /// ```text
-/// cost(anchor A, other B) = rows_A · (1 + filtered_A)
-///                         + E_A    · (1 + filtered_B)
-/// E_A = E · rows_A / label_rows_A
+/// cost(anchor A, other B) = scan_rows_A · (1 + filtered_A)
+///                         + E_A         · (1 + filtered_B)
+/// E_A = E · out_rows_A / label_rows_A
 /// ```
 ///
-/// where `rows` is the anchor's leaf-scan estimate (0 for a bound Seed,
-/// else label count narrowed by the best indexed literal-equality
-/// candidate — the same candidates `apply_index_seeks` would fuse),
-/// `E` is the live edge count of the anchor-adjacent hop's relationship
-/// type(s), and `filtered` marks pushable predicate work the row
-/// estimate gives no credit for (a `CONTAINS`, a range, an unindexed or
-/// `$param` equality). The terms are the traversal's real work items:
-/// scan `rows_A` leaf rows; evaluate the anchor's own filter once per
-/// scanned row (`rows_A · filtered_A` — pushed below the Expand by
-/// `build_match_plan`, this is what anchoring *at* the filtered side
-/// buys); walk `E_A` edges, the type's total prorated by how much the
-/// anchor's index narrowed its label (uniform-degree assumption, and
-/// selectivity 1 for uncredited filters — deliberately conservative,
-/// an unindexed predicate's selectivity is unknowable here); evaluate
-/// the *other* endpoint's stranded filter once per walked edge
-/// (`E_A · filtered_B`). Row scans, filter evaluations, and edge walks
-/// are weighted equally — measured on the recommendations dataset at
-/// ~0.66µs and ~0.65µs per item for the filter-eval and edge-walk
-/// halves, same order.
+/// where `scan_rows` is what the anchor's leaf physically visits (0 for
+/// a bound Seed, the index-match count when an indexed literal-equality
+/// candidate turns the scan into a seek — the same candidates
+/// `apply_index_seeks` would fuse — else the full label count),
+/// `out_rows` is what the leaf *emits* after its pushed filters (equal
+/// to `scan_rows` for a seek; an *unindexed* literal equality keeps the
+/// scan full but credits the emitted rows with a default 1/10
+/// selectivity — see `UNINDEXED_EQ_SELECTIVITY_DIVISOR`; other
+/// uncredited filters stay at selectivity 1, their true selectivity
+/// genuinely unknowable here), `E` is the live edge count of the
+/// anchor-adjacent hop's relationship type(s), and `filtered` marks
+/// pushable predicate work priced per scanned row (a `CONTAINS`, a
+/// range, an unindexed or `$param` equality). The terms are the
+/// traversal's real work items: visit `scan_rows_A` leaf rows; evaluate
+/// the anchor's own filter once per visited row (`scan_rows_A ·
+/// filtered_A` — pushed below the Expand by `build_match_plan`, this is
+/// what anchoring *at* the filtered side buys); walk `E_A` edges, the
+/// type's total prorated by the fraction of the label the leaf emits
+/// (uniform-degree assumption); evaluate the *other* endpoint's
+/// stranded filter once per walked edge (`E_A · filtered_B`). Row
+/// scans, filter evaluations, and edge walks are weighted equally —
+/// measured on the recommendations dataset at ~0.66µs and ~0.65µs per
+/// item for the filter-eval and edge-walk halves, same order.
+///
+/// Splitting `scan_rows` from `out_rows` is what lets an unindexed
+/// equality price correctly on *both* sides of the trade: the emitted-
+/// row credit stops a huge equality-filtered label from dragging the
+/// whole edge population into its estimate (`(m:Post {id: 100})-->
+/// (p:Person)` must anchor at Post even though Person's label is
+/// smaller — issue #208, measured 6x there and 70x on a variant whose
+/// far endpoint was unlabeled), while the still-full scan term keeps a
+/// low-selectivity equality against a tiny far endpoint reversing
+/// exactly as before.
 ///
 /// With no filters anywhere the model degenerates to the old plain row
 /// comparison (both sides carry the same full `E`). The benchmark query
@@ -830,46 +844,74 @@ fn rel_types_edge_count(txn: Txn, rel_types: &[String]) -> Result<u64, QueryErro
 /// sizes, but `rows · 2 + E · 2` on a pathological database shouldn't
 /// wrap into a nonsense comparison.
 fn anchor_cost(anchor: &EndpointCost, other: &EndpointCost, edges: u64) -> u64 {
-    let scan_and_filter = anchor.rows.saturating_mul(1 + u64::from(anchor.filtered));
+    // Physical rows visited (a filter never shrinks an unindexed scan),
+    // plus one filter evaluation per visited row when there is one.
+    let scan_and_filter = anchor
+        .scan_rows
+        .saturating_mul(1 + u64::from(anchor.filtered));
     // Prorate the type's edges by how much the anchor's own narrowing
-    // (index seek, or a Seed's zero rows) shrank its label.
+    // (index seek, unindexed-equality selectivity, or a Seed's zero
+    // rows) shrank what the leaf emits into the Expand.
     let walked = if anchor.label_rows == 0 {
         0
     } else {
-        u64::try_from(u128::from(edges) * u128::from(anchor.rows) / u128::from(anchor.label_rows))
-            .unwrap_or(u64::MAX)
+        u64::try_from(
+            u128::from(edges) * u128::from(anchor.out_rows) / u128::from(anchor.label_rows),
+        )
+        .unwrap_or(u64::MAX)
     };
     let expand_and_stranded = walked.saturating_mul(1 + u64::from(other.filtered));
     scan_and_filter.saturating_add(expand_and_stranded)
 }
 
+/// Default selectivity divisor for a literal-equality predicate with no
+/// index behind it: the endpoint is assumed to emit `1/10` of its
+/// scanned rows (System R's classic default for equality without
+/// statistics). Deliberately coarse — the point isn't accuracy, it's
+/// that an equality must price *better* than no filter at all: before
+/// this credit existed, an unindexed `{id: 100}` left `out_rows` at the
+/// full label count while `filtered` doubled the scan term, so the
+/// filter made its endpoint price strictly worse and start-point
+/// selection inverted (measured at 6-70x on the LDBC-style workload —
+/// see the fix's regression tests below and issue #208).
+const UNINDEXED_EQ_SELECTIVITY_DIVISOR: u64 = 10;
+
 /// What `endpoint_start_cost` knows about starting a traversal at one
 /// endpoint — the inputs to `anchor_cost`, see `plan_reversed_pattern`
 /// for the model.
 struct EndpointCost {
-    /// Rows the leaf scan would produce: 0 for a bound `Seed`, else the
-    /// label count narrowed by the best indexed literal-equality
-    /// candidate.
-    rows: u64,
+    /// Rows the leaf scan physically visits: 0 for a bound `Seed`, the
+    /// index-match count when an indexed literal-equality candidate
+    /// narrows the scan to a seek, else the full label count — an
+    /// *unindexed* filter never shrinks this, since the scan still
+    /// touches every label row to evaluate it.
+    scan_rows: u64,
+    /// Rows the leaf emits into the Expand above it, after every pushed
+    /// filter: equal to `scan_rows` for a seek (the index count is
+    /// exact), narrowed by `UNINDEXED_EQ_SELECTIVITY_DIVISOR` for a
+    /// literal equality with no index. `out_rows / label_rows` is the
+    /// fraction of the label the traversal actually walks edges for,
+    /// which is what prorates the edge-walk estimate.
+    out_rows: u64,
     /// The unnarrowed size of the endpoint's scan domain — its label
-    /// count, or the whole node table when unlabeled. `rows /
-    /// label_rows` is the fraction of the label the anchor actually
-    /// visits, which is what prorates the edge-walk estimate.
+    /// count, or the whole node table when unlabeled.
     label_rows: u64,
-    /// The endpoint has pushable filtering work `rows` gives no credit
-    /// for: a non-equality conjunct (`CONTAINS`, a range, ...), an
-    /// equality with no index behind it, or a `$param` equality whose
-    /// value is unknown at plan time. Anchoring here evaluates it once
-    /// per scanned row, below the Expand; anchoring at the other side
+    /// The endpoint has pushable filtering work priced per scanned row:
+    /// a non-equality conjunct (`CONTAINS`, a range, ...), an equality
+    /// with no index behind it, or a `$param` equality whose value is
+    /// unknown at plan time. Anchoring here evaluates it once per
+    /// scanned row, below the Expand; anchoring at the other side
     /// strands it above, once per walked edge.
     filtered: bool,
 }
 
 /// Cost facts for starting the pattern's traversal at `node` — see
-/// `plan_reversed_pattern` and `EndpointCost`. `rows` uses the same
-/// candidates `apply_index_seeks` would fuse into an `IndexSeek` once
-/// this endpoint actually is the start; anything pushable that *isn't*
-/// such a candidate can't narrow `rows` but still marks the endpoint
+/// `plan_reversed_pattern` and `EndpointCost`. `scan_rows` uses the
+/// same candidates `apply_index_seeks` would fuse into an `IndexSeek`
+/// once this endpoint actually is the start; a pushable literal
+/// equality that *isn't* such a candidate can't narrow the scan but
+/// still narrows `out_rows` (default equality selectivity) and marks
+/// the endpoint `filtered`; every other pushable predicate only marks
 /// `filtered`. Pushability here mirrors `build_match_plan`'s own
 /// start-only test (`conjunct_sole_var`), so `filtered` is only set for
 /// predicates that genuinely would wrap this endpoint's scan. A
@@ -885,7 +927,8 @@ fn endpoint_start_cost(
 ) -> Result<EndpointCost, QueryError> {
     if node.var.as_ref().is_some_and(|v| carried_vars.contains(v)) {
         return Ok(EndpointCost {
-            rows: 0,
+            scan_rows: 0,
+            out_rows: 0,
             label_rows: 0,
             filtered: false,
         });
@@ -895,9 +938,11 @@ fn endpoint_start_cost(
         Some(label) => GraphStore::label_count_in_txn(txn, label)?,
         None => GraphStore::node_count_in_txn(txn)?,
     };
-    let mut rows = label_rows;
+    let mut scan_rows = label_rows;
+    let mut out_rows = label_rows;
     let mut filtered = false;
-    let consider = |rows: &mut u64,
+    let consider = |scan_rows: &mut u64,
+                    out_rows: &mut u64,
                     filtered: &mut bool,
                     prop: &str,
                     lit: &Literal|
@@ -911,17 +956,25 @@ fn endpoint_start_cost(
                         prop,
                         &literal_to_value(lit),
                     )?;
-                    *rows = (*rows).min(count);
+                    // A seek both shrinks the physical scan and gives an
+                    // exact emitted-row count.
+                    *scan_rows = (*scan_rows).min(count);
+                    *out_rows = (*out_rows).min(count);
                     return Ok(());
                 }
             }
+            // Unindexed literal equality: the scan still visits every
+            // label row (priced via `filtered`), but what it *emits*
+            // gets the default equality-selectivity credit — see
+            // `UNINDEXED_EQ_SELECTIVITY_DIVISOR`.
+            *out_rows = (*out_rows).min((label_rows / UNINDEXED_EQ_SELECTIVITY_DIVISOR).max(1));
         }
         *filtered = true;
         Ok(())
     };
     for (key, expr) in &node.props {
         if let ReturnExpr::Lit(lit) = expr {
-            consider(&mut rows, &mut filtered, key, lit)?;
+            consider(&mut scan_rows, &mut out_rows, &mut filtered, key, lit)?;
         } else {
             filtered = true;
         }
@@ -933,7 +986,7 @@ fn endpoint_start_cost(
             }
             match c {
                 Expr::Compare(pa, CompareOp::Eq, lit) => {
-                    consider(&mut rows, &mut filtered, &pa.prop, lit)?
+                    consider(&mut scan_rows, &mut out_rows, &mut filtered, &pa.prop, lit)?
                 }
                 Expr::HasLabel(..) => {}
                 _ => filtered = true,
@@ -941,7 +994,8 @@ fn endpoint_start_cost(
         }
     }
     Ok(EndpointCost {
-        rows,
+        scan_rows,
+        out_rows,
         label_rows,
         filtered,
     })
@@ -1387,6 +1441,105 @@ mod tests {
             }
             other => panic!("expected a residual Filter over an IndexSeek, got {other:?}"),
         }
+    }
+
+    /// Issue #208's IS5 shape: a large label carrying an *unindexed*
+    /// literal equality versus a smaller unfiltered far label. The
+    /// equality collapses what Big emits, so Big must stay the anchor
+    /// even though Small's label is 10x smaller — before out_rows
+    /// existed, the equality only doubled Big's scan term and the
+    /// planner anchored at Small, walking every :E edge (measured 6x
+    /// slower at LDBC-style SF 0.1 scale, 33.9ms vs 5.6ms).
+    #[test]
+    fn unindexed_equality_keeps_its_own_large_label_as_anchor() {
+        let store = GraphStore::open_memory().unwrap();
+        // Big=100 {id}, Small=10, 150 :E edges Big->Small — the measured
+        // 10,000/1,000/15,000 ratios scaled by 100.
+        let mut big_ids = Vec::new();
+        for i in 0..100 {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), PropertyValue::Int(i));
+            big_ids.push(store.create_node(&["Big"], props).unwrap());
+        }
+        let mut small_ids = Vec::new();
+        for _ in 0..10 {
+            small_ids.push(store.create_node(&["Small"], BTreeMap::new()).unwrap());
+        }
+        for (i, big) in big_ids.iter().enumerate() {
+            store
+                .create_edge("E", *big, small_ids[i % 10], BTreeMap::new())
+                .unwrap();
+        }
+        for big in big_ids.iter().take(50) {
+            store
+                .create_edge("E", *big, small_ids[0], BTreeMap::new())
+                .unwrap();
+        }
+
+        let write = store.begin_write().unwrap();
+        // Written from the equality side: no reversal.
+        let pattern = pattern_from("MATCH (m:Big {id: 42})-[:E]->(p:Small) RETURN p");
+        assert!(
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .is_none(),
+            "the unindexed-equality endpoint must stay the anchor"
+        );
+        // Written from the far side: reversal lands on the equality.
+        let pattern = pattern_from("MATCH (p:Small)<-[:E]-(m:Big {id: 42}) RETURN p");
+        let reversed =
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .expect("expected reversal toward the unindexed equality on m");
+        assert_eq!(reversed.start.var.as_deref(), Some("m"));
+    }
+
+    /// Issue #208's IC2 shape: an equality-filtered start versus an
+    /// *unlabeled* far endpoint, with the start's adjacent hop the
+    /// larger edge population. The old model saw only the start's
+    /// doubled scan term plus its full adjacent-edge count and anchored
+    /// at the unlabeled end — an AllNodesScan (measured 70x slower,
+    /// 650ms vs ~9ms). The emitted-rows credit prorates the start's
+    /// edge walk down to its post-equality fraction.
+    #[test]
+    fn equality_start_beats_an_unlabeled_far_endpoint() {
+        let store = GraphStore::open_memory().unwrap();
+        let mut small_ids = Vec::new();
+        for i in 0..10 {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), PropertyValue::Int(i));
+            small_ids.push(store.create_node(&["Small"], props).unwrap());
+        }
+        let mut big_ids = Vec::new();
+        for _ in 0..100 {
+            big_ids.push(store.create_node(&["Big"], BTreeMap::new()).unwrap());
+        }
+        // 500 :E1 edges adjacent to Small (the start's first hop), 150
+        // :E2 edges adjacent to the unlabeled end.
+        for i in 0..500 {
+            store
+                .create_edge("E1", small_ids[i % 10], big_ids[i % 100], BTreeMap::new())
+                .unwrap();
+        }
+        for i in 0..150 {
+            store
+                .create_edge(
+                    "E2",
+                    big_ids[i % 100],
+                    big_ids[(i * 7) % 100],
+                    BTreeMap::new(),
+                )
+                .unwrap();
+        }
+
+        let write = store.begin_write().unwrap();
+        let pattern = pattern_from("MATCH (p:Small {id: 1})-[:E1]->(x:Big)<-[:E2]-(m) RETURN m");
+        assert!(
+            plan_reversed_pattern(&pattern, &None, &Default::default(), Txn::Write(&write))
+                .unwrap()
+                .is_none(),
+            "the equality-filtered start must beat the unlabeled far endpoint"
+        );
     }
 
     fn seed_people(store: &GraphStore, common: usize, rare: usize) -> Vec<marsdb_graph::NodeId> {
