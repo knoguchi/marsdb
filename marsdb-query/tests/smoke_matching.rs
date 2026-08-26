@@ -1491,3 +1491,127 @@ fn comma_separated_create_patterns() {
     let types: Vec<String> = result.rows.iter().map(|r| str_value(&r[0])).collect();
     assert_eq!(types, vec!["R".to_string(), "S".to_string()]);
 }
+
+// --- RETURN DISTINCT ... LIMIT early termination over var-length
+// traversal (lazy VarExpandIter + collect_rows_until_distinct) ----------
+
+/// The pipeline must stop pulling as soon as LIMIT-many distinct
+/// projected rows exist — proven the same way the plain-LIMIT laziness
+/// test in smoke_filtering.rs does: a relationship-expansion budget too
+/// small for full enumeration but ample for the early stop. A 6-node
+/// :K clique enumerates ~85 edge-distinct paths for `*1..3` from any
+/// node, while the first handful of DFS steps already yield 2 distinct
+/// endpoints.
+#[test]
+fn distinct_limit_terminates_var_length_traversal_early() {
+    use marsdb_query::{ExecutionOptions, QueryError};
+    let store = GraphStore::open_memory().unwrap();
+    let mut ids = Vec::new();
+    ids.push(
+        store
+            .create_node(&["Start"], std::collections::BTreeMap::new())
+            .unwrap(),
+    );
+    for _ in 0..5 {
+        ids.push(
+            store
+                .create_node(&["Mid"], std::collections::BTreeMap::new())
+                .unwrap(),
+        );
+    }
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            store
+                .create_edge("K", ids[i], ids[j], std::collections::BTreeMap::new())
+                .unwrap();
+        }
+    }
+    let executor = Executor::new(&store);
+    let budget = ExecutionOptions {
+        max_relationship_expansions: Some(25),
+        ..Default::default()
+    };
+
+    // Early stop: 2 distinct endpoints found within the budget.
+    let limited = parse("MATCH (s:Start)-[:K*1..3]-(m) RETURN DISTINCT m LIMIT 2").unwrap();
+    let result = executor.execute_with_options(&limited, &budget).unwrap();
+    assert_eq!(result.rows.len(), 2);
+
+    // Without the LIMIT the same budget is exhausted by full enumeration
+    // — the early stop above genuinely skipped that work rather than
+    // doing it and discarding rows.
+    let unlimited = parse("MATCH (s:Start)-[:K*1..3]-(m) RETURN DISTINCT m").unwrap();
+    let err = executor
+        .execute_with_options(&unlimited, &budget)
+        .unwrap_err();
+    assert!(matches!(err, QueryError::ResourceLimit(_)), "got: {err}");
+
+    // ORDER BY disqualifies the early stop (it must see every row) —
+    // same budget, same exhaustion.
+    let ordered =
+        parse("MATCH (s:Start)-[:K*1..3]-(m) RETURN DISTINCT m.x ORDER BY m.x LIMIT 2").unwrap();
+    let err = executor
+        .execute_with_options(&ordered, &budget)
+        .unwrap_err();
+    assert!(matches!(err, QueryError::ResourceLimit(_)), "got: {err}");
+}
+
+/// The early-terminated result is a correct DISTINCT result: exactly
+/// min(LIMIT, |full DISTINCT set|) rows, internally duplicate-free, and
+/// a subset of the un-LIMITed DISTINCT rows. SKIP composes on top (it
+/// slices after dedup, so SKIP s LIMIT k needs s+k distinct collected).
+#[test]
+fn distinct_limit_rows_are_a_correct_distinct_subset() {
+    let store = GraphStore::open_memory().unwrap();
+    // 4 people, each knowing the others (6 undirected edges): `*1..2`
+    // reaches every other person through many paths.
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("id".to_string(), marsdb_graph::PropertyValue::Int(i));
+        ids.push(store.create_node(&["P"], props).unwrap());
+    }
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            store
+                .create_edge("K", ids[i], ids[j], std::collections::BTreeMap::new())
+                .unwrap();
+        }
+    }
+    let full: std::collections::BTreeSet<i64> = run(
+        &store,
+        "MATCH (p:P {id: 0})-[:K*1..2]-(m:P) RETURN DISTINCT m.id",
+    )
+    .rows
+    .iter()
+    .map(|r| int(&r[0]))
+    .collect();
+
+    let limited = run(
+        &store,
+        "MATCH (p:P {id: 0})-[:K*1..2]-(m:P) RETURN DISTINCT m.id LIMIT 2",
+    );
+    let got: Vec<i64> = limited.rows.iter().map(|r| int(&r[0])).collect();
+    assert_eq!(got.len(), 2);
+    let got_set: std::collections::BTreeSet<i64> = got.iter().copied().collect();
+    assert_eq!(got_set.len(), 2, "LIMITed DISTINCT rows must be distinct");
+    assert!(got_set.is_subset(&full));
+
+    // LIMIT larger than the distinct set: every distinct row, once.
+    let all = run(
+        &store,
+        "MATCH (p:P {id: 0})-[:K*1..2]-(m:P) RETURN DISTINCT m.id LIMIT 100",
+    );
+    let all_set: std::collections::BTreeSet<i64> = all.rows.iter().map(|r| int(&r[0])).collect();
+    assert_eq!(all_set, full);
+    assert_eq!(all.rows.len(), full.len());
+
+    // SKIP composes: 1 skipped + 2 returned, all distinct, all valid.
+    let skipped = run(
+        &store,
+        "MATCH (p:P {id: 0})-[:K*1..2]-(m:P) RETURN DISTINCT m.id SKIP 1 LIMIT 2",
+    );
+    let sk: std::collections::BTreeSet<i64> = skipped.rows.iter().map(|r| int(&r[0])).collect();
+    assert_eq!(sk.len(), 2);
+    assert!(sk.is_subset(&full));
+}
