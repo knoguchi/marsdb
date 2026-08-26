@@ -199,11 +199,19 @@ fn idle_timeout_rolls_back_and_reports_on_the_next_statement() {
 
 #[test]
 fn activity_refreshes_the_idle_clock() {
+    // The three sleeps must together exceed the limit (proving activity
+    // resets the idle clock rather than the clock measuring total
+    // transaction age) while each individual gap stays well under it.
+    // The margin between one gap and the limit is deliberately large
+    // (600ms): `thread::sleep` only guarantees a *minimum*, and a loaded
+    // CI runner can overshoot by hundreds of ms — a 200ms-limit/50ms-gap
+    // version of this test flaked on the macOS runner with a measured
+    // idle of 201.4ms.
     let db = Database::in_memory().unwrap();
-    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(200)));
+    db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(1000)));
     db.execute("BEGIN").unwrap();
     for _ in 0..3 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(400));
         db.execute("CREATE (:N)").unwrap();
     }
     db.execute("COMMIT").unwrap();
