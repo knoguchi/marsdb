@@ -187,6 +187,16 @@ cache; every iteration below re-executes in full.
 | Write: create + delete node | 87 µs |
 | Write: create + delete relationship (two indexed lookups) | 91 µs |
 
+Without the `id` indexes the point-read rows degrade to label scans
+(~5.5ms at these label sizes) but the *shape* of every plan stays right:
+start-point selection credits an unindexed literal equality with a
+default selectivity since #209, which is worth 6-70x on this workload's
+IS5/IC2 shapes (33.9ms → 5.6ms, 650ms → 9.6ms) — before that fix an
+equality-filtered endpoint priced worse than an unfiltered one and the
+planner anchored on the wrong side. The indexed numbers in the table
+above are unaffected by that change (verified against criterion
+baselines, all within noise).
+
 The short reads and writes sit at tens of microseconds (indexed seeks +
 bounded hops). The heavy rows are honest whole-graph or exponential work
 and are the standing optimizer targets: IC1 enumerates ~1M var-length
