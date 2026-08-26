@@ -1364,3 +1364,130 @@ fn inline_properties_on_a_variable_length_relationship_pattern() {
     assert!(a_labels.contains(&"B".to_string()));
     assert!(b_labels.contains(&"C".to_string()));
 }
+
+// --- comma-separated MATCH patterns: cross joins, correlated parts, and
+// clause-wide relationship uniqueness ------------------------------------
+
+/// `MATCH (a:A), (b:B)` is a genuine cross join: every combination of the
+/// two disjoint parts, exactly the Cartesian product. (Split into
+/// separate `QueryPart`s by `group_into_linear_patterns`; found working
+/// while porting a third-party Northwind benchmark whose loader depends
+/// on this shape, previously listed as "not verified" in
+/// CYPHER_COVERAGE.md.)
+#[test]
+fn comma_separated_disjoint_match_is_a_cross_join() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:A {x: 1}), (:A {x: 2})");
+    run(&store, "CREATE (:B {y: 10}), (:B {y: 20}), (:B {y: 30})");
+    let result = run(
+        &store,
+        "MATCH (a:A), (b:B) RETURN a.x, b.y ORDER BY a.x, b.y",
+    );
+    let rows: Vec<(i64, i64)> = result
+        .rows
+        .iter()
+        .map(|r| (int(&r[0]), int(&r[1])))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, 10), (1, 20), (1, 30), (2, 10), (2, 20), (2, 30)]
+    );
+}
+
+/// Real Cypher's relationship-uniqueness rule spans the *whole* MATCH
+/// clause pattern, comma-separated parts included: two parts sharing a
+/// start node may not bind the same relationship instance, so the
+/// tag-co-occurrence shape yields only the (a,b)/(b,a) cross pairs, never
+/// the (a,a)/(b,b) self-pairs that reusing one HAS_TAG edge for both hops
+/// would produce. (The bug this guards against was masked in the
+/// benchmark that surfaced it by a `WHERE t1.id < t2.id` filter.)
+#[test]
+fn comma_separated_parts_of_one_match_share_relationship_uniqueness() {
+    let store = GraphStore::open_memory().unwrap();
+    run(
+        &store,
+        "CREATE (p:Post)-[:HAS_TAG]->(:Tag {name: 'a'}) CREATE (p)-[:HAS_TAG]->(:Tag {name: 'b'})",
+    );
+    let result = run(
+        &store,
+        "MATCH (p:Post)-[:HAS_TAG]->(t1:Tag), (p)-[:HAS_TAG]->(t2:Tag) \
+         RETURN t1.name, t2.name ORDER BY t1.name, t2.name",
+    );
+    let rows: Vec<(String, String)> = result
+        .rows
+        .iter()
+        .map(|r| (str_value(&r[0]), str_value(&r[1])))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string())
+        ]
+    );
+
+    // A separate MATCH *clause* starts a fresh uniqueness scope -- it may
+    // bind the very same relationship again (2 tags x 2 tags = 4 rows,
+    // self-pairs included).
+    let result = run(
+        &store,
+        "MATCH (p:Post)-[:HAS_TAG]->(t1:Tag) MATCH (p)-[:HAS_TAG]->(t2:Tag) \
+         RETURN t1.name, t2.name",
+    );
+    assert_eq!(result.rows.len(), 4);
+}
+
+/// The uniqueness scope covers variable-length hops across parts too: on
+/// a single-edge graph, a fixed hop in the second part can't re-bind the
+/// one edge the first part's var-length traversal used.
+#[test]
+fn comma_separated_parts_exclude_a_var_length_hops_traversed_edges() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X {n: 1})-[:R]->(:Y {n: 2})");
+    let result = run(&store, "MATCH (a)-[:R*1..1]->(b), (c)-[r:R]->(d) RETURN r");
+    assert_eq!(result.rows.len(), 0);
+
+    // With a second edge available, each part takes a different one.
+    run(&store, "MATCH (y:Y {n: 2}) CREATE (y)-[:R]->(:Z {n: 3})");
+    let result = run(
+        &store,
+        "MATCH (a)-[:R*1..1]->(b), (c)-[r:R]->(d) RETURN a.n, c.n",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
+
+/// Reusing one relationship-variable NAME across comma-separated parts of
+/// one MATCH clause is a compile-time error (same rule as within one
+/// pattern) -- while a later, separate MATCH clause reusing the name is
+/// legal and means "verify this exact relationship again".
+#[test]
+fn relationship_variable_reuse_across_comma_parts_errors_across_clauses_verifies() {
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (:X {n: 1})-[:R]->(:Y {n: 2})");
+    let stmt = parse("MATCH (a)-[r]->(b), (c)-[r]->(d) RETURN r").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("relationship variable"),
+        "expected the same-pattern reuse error, got: {err}"
+    );
+
+    let result = run(&store, "MATCH (a)-[r]->(b) MATCH (x)-[r]->(y) RETURN x.n");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(int(&result.rows[0][0]), 1);
+}
+
+/// Comma-separated CREATE patterns: disjoint node groups and disjoint
+/// relationship chains in one clause each create independently (also a
+/// previously "not verified" CYPHER_COVERAGE.md shape).
+#[test]
+fn comma_separated_create_patterns() {
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(&store, "CREATE (a:A {x: 1}), (b:B {y: 2})");
+    assert_eq!(result.stats.nodes_created, 2);
+    let result = run(&store, "CREATE (:C)-[:R]->(:D), (:E)-[:S]->(:F)");
+    assert_eq!(result.stats.nodes_created, 4);
+    assert_eq!(result.stats.relationships_created, 2);
+    let result = run(&store, "MATCH ()-[r]->() RETURN type(r) ORDER BY type(r)");
+    let types: Vec<String> = result.rows.iter().map(|r| str_value(&r[0])).collect();
+    assert_eq!(types, vec!["R".to_string(), "S".to_string()]);
+}

@@ -23,8 +23,8 @@ use crate::error::QueryError;
 use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::parse_helpers::validate_named_path_pattern;
 use crate::planner::{
-    apply_index_seeks, build_match_plan, pattern_all_vars, pattern_new_vars, plan_edge_scan,
-    plan_reversed_pattern,
+    apply_index_seeks, build_match_plan, build_match_plan_scoped, pattern_all_vars,
+    pattern_new_vars, plan_edge_scan, plan_reversed_pattern, MatchClauseScope,
 };
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
 use crate::result::{QueryResult, QueryStats};
@@ -1680,10 +1680,34 @@ impl<'a> Executor<'a> {
             }
             _ => None,
         };
+        // Relationship-uniqueness scope shared by the comma-separated
+        // parts of one MATCH clause (`QueryPart::continues_clause`) —
+        // reset whenever a Match part starts a new clause, threaded into
+        // `build_match_plan_scoped` so a later part's hops exclude every
+        // earlier part's relationships (real Cypher's edge-isomorphism
+        // rule spans the whole clause pattern, not each part).
+        let mut clause_scope = MatchClauseScope::default();
         for (clause_index, clause) in clauses.iter().enumerate() {
             let is_final_clause = clause_index + 1 == clauses.len();
             match clause {
                 QueryClause::Match(part) => {
+                    if !part.continues_clause {
+                        clause_scope = MatchClauseScope::default();
+                    }
+                    // Parts sharing a clause must all take the generic
+                    // scoped-plan path: `plan_edge_scan`'s whole-pattern
+                    // sweep bypasses `build_match_plan_scoped`, so a
+                    // part it planned would neither record its own
+                    // relationships into the scope nor exclude an
+                    // earlier part's. (The aggregating-expansion fast
+                    // path needs no gate — it requires a WITH and an
+                    // empty carried row, which no shared-clause part can
+                    // satisfy.)
+                    let shares_clause = part.continues_clause
+                        || matches!(
+                            clauses.get(clause_index + 1),
+                            Some(QueryClause::Match(next)) if next.continues_clause
+                        );
                     let plan_limit = is_final_clause
                         .then_some(final_stream_limit)
                         .flatten()
@@ -1754,9 +1778,11 @@ impl<'a> Executor<'a> {
                             rows = filtered;
                         }
                         rows
-                    } else if let Some(plan) = if part.optional {
+                    } else if let Some(plan) = if part.optional || shares_clause {
                         // OPTIONAL MATCH needs eval_optional_part's
                         // null-padding semantics -- never the sweep.
+                        // Shared-clause parts need the scoped-plan path
+                        // (see `shares_clause` above).
                         None
                     } else {
                         plan_edge_scan(&part.pattern, &part.where_clause, &carried_vars, txn)?
@@ -1780,7 +1806,12 @@ impl<'a> Executor<'a> {
                         )?;
                         let pattern = reversed.as_ref().unwrap_or(&part.pattern);
                         let plan = apply_index_seeks(
-                            build_match_plan(pattern, &part.where_clause, &carried_vars)?,
+                            build_match_plan_scoped(
+                                pattern,
+                                &part.where_clause,
+                                &carried_vars,
+                                &mut clause_scope,
+                            )?,
                             txn,
                         )?;
                         if part.optional {
