@@ -354,6 +354,16 @@ same split.
 All 7 of LDBC SNB Interactive's short-read reference queries (IS1-IS7) —
 see `marsdb-query/tests/ldbc_is_queries.rs`.
 
+A deterministic LDBC-style social-network workload (derived from a
+third-party benchmark suite, not official LDBC SNB — see
+`marsdb/tests/ldbc_support/mod.rs`): 17 queries spanning indexed point
+reads, multi-hop joins, var-length `DISTINCT` counting, negated pattern
+predicates, correlated comma patterns, and `OPTIONAL MATCH` + `WITH`-
+grouped aggregation, each checked against an answer recomputed
+independently in Rust from primitive edge scans — no golden values. SF
+0.005 runs in the default suite, SF 0.1 (~16k nodes / ~115k
+relationships) behind `--ignored`; see `marsdb/tests/ldbc_style.rs`.
+
 Not verified:
 - LDBC's complex queries (IC1-14) beyond one hand-crafted
   grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` check (see

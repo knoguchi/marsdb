@@ -8,8 +8,8 @@ exception, a real dataset-load comparison against Neo4j, see
 [Load comparison](#load-comparison-recommendations-dataset) below.
 
 Reproduce: `cargo bench -p marsdb-graph` and `cargo bench -p marsdb` (runs
-`cypher_ops`, `ldbc_ops`, `aggregate_ops`, `concurrency_ops`, and
-`index_ops`).
+`cypher_ops`, `ldbc_ops`, `ldbc_style_ops`, `aggregate_ops`,
+`concurrency_ops`, and `index_ops`).
 
 ## Storage layer (`marsdb-graph/benches/graph_ops.rs`)
 
@@ -147,6 +147,57 @@ truncating, so it can't be measured at the same dataset sizes as the rest
 of this table without tripping that guard.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_ops`.
+
+## LDBC-style workload (`marsdb/benches/ldbc_style_ops.rs`)
+
+Measured 2026-08-25 on Linux x86_64 (28 hw threads), release build,
+in-process. Whole-workload complement to the per-feature tables above: the
+deterministic LDBC-style social network from
+`marsdb/tests/ldbc_support/mod.rs` at SF 0.1 — 16,070 nodes / 114,603
+relationships (1,000 persons, ~50k KNOWS at avg degree ~100, 10k posts, 5k
+comments, 20k LIKES), property indexes on `id`. The schema and queries are
+derived from a third-party benchmark suite so results are comparable
+across engines; this is **not** the official LDBC SNB benchmark and these
+are not official LDBC results. The `ldbc_style` integration test proves
+these exact queries return correct results on this exact dataset (each
+answer recomputed independently in Rust from primitive edge scans), so
+these numbers are for verified-correct executions — worth stating because
+the engine this suite came from returns empty or mis-grouped results for
+several of them, and memoizes repeated reads, making its repeat-loop
+ops/sec reflect a result cache rather than execution. MarsDB has no result
+cache; every iteration below re-executes in full.
+
+| Query | Mean time |
+|---|---|
+| IS1 person profile (indexed point lookup) | 54 µs |
+| IS2 recent messages (1-hop + label-OR filter, top-10) | 129 µs |
+| IS3 friends (~100 undirected 1-hop rows) | 319 µs |
+| IS4 message content (indexed point lookup) | 28 µs |
+| IS5 message creator (point lookup + 1 hop) | 44 µs |
+| IS6 message tags (point lookup + 1 hop) | 35 µs |
+| IS7 message replies (2 hops + ORDER BY) | 71 µs |
+| IC1 friends `*1..3` + DISTINCT + LIMIT | 643 ms |
+| IC2 messages from friends (2-hop, ORDER BY, LIMIT) | 9.8 ms |
+| IC3 friends `*1..2` to country filter | 38 ms |
+| IC4 popular tags among friends | 655 µs |
+| IC5 friends-of-friends with negated pattern predicate | 71 ms |
+| Aggregation: posts per person | 38 ms |
+| Aggregation: average friends per city (OPTIONAL MATCH + WITH) | 62 ms |
+| Aggregation: tag co-occurrence (correlated comma patterns) | 69 ms |
+| Write: create + delete node | 87 µs |
+| Write: create + delete relationship (two indexed lookups) | 91 µs |
+
+The short reads and writes sit at tens of microseconds (indexed seeks +
+bounded hops). The heavy rows are honest whole-graph or exponential work
+and are the standing optimizer targets: IC1 enumerates ~1M var-length
+paths (avg degree ~100, up to 3 hops) before DISTINCT/LIMIT can apply —
+early termination for DISTINCT+LIMIT without ORDER BY is legal and not yet
+implemented; the three aggregations and IC5 scan or expand the whole graph
+by design.
+
+Reproduce: `cargo bench -p marsdb --bench ldbc_style_ops`. Correctness:
+`cargo test -p marsdb --test ldbc_style` (SF 0.005 in the default suite)
+and `-- --ignored` for this table's SF 0.1 graph.
 
 ## Property indexes (`marsdb/benches/index_ops.rs`)
 
