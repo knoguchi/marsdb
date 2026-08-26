@@ -5,6 +5,21 @@ All notable changes to MarsDB are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- `RETURN DISTINCT ... LIMIT k` with no ORDER BY and no aggregation now
+  stops the read pipeline as soon as `k` (plus SKIP) distinct projected
+  rows exist, and variable-length traversals enumerate their paths
+  lazily per input row instead of materializing every path up front —
+  together, a `[:KNOWS*1..3] ... RETURN DISTINCT ... LIMIT 20` over a
+  high-degree graph walks a few hundred paths instead of ~1M (measured
+  643 ms → 1.84 ms, and 71 ms → 714 µs on a fixed-2-hop DISTINCT+LIMIT,
+  LDBC-style SF 0.1). Emission order within a var-length hop is now
+  depth-first (row order without ORDER BY is unspecified), and a `*0..`
+  traversal that would exceed the safety depth cap still errors on any
+  fully-consumed query, but may now succeed if a satisfied
+  DISTINCT+LIMIT stops the enumeration before reaching the offending
+  branch.
+
 ### Fixed
 - Start-point selection prices unindexed literal-equality filters
   correctly: the endpoint's emitted-row estimate gets a default 1/10

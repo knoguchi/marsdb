@@ -338,6 +338,159 @@ struct ShortestPathSpec<'a> {
     max_hops: Option<u32>,
 }
 
+/// One node of `VarExpandIter`'s explicit DFS stack: the adjacency
+/// entries still to try from one reached node, plus the path state that
+/// got there. `depth` is the length of the paths this frame's entries
+/// produce.
+struct VarExpandFrame {
+    depth: u32,
+    used_edges: HashSet<EdgeId>,
+    segment: Vec<PathBinding>,
+    entries: std::vec::IntoIter<AdjEntry>,
+}
+
+/// Lazy variable-length path enumeration for one input row — see
+/// `Executor::expand_variable_iter`. A depth-first walk with an explicit
+/// frame stack (bounded by the hop cap, so ≤ `VAR_EXPAND_DEPTH_CAP`
+/// frames), yielding each qualifying path's row as it is discovered.
+///
+/// Two deliberate differences from the eager BFS this replaced, both
+/// only observable in ways Cypher leaves unspecified or that only fire
+/// on queries that previously did strictly more work:
+/// - **Emission order** is depth-first, not breadth-first. Row order
+///   without `ORDER BY` is unspecified; the *set* of emitted rows is
+///   identical (same reachability, same edge-isomorphism exclusions).
+/// - **The unbounded depth-cap error is discovered lazily**: a `*0..`
+///   traversal that can reach `VAR_EXPAND_DEPTH_CAP` hops still errors
+///   when the enumeration reaches such a path, so any fully-drained
+///   query behaves exactly as before — but a consumer that stops early
+///   (a satisfied `DISTINCT ... LIMIT`) may finish without ever walking
+///   the offending branch, succeeding where the eager version errored
+///   after having done all that work anyway.
+///
+/// The frontier/output-Vec `check_intermediate_rows` calls of the eager
+/// version are gone with the Vecs themselves: emitted rows are still
+/// counted by `count_stream` downstream, and `relationship_expansion`
+/// still meters every edge walked in here.
+struct VarExpandIter<'s, 'g> {
+    txn: Txn<'s>,
+    guard: &'s ExecutionGuard<'g>,
+    row: BindingRow,
+    spec: VarExpandSpec<'s>,
+    rel_props: Vec<(&'s str, PropertyValue)>,
+    effective_max: u32,
+    unbounded: bool,
+    pending_zero: Option<BindingRow>,
+    stack: Vec<VarExpandFrame>,
+    poisoned: bool,
+}
+
+impl VarExpandIter<'_, '_> {
+    fn emit(&self, other: NodeId, segment: &[PathBinding]) -> Result<BindingRow, QueryError> {
+        let mut new_row = self.row.clone();
+        new_row.insert(self.spec.to_var.to_string(), Binding::Node(other));
+        if let Some(path_segment_var) = self.spec.path_segment_var {
+            new_row.insert(
+                path_segment_var.to_string(),
+                Binding::Path(segment.to_vec()),
+            );
+        }
+        if let Some(rel_list_var) = self.spec.rel_list_var {
+            let edges = segment_edges_to_list(self.txn, segment)?;
+            new_row.insert(rel_list_var.to_string(), edges);
+        }
+        new_row.insert(
+            self.spec.exclude_edge_var.to_string(),
+            Binding::Path(segment.to_vec()),
+        );
+        Ok(new_row)
+    }
+}
+
+impl Iterator for VarExpandIter<'_, '_> {
+    type Item = Result<BindingRow, QueryError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+        if let Some(zero) = self.pending_zero.take() {
+            return Some(Ok(zero));
+        }
+        // Macro-free error plumbing: any failure ends the iteration for
+        // good (`poisoned`) after surfacing once.
+        macro_rules! try_iter {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.poisoned = true;
+                        return Some(Err(e));
+                    }
+                }
+            };
+        }
+        loop {
+            let frame = self.stack.last_mut()?;
+            let Some(entry) = frame.entries.next() else {
+                self.stack.pop();
+                continue;
+            };
+            try_iter!(self.guard.relationship_expansion());
+            if frame.used_edges.contains(&entry.edge_id) {
+                continue;
+            }
+            if !self.rel_props.is_empty() {
+                let fetched =
+                    try_iter!(GraphStore::get_edge_in_txn(self.txn, entry.edge_id)
+                        .map_err(QueryError::from));
+                let edge = try_iter!(deleted_entity_access(fetched));
+                let matches = self
+                    .rel_props
+                    .iter()
+                    .all(|(key, expected)| edge.props.get(*key) == Some(expected));
+                if !matches {
+                    continue;
+                }
+            }
+            let depth = frame.depth;
+            let mut next_segment = frame.segment.clone();
+            next_segment.push(PathBinding::Edge(entry.edge_id));
+            next_segment.push(PathBinding::Node(entry.other));
+            if depth < self.effective_max {
+                let mut next_used_edges = frame.used_edges.clone();
+                next_used_edges.insert(entry.edge_id);
+                let entries = try_iter!(neighbors_for_direction(
+                    self.txn,
+                    entry.other,
+                    self.spec.direction,
+                    self.spec.rel_labels,
+                ));
+                self.stack.push(VarExpandFrame {
+                    depth: depth + 1,
+                    used_edges: next_used_edges,
+                    segment: next_segment.clone(),
+                    entries: entries.into_iter(),
+                });
+            } else if self.unbounded {
+                // A valid path reached the safety cap with no written
+                // upper bound — same error, and for a fully-drained
+                // stream the same observable outcome, as the eager
+                // version's whole-call failure.
+                self.poisoned = true;
+                return Some(Err(QueryError::ResourceLimit(format!(
+                    "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
+                     hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
+                     add an explicit upper bound (e.g. *0..10)"
+                ))));
+            }
+            if depth >= self.spec.min_hops {
+                return Some(Ok(try_iter!(self.emit(entry.other, &next_segment))));
+            }
+        }
+    }
+}
+
 struct VarExpandSpec<'a> {
     from_var: &'a str,
     to_var: &'a str,
@@ -1680,6 +1833,27 @@ impl<'a> Executor<'a> {
             }
             _ => None,
         };
+        // DISTINCT's counterpart to `final_stream_limit`: `RETURN
+        // DISTINCT ... LIMIT k` with no ORDER BY and no aggregation can
+        // stop the final MATCH pipeline as soon as SKIP+LIMIT *distinct
+        // projected rows* have appeared — a plain row-count cap can't
+        // express that (the number of raw rows needed is data-dependent),
+        // so `collect_rows_until_distinct` projects and dedups while
+        // pulling, with exactly `dedup_rows`'s key so the semantics stay
+        // `materialize_return`'s. The payoff case is a var-length
+        // traversal that revisits the same endpoints through many paths
+        // (`(p)-[:KNOWS*1..3]-(friend) RETURN DISTINCT friend... LIMIT
+        // 20`): `VarExpandIter` is lazy, so unpulled paths are never
+        // enumerated at all.
+        let final_distinct_limit = match (order_by, limit, tail) {
+            (None, Some(limit), Some(Tail::Return(items, true))) if !has_aggregate(items) => {
+                Some((
+                    skip.unwrap_or(0).max(0) as usize + limit.max(0) as usize,
+                    items.as_slice(),
+                ))
+            }
+            _ => None,
+        };
         // Relationship-uniqueness scope shared by the comma-separated
         // parts of one MATCH clause (`QueryPart::continues_clause`) —
         // reset whenever a Match part starts a new clause, threaded into
@@ -1855,7 +2029,26 @@ impl<'a> Executor<'a> {
                                 carried_vars = out_names;
                                 continue;
                             }
-                            self.eval_plan_with_limit(txn, &plan, &current_rows, guard, plan_limit)?
+                            if let Some((cap, items)) = final_distinct_limit
+                                .filter(|_| is_final_clause && part.with.is_none())
+                            {
+                                self.collect_rows_until_distinct(
+                                    txn,
+                                    &plan,
+                                    &current_rows,
+                                    items,
+                                    cap,
+                                    guard,
+                                )?
+                            } else {
+                                self.eval_plan_with_limit(
+                                    txn,
+                                    &plan,
+                                    &current_rows,
+                                    guard,
+                                    plan_limit,
+                                )?
+                            }
                         }
                     };
                     let mut new_vars = pattern_all_vars(&part.pattern);
@@ -3544,6 +3737,49 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// `eval_plan_with_limit`'s `RETURN DISTINCT` counterpart (see
+    /// `final_distinct_limit` in `execute_match_seeded`): pulls the
+    /// pipeline only until `cap` *distinct projected* rows exist,
+    /// projecting each streamed row through the RETURN `items` and
+    /// deduping by exactly `dedup_rows`'s key (`eval_return_expr` →
+    /// `value_hash_key` per item), so which rows count as distinct is
+    /// decided by the same machinery `materialize_return` will apply to
+    /// what this returns. Duplicate-projecting rows are dropped here —
+    /// `materialize_return` would drop them anyway — which keeps the
+    /// returned Vec at `cap` rows. The projections are evaluated again
+    /// downstream for the kept rows; that re-evaluation is `cap` rows,
+    /// not the stream.
+    fn collect_rows_until_distinct(
+        &self,
+        txn: Txn,
+        plan: &LogicalPlan,
+        seed: &[BindingRow],
+        items: &[ReturnItem],
+        cap: usize,
+        guard: &ExecutionGuard<'_>,
+    ) -> Result<Vec<BindingRow>, QueryError> {
+        if cap == 0 {
+            return Ok(Vec::new());
+        }
+        let mut kept = Vec::new();
+        let mut seen: HashSet<Vec<HashKey>> = HashSet::new();
+        for res in self.stream_plan(txn, plan, seed, guard, None) {
+            let row = res?;
+            let mut key = Vec::with_capacity(items.len());
+            for item in items {
+                let value = self.eval_return_expr(txn, &item.expr, &row, guard)?;
+                key.push(value_hash_key(&value)?);
+            }
+            if seen.insert(key) {
+                kept.push(row);
+                if kept.len() >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(kept)
+    }
+
     /// Build a pull-based row pipeline. Each iterator owns only its current
     /// row (plus one relationship fan-out at an Expand), so scan/filter/
     /// expand chains no longer allocate a Vec at every logical-plan node.
@@ -3676,8 +3912,8 @@ impl<'a> Executor<'a> {
             } => {
                 let input = self.stream_plan(txn, input, seed, guard, None);
                 let stream = input.flat_map(move |res| {
-                    let rows = res.and_then(|row| {
-                        self.expand_variable_row(
+                    let iter = res.and_then(|row| {
+                        self.expand_variable_iter(
                             txn,
                             row,
                             VarExpandSpec {
@@ -3697,8 +3933,11 @@ impl<'a> Executor<'a> {
                             guard,
                         )
                     });
-                    match rows {
-                        Ok(rows) => Box::new(rows.into_iter().map(Ok)) as RowStream<'s>,
+                    match iter {
+                        // Lazy per input row: a downstream consumer that
+                        // stops early never pays for the paths it
+                        // doesn't pull (see `VarExpandIter`).
+                        Ok(iter) => Box::new(iter) as RowStream<'s>,
                         Err(error) => Box::new(std::iter::once(Err(error))),
                     }
                 });
@@ -4821,20 +5060,49 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn expand_variable_row(
-        &self,
-        txn: Txn,
+    /// Sets up a lazy variable-length expansion for one input row — the
+    /// per-row half of `LogicalPlan::VarExpand` evaluation. All the
+    /// once-per-row work happens here (start-binding resolution, the
+    /// `min_hops == 0` zero-length row, inline rel-prop evaluation, the
+    /// cross-hop excluded-edge seed); the traversal itself is the
+    /// returned `VarExpandIter`, which enumerates paths one at a time so
+    /// a downstream consumer that stops early (`RETURN DISTINCT ...
+    /// LIMIT k` with no ORDER BY, see `collect_rows_until_distinct`)
+    /// never pays for the paths it doesn't pull. This used to be an
+    /// eager BFS materializing every path into a `Vec` before anything
+    /// downstream ran — on a var-length hop over a high-degree graph
+    /// that Vec IS the query's cost (~1M paths for `[:KNOWS*1..3]` at
+    /// avg degree ~100), so laziness here is what makes any early
+    /// termination above worth having.
+    fn expand_variable_iter<'s, 'g>(
+        &'s self,
+        txn: Txn<'s>,
         row: BindingRow,
-        spec: VarExpandSpec<'_>,
-        guard: &ExecutionGuard<'_>,
-    ) -> Result<Vec<BindingRow>, QueryError> {
+        spec: VarExpandSpec<'s>,
+        guard: &'s ExecutionGuard<'g>,
+    ) -> Result<VarExpandIter<'s, 'g>, QueryError> {
         let start_id = match row.get(spec.from_var) {
-            Some(Binding::Node(id)) => *id,
-            Some(Binding::Value(PropertyValue::Null)) => return Ok(Vec::new()),
+            Some(Binding::Node(id)) => Some(*id),
+            Some(Binding::Value(PropertyValue::Null)) => None,
             _ => return Err(QueryError::UnboundVariable(spec.from_var.to_string())),
         };
-        let mut out = Vec::new();
-        if spec.min_hops == 0 {
+        let Some(start_id) = start_id else {
+            // A null start binding has no neighbors and contributes no
+            // rows — an empty iterator, not an error.
+            return Ok(VarExpandIter {
+                txn,
+                guard,
+                row,
+                spec,
+                rel_props: Vec::new(),
+                effective_max: 0,
+                unbounded: false,
+                pending_zero: None,
+                stack: Vec::new(),
+                poisoned: false,
+            });
+        };
+        let pending_zero = (spec.min_hops == 0).then(|| {
             let mut new_row = row.clone();
             new_row.insert(spec.to_var.to_string(), Binding::Node(start_id));
             if let Some(path_segment_var) = spec.path_segment_var {
@@ -4844,14 +5112,14 @@ impl<'a> Executor<'a> {
                 new_row.insert(rel_list_var.to_string(), Binding::List(Vec::new()));
             }
             new_row.insert(spec.exclude_edge_var.to_string(), Binding::Path(Vec::new()));
-            out.push(new_row);
-        }
+            new_row
+        });
         // `[:TYPE* {year: 1988}]` -- evaluated once here (constant across
-        // the whole BFS, not per-candidate; the values can reference this
-        // row's own already-bound variables, same as a fixed hop's inline
-        // props already can) and checked against each candidate edge's
-        // own stored properties during expansion below (TCK's Match4
-        // `[5]`).
+        // the whole traversal, not per-candidate; the values can
+        // reference this row's own already-bound variables, same as a
+        // fixed hop's inline props already can) and checked against each
+        // candidate edge's own stored properties during expansion (TCK's
+        // Match4 `[5]`).
         let rel_props = spec
             .rel_props
             .iter()
@@ -4864,7 +5132,7 @@ impl<'a> Executor<'a> {
         let effective_max = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
         // Real Cypher's edge-isomorphism rule (no relationship repeated
         // within one MATCH pattern) applies across the *whole* pattern, not
-        // just within this hop's own BFS -- seed the excluded set with
+        // just within this hop's own traversal -- seed the excluded set with
         // whatever edges earlier fixed hops of this same pattern already
         // bound, so this traversal can't walk back over one of them (see
         // `LogicalPlan::VarExpand`'s docs; found via TCK's Match5 `[27]`).
@@ -4892,74 +5160,28 @@ impl<'a> Executor<'a> {
                 }
             }))
             .collect();
-        // The ordered `Edge, Node, Edge, Node, ...` sequence built up so
-        // far, alongside the existing `used_edges` isomorphism set --
-        // only actually consulted when `path_segment_var` is set (named-
-        // path capture over this hop, see `LogicalPlan::VarExpand`'s own
-        // docs), but always threaded through the BFS regardless (a plain
-        // `Vec`, cheap to carry and clone even when unused).
-        let mut frontier = vec![(start_id, seed_used_edges, Vec::<PathBinding>::new())];
-        let mut depth = 0u32;
-        while depth < effective_max && !frontier.is_empty() {
-            depth += 1;
-            let mut next_frontier = Vec::new();
-            for (node, used_edges, segment) in frontier {
-                for entry in neighbors_for_direction(txn, node, spec.direction, spec.rel_labels)? {
-                    guard.relationship_expansion()?;
-                    if used_edges.contains(&entry.edge_id) {
-                        continue;
-                    }
-                    if !rel_props.is_empty() {
-                        let edge = deleted_entity_access(GraphStore::get_edge_in_txn(
-                            txn,
-                            entry.edge_id,
-                        )?)?;
-                        let matches = rel_props
-                            .iter()
-                            .all(|(key, expected)| edge.props.get(*key) == Some(expected));
-                        if !matches {
-                            continue;
-                        }
-                    }
-                    let mut next_used_edges = used_edges.clone();
-                    next_used_edges.insert(entry.edge_id);
-                    let mut next_segment = segment.clone();
-                    next_segment.push(PathBinding::Edge(entry.edge_id));
-                    next_segment.push(PathBinding::Node(entry.other));
-                    next_frontier.push((entry.other, next_used_edges, next_segment.clone()));
-                    guard.check_intermediate_rows(next_frontier.len())?;
-                    if depth >= spec.min_hops {
-                        let mut new_row = row.clone();
-                        new_row.insert(spec.to_var.to_string(), Binding::Node(entry.other));
-                        if let Some(path_segment_var) = spec.path_segment_var {
-                            new_row.insert(
-                                path_segment_var.to_string(),
-                                Binding::Path(next_segment.clone()),
-                            );
-                        }
-                        if let Some(rel_list_var) = spec.rel_list_var {
-                            let edges = segment_edges_to_list(txn, &next_segment)?;
-                            new_row.insert(rel_list_var.to_string(), edges);
-                        }
-                        new_row.insert(
-                            spec.exclude_edge_var.to_string(),
-                            Binding::Path(next_segment.clone()),
-                        );
-                        out.push(new_row);
-                        guard.check_intermediate_rows(out.len())?;
-                    }
-                }
-            }
-            frontier = next_frontier;
-            if depth == effective_max && unbounded && !frontier.is_empty() {
-                return Err(QueryError::ResourceLimit(format!(
-                    "variable-length traversal exceeded the safety depth cap ({VAR_EXPAND_DEPTH_CAP} \
-                     hops) — likely a cyclic graph or unexpectedly large fanout; narrow the pattern or \
-                     add an explicit upper bound (e.g. *0..10)"
-                )));
-            }
+        let mut stack = Vec::new();
+        if effective_max >= 1 {
+            let entries = neighbors_for_direction(txn, start_id, spec.direction, spec.rel_labels)?;
+            stack.push(VarExpandFrame {
+                depth: 1,
+                used_edges: seed_used_edges,
+                segment: Vec::new(),
+                entries: entries.into_iter(),
+            });
         }
-        Ok(out)
+        Ok(VarExpandIter {
+            txn,
+            guard,
+            row,
+            spec,
+            rel_props,
+            effective_max,
+            unbounded,
+            pending_zero,
+            stack,
+            poisoned: false,
+        })
     }
 
     /// `LogicalPlan::MatchRelList`'s own docs -- deterministic, no search:

@@ -176,11 +176,11 @@ cache; every iteration below re-executes in full.
 | IS5 message creator (point lookup + 1 hop) | 44 µs |
 | IS6 message tags (point lookup + 1 hop) | 35 µs |
 | IS7 message replies (2 hops + ORDER BY) | 71 µs |
-| IC1 friends `*1..3` + DISTINCT + LIMIT | 643 ms |
+| IC1 friends `*1..3` + DISTINCT + LIMIT | 1.84 ms |
 | IC2 messages from friends (2-hop, ORDER BY, LIMIT) | 9.8 ms |
 | IC3 friends `*1..2` to country filter | 38 ms |
 | IC4 popular tags among friends | 655 µs |
-| IC5 friends-of-friends with negated pattern predicate | 71 ms |
+| IC5 friends-of-friends with negated pattern predicate | 714 µs |
 | Aggregation: posts per person | 38 ms |
 | Aggregation: average friends per city (OPTIONAL MATCH + WITH) | 62 ms |
 | Aggregation: tag co-occurrence (correlated comma patterns) | 69 ms |
@@ -198,12 +198,14 @@ above are unaffected by that change (verified against criterion
 baselines, all within noise).
 
 The short reads and writes sit at tens of microseconds (indexed seeks +
-bounded hops). The heavy rows are honest whole-graph or exponential work
-and are the standing optimizer targets: IC1 enumerates ~1M var-length
-paths (avg degree ~100, up to 3 hops) before DISTINCT/LIMIT can apply —
-early termination for DISTINCT+LIMIT without ORDER BY is legal and not yet
-implemented; the three aggregations and IC5 scan or expand the whole graph
-by design.
+bounded hops). IC1 and IC5 are `RETURN DISTINCT ... LIMIT` shapes with no
+ORDER BY, where the pipeline stops as soon as LIMIT-many distinct
+projected rows exist — variable-length paths enumerate lazily, so at avg
+degree ~100 IC1 walks a few hundred of its ~1M possible `*1..3` paths
+instead of all of them (643 ms → 1.84 ms when this landed; IC5 71 ms →
+714 µs). The remaining heavy rows are honest whole-graph work — the three
+aggregations and IC3's var-length-to-filter join must see every row by
+design — and are the standing optimizer targets.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_style_ops`. Correctness:
 `cargo test -p marsdb --test ldbc_style` (SF 0.005 in the default suite)
