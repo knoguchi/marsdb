@@ -13,8 +13,8 @@ categories.workspace = true
 description = "Natural-language-to-Cypher translation for MarsDB: schema introspection, prompt building, and validate-and-repair against a pluggable LLM client."
 
 [dependencies]
-marsdb = { path = "../marsdb", version = "0.9.0" }
-marsdb-query = { path = "../marsdb-query", version = "0.9.0" }
+marsdb = { path = "../marsdb", version = "0.9.1" }
+marsdb-query = { path = "../marsdb-query", version = "0.9.1" }
 
 [dev-dependencies]
 tempfile.workspace = true

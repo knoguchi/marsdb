@@ -17,9 +17,9 @@ name = "marsdb"
 path = "src/lib.rs"
 
 [dependencies]
-marsdb-storage = { path = "../marsdb-storage", version = "0.9.0" }
-marsdb-graph = { path = "../marsdb-graph", version = "0.9.0" }
-marsdb-query = { path = "../marsdb-query", version = "0.9.0" }
+marsdb-storage = { path = "../marsdb-storage", version = "0.9.1" }
+marsdb-graph = { path = "../marsdb-graph", version = "0.9.1" }
+marsdb-query = { path = "../marsdb-query", version = "0.9.1" }
 thiserror.workspace = true
 # `arrow` feature only -- heavyweight, off by default. The feature is
 # exempt from the workspace MSRV (arrow-rs tracks recent stable).
