@@ -389,6 +389,36 @@ impl AggAcc {
         Ok(())
     }
 
+    /// `count()`-only fold of a node/relationship reference by graph
+    /// identity, bypassing `fold`'s materialized-`Value` interface:
+    /// `count` never inspects the record, so an entity deleted earlier in
+    /// the same statement (`... DELETE p RETURN count(p)`) still counts,
+    /// matching Neo4j — while every record-touching path (`count(p.prop)`,
+    /// `RETURN p` itself) keeps erroring via `deleted_entity_access`
+    /// (TCK Return2 [15]-[17]). `key` is the same `HashKey::Node`/`Edge`
+    /// that `value_hash_key` derives from a materialized entity, so
+    /// `count(DISTINCT p)` dedups identically on both paths.
+    pub(crate) fn fold_count_entity(&mut self, key: HashKey) -> Result<(), QueryError> {
+        match self {
+            AggAcc::Count { distinct, n } => {
+                let fresh = match distinct {
+                    None => true,
+                    Some(seen) => seen.insert(key),
+                };
+                if fresh {
+                    *n = n
+                        .checked_add(1)
+                        .ok_or_else(|| QueryError::Type("count() overflow".into()))?;
+                }
+                Ok(())
+            }
+            _ => unreachable!(
+                "fold_count_entity is only ever called on a count() accumulator — \
+                 resolve_grouped_rows checks the aggregate name first"
+            ),
+        }
+    }
+
     /// Folds one row's (value, percentile) pair for `percentileCont()`/
     /// `percentileDisc()` — the only two-argument aggregates, so they can't
     /// share `fold`'s single-`Value` interface. Same null-skipping
