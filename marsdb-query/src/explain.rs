@@ -27,7 +27,8 @@ use crate::error::QueryError;
 use crate::executor::with_item_output_name;
 use crate::ir::{ExpandDirection, IndexSeekValue, LogicalPlan};
 use crate::planner::{
-    apply_index_seeks, build_match_plan, pattern_all_vars, plan_reversed_pattern,
+    apply_index_seeks, build_match_plan_scoped, pattern_all_vars, plan_reversed_pattern,
+    MatchClauseScope,
 };
 
 pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, QueryError> {
@@ -53,8 +54,24 @@ pub fn explain_statement(stmt: &Statement, txn: Txn) -> Result<Vec<String>, Quer
         Statement::Match { clauses, tail, .. } => {
             let mut out = Vec::new();
             let mut carried_vars: HashSet<String> = HashSet::new();
-            for clause in clauses {
-                explain_clause(clause, txn, &mut carried_vars, &mut out)?;
+            // Mirrors `execute_match_seeded`'s clause-scope threading so
+            // the described plan (cross-part uniqueness filters included)
+            // is the executed plan.
+            let mut clause_scope = MatchClauseScope::default();
+            for (i, clause) in clauses.iter().enumerate() {
+                let shares_clause = matches!(clause, QueryClause::Match(p) if p.continues_clause)
+                    || matches!(
+                        clauses.get(i + 1),
+                        Some(QueryClause::Match(next)) if next.continues_clause
+                    );
+                explain_clause(
+                    clause,
+                    txn,
+                    &mut carried_vars,
+                    &mut clause_scope,
+                    shares_clause,
+                    &mut out,
+                )?;
             }
             if let Some(tail) = tail {
                 out.push(explain_tail(tail));
@@ -108,10 +125,14 @@ fn explain_clause(
     clause: &QueryClause,
     txn: Txn,
     carried_vars: &mut HashSet<String>,
+    clause_scope: &mut MatchClauseScope,
+    shares_clause: bool,
     out: &mut Vec<String>,
 ) -> Result<(), QueryError> {
     match clause {
-        QueryClause::Match(part) => explain_match_part(part, txn, carried_vars, out),
+        QueryClause::Match(part) => {
+            explain_match_part(part, txn, carried_vars, clause_scope, shares_clause, out)
+        }
         QueryClause::Unwind(u) => {
             explain_unwind(u, carried_vars, out);
             Ok(())
@@ -195,8 +216,13 @@ fn explain_match_part(
     part: &QueryPart,
     txn: Txn,
     carried_vars: &mut HashSet<String>,
+    clause_scope: &mut MatchClauseScope,
+    shares_clause: bool,
     out: &mut Vec<String>,
 ) -> Result<(), QueryError> {
+    if !part.continues_clause {
+        *clause_scope = MatchClauseScope::default();
+    }
     if part.shortest_path {
         out.push(format!(
             "{}ShortestPath (BFS, not compiled to a LogicalPlan)",
@@ -204,9 +230,10 @@ fn explain_match_part(
         ));
     } else {
         // Mirrors the executor's own start-point selection exactly (plain
-        // MATCH only, never a named path) so the described plan is the
-        // executed plan.
-        let plan = if part.path_var.is_none() && !part.optional {
+        // MATCH only, never a named path; shared-clause parts skip the
+        // edge sweep, same as `execute_match_seeded`) so the described
+        // plan is the executed plan.
+        let plan = if part.path_var.is_none() && !part.optional && !shares_clause {
             crate::planner::plan_edge_scan(&part.pattern, &part.where_clause, carried_vars, txn)?
         } else {
             None
@@ -221,7 +248,12 @@ fn explain_match_part(
                 };
                 let pattern = reversed.as_ref().unwrap_or(&part.pattern);
                 apply_index_seeks(
-                    build_match_plan(pattern, &part.where_clause, carried_vars)?,
+                    build_match_plan_scoped(
+                        pattern,
+                        &part.where_clause,
+                        carried_vars,
+                        clause_scope,
+                    )?,
                     txn,
                 )?
             }

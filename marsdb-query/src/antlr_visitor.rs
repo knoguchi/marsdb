@@ -1062,6 +1062,9 @@ impl AstBuilder {
                     None
                 },
                 with: None,
+                // Parts 1.. share the clause's relationship-uniqueness
+                // scope with part 0 — see `QueryPart::continues_clause`.
+                continues_clause: i > 0,
             })
             .collect())
     }

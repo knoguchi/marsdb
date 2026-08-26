@@ -14,10 +14,6 @@ struct VarNamer {
 }
 
 impl VarNamer {
-    fn new() -> Self {
-        Self { next: 0 }
-    }
-
     /// Anonymous nodes/rels (e.g. `(a)-->()`) still need a name to track
     /// their binding through the plan; synthesize one that can't collide
     /// with a user-written identifier.
@@ -33,12 +29,52 @@ impl VarNamer {
     }
 }
 
+/// Relationship-uniqueness state shared by the comma-separated parts of
+/// one `MATCH` clause (see `QueryPart::continues_clause`). Real Cypher's
+/// edge-isomorphism rule spans the whole clause pattern: `MATCH
+/// (p)-[:T]->(a), (p)-[:T]->(b)` must not bind both hops to the same
+/// relationship instance, exactly as if the parts were hops of one chain.
+/// Carries forward, part to part: the synthesized-name counter (so a
+/// later part's `__anonN` names can't collide with — and silently
+/// overwrite — an earlier part's still-in-row bindings), every earlier
+/// part's bound relationship vars (fixed hops) and traversed-edge-set
+/// vars (variable-length hops), and the user-written relationship
+/// variable names (a name may not repeat across parts of one clause,
+/// same compile-time error as within one pattern). A separate `MATCH`
+/// clause starts a fresh scope — reuse across clauses stays legal.
+#[derive(Default)]
+pub struct MatchClauseScope {
+    namer_next: usize,
+    prior_rel_vars: Vec<String>,
+    prior_edge_sets: Vec<String>,
+    rel_var_names: HashSet<String>,
+}
+
 pub fn build_match_plan(
     pattern: &Pattern,
     where_clause: &Option<Expr>,
     carried_vars: &HashSet<String>,
 ) -> Result<LogicalPlan, QueryError> {
-    let mut namer = VarNamer::new();
+    // Standalone pattern (a whole clause of its own, or a context like a
+    // pattern predicate / MERGE that never has comma-separated parts):
+    // fresh, discarded scope.
+    build_match_plan_scoped(
+        pattern,
+        where_clause,
+        carried_vars,
+        &mut MatchClauseScope::default(),
+    )
+}
+
+pub fn build_match_plan_scoped(
+    pattern: &Pattern,
+    where_clause: &Option<Expr>,
+    carried_vars: &HashSet<String>,
+    scope: &mut MatchClauseScope,
+) -> Result<LogicalPlan, QueryError> {
+    let mut namer = VarNamer {
+        next: scope.namer_next,
+    };
     let start_var = namer.name(&pattern.start.var);
     let mut plan = if carried_vars.contains(&start_var) {
         // Already bound by a prior QueryPart's WITH output — continue from
@@ -86,21 +122,23 @@ pub fn build_match_plan(
     }
     let mut from_var = start_var.clone();
     // Real Cypher pattern matching is edge-isomorphic: no single MATCH
-    // pattern may bind two hops to the *same* relationship instance, even
-    // if their types/directions differ (a self-loop plus an undirected hop
-    // back out is the case that surfaces this — without this check, the
-    // hop back out can silently re-match the edge the previous hop just
-    // came in on). Scoped to hops within *this* pattern only — a separate
-    // MATCH clause, or a separate comma-separated pattern, may reuse the
+    // clause pattern may bind two hops to the *same* relationship
+    // instance, even if their types/directions differ (a self-loop plus
+    // an undirected hop back out is the case that surfaces this — without
+    // this check, the hop back out can silently re-match the edge the
+    // previous hop just came in on). Scoped to the whole MATCH clause:
+    // hops within this pattern, plus every hop of an earlier
+    // comma-separated part of the same clause (seeded from `scope`, see
+    // `MatchClauseScope`). Only a separate MATCH *clause* may reuse the
     // same relationship freely.
-    let mut prior_rel_vars: Vec<String> = Vec::new();
+    let mut prior_rel_vars: Vec<String> = std::mem::take(&mut scope.prior_rel_vars);
     // Complementary to `prior_rel_vars` above -- edges an *earlier
     // variable-length* hop of this same pattern traversed can't be named
     // by a single id the way a fixed hop's own `rel_var` can (each row's
     // own BFS can use a different set of edges), so this tracks each such
     // hop's own `exclude_edge_var` name instead (see `LogicalPlan::
     // VarExpand::exclude_edge_sets`'s own docs).
-    let mut prior_edge_sets: Vec<String> = Vec::new();
+    let mut prior_edge_sets: Vec<String> = std::mem::take(&mut scope.prior_edge_sets);
     // A node variable can repeat *within* one pattern too, not just across
     // a `WITH` boundary -- `MATCH (n)-[r]->(n)` (a self-relationship) reuses
     // `n` for both ends of the same pattern. Seeded with the start node so
@@ -117,7 +155,7 @@ pub fn build_match_plan(
     // synthesized names for the *different*, allowed edge-isomorphism
     // check ("two hops can't reuse the same relationship *instance*" even
     // when they're different variables or none at all).
-    let mut pattern_rel_var_names: HashSet<String> = HashSet::new();
+    let mut pattern_rel_var_names: HashSet<String> = std::mem::take(&mut scope.rel_var_names);
     for (rel, node) in &pattern.hops {
         // "Bound-node repetition": this hop's variable was already bound
         // before this hop -- either from a prior QueryPart (e.g. IS7's `p`,
@@ -331,6 +369,13 @@ pub fn build_match_plan(
             predicate,
         };
     }
+    // Hand the accumulated uniqueness state back for the clause's next
+    // comma-separated part (a no-op for the standalone-`build_match_plan`
+    // wrapper, whose scope is discarded).
+    scope.namer_next = namer.next;
+    scope.prior_rel_vars = prior_rel_vars;
+    scope.prior_edge_sets = prior_edge_sets;
+    scope.rel_var_names = pattern_rel_var_names;
     Ok(plan)
 }
 

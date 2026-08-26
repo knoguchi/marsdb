@@ -85,8 +85,20 @@ Columns:
 - `CREATE`/`MERGE` require exactly one explicit relationship type per hop
   (matches real Cypher — an edge being created can't be ambiguous about
   its type)
+- Comma-separated patterns within one `MATCH`/`CREATE` clause: parts
+  that continue the previous part's last variable splice into one chain;
+  disjoint parts cross-join (`MATCH (a:A), (b:B)` is the full Cartesian
+  product); a part may correlate on any earlier-bound variable
+  (`MATCH (p)-[:T]->(t1), (p)-[:T]->(t2)`). Relationship uniqueness
+  spans the whole clause, as in real Cypher: no two hops anywhere in one
+  `MATCH`'s pattern bind the same relationship instance (variable-length
+  hops' traversed edges included), and a relationship variable name
+  can't repeat across parts — while a separate `MATCH` clause starts
+  fresh and may re-bind or (by reusing the variable) re-verify the same
+  relationship.
 - Named-path capture: `MATCH p = (a)-[:KNOWS]->(b) RETURN p`
-  (fixed-hop only)
+  (fixed-hop only; a named path/`shortestPath()` can't span a
+  comma-separated cross join)
 - `shortestPath((a)-[:TYPE*..N]-(b))` — real BFS shortest path, not just
   first-found
 - `length(p)` on a captured path
@@ -346,9 +358,6 @@ Not verified:
 - LDBC's complex queries (IC1-14) beyond one hand-crafted
   grouping+`WITH...WHERE`+`ORDER BY`+`LIMIT`+`collect()` check (see
   `marsdb-query/tests/smoke.rs`)
-- Comma-separated patterns *within one* `MATCH`/`CREATE` clause beyond a
-  single linear chain (general cross-joins — different from the
-  `WITH`-chaining cross-join above, which works)
 - `MERGE` patterns with more than one relationship hop (no
   whole-pattern atomicity across multiple simultaneously-unbound hops)
 - `shortestPath()` with a minimum hop count greater than 1 (plain

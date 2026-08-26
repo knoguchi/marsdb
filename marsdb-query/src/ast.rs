@@ -676,6 +676,17 @@ pub struct QueryPart {
     pub pattern: Pattern,
     pub where_clause: Option<Expr>,
     pub with: Option<WithClause>,
+    /// True when this part came from the same `MATCH` clause as the
+    /// immediately preceding `QueryClause::Match` part (a disjoint
+    /// comma-separated group, split by `group_into_linear_patterns`).
+    /// Real Cypher's relationship-uniqueness rule spans the *whole*
+    /// clause pattern, comma-separated parts included — so parts that
+    /// continue a clause share one `planner::MatchClauseScope` (each
+    /// part's hops exclude every earlier part's relationships, and a
+    /// relationship variable name may not repeat across them), while a
+    /// separate `MATCH` clause (`continues_clause: false`) starts fresh
+    /// and may legally re-bind or re-verify the same relationship.
+    pub continues_clause: bool,
 }
 
 /// `UNWIND <source> AS <var> [WHERE ...] [WITH ...]` — fans a list out into
