@@ -1092,6 +1092,56 @@ fn delete_then_return_a_property_of_the_deleted_var_errors() {
 }
 
 #[test]
+fn count_of_a_deleted_variable_works_property_access_still_errors() {
+    // Neo4j counts a variable deleted earlier in the same statement --
+    // `count(p)` needs only the entity's identity, never its record, so
+    // `CREATE (p) WITH p DELETE p RETURN count(p)` answers 1 rather than
+    // raising DeletedEntityAccess (found porting a third-party Northwind
+    // benchmark whose write queries use exactly this shape). Property
+    // access on the deleted variable must keep erroring (TCK Return2
+    // [15]/[17], the tests above) -- only the identity-only count path
+    // bypasses `deleted_entity_access`.
+    let store = GraphStore::open_memory().unwrap();
+    let result = run(
+        &store,
+        "CREATE (p:Product {productID: 999}) WITH p DELETE p RETURN count(p) AS c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    // Same shape for a relationship variable.
+    let result = run(
+        &store,
+        "CREATE (:S)-[r:T]->(:P) WITH r DELETE r RETURN count(r) AS c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 1);
+
+    // count(DISTINCT <deleted var>) dedups by graph identity, same as it
+    // would for live entities.
+    run(&store, "CREATE (:D), (:D)");
+    let result = run(&store, "MATCH (m:D) DELETE m RETURN count(DISTINCT m) AS c");
+    assert_eq!(int(&result.rows[0][0]), 2);
+
+    // The identity-only fast path must not break count()'s null-skipping:
+    // an unmatched OPTIONAL MATCH variable still contributes nothing.
+    run(&store, "CREATE (:Lonely)");
+    let result = run(
+        &store,
+        "MATCH (n:Lonely) OPTIONAL MATCH (n)-[:NOPE]->(x) RETURN count(x) AS c",
+    );
+    assert_eq!(int(&result.rows[0][0]), 0);
+
+    // count(p.prop) on a deleted variable touches the record and must
+    // still error, same as the bare property access above.
+    run(&store, "CREATE (:E {num: 1})");
+    let stmt = parse("MATCH (n:E) DELETE n RETURN count(n.num)").unwrap();
+    let err = Executor::new(&store).execute(&stmt).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("no longer exists"),
+        "expected a deleted-entity error, got: {err}"
+    );
+}
+
+#[test]
 fn detach_delete_then_return() {
     let store = GraphStore::open_memory().unwrap();
     run(

@@ -2992,6 +2992,29 @@ impl<'a> Executor<'a> {
                             group.accs[i][k].fold(&Value::Literal(Literal::Bool(true)))?;
                         }
                         ReturnExpr::Call { name, args, .. } => {
+                            // `count(<bare var>)` of a node/relationship
+                            // needs only the entity's identity, never its
+                            // record — fold by id directly, skipping the
+                            // record decode `eval_return_expr` would do.
+                            // Besides the per-row saving, this is what lets
+                            // `... DELETE p RETURN count(p)` count an
+                            // entity deleted earlier in the same statement
+                            // (Neo4j-compatible), while property access on
+                            // it keeps erroring via `deleted_entity_access`.
+                            if name.eq_ignore_ascii_case("count") {
+                                let key = match args.first() {
+                                    Some(ReturnExpr::Var(v)) => match row.get(v) {
+                                        Some(Binding::Node(id)) => Some(HashKey::Node(*id)),
+                                        Some(Binding::Edge(id)) => Some(HashKey::Edge(*id)),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                if let Some(key) = key {
+                                    group.accs[i][k].fold_count_entity(key)?;
+                                    continue;
+                                }
+                            }
                             // Standard Cypher null-skipping: a null
                             // argument (e.g. an unmatched OPTIONAL MATCH
                             // variable) contributes to neither the
