@@ -272,6 +272,7 @@ Recent changes: [CHANGELOG.md](CHANGELOG.md).
 ```
 cargo test --workspace                                             # ~8s
 cargo test -p marsdb-graph --test stress -- --ignored --nocapture  # ~15s, large-scale
+cargo test -p marsdb --test ldbc_style -- --ignored --nocapture    # ~35s, SF 0.1 LDBC-style workload correctness
 cargo test -p marsdb-crash-harness -- --ignored --nocapture        # ~7s/30 runs, SIGKILL-and-verify
 cargo bench -p marsdb-graph
 cargo bench -p marsdb

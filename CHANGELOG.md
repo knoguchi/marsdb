@@ -3,6 +3,33 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- `Transaction::execute_prepared_statement` — the prepared-statement
+  counterpart of `Transaction::execute_with_params`, mirroring
+  `Database::execute_prepared_statement`: bulk loaders re-executing one
+  parsed statement with per-row parameters inside a single transaction
+  no longer pay a parse per row.
+- LDBC-style workload verification and benchmark: a deterministic
+  social-network generator (`marsdb/tests/ldbc_support/`) with 17
+  queries whose answers are each recomputed independently in Rust from
+  primitive edge scans and asserted equal — no golden values (SF 0.005
+  in the default suite, SF 0.1 `--ignored`), plus the same queries as a
+  criterion suite (`cargo bench -p marsdb --bench ldbc_style_ops`; see
+  BENCHMARKS.md).
+
+### Fixed
+- `count()` of a variable deleted earlier in the same statement
+  (`CREATE (p) WITH p DELETE p RETURN count(p)`) counts by graph
+  identity instead of erroring; property access on the deleted variable
+  still errors, as the TCK requires (#203).
+- Relationship uniqueness now spans all comma-separated parts of one
+  `MATCH` clause, as in real Cypher: `MATCH (p)-[:T]->(t1), (p)-[:T]->(t2)`
+  no longer returns rows binding both hops to the same relationship, and
+  reusing a relationship variable across parts of one clause is a
+  compile-time error (#204).
+
 ## [0.9.0] - 2026-08-10
 
 The release that declares the C API stable. Everything a non-Rust
