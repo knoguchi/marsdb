@@ -3,7 +3,7 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.9.1] - 2026-08-26
 
 ### Added
 - `Transaction::execute_prepared_statement` — the prepared-statement
