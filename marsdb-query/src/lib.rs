@@ -10,6 +10,7 @@ mod ir;
 mod params;
 mod parse_helpers;
 mod planner;
+mod prepared;
 mod procedure;
 mod result;
 mod semantic;
@@ -24,7 +25,9 @@ pub use executor::{
     is_read_only, CancellationToken, ExecutionEvent, ExecutionObserver, ExecutionOptions,
     ExecutionOutcome, Executor, RowSink,
 };
-pub use params::substitute_params;
+pub use params::{substitute_params, substitute_params_tracked, ParamSite, PathStep};
+pub use planner::{apply_index_seeks_tracked, IndexSeekOutcome};
+pub use prepared::PreparedPlan;
 pub use procedure::{ProcedureProvider, ProcedureSignature, Procedures};
 pub use result::{QueryResult, QueryStats};
 pub use semantic::validate_statement;

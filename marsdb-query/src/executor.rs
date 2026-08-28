@@ -784,7 +784,26 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         let started = Instant::now();
         let guard = ExecutionGuard::new(options);
-        let result = self.execute_with_guard(stmt, &guard);
+        let result = self.execute_with_guard(stmt, &guard, true);
+        Self::notify_observer(options, stmt, started, &guard, &result);
+        result
+    }
+
+    /// Same as `execute_with_options`, but skips `validate_statement`.
+    /// Only safe when the caller has already validated an
+    /// equivalently-shaped statement and confirmed the current
+    /// parameter bindings can't change the validation outcome — see
+    /// `PreparedPlan`'s doc comment for the exact safety condition.
+    /// Every other entry point (including this crate's own recursive
+    /// calls into itself, e.g. subqueries) always validates.
+    pub fn execute_with_options_trusted(
+        &self,
+        stmt: &Statement,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, QueryError> {
+        let started = Instant::now();
+        let guard = ExecutionGuard::new(options);
+        let result = self.execute_with_guard(stmt, &guard, false);
         Self::notify_observer(options, stmt, started, &guard, &result);
         result
     }
@@ -793,8 +812,11 @@ impl<'a> Executor<'a> {
         &self,
         stmt: &Statement,
         guard: &ExecutionGuard<'_>,
+        validate: bool,
     ) -> Result<QueryResult, QueryError> {
-        crate::semantic::validate_statement(stmt)?;
+        if validate {
+            crate::semantic::validate_statement(stmt)?;
+        }
         guard.checkpoint()?;
         // Fresh cache generation per statement -- an `Executor` is reused
         // across many statements (`execute_batch`, group commit), so a
@@ -1015,7 +1037,23 @@ impl<'a> Executor<'a> {
     ) -> Result<QueryResult, QueryError> {
         let started = Instant::now();
         let guard = ExecutionGuard::new(options);
-        let result = self.execute_in_write_transaction_with_guard(stmt, write_txn, &guard);
+        let result = self.execute_in_write_transaction_with_guard(stmt, write_txn, &guard, true);
+        Self::notify_observer(options, stmt, started, &guard, &result);
+        result
+    }
+
+    /// Same as `execute_in_write_transaction_with_options`, but skips
+    /// `validate_statement` -- see `execute_with_options_trusted`'s doc
+    /// comment for the safety condition.
+    pub fn execute_in_write_transaction_with_options_trusted(
+        &self,
+        stmt: &Statement,
+        write_txn: &WriteTransaction,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, QueryError> {
+        let started = Instant::now();
+        let guard = ExecutionGuard::new(options);
+        let result = self.execute_in_write_transaction_with_guard(stmt, write_txn, &guard, false);
         Self::notify_observer(options, stmt, started, &guard, &result);
         result
     }
@@ -1025,8 +1063,11 @@ impl<'a> Executor<'a> {
         stmt: &Statement,
         write_txn: &WriteTransaction,
         guard: &ExecutionGuard<'_>,
+        validate: bool,
     ) -> Result<QueryResult, QueryError> {
-        crate::semantic::validate_statement(stmt)?;
+        if validate {
+            crate::semantic::validate_statement(stmt)?;
+        }
         guard.checkpoint()?;
         // Same cache-generation reset as the top-level path
         // (`execute_with_guard`): this is a second entry point (an
@@ -1123,6 +1164,7 @@ impl<'a> Executor<'a> {
             } => {
                 guard.checkpoint()?;
                 GraphStore::create_index_in_txn(write_txn, label, prop, *unique)?;
+                self.store.bump_schema_generation();
                 Ok(QueryResult {
                     columns: vec![],
                     rows: vec![],
