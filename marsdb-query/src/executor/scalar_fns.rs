@@ -13,12 +13,9 @@ pub(crate) fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryErr
     if matches!(list, Value::Null) || matches!(index, Value::Null) {
         return Ok(Value::Null);
     }
-    // `map[key]` -- real Cypher's dynamic map-field access (`map['name']`,
-    // as opposed to `map.name`'s static form -- `lookup_prop`/`ReturnExpr
-    // ::Prop` above). Unlike `.prop`, this can return a full nested
-    // `Value` (a list/map field value), not just a scalar `PropertyValue`
-    // -- `apply_index`'s return type already allows that, no narrowing
-    // needed the way `map_value_as_property` has to for `.prop`.
+    // `map[key]` -- dynamic map-field access, as opposed to `map.name`'s
+    // static form. Unlike `.prop`, this can return a full nested `Value`
+    // (a list/map field value), not just a scalar `PropertyValue`.
     if let Value::Map(entries) = list {
         let Some(key) = as_arith_str(index) else {
             return Err(QueryError::Type(format!(
@@ -29,9 +26,8 @@ pub(crate) fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryErr
     }
     // `n['name']` -- dynamic property access on a node/relationship/
     // temporal value, same as `n.name`'s static form but with a computed
-    // key (TCK's Graph7 `[1]`-`[3]`). Reuses `property_of_value` exactly
-    // -- the only actual difference from `.prop` is where the key string
-    // comes from.
+    // key. Reuses `property_of_value` exactly -- the only difference
+    // from `.prop` is where the key string comes from.
     if matches!(list, Value::Node(_) | Value::Edge(_) | Value::Property(_)) {
         let Some(key) = as_arith_str(index) else {
             return Err(QueryError::Type(format!(
@@ -62,8 +58,7 @@ pub(crate) fn apply_index(list: &Value, index: &Value) -> Result<Value, QueryErr
 /// `apply_index`, but bounds clamp to `[0, len]` instead of nulling out
 /// (`[1,2,3][-5..5]` is the whole list, not `null`), and a start at or
 /// past the (clamped) end yields `[]` rather than erroring
-/// (`[1,2,3][3..1]` is `[]`) -- both match real Cypher, and both were
-/// real TCK scenarios, not guessed behavior.
+/// (`[1,2,3][3..1]` is `[]`).
 pub(crate) fn apply_slice(
     list: &Value,
     start: Option<&Value>,
@@ -140,7 +135,8 @@ pub(crate) fn call_builtin(
         }
         "time" => time_builtin(args, now),
         "time.transaction" | "time.statement" | "time.realtime" => {
-            // No-arg time() defaults to UTC offset (real Cypher's statement default timezone)
+            // No-arg time() defaults to UTC offset (the statement's
+            // default timezone).
             Ok(now_or_null(args, || {
                 Value::Property(PropertyValue::Time {
                     nanos_of_day: now.nanos_of_day,
@@ -159,7 +155,8 @@ pub(crate) fn call_builtin(
         }
         "datetime" => date_time_builtin(args, now),
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => {
-            // No-arg datetime() defaults to UTC offset (real Cypher's statement default timezone)
+            // No-arg datetime() defaults to UTC offset (the statement's
+            // default timezone).
             Ok(now_or_null(args, || {
                 Value::Property(PropertyValue::DateTime {
                     epoch_seconds: now.epoch_seconds,
@@ -297,14 +294,13 @@ pub(crate) fn call_builtin(
     }
 }
 
-/// `rand()` -- a fresh pseudo-random `f64` in `[0, 1)` on every call (no
-/// memoization like `now()`/`date()`'s `NowSnapshot` -- real Cypher's
-/// `rand()` is independently random each time it's evaluated, even
-/// multiple times in the same query). No external RNG crate: combines an
-/// atomic per-process counter with `RandomState`'s own already-randomized
-/// per-construction seed (the same source `HashMap`'s DoS-resistant
-/// default hasher draws from), good enough for a general-purpose
-/// `rand()` without pulling in a dependency for one function.
+/// `rand()` -- a fresh pseudo-random `f64` in `[0, 1)` on every call, no
+/// memoization like `now()`/`date()`'s `NowSnapshot`: `rand()` is
+/// independently random each time it's evaluated, even multiple times in
+/// the same query. No external RNG crate: combines an atomic per-process
+/// counter with `RandomState`'s own already-randomized per-construction
+/// seed (the same source `HashMap`'s DoS-resistant default hasher draws
+/// from), good enough without a dependency for one function.
 pub(crate) fn rand_f64() -> f64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -717,10 +713,9 @@ pub(crate) fn to_float(v: &Value) -> Result<Value, QueryError> {
         Value::Literal(Literal::Param(name)) => {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
-        // `Bool` is a real, deliberate type error, not `null` -- unlike
-        // an unparseable *string*, which real Cypher does treat as
-        // `null` (a string always at least plausibly *could* be numeric
-        // text), a boolean never could be (TCK's TypeConversion3 [6]).
+        // `Bool` is a real type error, not `null`: unlike an unparseable
+        // string, which is treated as `null` (a string always at least
+        // plausibly could be numeric text), a boolean never could be.
         other => {
             return Err(QueryError::Type(format!(
                 "toFloat() cannot convert {other:?} to a float"
@@ -773,11 +768,6 @@ pub(crate) fn item_truthy(v: &Value) -> Option<bool> {
 /// a single definite `true`/`false` among the elements can already decide
 /// the answer even in the presence of other `null` elements, and only
 /// "no definite answer, but at least one unknown" actually yields `null`.
-/// Confirmed against the real TCK scenarios (Quantifier1-4, scenario 10,
-/// "... on lists containing nulls") rather than assumed -- a first version
-/// of this collapsed `null` predicates to `false`, which silently passed
-/// every non-null-list scenario but produced 19 real wrong answers on
-/// exactly these null-list cases.
 pub(crate) fn eval_quantifier(kind: QuantifierKind, preds: &[Option<bool>]) -> Option<bool> {
     let true_count = preds.iter().filter(|p| **p == Some(true)).count();
     let any_false = preds.contains(&Some(false));
@@ -823,11 +813,10 @@ pub(crate) fn eval_quantifier(kind: QuantifierKind, preds: &[Option<bool>]) -> O
 }
 
 pub(crate) fn to_integer(v: &Value) -> Result<Value, QueryError> {
-    // A float-formatted string ('1.7', '2.9') isn't an i64, but real
-    // Cypher's toInteger() still accepts it -- parse as a float and
-    // truncate, same as the Float arm below, rather than failing straight
-    // to null the way a bare `i64::parse` would (found via a real TCK
-    // scenario: `toInteger('1.7')` must be `1`, not `null`).
+    // A float-formatted string ('1.7', '2.9') isn't an i64, but
+    // toInteger() still accepts it -- parse as a float and truncate, same
+    // as the Float arm below, rather than failing straight to null the
+    // way a bare `i64::parse` would (`toInteger('1.7')` must be `1`).
     let as_str_parse = |s: &str| match s.trim().parse::<i64>() {
         Ok(i) => Value::Property(PropertyValue::Int(i)),
         Err(_) => match s.trim().parse::<f64>() {
@@ -849,9 +838,8 @@ pub(crate) fn to_integer(v: &Value) -> Result<Value, QueryError> {
             unreachable!("param ${name} must be substituted before execution — see params::substitute_params")
         }
         // A node/edge/list/map/path has no numeric conversion at all -- a
-        // real error (found via a real TCK scenario expecting exactly
-        // this), not a silent null the way an out-of-range/unparseable
-        // scalar is.
+        // real error, not a silent null the way an out-of-range/
+        // unparseable scalar is.
         Value::Property(
             PropertyValue::Date(_)
             | PropertyValue::Duration { .. }
@@ -874,12 +862,11 @@ pub(crate) fn to_integer(v: &Value) -> Result<Value, QueryError> {
     })
 }
 
-/// `toString(...)` — Int/Float/Bool render the same as their `Display`
+/// `toString(...)` -- Int/Float/Bool render the same as their `Display`
 /// impl already does elsewhere (`marsdb-cli`'s `format_property`/
 /// `format_literal`); `Date`/`Duration` go through `temporal::format_*`.
 /// Null propagates, while graph, collection, map, and path values are a
-/// runtime type error rather than silently becoming null (TypeConversion4
-/// scenario [10]).
+/// runtime type error rather than silently becoming null.
 pub(crate) fn to_string_value(v: &Value) -> Result<Value, QueryError> {
     let s = match v {
         Value::Property(PropertyValue::String(s)) | Value::Literal(Literal::String(s)) => s.clone(),

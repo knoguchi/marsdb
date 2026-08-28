@@ -1,19 +1,15 @@
 //! `EXPLAIN <statement>` — describes the plan a statement would run
 //! (scan vs seek, pushdown applied) without executing any of it.
 //!
-//! Full `LogicalPlan` detail (the actual payoff: seeing whether an
-//! `IndexSeek` fired, and which residual `Filter` survives) is only
-//! produced for `QueryClause::Match` parts — the only clause kind that
-//! ever compiles to a `LogicalPlan` at all (see `ir.rs`'s own doc comment:
+//! Full `LogicalPlan` detail (whether an `IndexSeek` fired, which residual
+//! `Filter` survives) is only produced for `QueryClause::Match` parts —
+//! the only clause kind that compiles to a `LogicalPlan` (see `ir.rs`):
 //! `UNWIND`/`WITH` are row-vector operations with no traversal/filter
-//! shape, `MERGE`'s match-half plan depends on each row's own bindings and
-//! isn't practical to show without executing, and `CREATE` has no
-//! traversal semantics whatsoever). Those other clause kinds still get a
-//! one-line label so the overall statement shape is visible, and
-//! `carried_vars` is still threaded through them correctly (via the exact
-//! same pure name-computation `execute_match` itself uses) so that a
-//! `MATCH` clause *after* one of them sees the right `Seed` vs scan
-//! choice.
+//! shape, `MERGE`'s match-half plan depends on each row's own bindings,
+//! and `CREATE` has no traversal semantics. Other clause kinds still get
+//! a one-line label, and `carried_vars` threads through them correctly
+//! (via the same pure name-computation `execute_match` uses) so a later
+//! `MATCH` clause sees the right `Seed` vs scan choice.
 
 use std::collections::HashSet;
 
@@ -326,13 +322,12 @@ fn explain_with_projection(
         .collect();
 }
 
-/// Shared "does this clause end in a `WITH`" carried-vars update every
-/// clause kind needs: no `WITH` extends `carried_vars` with whatever the
-/// clause itself just bound (real Cypher shares one binding scope across
-/// WITH-unseparated clauses); a `WITH` replaces `carried_vars` entirely
-/// with its own projected output names — mirrors `Executor::
-/// apply_with_or_carry`'s carried-vars bookkeeping exactly, without
-/// needing any actual bound rows to compute it.
+/// Shared "does this clause end in a `WITH`" carried-vars update: no
+/// `WITH` extends `carried_vars` with whatever the clause just bound
+/// (Cypher shares one binding scope across WITH-unseparated clauses); a
+/// `WITH` replaces `carried_vars` entirely with its projected output
+/// names — mirrors `Executor::apply_with_or_carry` without needing
+/// actual bound rows.
 fn apply_with_to_carried_vars(
     with: &Option<WithClause>,
     new_vars: HashSet<String>,
@@ -601,13 +596,10 @@ fn rel_labels_text(rel_labels: &[String]) -> String {
 }
 
 fn rel_label_text(rel_var: &Option<String>, rel_labels: &[String]) -> String {
-    // `rel_var` here is `LogicalPlan::Expand`'s `rel_var` -- always some
-    // name, even for a pattern the user wrote with none at all
-    // (`build_match_plan` synthesizes an internal `__anonN` so it can
-    // still enforce edge-isomorphism/inline-property filters). Showing
-    // that synthesized name to an EXPLAIN reader would look like a real
-    // binding that leaked out; only a real user-written var is worth
-    // surfacing here.
+    // `build_match_plan` synthesizes an internal `__anonN` name even for
+    // patterns with no user-written rel var, to enforce edge-isomorphism/
+    // inline-property filters. Only a real user-written var is worth
+    // surfacing to an EXPLAIN reader.
     let user_var = rel_var.as_deref().filter(|v| !v.starts_with("__anon"));
     let labels = rel_labels_text(rel_labels);
     match user_var {

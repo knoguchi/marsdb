@@ -61,8 +61,7 @@ errored *at all* (not the specific error kind). See
 | **TOTAL** | **3880** | **3880** | **0** | **0** | **0** | **0** | **100.0%** |
 
 Parser: ANTLR4-generated (`marsdb-query/grammar/`, see that directory's
-own README). Replaced an earlier hand-rolled `pest` grammar; see git
-history for that version of this table.
+own README).
 
 Columns:
 - **pass** — correct result (or, for an error-expecting scenario, any error).
@@ -287,7 +286,8 @@ in code.
   compares them cross-type) as a deliberate superset, with the original
   predicate kept as a residual filter for exactness.
 
-Not yet supported: `CREATE CONSTRAINT`, composite indexes.
+Not supported: `CREATE CONSTRAINT`. Composite indexes are also not
+supported. They're on the [roadmap](https://github.com/knoguchi/marsdb#roadmap).
 
 ## Schema introspection
 

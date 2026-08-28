@@ -13,19 +13,13 @@ use crate::executor::comparable_ordering;
 use crate::value::{PathElem, Value};
 
 /// A hashable, `Eq` stand-in for `Value` — `Value`/`PropertyValue` don't
-/// derive `Eq`/`Hash` themselves (`PropertyValue::Float(f64)` can't: IEEE
-/// floats have no reflexive equality, so Rust's std deliberately excludes
-/// `Eq`/`Hash` for `f64`). `FloatBits` hashes/compares by bit pattern
-/// instead — the practical trade-off every DB doing this makes: ordinary
-/// float grouping/dedup is completely unaffected (equal floats have equal
-/// bits), the only visible difference is at the edges (`NaN` groups with
-/// `NaN` here, unlike IEEE `NaN != NaN`; `+0.0`/`-0.0` are distinct here,
-/// unlike IEEE `==`) — the same class of documented trade-off as the
-/// label index and the linear-scan grouping this type replaces. `Node`/
-/// `Edge` hash by id (graph identity), matching `value_eq`'s existing
-/// convention. Used for both `resolve_grouped_rows`' grouping-key lookup
-/// (`executor.rs`, via `binding_hash_key`) and `DISTINCT`'s "seen" set
-/// below — same underlying problem, same fix.
+/// derive `Eq`/`Hash` (IEEE floats have no reflexive equality, so Rust
+/// excludes `f64`). `FloatBits` hashes/compares by bit pattern instead:
+/// ordinary float grouping/dedup is unaffected (equal floats have equal
+/// bits), but `NaN` groups with `NaN` here (unlike IEEE) and `+0.0`/`-0.0`
+/// are distinct. `Node`/`Edge` hash by id, matching `value_eq`'s
+/// convention. Used for both grouping-key lookup (`executor::
+/// binding_hash_key`) and `DISTINCT`'s "seen" set.
 #[derive(PartialEq, Eq, Hash)]
 pub(crate) enum HashKey {
     Node(marsdb_graph::NodeId),
@@ -39,14 +33,12 @@ pub(crate) enum HashKey {
     Date(i64),
     Duration(i64, i64, i64, i32),
     LocalTime(i64),
-    // Keyed by the UTC-equivalent instant-of-day, not the raw wall-clock
-    // fields -- matches `Time`'s equality rule (see its doc comment), so
-    // two structurally-different `Time`s at the same instant hash equal.
+    // Keyed by UTC-equivalent instant-of-day, not raw wall-clock fields,
+    // matching `Time`'s equality rule: two structurally-different `Time`s
+    // at the same instant hash equal.
     TimeInstant(i64),
     LocalDateTime(i64, i32),
-    // `offset_seconds` deliberately excluded -- see `DateTime`'s doc
-    // comment (equality/ordering is instant-only), same reasoning as
-    // `TimeInstant` above.
+    // `offset_seconds` excluded, same instant-only equality as `TimeInstant`.
     DateTimeInstant(i64, i32),
 }
 
@@ -63,8 +55,8 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
                 .map(value_hash_key)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        // Same "identity is the exact node/edge sequence" convention as
-        // executor::binding_hash_key's matching `Binding::Path` arm.
+        // Identity is the exact node/edge sequence, matching
+        // executor::binding_hash_key's `Binding::Path` arm.
         Value::Path(elems) => HashKey::List(
             elems
                 .iter()
@@ -74,13 +66,10 @@ pub(crate) fn value_hash_key(v: &Value) -> Result<HashKey, QueryError> {
                 })
                 .collect(),
         ),
-        // A `BTreeMap` already iterates in sorted key order, so this is a
+        // `BTreeMap` already iterates in sorted key order, so this is a
         // deterministic, canonical key regardless of the map literal's
-        // own written order (`{a: 1, b: 2}` and `{b: 2, a: 1}` must hash
-        // equal) -- each entry becomes its own 2-element `HashKey::List`
-        // (key, value), all wrapped in one outer list (TCK's With5 [2]/
-        // Return5 [1,3,4], grouping/DISTINCT by a map that itself
-        // contains a list).
+        // own written order. Each entry becomes its own 2-element
+        // `HashKey::List` (key, value), wrapped in one outer list.
         Value::Map(m) => HashKey::List(
             m.iter()
                 .map(|(k, v)| -> Result<HashKey, QueryError> {
@@ -276,11 +265,10 @@ impl AggAcc {
     }
 
     /// Folds one row's already-evaluated argument value into the
-    /// accumulator. Callers must skip calling this entirely for
-    /// `Value::Null` — standard Cypher null-skipping, and what makes
-    /// `count(x)` exclude an `OPTIONAL MATCH` non-match while `count(*)`
-    /// (computed separately, not through this accumulator at all)
-    /// includes it. `fold` never sees `Value::Null`.
+    /// accumulator. Callers must skip calling this for `Value::Null`
+    /// (standard Cypher null-skipping) — `fold` never sees `Value::Null`.
+    /// This is what makes `count(x)` exclude an `OPTIONAL MATCH`
+    /// non-match while `count(*)`, computed separately, includes it.
     pub(crate) fn fold(&mut self, v: &Value) -> Result<(), QueryError> {
         debug_assert!(
             !matches!(v, Value::Null),
@@ -393,11 +381,11 @@ impl AggAcc {
     /// identity, bypassing `fold`'s materialized-`Value` interface:
     /// `count` never inspects the record, so an entity deleted earlier in
     /// the same statement (`... DELETE p RETURN count(p)`) still counts,
-    /// matching Neo4j — while every record-touching path (`count(p.prop)`,
-    /// `RETURN p` itself) keeps erroring via `deleted_entity_access`
-    /// (TCK Return2 [15]-[17]). `key` is the same `HashKey::Node`/`Edge`
-    /// that `value_hash_key` derives from a materialized entity, so
-    /// `count(DISTINCT p)` dedups identically on both paths.
+    /// while every record-touching path (`count(p.prop)`, `RETURN p`
+    /// itself) keeps erroring via `deleted_entity_access`. `key` is the
+    /// same `HashKey::Node`/`Edge` `value_hash_key` derives from a
+    /// materialized entity, so `count(DISTINCT p)` dedups identically on
+    /// both paths.
     pub(crate) fn fold_count_entity(&mut self, key: HashKey) -> Result<(), QueryError> {
         match self {
             AggAcc::Count { distinct, n } => {
@@ -420,13 +408,11 @@ impl AggAcc {
     }
 
     /// Folds one row's (value, percentile) pair for `percentileCont()`/
-    /// `percentileDisc()` — the only two-argument aggregates, so they can't
-    /// share `fold`'s single-`Value` interface. Same null-skipping
-    /// convention as `fold`: callers must skip calling this when `value` is
-    /// `Value::Null`. The percentile is validated (numeric, `0.0..=1.0` —
-    /// TCK's Aggregation6 `[3]`/`[4]`) on every call rather than just the
-    /// first, since nothing here assumes it's constant across the group
-    /// even though real usage always writes it that way.
+    /// `percentileDisc()` — the only two-argument aggregates, so they
+    /// can't share `fold`'s single-`Value` interface. Same null-skipping
+    /// convention as `fold`. The percentile is validated (numeric,
+    /// `0.0..=1.0`) on every call rather than just the first, since
+    /// nothing here assumes it's constant across the group.
     pub(crate) fn fold_percentile(
         &mut self,
         value: &Value,
@@ -494,13 +480,9 @@ impl AggAcc {
         Ok(())
     }
 
-    /// Finishes the accumulator into its group's output `Value`. Called
-    /// once a group's rows are fully folded — includes the zero-contributing-
-    /// rows case (e.g. every row in the group had a null argument, or the
-    /// group itself is the single synthesized empty-result group — see
-    /// `resolve_grouped_rows`): `count` -> 0, `sum` -> 0, `avg`/`min`/`max`
-    /// -> `Null`, `collect` -> `[]`, matching real Cypher's documented
-    /// empty-aggregate behavior.
+    /// Finishes the accumulator into its group's output `Value`, including
+    /// the zero-contributing-rows case: `count` -> 0, `sum` -> 0,
+    /// `avg`/`min`/`max` -> `Null`, `collect` -> `[]`.
     pub(crate) fn finish(self) -> Value {
         match self {
             AggAcc::Count { n, .. } => Value::Property(PropertyValue::Int(n)),
@@ -678,11 +660,9 @@ mod tests {
 
     #[test]
     fn min_max_on_non_orderable_errors() {
-        // Non-orderable stand-in, avoids constructing a real Node/Edge in
-        // a unit test -- `List` no longer qualifies (it's genuinely
-        // orderable now, element-by-element, matching real Cypher's
-        // `max()`/`min()` over a list argument), `Map` still has no
-        // defined order (see `comparable_ordering`'s docs).
+        // `Map` has no defined order (see `comparable_ordering`), so it's
+        // a convenient non-orderable stand-in without constructing a real
+        // Node/Edge.
         let node = Value::Map(std::collections::BTreeMap::new());
         assert!(AggAcc::identity("min", false).fold(&node).is_err());
         assert!(AggAcc::identity("max", false).fold(&node).is_err());

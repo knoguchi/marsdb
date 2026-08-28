@@ -69,10 +69,9 @@ pub(crate) fn as_date_time(v: &Value) -> Option<(i64, i32, temporal::TzId)> {
     }
 }
 
-/// `marsdb_graph::TzId` <-> `temporal::TzId` -- two independent, same-
-/// shaped types (`temporal.rs` deliberately doesn't depend on
-/// `marsdb_graph`, see its own module doc comment), converted at this
-/// storage/query-layer boundary.
+/// `marsdb_graph::TzId` <-> `temporal::TzId` -- two independent,
+/// same-shaped types (`temporal.rs` doesn't depend on `marsdb_graph`),
+/// converted at this storage/query-layer boundary.
 pub(crate) fn tz_from_graph(zone: &GraphTzId) -> temporal::TzId {
     match zone {
         GraphTzId::Offset(o) => temporal::TzId::Offset(*o),
@@ -92,14 +91,12 @@ pub(crate) fn tz_to_graph(zone: temporal::TzId) -> GraphTzId {
 /// numeric path, since none of these are ever an `ArithNum`. Returns
 /// `Ok(None)` (not an error) for any operand-type combination it doesn't
 /// recognize, so `apply_arith` falls through to its own "not two
-/// numbers" error with the *original* operands in the message, rather
-/// than this function needing to duplicate that error text.
+/// numbers" error with the original operands in the message.
 ///
-/// `<temporal> - <temporal>` (real Cypher's `duration.between(...)` is
-/// the actual spelling for that, itself out of scope -- see the README)
-/// is deliberately *not* handled for any of the 5 non-Duration types,
-/// falling through to the same "not two numbers" error a truly
-/// nonsensical subtraction would already get.
+/// `<temporal> - <temporal>` is spelled `duration.between(...)` in
+/// Cypher, not `-`, so it's not handled here for any of the 5
+/// non-Duration types -- falls through to the same "not two numbers"
+/// error.
 pub(crate) fn apply_temporal_arith(
     op: ArithOp,
     a: &Value,
@@ -154,11 +151,8 @@ pub(crate) fn apply_temporal_arith(
     };
     // `Named` zone arithmetic is only ever a single fixed-offset op, not
     // a full DST-crossing re-resolution -- the offset is resolved once
-    // (at the *pre*-arithmetic instant) via `resolve_offset` and carried
-    // through unchanged, same as `Offset`'s own behavior; no TCK scenario
-    // exercises arithmetic on a `Named`-zone `DateTime` at all, so this
-    // is a real, deliberately narrow scope, not silently wrong for a
-    // tested case.
+    // (at the pre-arithmetic instant) via `resolve_offset` and carried
+    // through unchanged, same as `Offset`'s own behavior.
     let date_time_plus_duration =
         |(epoch_seconds, existing_nanos, zone): (i64, i32, temporal::TzId),
          dur: temporal::DurationParts,
@@ -255,35 +249,22 @@ pub(crate) fn apply_temporal_arith(
             }
         }
         ArithOp::Mod => None,
-        // `^` is never meaningful for a date/duration/etc operand --
-        // real Cypher has no temporal exponentiation, so this always
-        // falls through to `apply_arith`'s own numeric-only rejection.
+        // `^` is never meaningful for a temporal operand -- falls
+        // through to `apply_arith`'s numeric-only rejection.
         ArithOp::Pow => None,
     })
 }
 
-/// `date()` — zero args (today, UTC, from the `Executor`-cached
-/// `temporal::NowSnapshot` — see its docs for why every no-arg temporal
-/// call within one query shares the same captured instant), a string
-/// (`date('2015-07-21')`, the calendar forms `temporal::
-/// parse_date` supports), a map (`date({year: 1984, month: 10, day:
-/// 11})`, calendar construction only), or another `Date` (identity —
-/// `date(d)` where `d` is already a `Date`, e.g. from `toString`
-/// round-tripping through `date(toString(d))`). Deliberately does *not*
-/// support the week-date/ordinal-date/quarter map or string construction
-/// forms real Cypher also has (`date({year: 2015, week: 1})`,
-/// `date('2015-W30-2')`, ...) — a real, documented gap (see the README),
-/// not a silent wrong answer: both `parse_date` and `date_from_map`
-/// return a clear error/`None` for those rather than guessing.
-/// `date.transaction()`/`.statement()`/`.realtime()` and their siblings
-/// for the other 4 temporal types conceptually take no argument (they
-/// always return the current transaction/statement/realtime instant) --
-/// but real Cypher still requires them to propagate a `null` argument
-/// (TCK's Temporal4 [13] "Should propagate null"), same as every other
-/// temporal constructor. Found via the TCK: pest's own grammar couldn't
-/// parse these namespaced calls with an argument at all, so this always-
-/// ignore-args behavior was untested until ANTLR's grammar (which does
-/// support it) newly exposed it as a silent wrong answer instead of null.
+/// `date()` -- zero args (today, UTC, from the `Executor`-cached
+/// `temporal::NowSnapshot`, which every no-arg temporal call within a
+/// query shares), a string (`date('2015-07-21')`, the calendar/week-date/
+/// ordinal-date forms `temporal::parse_date` supports), a map
+/// (`date({year: 1984, month: 10, day: 11})`, or its week/ordinal/quarter
+/// alternates via `calendar_fields_from_map`), or another `Date`
+/// (identity). `date.transaction()`/`.statement()`/`.realtime()` and
+/// their siblings for the other 4 temporal types take no argument
+/// conceptually, but still must propagate a `null` argument like every
+/// other temporal constructor.
 pub(crate) fn now_or_null(args: &[Value], now_value: impl FnOnce() -> Value) -> Value {
     if matches!(args.first(), Some(Value::Null)) {
         Value::Null
@@ -342,11 +323,9 @@ pub(crate) fn date_builtin(
 /// Pulls the local (offset-adjusted for `DateTime`) epoch-day out of a
 /// `Date`/`LocalDateTime`/`DateTime` value -- the "base" a `date`/
 /// `datetime` map key projects its calendar fields from
-/// (`date({date: other, day: 5})`, `localdatetime({date: other, hour:
-/// 10, ...})`, ...). Returns the raw epoch-day (not a pre-split
-/// `(year, month, day)`) so a caller can read *any* calendar component
-/// off it (`weekYear`/`week`/`dayOfWeek`/`quarter`/`dayOfQuarter`/
-/// `ordinalDay` via `date_component`), for defaulting the alternate
+/// (`date({date: other, day: 5})`). Returns the raw epoch-day, not a
+/// pre-split `(year, month, day)`, so a caller can read any calendar
+/// component off it via `date_component`, for defaulting the alternate
 /// week/ordinal/quarter-date map-construction forms (see
 /// `calendar_fields_from_map`).
 pub(crate) fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i64, QueryError> {
@@ -372,15 +351,13 @@ pub(crate) fn extract_date_base_epoch_day(key: &str, v: &Value) -> Result<i64, Q
 /// `(hour, minute, second, nanos, zone)` pulled out of a `LocalTime`/
 /// `Time`/`LocalDateTime`/`DateTime` value -- the "base" a `time`/
 /// `datetime` map key projects its clock fields from. `nanos` here is
-/// just the nanosecond-of-second remainder (not the whole nanos-of-day),
+/// just the nanosecond-of-second remainder, not the whole nanos-of-day,
 /// matching the map constructors' own `nanosecond` field. `zone` is
 /// `Some((original_zone, resolved_offset_seconds))` only for `Time`/
 /// `DateTime` sources -- both are kept, not just the resolved number, so
-/// a caller that projects this base *without* an explicit `timezone`
-/// override (`{time: t}`, `{datetime: dt}`) can preserve the source's
-/// own zone *identity* (a `Named` zone stays `Named`, TCK's Temporal3
-/// [9]/[11] `{datetime: other}` rows), while a caller that only ever
-/// needs a plain number (`time_builtin`'s cross-type conversion, `TIME`
+/// a caller projecting this base without an explicit `timezone` override
+/// can preserve the source's own zone identity (a `Named` zone stays
+/// `Named`), while a caller that only needs a plain number (`TIME`
 /// structurally can't hold a name) uses the resolved half directly.
 pub(crate) type ClockBase = (i64, i64, i64, i64, Option<(temporal::TzId, i32)>);
 
@@ -461,16 +438,14 @@ pub(crate) fn date_from_map(m: &BTreeMap<String, Value>) -> Result<i64, QueryErr
 /// Computes `(year, month, day)` from a map that specifies one of four
 /// mutually exclusive ways to pin a calendar day -- the plain calendar
 /// form (`year`/`month`/`day`, each optionally defaulted from a `date`/
-/// `datetime` base's own value), ISO week-date (`week`/`dayOfWeek`,
-/// defaulted from the base's `weekYear`/`week`/`dayOfWeek`), ordinal-date
-/// (`ordinalDay`, year defaulted from the base's `year`), or quarter-date
+/// `datetime` base), ISO week-date (`week`/`dayOfWeek`, defaulted from
+/// the base's `weekYear`/`week`/`dayOfWeek`), ordinal-date (`ordinalDay`,
+/// year defaulted from the base's `year`), or quarter-date
 /// (`quarter`/`dayOfQuarter`, defaulted from the base's `quarter`/
-/// `dayOfQuarter`) -- real Cypher's four alternate ways to construct a
-/// date, all reducible to the same `(year, month, day)` triple
-/// `epoch_day_from_ymd` needs. Shared by `date()`'s own map form and
+/// `dayOfQuarter`), all reducible to the `(year, month, day)` triple
+/// `epoch_day_from_ymd` needs. Shared by `date()`'s and
 /// `localdatetime()`/`datetime()`'s map forms (`allowed` differs only in
-/// whether clock/timezone keys are also permitted in the same map -- this
-/// function only ever looks at the date-shaped keys).
+/// whether clock/timezone keys are also permitted).
 pub(crate) fn calendar_fields_from_map(
     caller: &str,
     m: &BTreeMap<String, Value>,
@@ -694,22 +669,18 @@ pub(crate) fn duration_fields_from_map(
 
 /// Sums the 3 sub-second map keys (`millisecond`/`microsecond`/
 /// `nanosecond`) shared by every one-of-day-or-later temporal map
-/// constructor into one nanosecond count -- each key independently
-/// *additive* (matching real Cypher's own construction semantics,
-/// e.g. `{millisecond: 645, nanosecond: 123}` is `645ms + 123ns`, not
-/// "645ms, ignore the usual nanosecond digit position"), separate from
-/// `duration`'s own `nanoseconds` field of the same name.
+/// constructor into one nanosecond count -- each key is independently
+/// additive (`{millisecond: 645, nanosecond: 123}` is `645ms + 123ns`),
+/// separate from `duration`'s own `nanoseconds` field of the same name.
 ///
-/// `base_fraction_ns` (`0..1_000_000_000`) is the fractional-second
-/// part of whatever this map is *overriding* (a `time`/`datetime`
-/// projection key, or a `.truncate()` call's already-truncated value)
-/// -- `0` for plain from-scratch construction, where there's no base to
-/// inherit from. Any of the 3 keys the map doesn't set defaults to that
-/// *digit group* of the base (millisecond/microsecond/nanosecond each
-/// their own `0..999` slice), not to `0` outright -- found as a real
-/// bug: `{nanosecond: 2}` alone on a base with a real millisecond value
-/// was silently dropping that millisecond instead of keeping it, only
-/// the nanosecond digit was meant to change.
+/// `base_fraction_ns` (`0..1_000_000_000`) is the fractional-second part
+/// of whatever this map is overriding (a `time`/`datetime` projection
+/// key, or a `.truncate()` call's already-truncated value) -- `0` for
+/// plain from-scratch construction. Any of the 3 keys the map doesn't
+/// set defaults to that digit group of the base (millisecond/
+/// microsecond/nanosecond each their own `0..999` slice), not to `0`
+/// outright: `{nanosecond: 2}` alone on a base with a real millisecond
+/// value must keep that millisecond, changing only the nanosecond digit.
 pub(crate) fn sub_second_nanos_from_map(
     base_fraction_ns: i64,
     m: &BTreeMap<String, Value>,
@@ -739,33 +710,25 @@ pub(crate) fn int_field(
 /// Computes `(hour, minute, second, nanos, offset_seconds)` for a
 /// `localtime`/`time`/`localdatetime`/`datetime` map constructor -- a
 /// `time`/`datetime` key (if present) projects its clock fields as the
-/// default, explicit `hour`/`minute`/`second`/`millisecond`/
+/// default, and explicit `hour`/`minute`/`second`/`millisecond`/
 /// `microsecond`/`nanosecond` keys override individual fields on top of
 /// that (`{time: other, second: 42}` keeps everything from `other`
-/// except `second`). No base key falls back to all-zero defaults,
-/// matching the plain (non-projecting) map form.
+/// except `second`). No base key falls back to all-zero defaults.
 ///
 /// If the base carries an offset (`Time`/`DateTime`) and an explicit
-/// `timezone` key names a *different* one, the wall-clock is shifted
-/// first to preserve the same instant (`{time: other, timezone:
-/// '+05:00'}` on a `+01:00` base advances the hour by 4) -- real
-/// Cypher's rule, confirmed against Temporal3's own examples -- and
-/// only *then* do explicit hour/minute/second overrides apply, on top
-/// of the shifted result, not the original.
+/// `timezone` key names a different one, the wall-clock is shifted first
+/// to preserve the same instant (`{time: other, timezone: '+05:00'}` on
+/// a `+01:00` base advances the hour by 4), and only then do explicit
+/// hour/minute/second overrides apply, on top of the shifted result.
 /// `epoch_day` is the calendar date the resulting clock fields will be
-/// combined with -- only needed to resolve a *shift into a named zone*
-/// (its real, DST-aware offset depends on the date, TCK's Temporal3 [9]
-/// row: `{time: t+01:00, second: 42, timezone: 'Pacific/Honolulu'}`),
-/// `None` for callers with no date at all (`time()`'s own map form,
-/// which can't shift into a named zone regardless -- its caller rejects
-/// that case itself) or that don't care about the resolved zone
-/// (`localdatetime()`'s map form, which discards it).
+/// combined with -- only needed to resolve a shift into a named zone,
+/// whose DST-aware offset depends on the date; `None` for callers with
+/// no date at all, or that don't care about the resolved zone.
 /// The 5th element is `Some((effective_zone, effective_offset))` --
-/// `effective_zone` preserves a `Named` base's identity when no
-/// explicit `timezone` override is given (needed by `DATETIME`, which
-/// can hold one); `effective_offset` is always a plain resolved number,
-/// usable directly by a caller that structurally can't hold a zone name
-/// (`TIME`) regardless of which case produced it.
+/// `effective_zone` preserves a `Named` base's identity when no explicit
+/// `timezone` override is given (needed by `DATETIME`); `effective_offset`
+/// is always a plain resolved number, usable directly by a caller that
+/// structurally can't hold a zone name (`TIME`).
 pub(crate) fn clock_fields_from_map(
     m: &BTreeMap<String, Value>,
     epoch_day: Option<i64>,
@@ -780,31 +743,22 @@ pub(crate) fn clock_fields_from_map(
     let has_explicit_timezone = m.contains_key("timezone");
     let effective_zone = match m.get("timezone") {
         Some(v) => Some(timezone_value_to_tzid(v)?),
-        // No explicit override -- preserve the base's own zone
-        // *identity* (a `Named` zone stays `Named`), not just its
-        // resolved offset (TCK's Temporal3 [9]/[11] `{datetime: other}`
-        // rows, where `other` is itself a named-zone value).
+        // No explicit override -- preserve the base's own zone identity
+        // (a `Named` zone stays `Named`), not just its resolved offset.
         None => base_zone.as_ref().map(|(tz, _)| tz.clone()),
     };
-    // The wall-clock is only ever *shifted* by an *explicit* `timezone`
-    // override that actually changes the zone -- with no override, the
-    // literal local time passes straight through unchanged even if the
-    // base's own zone's real offset differs for the (possibly
-    // day-overridden) new date, e.g. a DST boundary crossed by a `day`
-    // override (TCK's Temporal3 [10]: a `Named` base carried through
-    // with no `timezone` key keeps its `12:00` wall-clock as `12:00`,
-    // just re-displayed with whatever offset that zone now resolves to
-    // -- it does *not* shift to a different wall-clock hour).
+    // The wall-clock is only shifted by an explicit `timezone` override
+    // that actually changes the zone -- with no override, the literal
+    // local time passes straight through unchanged even if the base's
+    // own zone's real offset differs for the new date (e.g. a DST
+    // boundary crossed by a `day` override).
     let base_nanos_of_day =
         base_h * 3_600_000_000_000 + base_m * 60_000_000_000 + base_s * 1_000_000_000 + base_ns;
     let (base_h, base_m, base_s, base_ns, effective_offset) = if has_explicit_timezone {
-        // The base's own offset, re-resolved against the *new* date --
-        // not its own original instant's offset (`extract_time_base`'s
-        // `Named` resolution, which used the *source* value's own
-        // epoch_seconds/date, not necessarily this one -- a `day`
-        // override can move the result to a different date than the
-        // base's, potentially across a DST boundary for the *same*
-        // zone, TCK's Temporal3 [10] row 337).
+        // The base's own offset, re-resolved against the new date, not
+        // its original instant's offset -- a `day` override can move the
+        // result to a different date than the base's, potentially
+        // across a DST boundary for the same zone.
         let from_offset = match base_zone.as_ref() {
             Some((temporal::TzId::Offset(o), _)) => Some(*o),
             Some((zone @ temporal::TzId::Named(_), resolved)) => Some(match epoch_day {
@@ -841,11 +795,9 @@ pub(crate) fn clock_fields_from_map(
             _ => (base_h, base_m, base_s, base_ns, to_offset.unwrap_or(0)),
         }
     } else {
-        // No override -- the resolved offset is just the base's own
-        // (unchanged, no re-resolution -- a caller that can't hold a
-        // zone name, `TIME`, degrades a `Named` base to this number
-        // silently, TCK's Temporal3 [3] row 125: `{time: t}` where `t`
-        // is a named-zone `DateTime` -> the plain offset, no error).
+        // No override -- the resolved offset is just the base's own,
+        // unchanged. A caller that can't hold a zone name (`TIME`)
+        // silently degrades a `Named` base to this plain number.
         (
             base_h,
             base_m,
@@ -889,7 +841,7 @@ pub(crate) fn local_time_builtin(
     }
     // `localtime(otherTemporal)` -- a bare `Time`/`LocalDateTime`/
     // `DateTime` argument projects its own time-of-day part (offset
-    // dropped, same as `{time: otherTemporal}`), TCK's Temporal3 [2].
+    // dropped), same as `{time: otherTemporal}`.
     if matches!(
         arg,
         Value::Property(
@@ -939,7 +891,7 @@ pub(crate) fn local_time_builtin(
 /// (except identity) requires a `timezone` map key / string offset
 /// suffix. A bracketed named-zone suffix (`[Europe/Stockholm]`) gets a
 /// specific "not supported" error rather than the generic parse-failure
-/// message, since that's a real (if out of scope) Cypher form, not
+/// message, since that's a real Cypher form, out of scope here, not
 /// malformed input.
 pub(crate) fn time_builtin(
     args: &[Value],
@@ -973,8 +925,7 @@ pub(crate) fn time_builtin(
     // `time(otherTemporal)` -- a bare `LocalTime`/`LocalDateTime`/
     // `DateTime` argument projects its own time part, defaulting the
     // offset to UTC when the source has none (`LocalTime`/
-    // `LocalDateTime`), same as `{time: otherTemporal}` (TCK's
-    // Temporal3 [3]).
+    // `LocalDateTime`), same as `{time: otherTemporal}`.
     if matches!(
         arg,
         Value::Property(
@@ -989,10 +940,8 @@ pub(crate) fn time_builtin(
         return Ok(Value::Property(PropertyValue::Time {
             nanos_of_day,
             // `TIME` structurally can't carry a zone name -- degrades a
-            // `Named` source to its resolved numeric offset (TCK's
-            // Temporal3 [3] `datetime({..., timezone: 'Europe/
-            // Stockholm'})` -> `time(other)` = `'12:00+01:00'`, the
-            // offset alone, no bracket).
+            // `Named` source to its resolved numeric offset alone, no
+            // bracket.
             offset_seconds: zone.map_or(0, |(_, o)| o),
         }));
     }
@@ -1031,13 +980,11 @@ pub(crate) fn time_builtin(
         let (hour, minute, second, nanos, zone) = clock_fields_from_map(m, None)?;
         let offset_seconds = match zone {
             None => 0,
-            // A `Named` zone reaching here with no *explicit* `timezone`
+            // A `Named` zone reaching here with no explicit `timezone`
             // key was just carried through from a projected `time`/
-            // `datetime` base (`{time: namedZoneDateTime}`) -- `TIME`
-            // can't hold a name, so it silently degrades to the base's
-            // own resolved offset, same as the cross-type positional
-            // form already does (TCK's Temporal3 [3] row 125). An
-            // *explicit* named-zone request, though, is a real error --
+            // `datetime` base -- `TIME` can't hold a name, so it
+            // silently degrades to the base's own resolved offset. An
+            // explicit named-zone request, though, is a real error --
             // there's no calendar date here to resolve it against.
             Some((_, o)) if !m.contains_key("timezone") => o,
             Some((temporal::TzId::Offset(o), _)) => o,
@@ -1064,10 +1011,10 @@ pub(crate) fn time_builtin(
 /// `{timezone: '+01:00'}`'s value -- a fixed UTC offset, or an IANA zone
 /// name (`'Europe/Stockholm'`). Both forms are always syntactically
 /// disjoint (an offset always starts with `+`/`-`/`Z`, a zone name never
-/// does), so there's no ambiguity to resolve between them. A caller that
-/// can't accept a `Named` zone (`time_builtin`'s map form -- `TIME` has
-/// no calendar date to resolve a named zone's DST-dependent offset
-/// against) rejects it itself, after this succeeds.
+/// does), so there's no ambiguity between them. A caller that can't
+/// accept a `Named` zone (`time_builtin`'s map form -- `TIME` has no
+/// calendar date to resolve a named zone's DST-dependent offset against)
+/// rejects it itself, after this succeeds.
 pub(crate) fn timezone_value_to_tzid(v: &Value) -> Result<temporal::TzId, QueryError> {
     let s = as_arith_str(v).ok_or_else(|| {
         QueryError::Type(
@@ -1121,7 +1068,7 @@ pub(crate) fn local_date_time_builtin(
     }
     // `localdatetime(otherTemporal)` -- a bare `DateTime` argument drops
     // its offset and keeps its local date+time, same as
-    // `{datetime: otherTemporal}` (TCK's Temporal3 [7]).
+    // `{datetime: otherTemporal}`.
     if matches!(arg, Value::Property(PropertyValue::DateTime { .. })) {
         let epoch_day = extract_date_base_epoch_day("localdatetime() argument", arg)?;
         let year = temporal::date_component(epoch_day, "year").unwrap();
@@ -1244,8 +1191,8 @@ pub(crate) fn date_time_builtin(
         }));
     }
     // `datetime(otherLocalDateTime)` -- a bare `LocalDateTime` argument
-    // has no zone of its own, defaults to UTC, same as `{datetime:
-    // otherLocalDateTime}` (TCK's Temporal3 [11]).
+    // has no zone of its own, defaults to UTC, same as
+    // `{datetime: otherLocalDateTime}`.
     if let Value::Property(PropertyValue::LocalDateTime {
         epoch_seconds,
         nanos,
@@ -1423,10 +1370,8 @@ pub(crate) fn parse_truncate_args<'a>(
 /// `.truncate()` builtin's optional trailing map -- any key the map
 /// doesn't set keeps the truncated base's own value (`date.truncate(
 /// 'month', d, {day: 5})` keeps the truncated year/month, only `day`
-/// is overridden). `dayOfWeek` applies *after* year/month/day (moving
-/// within the resulting date's own ISO week, see `set_iso_weekday`'s
-/// docs) -- other week/quarter/ordinal-day override keys stay
-/// unsupported, the same pre-existing construction gap as `date_from_map`.
+/// is overridden). `dayOfWeek` applies after year/month/day, moving
+/// within the resulting date's own ISO week (see `set_iso_weekday`).
 pub(crate) fn apply_date_overrides(
     base_epoch_day: i64,
     map: Option<&BTreeMap<String, Value>>,
@@ -1737,18 +1682,11 @@ pub(crate) fn date_time_truncate_builtin(args: &[Value]) -> Result<Value, QueryE
     }))
 }
 
-/// Shared `Date`/`Duration` component access for `d.<prop>` — used by
-/// both `lookup_prop` (a bound row variable, e.g. `WITH v.date AS d ...
-/// d.year`) and `eval_projected_expr`'s `Prop` arm (the post-projection/
-/// ORDER BY path). Returns `None` for any property name that isn't a
-/// recognized component (or a non-temporal `PropertyValue`), the same
-/// "treat as absent, not an error" convention every other `.prop` access
-/// already follows for an unknown property.
 /// True for the 6 `PropertyValue` variants that have a real `.prop`
-/// component-access interface (`temporal_component`) -- distinguishes
-/// "a temporal value with an *unrecognized* property name" (still `null`,
-/// same as a node/edge's own missing-property rule) from "a plain scalar
-/// with *no* `.prop` interface at all" (a real type error, see
+/// component-access interface (`temporal_component`) -- distinguishes "a
+/// temporal value with an unrecognized property name" (still `null`,
+/// same as a node/edge's missing-property rule) from "a plain scalar
+/// with no `.prop` interface at all" (a real type error, see
 /// `lookup_prop_value`'s docs) -- `temporal_component` alone can't tell
 /// these apart, since it returns `None` for both.
 pub(crate) fn is_temporal_property_value(pv: &PropertyValue) -> bool {
@@ -1812,19 +1750,16 @@ pub(crate) fn time_component(
 }
 
 /// `LocalDateTime`/`DateTime`'s shared component set: every `Date`
-/// component, every `LocalTime` component, and (only when
-/// `offset_seconds` is `Some`, i.e. a real `DateTime`) the same offset/
-/// epoch fields `Time`/this-function's own `epochSeconds`/`epochMillis`
-/// add on top.
+/// component, every `LocalTime` component, and (only for a real
+/// `DateTime`, `zone: Some`) the offset/epoch fields `epochSeconds`/
+/// `epochMillis` add on top.
 ///
 /// Calendar/clock components (`year`..`nanosecond`) are computed against
-/// the *local* (offset-adjusted) wall-clock reading, not the stored UTC
+/// the local (offset-adjusted) wall-clock reading, not the stored UTC
 /// instant -- `datetime({..., hour: 12, timezone: '+01:00'}).hour` must
-/// answer `12` (what was written/displayed), not `11` (the UTC hour) --
-/// same "display the local reading" rule `format_date_time` already
-/// follows. `epochSeconds`/`epochMillis` are the one exception,
-/// deliberately using the raw (UTC) `epoch_seconds` -- "epoch" always
-/// means the UTC instant, regardless of offset.
+/// answer `12`, not `11` (the UTC hour), same as `format_date_time`.
+/// `epochSeconds`/`epochMillis` are the one exception, using the raw
+/// UTC `epoch_seconds` -- "epoch" always means the UTC instant.
 pub(crate) fn date_time_component(
     epoch_seconds: i64,
     nanos: i32,
@@ -1834,12 +1769,10 @@ pub(crate) fn date_time_component(
     if let Some(zone) = zone {
         let offset_seconds = temporal::resolve_offset(zone, epoch_seconds);
         match prop {
-            // `.timezone` is the zone *identifier* as written -- the
-            // zone name for a `Named` zone, or the offset text itself
-            // for a fixed `Offset` (there's no separate name); `.offset`
-            // is always the *resolved* offset text, so the two only
-            // diverge for a `Named` zone (TCK's Temporal5's `d.timezone`
-            // = `'Europe/Stockholm'` vs `d.offset` = `'+01:00'`).
+            // `.timezone` is the zone identifier as written -- the zone
+            // name for a `Named` zone, or the offset text itself for a
+            // fixed `Offset`; `.offset` is always the resolved offset
+            // text, so the two only diverge for a `Named` zone.
             "timezone" => {
                 let text = match zone {
                     temporal::TzId::Named(name) => name.clone(),

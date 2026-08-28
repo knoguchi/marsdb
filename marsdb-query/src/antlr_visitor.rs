@@ -1,30 +1,23 @@
 // `AstBuilder`/`AstNode` internals stay unused-by-external-code from
-// rustc's perspective even though `parse_antlr` (this file's real public
-// entry point, re-exported as `lib.rs`'s `parse`/`parse_many`) exercises
-// them at runtime -- the visitor trait's `visit_X` overrides are only
-// ever called through dynamic dispatch (`accept()`), which rustc's
-// dead-code analysis can't see through.
+// rustc's perspective even though `parse_antlr` (re-exported as `lib.rs`'s
+// `parse`/`parse_many`) exercises them at runtime -- the visitor trait's
+// `visit_X` overrides are only called through dynamic dispatch
+// (`accept()`), which rustc's dead-code analysis can't see through.
 #![allow(dead_code)]
 
-//! ANTLR-based AST builder -- replaced the old pest-tree-walk
-//! (`parser.rs`/`cypher.pest`, deleted at cutover) as this
-//! crate's real Cypher parser. `parse_antlr`/`parse_antlr_many` are
-//! re-exported by `lib.rs` as `parse`/`parse_many`.
+//! ANTLR-based AST builder, this crate's Cypher parser.
+//! `parse_antlr`/`parse_antlr_many` are re-exported by `lib.rs` as
+//! `parse`/`parse_many`.
 //!
 //! Implements the generated `CypherParserVisitorCompat` trait rather than
-//! manually walking context accessors: ANTLR's own `accept()`/`visit()`
+//! manually walking context accessors: ANTLR's `accept()`/`visit()`
 //! double-dispatch already routes to the right `visit_X` method for
-//! whichever grammar alternative is actually present, so alternation
-//! (`literal : boolLit | numLit | NULL_W | stringLit | charLit | listLit
-//! | mapLit`) doesn't need a hand-written `if let Some(x) = ctx.boolLit()
-//! ... else if ...` chain -- only `visit_literal` needs a one-line manual
-//! check, for the bare `NULL_W` terminal alternative specifically (a
-//! terminal has no grammar-rule `visit_X` hook of its own to override).
+//! whichever grammar alternative is present, so alternation doesn't need
+//! a hand-written `if let Some(x) = ctx.boolLit() ... else if ...` chain.
 //!
 //! `Return` (via [`AstNode`]) is one shared enum across the whole
-//! visitor -- required by `ParseTreeVisitorCompat`, which supports
-//! exactly one `Return` type for the entire tree walk, not a per-rule
-//! type. Grows a variant per AST node kind as later increments need it.
+//! visitor, required by `ParseTreeVisitorCompat`, which supports exactly
+//! one `Return` type for the entire tree walk.
 
 use crate::ast::{
     is_aggregate_name, ArithOp, CallClause, CallYield, CompareOp, Expr, Literal, MergeClause,
@@ -221,13 +214,12 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
 
     /// The lexer's `DIGIT` token covers hex/octal/decimal integers *and*
     /// floats in one token (`DIGIT : HexDigits | OctalDigits | Digits |
-    /// FLOAT;`), unlike pest's grammar which split `int_literal`/
-    /// `float_literal` into separate rules -- so int-vs-float is decided
-    /// from the raw text here instead of from which sub-rule matched.
-    /// Hex/octal integers can't contain `.`/exponent/`f`/`d` at all (the
-    /// lexer wouldn't have matched `DIGIT` as those alternatives if they
-    /// did), so checking for those unconditionally is safe and doesn't
-    /// misfire on e.g. `0xE` (a hex digit `E`, not a float exponent).
+    /// FLOAT;`), so int-vs-float is decided from the raw text here
+    /// instead of from which sub-rule matched. Hex/octal integers can't
+    /// contain `.`/exponent/`f`/`d` at all (the lexer wouldn't have
+    /// matched `DIGIT` as those alternatives if they did), so checking
+    /// for those unconditionally is safe and doesn't misfire on e.g.
+    /// `0xE` (a hex digit `E`, not a float exponent).
     fn visit_numLit(&mut self, ctx: &NumLitContext<'input>) -> Self::Return {
         let text = ctx
             .DIGIT()
@@ -418,8 +410,7 @@ impl<'input> CypherParserVisitorCompat<'input> for AstBuilder {
     }
 
     /// Left-associative (`4 ^ 3 ^ 2` is `(4 ^ 3) ^ 2`), same as every
-    /// other binary chain here -- matches `parser.rs`'s `parse_pow_expr`,
-    /// confirmed against the real TCK fixture (see that function's docs).
+    /// other binary chain here.
     fn visit_powerExpression(&mut self, ctx: &PowerExpressionContext<'input>) -> Self::Return {
         let mut operands = ctx.unaryAddSubExpression_all().into_iter();
         let mut lhs = match self
@@ -672,9 +663,8 @@ fn symbol_text(ctx: &SymbolContextAll) -> String {
 /// `symbol_text` (backtick-stripping) when the alternative taken is
 /// `symbol` -- a bare `.get_text()` here would keep the backticks
 /// themselves as part of the name (e.g. `` map.`name` `` would look up
-/// the map key `` `name` `` instead of `name`, always missing -- a real
-/// bug found via the TCK, not just deferred coverage). `reservedWord` has
-/// no escaping to strip either way.
+/// the map key `` `name` `` instead of `name`, always missing).
+/// `reservedWord` has no escaping to strip either way.
 fn name_text(ctx: &NameContextAll) -> String {
     match ctx.symbol() {
         Some(s) => symbol_text(&s),
@@ -689,12 +679,9 @@ fn name_text(ctx: &NameContextAll) -> String {
 fn parse_num_lit_text(text: &str) -> Result<Literal, QueryError> {
     // A hex/octal literal's own digits can end in `f`/`F`/`d`/`D` (real hex
     // digits, e.g. `0x7FFFFFFFFFFFFFFF`) or contain `e`/`E` (also a real
-    // hex digit) -- neither is real openCypher's `<approximate number
-    // suffix>` (`F`/`D`/`f`), which per spec only ever follows a decimal
-    // literal already in scientific or common (has a `.`) notation. Found
-    // via a Phase 3 dry-run behavioral test failure
-    // (`int_literal_accepts_hex_and_octal_forms`): a hex literal ending in
-    // a suffix-shaped digit was misdetected as float and failed to parse.
+    // hex digit) -- neither is openCypher's `<approximate number suffix>`
+    // (`F`/`D`/`f`), which only ever follows a decimal literal already in
+    // scientific or common (has a `.`) notation.
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     let is_hex_or_octal = unsigned
         .as_bytes()
@@ -713,9 +700,8 @@ fn parse_num_lit_text(text: &str) -> Result<Literal, QueryError> {
             .map_err(|_| QueryError::Syntax(format!("invalid float literal '{text}'")))?;
         // `str::parse::<f64>()` silently returns `f64::INFINITY` for a
         // magnitude beyond f64's representable range instead of erroring
-        // (`"1e999".parse::<f64>()` is `Ok(inf)`) -- real Cypher requires
-        // this to be a compile-time error (TCK Literals5 [27],
-        // `FloatingPointOverflow`).
+        // (`"1e999".parse::<f64>()` is `Ok(inf)`) -- Cypher requires this
+        // to be a compile-time error.
         if f.is_infinite() {
             Err(QueryError::Syntax(format!(
                 "float literal '{text}' is too large to represent"
@@ -768,10 +754,9 @@ fn invocation_name_text(ctx: &InvocationNameContextAll) -> String {
 /// no property/label/postfix suffixes at any level between it and the
 /// `numLit` itself. Used by `build_unary_add_sub_expression` to fold a
 /// leading `-` directly into the literal (see that function's docs).
-/// `stringExpression`/`nullExpression`/`inExpression` no longer live at
-/// this level at all (moved up to `stringListNullExpression`, see its own
-/// docs) -- only `listExpression` (postfix index/slice) can still appear
-/// here, so that's the only check left.
+/// `stringExpression`/`nullExpression`/`inExpression` live at
+/// `stringListNullExpression` instead, so only `listExpression` (postfix
+/// index/slice) can appear here.
 fn bare_num_lit<'i>(
     ctx: &AtomicExpressionContextAll<'i>,
 ) -> Option<std::rc::Rc<NumLitContextAll<'i>>> {
@@ -811,9 +796,7 @@ impl AstBuilder {
     /// `properties : mapLit | parameter`. Only the `mapLit` alternative
     /// has a real `NodePattern`/`RelPattern::props` representation --
     /// `Vec<(String, ReturnExpr)>` has no "the whole map comes from one
-    /// parameter" shape, and pest doesn't support that on a pattern's
-    /// inline properties either (only `map_expr`), so rejecting it here
-    /// isn't a regression, just parity.
+    /// parameter" shape, so a `parameter` alternative here is rejected.
     fn build_properties(
         &mut self,
         ctx: Option<Rc<PropertiesContextAll>>,
@@ -891,15 +874,10 @@ impl AstBuilder {
                 rel_list_var: None,
             },
         };
-        // Both LT and GT present (`<-[...]->`) is *not* "left wins" --
-        // it's the same undirected/either shape as neither being present
+        // Both LT and GT present (`<-[...]->`) is *not* "left wins" -- it's
+        // the same undirected/either shape as neither being present
         // (`-[...]-`), and CREATE/MERGE already reject `Either` outright
-        // (`RequiresDirectedRelationship`, executor.rs). Found via the
-        // TCK: the old `if LT ... else if GT ...` order silently treated
-        // `<-[:FOO]->` as plain `Left`, both letting CREATE wrongly
-        // succeed (Create2 [20]) and giving MATCH's own undirected
-        // multi-hop patterns the wrong direction entirely
-        // (Match5 [27]/Match6 [12]'s wrong row counts).
+        // (`RequiresDirectedRelationship`, executor.rs).
         rel.direction = match (ctx.LT().is_some(), ctx.GT().is_some()) {
             (true, false) => RelDirection::Left,
             (false, true) => RelDirection::Right,
@@ -935,10 +913,10 @@ impl AstBuilder {
 
     /// `relationshipsChainPattern : nodePattern patternElemChain+` -- an
     /// `atom` alternative (`(n)-->()` used directly as a boolean
-    /// expression, TCK's Pattern1/2 "Pattern predicate"), same node+chain
-    /// shape `build_pattern_elem` already builds for real match patterns,
-    /// just requiring at least one hop (no bare-node pattern predicate,
-    /// matching the grammar's own `+` here vs `patternElem`'s `*`).
+    /// expression, a "pattern predicate"), same node+chain shape
+    /// `build_pattern_elem` builds for real match patterns, but requiring
+    /// at least one hop (no bare-node pattern predicate, matching the
+    /// grammar's `+` here vs `patternElem`'s `*`).
     fn build_relationships_chain_pattern(
         &mut self,
         ctx: &RelationshipsChainPatternContext,
@@ -962,10 +940,9 @@ impl AstBuilder {
         Ok(Pattern { start, hops })
     }
 
-    /// Mirrors `parser.rs`'s `parse_match_part` -- comma-separated pattern
-    /// parts splice into linear chains (shared-node merging) or split into
-    /// separate `QueryPart`s (disjoint cross join) via
-    /// `group_into_linear_patterns`, reused as-is.
+    /// Comma-separated pattern parts splice into linear chains
+    /// (shared-node merging) or split into separate `QueryPart`s
+    /// (disjoint cross join) via `group_into_linear_patterns`.
     fn build_match_st(&mut self, ctx: &MatchStContext) -> Result<Vec<QueryPart>, QueryError> {
         let optional = ctx.OPTIONAL().is_some();
         let pw = ctx
@@ -989,9 +966,8 @@ impl AstBuilder {
         for (i, part) in pattern_ctx.patternPart_all().into_iter().enumerate() {
             // `shortestPathWrapper` is grammar-permissive (any
             // comma-separated position) -- restricted here to the first
-            // position only, same as `parser.rs`'s `parse_path_pattern`
-            // (real Cypher: naming/shortestPath only make sense on a
-            // single linear pattern, never a cross join).
+            // position only: naming/shortestPath only make sense on a
+            // single linear pattern, never a cross join.
             let pattern = match part.shortestPathWrapper() {
                 Some(sp_ctx) => {
                     if i != 0 {
@@ -1040,13 +1016,12 @@ impl AstBuilder {
             validate_named_path_pattern(&groups[0])?;
         }
 
-        // `where_clause` attaches to the *last* group only, same as
-        // `parser.rs`'s `parse_match_part` -- a comma-separated cross join
-        // sees every group's bindings by the time WHERE runs. `with` stays
-        // unconditionally `None` here: this grammar's `matchSt` has no
-        // trailing WITH of its own (that's a separate clause in the
-        // statement's clause list, attached by whichever caller builds
-        // that list, not here).
+        // `where_clause` attaches to the last group only -- a
+        // comma-separated cross join sees every group's bindings by the
+        // time WHERE runs. `with` stays unconditionally `None` here:
+        // this grammar's `matchSt` has no trailing WITH of its own
+        // (that's a separate clause in the statement's clause list,
+        // attached by whichever caller builds that list, not here).
         let last = groups.len() - 1;
         Ok(groups
             .into_iter()
@@ -1069,13 +1044,12 @@ impl AstBuilder {
             .collect())
     }
 
-    /// Mirrors `parser.rs`'s `parse_compare_expr` -- a chain folds into
-    /// nested `And`s of each *adjacent* pair (`a op0 b op1 c` -> `(a op0
-    /// b) AND (b op1 c)`, real Cypher's own chained-comparison semantics),
-    /// not a separate AST shape. Operand type is `stringListNullExpression`
-    /// (not `addSubExpression` directly) since the precedence fix moved
-    /// `IN`/`STARTS WITH`/etc up to sit between this level and arithmetic
-    /// -- see `build_string_list_null_expression`'s docs.
+    /// A chain folds into nested `And`s of each adjacent pair
+    /// (`a op0 b op1 c` -> `(a op0 b) AND (b op1 c)`, Cypher's own
+    /// chained-comparison semantics), not a separate AST shape. Operand
+    /// type is `stringListNullExpression`, not `addSubExpression`
+    /// directly, since `IN`/`STARTS WITH`/etc sit between this level and
+    /// arithmetic — see `build_string_list_null_expression`.
     fn build_comparison_expression(
         &mut self,
         ctx: &ComparisonExpressionContext,
@@ -1170,19 +1144,14 @@ impl AstBuilder {
         Ok(lhs)
     }
 
-    /// The parser already has correct unary-minus handling at this
-    /// precedence level (`(PLUS | SUB)? atomicExpression`), but for
-    /// `i64::MIN` (`-9223372036854775808`) to round-trip, the sign has to
-    /// fold directly into the literal's own parse rather than building
-    /// `Neg(Lit(Int(9223372036854775808)))` -- `9223372036854775808`
-    /// itself doesn't fit in a positive `i64` at all (only `i64::MIN`'s
-    /// magnitude does, via `parse_int_literal`'s two's-complement special
-    /// case, which needs the sign in its input string up front). Pest's
-    /// grammar sidestepped this by including an optional leading `-` in
-    /// `int_literal`/`float_literal` themselves; this grammar's `DIGIT`
-    /// deliberately doesn't (see the binary-minus fix), so the fold has to
-    /// happen here instead, for the one case where the operand is exactly
-    /// a bare numeric literal with no other operators/suffixes.
+    /// For `i64::MIN` (`-9223372036854775808`) to round-trip, the sign
+    /// has to fold directly into the literal's own parse rather than
+    /// building `Neg(Lit(Int(9223372036854775808)))`: that magnitude
+    /// doesn't fit in a positive `i64` at all, only via
+    /// `parse_int_literal`'s two's-complement special case, which needs
+    /// the sign in its input string up front. So the fold happens here,
+    /// for the one case where the operand is exactly a bare numeric
+    /// literal with no other operators/suffixes.
     fn build_unary_add_sub_expression(
         &mut self,
         ctx: &UnaryAddSubExpressionContext,
@@ -1206,13 +1175,10 @@ impl AstBuilder {
     }
 
     /// `atomicExpression : propertyOrLabelExpression (listExpression)*`
-    /// -- only postfix index/slice suffixes live here now (`IN`/
-    /// `stringExpression`/`nullExpression` moved up to
-    /// `stringListNullExpression`, see its own docs); genuinely
-    /// left-to-right chainable (`list[0][1]`, real postfix repetition per
-    /// openCypher.bnf's `<postfix expression> ::= ... | <postfix
-    /// expression> <postfix operator>`), so no "at most one" restriction
-    /// is needed here at all anymore.
+    /// -- only postfix index/slice suffixes live here (`IN`/
+    /// `stringExpression`/`nullExpression` live at
+    /// `stringListNullExpression` instead); left-to-right chainable
+    /// (`list[0][1]`), so no "at most one" restriction is needed.
     fn build_atomic_expression(
         &mut self,
         ctx: &AtomicExpressionContext,
@@ -1228,16 +1194,12 @@ impl AstBuilder {
     }
 
     /// `stringListNullExpression : addSubExpression (stringExpression |
-    /// inExpression | nullExpression)?` -- fixes a real precedence bug in
-    /// the vendored grammar (found via a Phase 3 behavioral dry-run, not
-    /// the TCK): `IN`/`STARTS WITH`/`ENDS WITH`/`CONTAINS`/`IS NULL` used
-    /// to attach at `atomicExpression`'s level (tighter than `+`/`-`/`*`/
-    /// `/`/`^`), so `n.val + 0 IS NULL` parsed as `n.val + (0 IS NULL)`.
-    /// Per openCypher.bnf's `<comparison predicate>` chain, these operate
-    /// on a full `<arithmetic value expression>` (this file's
-    /// `addSubExpression`), sitting above arithmetic and below `=`/`<>`/
-    /// `<`/`>`/`<=`/`>=` (`comparisonExpression`, one level up) --
-    /// see `grammar/README.md` for the upstream PR this was also sent to.
+    /// inExpression | nullExpression)?` -- `IN`/`STARTS WITH`/`ENDS
+    /// WITH`/`CONTAINS`/`IS NULL` operate on a full `addSubExpression`
+    /// here, sitting above arithmetic and below `=`/`<>`/`<`/`>`/`<=`/`>=`
+    /// (`comparisonExpression`, one level up); attaching them at
+    /// `atomicExpression`'s tighter level would parse `n.val + 0 IS NULL`
+    /// as `n.val + (0 IS NULL)`.
     fn build_string_list_null_expression(
         &mut self,
         ctx: &StringListNullExpressionContext,
@@ -1355,13 +1317,11 @@ impl AstBuilder {
 
     /// `propertyExpression : atom (DOT name)*`. A bare atom (no `.name`
     /// suffix) passes through unchanged; the first suffix on a bare
-    /// variable becomes the flat `Prop` shape (`{var, prop}`); every other
-    /// suffix -- the first one when `atom` isn't a bare variable, and
-    /// every suffix after the first regardless -- becomes `PropOf`
-    /// instead, folded left-to-right (`a.b.c` -> `PropOf(Prop{a,b}, c)`),
-    /// each evaluated by evaluating its own base first, then looking the
-    /// property up on whatever `Value` that produced (TCK's Graph6 [4]/
-    /// [8], Map1 [3], Merge5 [11], With2 [2]).
+    /// variable becomes the flat `Prop` shape (`{var, prop}`); every
+    /// other suffix becomes `PropOf` instead, folded left-to-right
+    /// (`a.b.c` -> `PropOf(Prop{a,b}, c)`), each evaluated by evaluating
+    /// its own base first, then looking the property up on whatever
+    /// `Value` that produced.
     fn build_property_expression(
         &mut self,
         ctx: &PropertyExpressionContext,
@@ -1372,11 +1332,6 @@ impl AstBuilder {
         let Some(first) = names.next() else {
             return Ok(base);
         };
-        // First suffix on a bare variable becomes the flat `Prop` shape
-        // (`{var, prop}`); every suffix after that -- including this one
-        // when `base` isn't a bare variable -- becomes `PropOf`, folded
-        // left-to-right (`a.b.c` -> `PropOf(Prop{a,b}, c)`, TCK's With2
-        // `[2]`, `nestedMap.name.name2`).
         let mut expr = match base {
             ReturnExpr::Var(var) => ReturnExpr::Prop(PropAccess {
                 var,
@@ -1440,12 +1395,11 @@ impl AstBuilder {
     /// STICK expression RBRACK` -- `lhs` (`symbol ASSIGN`) is the optional
     /// named-path capture (`p = (n)-->()`), reusing
     /// `build_relationships_chain_pattern` for the pattern itself (same
-    /// node+chain shape a pattern predicate already builds, just here it's
-    /// enumerated rather than existence-checked) and the same `where?`
-    /// production `build_match_st` uses for an ordinary `MATCH`'s own
-    /// pattern-level `WHERE` (not `ListComp`'s post-projection
-    /// `ReturnExpr`-shaped filter -- `patternComprehension` shares its
-    /// grammar rule with `MATCH`, not with `listComprehension`).
+    /// node+chain shape a pattern predicate builds, but enumerated rather
+    /// than existence-checked) and the same `where?` production
+    /// `build_match_st` uses for an ordinary `MATCH`'s pattern-level
+    /// `WHERE`, not `ListComp`'s post-projection `ReturnExpr`-shaped
+    /// filter.
     fn build_pattern_comprehension(
         &mut self,
         ctx: &PatternComprehensionContext,
@@ -1481,20 +1435,17 @@ impl AstBuilder {
     }
 
     /// `subqueryExist : EXISTS LBRACE (regularQuery | patternWhere)
-    /// RBRACE` -- `patternWhere` (TCK's ExistentialSubquery1, the "simple"
-    /// form: a pattern with an optional inline `WHERE`, same grammar rule
-    /// `MATCH` itself uses) builds a `ReturnExpr::ExistsPattern`;
-    /// `regularQuery` (TCK's ExistentialSubquery2/3, a full nested `MATCH
-    /// ... RETURN ...` subquery, arbitrarily many clauses, possibly itself
-    /// containing a nested `exists {}`) reuses `build_regular_query`
-    /// verbatim -- the exact same builder a top-level statement goes
-    /// through -- and wraps the result in `ReturnExpr::ExistsSubquery`.
-    /// Real Cypher restricts `exists {}`'s body to read-only clauses;
-    /// `semantic::validate_statement`/`validate_match_clauses` reject a
-    /// mutating clause or non-`Statement::Match` shape at compile time
-    /// (TCK's ExistentialSubquery2 `[3]`), not here -- this stays a
-    /// structural build step, same division of labor as every other
-    /// pattern this visitor builds.
+    /// RBRACE` -- `patternWhere` (the "simple" form: a pattern with an
+    /// optional inline `WHERE`, same grammar rule `MATCH` uses) builds a
+    /// `ReturnExpr::ExistsPattern`; `regularQuery` (a full nested `MATCH
+    /// ... RETURN ...` subquery, arbitrarily many clauses, possibly
+    /// itself containing a nested `exists {}`) reuses
+    /// `build_regular_query` verbatim, the same builder a top-level
+    /// statement goes through, and wraps the result in
+    /// `ReturnExpr::ExistsSubquery`. Cypher restricts `exists {}`'s body
+    /// to read-only clauses; `semantic::validate_statement`/
+    /// `validate_match_clauses` reject a mutating clause or
+    /// non-`Statement::Match` shape at compile time, not here.
     fn build_subquery_exist(
         &mut self,
         ctx: &SubqueryExistContext,
@@ -1544,13 +1495,10 @@ impl AstBuilder {
     /// `caseExpression : CASE expression? (WHEN expression THEN
     /// expression)+ (ELSE expression)? END`. No typed per-`WHEN`/`THEN`
     /// accessor exists (`expression_all()` flattens every branch's exprs
-    /// together, `WHEN()`/`THEN()`/`ELSE()` only ever return the *first*
-    /// occurrence) -- walked via raw children instead, same "read raw
-    /// children in source order" approach `build_add_sub_expression` uses,
-    /// tracking position via each keyword *terminal*'s own text. Matched
-    /// case-insensitively (the lexer's `caseInsensitive = true` means
-    /// `get_text()` returns the source's own casing, e.g. `case`/`CASE`
-    /// both valid) -- safe against a same-named real expression, since
+    /// together, `WHEN()`/`THEN()`/`ELSE()` only return the first
+    /// occurrence) -- walked via raw children instead, tracking position
+    /// via each keyword terminal's own text, matched case-insensitively.
+    /// Safe against a same-named real expression, since
     /// CASE/WHEN/THEN/ELSE/END are all in `reservedWord`, so none can
     /// appear as a bare variable at this position.
     fn build_case_expression(
@@ -1701,11 +1649,11 @@ impl AstBuilder {
     }
 
     /// `standaloneCall : CALL invocationName parenExpressionChain? (YIELD
-    /// (MULT | yieldItems))?` -- the top-level, no-MATCH form (TCK's
-    /// Call1/Call2). `parenExpressionChain?`'s absence is the implicit-
-    /// argument shape (`CALL proc`, no parens at all -- `CallClause::args:
-    /// None`, see its own docs); `MULT` (`YIELD *`) is only reachable
-    /// here, never from `queryCallSt`'s own grammar production below.
+    /// (MULT | yieldItems))?` -- the top-level, no-MATCH form.
+    /// `parenExpressionChain?`'s absence is the implicit-argument shape
+    /// (`CALL proc`, no parens at all -- `CallClause::args: None`, see
+    /// its own docs); `MULT` (`YIELD *`) is only reachable here, never
+    /// from `queryCallSt`'s own grammar production below.
     fn build_standalone_call(
         &mut self,
         ctx: &StandaloneCallContext,
@@ -1734,12 +1682,9 @@ impl AstBuilder {
     }
 
     /// `queryCallSt : CALL invocationName parenExpressionChain (YIELD
-    /// yieldItems)?` -- the in-query reading-clause form (TCK's
-    /// Call1 `[3]`/`[4]`/etc). Parens are mandatory here (no implicit-
-    /// argument shape mid-query, TCK's Call2 `[4]`, `@skipGrammarCheck`
-    /// but structurally impossible to reach via this grammar rule either
-    /// way) and there's no `YIELD *` alternative (only `standaloneCall`
-    /// has one).
+    /// yieldItems)?` -- the in-query reading-clause form. Parens are
+    /// mandatory here (no implicit-argument shape mid-query) and there's
+    /// no `YIELD *` alternative (only `standaloneCall` has one).
     fn build_query_call_st(
         &mut self,
         ctx: &QueryCallStContextAll,
@@ -1965,14 +1910,13 @@ impl AstBuilder {
         })
     }
 
-    /// `UnwindClause::where_clause`/`::with` are populated wherever mars's
-    /// own AST assembly attaches a following `WHERE`/`WITH` -- neither is
-    /// part of `unwindSt`'s own grammar (`UNWIND expression AS symbol`,
-    /// no trailing clauses at all), unlike pest's grammar, which does let
-    /// UNWIND carry an inline WHERE directly (a mars-specific extension
-    /// beyond real openCypher syntax, per `UnwindClause::where_clause`'s
-    /// own docs). Always `None` here; a real capability gap versus pest
-    /// for this specific extension, not a deferred-for-now stub.
+    /// `UnwindClause::where_clause`/`::with` are populated wherever
+    /// MarsDB's own AST assembly attaches a following `WHERE`/`WITH` --
+    /// neither is part of `unwindSt`'s own grammar (`UNWIND expression AS
+    /// symbol`, no trailing clauses at all), so this grammar can't yet
+    /// parse an inline `WHERE` directly on `UNWIND` (see
+    /// `UnwindClause::where_clause`'s own docs for that extension);
+    /// always `None` here.
     fn build_unwind_st(&mut self, ctx: &UnwindStContext) -> Result<UnwindClause, QueryError> {
         let expr_ctx = ctx.expression().expect("unwindSt always has an expression");
         let source = UnwindSource(self.visit(&*expr_ctx).into_return_expr()?);
@@ -1994,15 +1938,14 @@ impl AstBuilder {
 
     fn build_set_item(&mut self, ctx: &SetItemContextAll) -> Result<SetItem, QueryError> {
         // `setItem`'s first alternative is `propertyExpression ASSIGN
-        // expression`, and `propertyExpression`'s own zero-`.name`-suffix
-        // form degenerates to a bare variable -- so `n = {...}` (no dots
-        // at all) parses through *this* alternative too, not the
-        // `symbol ASSIGN expression` one below (which ANTLR only reaches
-        // for `+=`, since alternative one has no ADD_ASSIGN option at
-        // all). `build_property_expression`'s result tells them apart:
-        // `Prop` is real `x.prop` access; `Var` is the degenerate case,
-        // meaning `SetItem::MapAssign` (never `merge: true` here --
-        // that's only reachable via `+=`, which can't take this branch).
+        // expression`, and `propertyExpression`'s zero-`.name`-suffix
+        // form degenerates to a bare variable -- so `n = {...}` (no dots)
+        // parses through this alternative too, not the `symbol ASSIGN
+        // expression` one below (only reachable for `+=`).
+        // `build_property_expression`'s result tells them apart: `Prop`
+        // is real `x.prop` access; `Var` is the degenerate case, meaning
+        // `SetItem::MapAssign` (never `merge: true` here -- only reachable
+        // via `+=`, which can't take this branch).
         if let Some(prop_ctx) = ctx.propertyExpression() {
             let expr_ctx = ctx
                 .expression()
@@ -2080,14 +2023,11 @@ impl AstBuilder {
         Ok(RemoveItem::Labels(symbol_text(&sym_ctx), labels))
     }
 
-    /// `propertyExpression`'s own grammar rule is reused by `setItem`/
+    /// `propertyExpression`'s grammar rule is reused by `setItem`/
     /// `removeItem` for their `x.prop` alternative -- `build_property_
     /// expression` already builds exactly `ReturnExpr::Prop` for that
     /// shape (or errors for anything wider, chained access etc), so this
-    /// just unwraps the one variant these two callers can ever legally
-    /// see here (the grammar alternative they're on doesn't admit a bare
-    /// `symbol` or anything else propertyExpression could otherwise
-    /// produce).
+    /// just unwraps the one variant these two callers can ever see here.
     fn build_prop_access(
         &mut self,
         ctx: &PropertyExpressionContext,
@@ -2103,9 +2043,8 @@ impl AstBuilder {
     /// `Statement::Create`'s `Vec<Pattern>` has no named-path-capture slot
     /// at all (unlike `QueryPart::path_var`), and unlike `MATCH`, CREATE's
     /// comma-separated patterns are never spliced into linear chains --
-    /// each becomes its own independent `Pattern` directly (matches
-    /// `parser.rs`'s `parse_create_patterns`, which does the same, no
-    /// `group_into_linear_patterns` call).
+    /// each becomes its own independent `Pattern` directly, no
+    /// `group_into_linear_patterns` call.
     fn build_create_st(&mut self, ctx: &CreateStContext) -> Result<Vec<Pattern>, QueryError> {
         let pattern_ctx = ctx.pattern().expect("createSt always has a pattern");
         pattern_ctx
@@ -2130,19 +2069,16 @@ impl AstBuilder {
             .collect()
     }
 
-    /// Mirrors `parser.rs`'s `parse_merge_clause`: `MergeClause::pattern`
-    /// caps at one relationship hop (checked here, not the grammar, which
-    /// permissively allows any hop count via the same `patternElem` every
-    /// other pattern context uses), and real Cypher rejects more than one
-    /// `ON CREATE`/`ON MATCH` on the same MERGE (also grammar-permissive,
-    /// `mergeAction*` allows any order/count) -- same "grammar permissive,
-    /// builder enforces the exact constraint" split used there.
-    /// `p = ...` named-path capture (unlike `build_create_st`, which still
-    /// rejects it) is supported here -- MERGE's own pattern is simple
+    /// `MergeClause::pattern` caps at one relationship hop (checked here,
+    /// not the grammar, which permissively allows any hop count via the
+    /// same `patternElem` every other pattern context uses), and Cypher
+    /// rejects more than one `ON CREATE`/`ON MATCH` on the same MERGE
+    /// (also grammar-permissive, `mergeAction*` allows any order/count).
+    /// `p = ...` named-path capture (unlike `build_create_st`, which
+    /// still rejects it) is supported here -- MERGE's pattern is simple
     /// enough (at most one hop, no `shortestPath()`, no variable-length
-    /// hop) that `executor::merge_one_row` can just reuse ordinary MATCH's
-    /// own `name_pattern_for_path`/`assemble_path` machinery directly, no
-    /// bespoke path-assembly logic needed.
+    /// hop) that `executor::merge_one_row` can reuse ordinary MATCH's own
+    /// `name_pattern_for_path`/`assemble_path` machinery directly.
     fn build_merge_st(&mut self, ctx: &MergeStContext) -> Result<MergeClause, QueryError> {
         let part_ctx = ctx.patternPart().expect("mergeSt always has a patternPart");
         let path_var = if part_ctx.ASSIGN().is_some() {
@@ -2212,12 +2148,9 @@ impl AstBuilder {
     /// expand to more than one `QueryClause::Match` (comma-separated
     /// disjoint patterns splice into separate `QueryPart`s -- see
     /// `build_match_st`'s docs), so this appends rather than returning a
-    /// single clause. `queryCallSt` (`CALL proc(...) YIELD ...` used as a
-    /// reading clause) builds a `QueryClause::Call` -- unlike
-    /// `standaloneCall`'s own grammar rule, this one's `parenExpressionChain`
-    /// is mandatory (no implicit-argument form in-query) and its `YIELD`
-    /// has no `*` alternative (only `yieldItems`), see `CallClause`'s own
-    /// docs.
+    /// single clause. `queryCallSt` builds a `QueryClause::Call` -- unlike
+    /// `standaloneCall`, this rule's `parenExpressionChain` is mandatory
+    /// and its `YIELD` has no `*` alternative, see `CallClause`'s docs.
     fn append_reading_statement(
         &mut self,
         ctx: &ReadingStatementContextAll,
@@ -2279,27 +2212,19 @@ impl AstBuilder {
 
     /// The statement's final mutating clause (`createSt`/`deleteSt`/
     /// `setSt`/`removeSt` -- never `mergeSt`, which has no `Tail` variant
-    /// at all and always becomes a `QueryClause::Merge` entry even when
-    /// it's last, per `Statement::Match`'s own "missing tail is only valid
-    /// with a MERGE clause" rule) folds into a `Tail::X(_, Option
-    /// <ReturnTail>)`, consuming an optional trailing `returnSt` as a
-    /// narrower `ReturnTail` (items + distinct only, matching pest's
-    /// `ReturnTail`, which has no other fields either). `RETURN *` isn't
-    /// supported in this position (`ReturnTail` has no star-resolution
-    /// site -- mirrors `parser.rs`'s `parse_mutating_tail`, same
-    /// real restriction there too, confirmed via the TCK). ORDER BY/SKIP/
-    /// LIMIT, though, are NOT restricted here (an earlier version of this
-    /// function wrongly rejected them, found via a full TCK parse-parity
-    /// run -- `MATCH (n) DELETE n RETURN 42 LIMIT 0` is real, TCK-tested
-    /// Cypher) -- returned to the caller instead, which places them on the
-    /// *statement's* own `order_by`/`skip`/`limit` fields, same as pest:
-    /// its `mutating_tail` rule has no order/skip/limit slot of its own at
-    /// all, they're siblings of `tail_clause` at `match_stmt`'s own level
-    /// (`clause* ~ tail_clause? ~ order_by_clause? ~ skip_clause? ~
-    /// limit_clause?`), applying regardless of which `Tail` variant is
-    /// active. This grammar just nests them inside `returnSt`'s own
-    /// `projectionBody` structurally instead of keeping them as separate
-    /// statement-level siblings -- same semantics, different grammar shape.
+    /// and always becomes a `QueryClause::Merge` entry even when it's
+    /// last, per `Statement::Match`'s "missing tail is only valid with a
+    /// MERGE clause" rule) folds into a `Tail::X(_, Option<ReturnTail>)`,
+    /// consuming an optional trailing `returnSt` as a narrower
+    /// `ReturnTail` (items + distinct only). `RETURN *` isn't supported
+    /// in this position (`ReturnTail` has no star-resolution site).
+    /// ORDER BY/SKIP/LIMIT are NOT restricted here, though: they're
+    /// returned to the caller, which places them on the statement's own
+    /// `order_by`/`skip`/`limit` fields, applying regardless of which
+    /// `Tail` variant is active. This grammar nests them inside
+    /// `returnSt`'s own `projectionBody` structurally instead of keeping
+    /// them as separate statement-level siblings -- same semantics,
+    /// different grammar shape.
     #[allow(clippy::type_complexity)]
     fn build_mutating_tail(
         &mut self,
@@ -2354,16 +2279,13 @@ impl AstBuilder {
     }
 
     /// `singlePartQ : readingStatement* (returnSt | updatingStatement+
-    /// returnSt?)`. No WITH chaining at this level at all (that's
-    /// `multiPartQ`'s job, not yet wired up -- see this file's module
-    /// doc). Mirrors `parser.rs`'s `parse_match_stmt` for the no-WITH
-    /// case: leading reading statements become `QueryClause`s; either a
+    /// returnSt?)`. No WITH chaining at this level (that's `multiPartQ`'s
+    /// job): leading reading statements become `QueryClause`s; either a
     /// bare `returnSt` becomes the statement's `Tail::Return`/`ReturnStar`
-    /// (with ORDER BY/SKIP/LIMIT at the statement level, where they
-    /// belong for this form), or the *last* updating statement becomes the
-    /// tail (see `build_mutating_tail`) with every earlier one just
-    /// another `QueryClause`, unless that last one is `mergeSt` (never a
-    /// tail -- see that function's docs), in which case a trailing
+    /// (with ORDER BY/SKIP/LIMIT at the statement level), or the last
+    /// updating statement becomes the tail (see `build_mutating_tail`)
+    /// with every earlier one just another `QueryClause`, unless that
+    /// last one is `mergeSt` (never a tail), in which case a trailing
     /// `returnSt`, if present, becomes the statement's own `Tail::Return`
     /// instead.
     fn build_single_part_q(&mut self, ctx: &SinglePartQContext) -> Result<Statement, QueryError> {
@@ -2376,14 +2298,11 @@ impl AstBuilder {
         let return_ctx = ctx.returnSt();
 
         // Bare `CREATE (...)` with nothing else at all (no leading MATCH/
-        // UNWIND, no trailing RETURN, no other updating clause) -- mirrors
-        // pest's `create_stmt_only` (`create_stmt ~ !(return_clause |
-        // chainable_clause_follows)`), producing a real `Statement::Create`
-        // directly instead of wrapping in `Statement::Match` with a
-        // `Tail::Create`. Found via a Phase 3 dry-run behavioral test
-        // failure (`explain_never_mutates_even_a_write_statement`):
-        // `explain.rs`'s "no query plan" output depends on this exact
-        // shape distinction, not just equivalent semantics.
+        // UNWIND, no trailing RETURN, no other updating clause) produces
+        // a real `Statement::Create` directly instead of wrapping in
+        // `Statement::Match` with a `Tail::Create` -- `explain.rs`'s "no
+        // query plan" output depends on this exact shape distinction,
+        // not just equivalent semantics.
         if clauses.is_empty() && return_ctx.is_none() && updating.len() == 1 {
             if let Some(create_ctx) = updating[0].createSt() {
                 let patterns = self.visit(&*create_ctx).into_create_patterns()?;
@@ -2451,14 +2370,12 @@ impl AstBuilder {
     /// `updatingStatement` from a `withSt`).
     ///
     /// A `withSt` attaches to the immediately preceding MATCH/UNWIND/MERGE
-    /// clause's own `with` field (only the *last* one, for a comma
-    /// cross-join `matchSt`) -- same as `parser.rs`'s `parse_match_part`/
-    /// `parse_merge_clause`/`parse_unwind_clause`. If nothing attachable
-    /// immediately precedes it (statement-leading, or right after a
-    /// SET/DELETE/REMOVE/CREATE -- none of which have a `with` field on
-    /// their `QueryClause` variant -- or right after another `withSt`), it
-    /// becomes its own standalone `QueryClause::With` entry, mirroring
-    /// pest's `clause = { ... | with_clause | ... }` alternative.
+    /// clause's own `with` field (only the last one, for a comma
+    /// cross-join `matchSt`). If nothing attachable immediately precedes
+    /// it (statement-leading, or right after a SET/DELETE/REMOVE/CREATE
+    /// -- none of which have a `with` field on their `QueryClause`
+    /// variant -- or right after another `withSt`), it becomes its own
+    /// standalone `QueryClause::With` entry.
     fn build_multi_part_q(&mut self, ctx: &MultiPartQContext) -> Result<Statement, QueryError> {
         enum Item<'i> {
             Reading(Rc<ReadingStatementContextAll<'i>>),
@@ -2517,12 +2434,12 @@ impl AstBuilder {
             .expect("multiPartQ always ends in a singlePartQ");
         // `build_single_part_q` can also return a bare `Statement::Create`
         // directly (its own "CREATE with nothing else at all" special
-        // case, mirroring pest's `create_stmt_only`) -- but nested inside
-        // a `multiPartQ` (past at least one `WITH` boundary already),
-        // that's still just this statement's final `Tail::Create`, same
-        // as an ordinary trailing `CREATE` would be. Only a genuinely
-        // top-level, whole-statement bare CREATE gets the dedicated
-        // `Statement::Create` shape (`explain.rs`'s "no query plan" case).
+        // case) -- but nested inside a `multiPartQ` (past at least one
+        // `WITH` boundary already), that's still just this statement's
+        // final `Tail::Create`, same as an ordinary trailing `CREATE`
+        // would be. Only a top-level, whole-statement bare CREATE gets
+        // the dedicated `Statement::Create` shape (`explain.rs`'s "no
+        // query plan" case).
         let (tail_clauses, tail, order_by, skip, limit) =
             match self.build_single_part_q(&sp_ctx)? {
                 Statement::Match {
@@ -2549,10 +2466,8 @@ impl AstBuilder {
         })
     }
 
-    /// `explainSt : EXPLAIN (createIndexSt | regularQuery)` -- mars-specific
-    /// grammar extension (this file's own local addition, not from
-    /// upstream `antlr/grammars-v4/cypher`; see `grammar/README.md`), no
-    /// real openCypher equivalent. Mirrors `parser.rs`'s `parse_explain_stmt`.
+    /// `explainSt : EXPLAIN (createIndexSt | regularQuery)` -- a
+    /// MarsDB-specific grammar extension, no real openCypher equivalent.
     fn build_explain_st(&mut self, ctx: &ExplainStContext) -> Result<Statement, QueryError> {
         let inner = match ctx.createIndexSt() {
             Some(ci_ctx) => self.build_create_index_st(&ci_ctx)?,
@@ -2567,10 +2482,8 @@ impl AstBuilder {
     }
 
     /// `createIndexSt : CREATE INDEX ON COLON name LPAREN name RPAREN
-    /// UNIQUE?` -- same mars-specific-extension caveat as `build_explain_st`
-    /// above. Mirrors `parser.rs`'s `parse_create_index_stmt`; `name_all()`
-    /// returns the label then the property name in source order (the only
-    /// two `name` children this rule ever has).
+    /// UNIQUE?` -- `name_all()` returns the label then the property name
+    /// in source order (the only two `name` children this rule ever has).
     fn build_create_index_st(
         &mut self,
         ctx: &CreateIndexStContext,
@@ -2597,11 +2510,10 @@ impl AstBuilder {
     /// passes the single `Statement` straight through -- `singleQuery`
     /// itself (`singlePartQ | multiPartQ`) needs no override, default
     /// dispatch already routes to whichever of those two produced the
-    /// `Statement`. Otherwise mirrors `parser.rs`'s `parse_union_stmt`:
-    /// every `unionSt`'s `ALL` presence must agree (real Cypher rejects
-    /// mixing bare `UNION` and `UNION ALL` in one statement), checked here
-    /// rather than in the grammar since it's only knowable once every
-    /// occurrence is in hand.
+    /// `Statement`. Otherwise, every `unionSt`'s `ALL` presence must
+    /// agree (Cypher rejects mixing bare `UNION` and `UNION ALL` in one
+    /// statement), checked here rather than in the grammar since it's
+    /// only knowable once every occurrence is in hand.
     fn build_regular_query(&mut self, ctx: &RegularQueryContext) -> Result<Statement, QueryError> {
         let sq_ctx = ctx
             .singleQuery()
@@ -2636,20 +2548,16 @@ impl AstBuilder {
     }
 }
 
-/// The real implementation behind `lib.rs`'s public `parse` -- the
-/// pest-based `parser.rs`/`cypher.pest` this replaced are gone (see
-/// `grammar/README.md`).
+/// The real implementation behind `lib.rs`'s public `parse`.
 pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     // Session-transaction extension (`Statement::Begin`'s docs):
     // recognized before the grammar runs. A whole statement that is
     // exactly one of these keyword forms (case-insensitive, any
-    // whitespace between words, optional trailing `;` -- `script :
-    // query SEMI? EOF` tolerates one the same way) can never be valid
-    // Cypher otherwise, so this can't shadow anything the grammar would
-    // have accepted. `BEGIN TRANSACTION` is an accepted alias for
-    // `BEGIN` -- the two-word form is what other embedded graph
-    // engines' Cypher dialects use, and rejecting it over one word
-    // would be pure friction. (No `READ ONLY` variant: MarsDB has no
+    // whitespace between words, optional trailing `;`) can never be
+    // valid Cypher otherwise, so this can't shadow anything the grammar
+    // would have accepted. `BEGIN TRANSACTION` is an accepted alias for
+    // `BEGIN` -- the two-word form is what other embedded graph engines'
+    // Cypher dialects use. (No `READ ONLY` variant: MarsDB has no
     // read-only session transactions -- reads outside a transaction
     // already run on their own snapshots.)
     let trimmed = input.trim();
@@ -2719,12 +2627,11 @@ pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
     // straight into the default `aggregate_results`' unconditional
     // "last child wins" rule (not "last *non-default*", despite this
     // file's other alternation rules getting away with relying on that
-    // distinction -- see this function's own docs): the trailing `EOF`
-    // terminal has no `visit_X` hook of its own, so it'd overwrite
-    // `query`'s real result with `AstNode::None`. Visiting `query`
-    // directly sidesteps it -- `script`'s own job (rejecting trailing
-    // garbage after a valid query) is already done by the `parser.script()`
-    // call above succeeding.
+    // distinction): the trailing `EOF` terminal has no `visit_X` hook of
+    // its own, so it'd overwrite `query`'s real result with
+    // `AstNode::None`. Visiting `query` directly sidesteps it -- `script`'s
+    // own job (rejecting trailing garbage after a valid query) is already
+    // done by the `parser.script()` call above succeeding.
     let query_ctx = ctx.query().expect("script always has a query");
     AstBuilder::new().visit(&*query_ctx).into_statement()
 }
@@ -2734,21 +2641,16 @@ pub fn parse_antlr(input: &str) -> Result<Statement, QueryError> {
 /// CREATE (b); MATCH (n) RETURN n"`). Splits the input into individual
 /// statements itself (`split_statements`, respecting Cypher's quoting
 /// rules) and parses each one independently via `parse_antlr`, rather
-/// than parsing the whole batch as one shared ANTLR tree the way the
-/// grammar's own `queries : query (SEMI query)* EOF` rule (a
-/// mars-specific extension, see `grammar/README.md`) would: building one
-/// tree for a large batch means every statement's tree is alive in
+/// than parsing the whole batch as one shared ANTLR tree: building one
+/// tree for a large batch means every statement's tree stays alive in
 /// memory simultaneously until the last one is converted to a
-/// lightweight `Statement` and the whole tree can finally drop.
-/// Confirmed via `/usr/bin/time -l`: a real 29MB/9,771-statement import
-/// script peaked at 13GB RSS in the parse step alone (before any
-/// execution) parsed the old way. Splitting first means only the
-/// *largest single statement's* tree is ever alive at once.
+/// lightweight `Statement`. Splitting first means only the largest
+/// single statement's tree is ever alive at once.
 ///
-/// Also strips a single genuinely-trailing `;` first, same as before --
-/// `script : query SEMI? EOF` (what `parse_antlr` uses per statement)
-/// already tolerates one, but stripping it here first keeps
-/// `split_statements` from ever seeing a trailing empty segment.
+/// Also strips a single trailing `;` first -- `script : query SEMI? EOF`
+/// (what `parse_antlr` uses per statement) already tolerates one, but
+/// stripping it here first keeps `split_statements` from ever seeing a
+/// trailing empty segment.
 pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
     let trimmed = input.trim_end();
     let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
@@ -2761,15 +2663,14 @@ pub fn parse_antlr_many(input: &str) -> Result<Vec<Statement>, QueryError> {
 /// Splits `;`-separated statement text into individual statement slices
 /// without building any parse tree -- a `;` inside a single-quoted
 /// (`'...'`), double-quoted (`"..."`), or backtick-quoted (`` `...` ``)
-/// region is never treated as a separator, matching exactly what the
-/// lexer's own `CHAR_LITERAL`/`STRING_LITERAL`/`ESC_LITERAL` rules
-/// consider part of the literal (see `grammar/CypherLexer.g4`).
-/// Backtick-quoted identifiers have no escape sequences in this grammar
-/// (`ESC_LITERAL : '`' .*? '`'`) -- a backslash there is just a literal
-/// character, not an escape introducer, unlike inside the other two.
-/// Doesn't validate escape sequences itself (that's `parse_antlr`'s job
-/// once each slice is actually parsed) -- only tracks "am I currently
-/// inside a quoted region" well enough to find the real separators.
+/// region is never treated as a separator, matching what the lexer's own
+/// `CHAR_LITERAL`/`STRING_LITERAL`/`ESC_LITERAL` rules consider part of
+/// the literal. Backtick-quoted identifiers have no escape sequences in
+/// this grammar (`ESC_LITERAL : '`' .*? '`'`) -- a backslash there is
+/// just a literal character, unlike inside the other two. Doesn't
+/// validate escape sequences itself (that's `parse_antlr`'s job once
+/// each slice is parsed) -- only tracks "am I currently inside a quoted
+/// region" well enough to find the real separators.
 pub fn split_statements(input: &str) -> Vec<&str> {
     let bytes = input.as_bytes();
     let mut starts = vec![0usize];
@@ -2807,15 +2708,12 @@ pub fn split_statements(input: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `where`'s grammar reuses the same `expression` rule as everywhere else
-/// (unlike pest, which has a separate, narrower `with_expr` grammar chain
-/// building `WithExpr` directly) -- so a full `ReturnExpr` has to be built
-/// first and then folded down into `WithExpr` here. Only the variants with
-/// an exact `WithExpr` counterpart (`And`/`Or`/`Not`/`Compare`/`IsNull`)
-/// unwrap recursively; everything else (including `Xor`, which `WithExpr`
-/// has no variant for at all) becomes `Bare` -- `WithExpr::Bare`'s own
-/// docs already cover "any boolean-valued expression used directly as a
-/// predicate", which this falls under regardless of its exact shape.
+/// `where`'s grammar reuses the same `expression` rule as everywhere
+/// else, so a full `ReturnExpr` has to be built first and then folded
+/// down into `WithExpr` here. Only the variants with an exact `WithExpr`
+/// counterpart (`And`/`Or`/`Not`/`Compare`/`IsNull`) unwrap recursively;
+/// everything else (including `Xor`, which `WithExpr` has no variant for
+/// at all) becomes `Bare`.
 fn return_expr_to_with_expr(expr: ReturnExpr) -> WithExpr {
     match expr {
         ReturnExpr::And(l, r) => WithExpr::And(
@@ -2834,22 +2732,18 @@ fn return_expr_to_with_expr(expr: ReturnExpr) -> WithExpr {
 }
 
 /// `matchSt`'s `where`, like `withSt`'s, reuses the same generic
-/// `expression` rule as everywhere else (unlike pest, which has dedicated
-/// narrower grammar rules -- `comparison`/`general_comparison`/
-/// `label_predicate`/`var_compare` -- picking the right `Expr` variant
-/// directly at parse time). So the same fold-down-after-the-fact approach
-/// as `return_expr_to_with_expr` applies here too, just against `Expr`'s
-/// wider shape: a `Compare` between two bare `Prop`s becomes `PropCompare`,
-/// a `Prop` compared to a `Lit` keeps the planner-fusable `Compare` variant
-/// pest's `comparison` rule reserves for exactly that shape, two bare
-/// `Var`s becomes identity comparison (`VarEq`/`Not(VarEq)`, matching
-/// pest's `var_compare`'s restriction to `=`/`<>` — anything else is a real
-/// error, not a silent `GeneralCompare` fallback, since no ordering exists
-/// between two nodes/relationships), anything else falls back to
-/// `GeneralCompare`. Similarly `IsNull` on a bare `Prop` keeps the narrow
-/// variant, anything else becomes `GeneralIsNull`. `HasLabel` folds
-/// multiple labels into a `HasLabel` `And` chain exactly like pest's
-/// `parse_label_predicate`. Everything else becomes `GeneralBare`.
+/// `expression` rule as everywhere else, so the same
+/// fold-down-after-the-fact approach as `return_expr_to_with_expr`
+/// applies here too, against `Expr`'s wider shape: a `Compare` between
+/// two bare `Prop`s becomes `PropCompare`, a `Prop` compared to a `Lit`
+/// keeps the planner-fusable `Compare` variant, two bare `Var`s become
+/// identity comparison (`VarEq`/`Not(VarEq)`, restricted to `=`/`<>` --
+/// anything else is a real error, not a silent `GeneralCompare`
+/// fallback, since no ordering exists between two nodes/relationships),
+/// anything else falls back to `GeneralCompare`. Similarly `IsNull` on a
+/// bare `Prop` keeps the narrow variant, anything else becomes
+/// `GeneralIsNull`. `HasLabel` folds multiple labels into a `HasLabel`
+/// `And` chain. Everything else becomes `GeneralBare`.
 fn return_expr_to_expr(expr: ReturnExpr) -> Result<Expr, QueryError> {
     Ok(match expr {
         ReturnExpr::And(l, r) => Expr::And(
@@ -3088,15 +2982,11 @@ mod tests {
     }
 
     // `i64::MIN`'s two's-complement edge case (`-9223372036854775808`) is
-    // exercised once sign-folding lands at the `unaryAddSubExpression`
-    // level (see this file's module doc) -- unlike pest's `int_literal`,
-    // which included an optional leading `-` in the literal token itself,
-    // this grammar's `literal`/`numLit` never carries a sign at all; `-`
+    // exercised via sign-folding at the `unaryAddSubExpression` level:
+    // this grammar's `literal`/`numLit` never carries a sign at all, `-`
     // is strictly `unaryAddSubExpression`'s prefix operator, one level up.
-    // `parse_int_literal` (reused from `parser.rs`) already handles the
-    // two's-complement case correctly given a leading `-` in its input --
-    // that part's covered; only the fold-sign-into-literal-vs-build-a-Neg-
-    // node decision at the expression level remains.
+    // `parse_int_literal` already handles the two's-complement case
+    // correctly given a leading `-` in its input.
 
     #[test]
     fn float_literals() {
@@ -3179,9 +3069,7 @@ mod tests {
             RelDirection::Either
         );
         // Both arrowheads (`<-...->`) is the same undirected/either shape
-        // as neither -- regression found via the TCK (Match6 [12]/
-        // Create2 [20]): used to silently resolve to Left,
-        // checking LT before GT and never noticing GT was also present.
+        // as neither.
         assert_eq!(
             parse_pattern("(a)<-->(b)").unwrap().hops[0].0.direction,
             RelDirection::Either
@@ -3360,17 +3248,13 @@ mod tests {
 
     #[test]
     fn named_path_over_a_single_variable_length_hop_is_supported() {
-        // TCK's Quantifier1-4 [8]/[9] -- a single variable-length hop is
-        // fine; only *mixing* one with another hop stays rejected (see
-        // the next test).
         let parts = parse_match("MATCH p = (a)-[*1..3]->(b)").unwrap();
         assert_eq!(parts[0].path_var.as_deref(), Some("p"));
     }
 
     #[test]
     fn named_path_over_variable_length_mixed_with_another_hop_is_supported() {
-        // Was rejected until the `LogicalPlan::VarExpand` edge-isomorphism
-        // gap was fixed -- see `validate_named_path_pattern`'s docs.
+        // See `validate_named_path_pattern`'s docs.
         let parts = parse_match("MATCH p = (a)-[*1..3]->(b)-->(c)").unwrap();
         assert_eq!(parts[0].path_var.as_deref(), Some("p"));
     }
@@ -3616,10 +3500,9 @@ mod tests {
 
     #[test]
     fn is_null_binds_looser_than_arithmetic() {
-        // Precedence bug found via a Phase 3 behavioral dry-run: `IS
-        // NULL`/`IN`/`STARTS WITH` etc must bind above `+`/`-`/`*`/`/`/`^`
-        // (openCypher.bnf's <comparison predicate> chain), so `x + 0 IS
-        // NULL` is `(x + 0) IS NULL`, not `x + (0 IS NULL)`.
+        // `IS NULL`/`IN`/`STARTS WITH` etc must bind above
+        // `+`/`-`/`*`/`/`/`^`, so `x + 0 IS NULL` is `(x + 0) IS NULL`,
+        // not `x + (0 IS NULL)`.
         assert_eq!(
             parse_expr("x + 0 IS NULL").unwrap(),
             ReturnExpr::IsNull(Box::new(ReturnExpr::Arith(
@@ -3833,13 +3716,12 @@ mod tests {
 
     #[test]
     fn list_comprehension_bare_identity_no_where_no_project() {
-        // `[x IN list]` (neither WHERE nor `| project`) is genuinely
-        // ambiguous with a one-element `listLit` containing the boolean
-        // `x IN list` membership test -- `atom`'s alternatives are
-        // ordered so `listComprehension` wins (real, spec-valid Cypher on
-        // its own per openCypher.bnf's `<list comprehension>`, whose
-        // filter/projection half is optional; found wrong via a Phase 3
-        // behavioral dry-run, not the TCK).
+        // `[x IN list]` (neither WHERE nor `| project`) is ambiguous with
+        // a one-element `listLit` containing the boolean `x IN list`
+        // membership test -- `atom`'s alternatives are ordered so
+        // `listComprehension` wins, since the filter/projection half of
+        // a list comprehension is optional and this is spec-valid on
+        // its own.
         assert_eq!(
             parse_expr("[x IN [1, 2, 3]]").unwrap(),
             ReturnExpr::ListComp {
@@ -3931,11 +3813,9 @@ mod tests {
 
     #[test]
     fn property_access_with_backtick_escaped_name() {
-        // Regression (found via the TCK, Map1 [5]): `.get_text()` on the
-        // `name` context kept the surrounding backticks as part of the
-        // property name (`` `name` `` instead of `name`), so this always
-        // looked up the wrong key. `name_text` strips them, same as
-        // `symbol_text` already does for backtick-escaped variable names.
+        // `name_text` strips backticks, same as `symbol_text` does for
+        // backtick-escaped variable names -- a bare `.get_text()` would
+        // keep them as part of the property name.
         assert_eq!(
             parse_expr("n.`weird name`").unwrap(),
             ReturnExpr::Prop(PropAccess {
@@ -3948,9 +3828,8 @@ mod tests {
     #[test]
     fn property_access_on_computed_expr_becomes_prop_of() {
         // `<expr>.prop` where `<expr>` isn't a bare variable -- `ReturnExpr::
-        // PropOf`, evaluated by evaluating the base first, then looking the
-        // property up on whatever `Value` it produced (TCK's Graph6 [4]/
-        // [8], Map1 [3], Merge5 [11]).
+        // PropOf`, evaluated by evaluating the base first, then looking
+        // the property up on whatever `Value` it produced.
         let expr = parse_expr("duration.between(a, b).days").unwrap();
         let ReturnExpr::PropOf(base, prop) = expr else {
             panic!("expected PropOf, got {expr:?}");
@@ -3961,7 +3840,7 @@ mod tests {
 
     #[test]
     fn chained_property_access_folds_left_to_right() {
-        // `a.b.c` -> `PropOf(Prop{a,b}, c)` -- TCK's With2 [2].
+        // `a.b.c` -> `PropOf(Prop{a,b}, c)`.
         let expr = parse_expr("a.b.c").unwrap();
         let ReturnExpr::PropOf(base, prop) = expr else {
             panic!("expected PropOf, got {expr:?}");
@@ -4124,11 +4003,10 @@ mod tests {
 
     #[test]
     fn limit_accepts_arbitrary_expression() {
-        // skipSt/limitSt grammar-allow any expression -- SKIP/LIMIT no
-        // longer restrict to a literal integer at parse time (real Cypher
-        // permits `SKIP $n`/`LIMIT toInteger(rand()*9)`, TCK's
-        // `ReturnSkipLimit1 [2]`/`[3]`); the non-negative-integer check
-        // happens once at execution time instead (see
+        // skipSt/limitSt grammar-allow any expression -- SKIP/LIMIT don't
+        // restrict to a literal integer at parse time (Cypher permits
+        // `SKIP $n`/`LIMIT toInteger(rand()*9)`); the non-negative-integer
+        // check happens once at execution time instead (see
         // `executor::resolve_skip_limit`).
         let c = parse_return("RETURN a LIMIT 1 + 1").unwrap();
         assert!(c.limit.is_some());
@@ -4521,11 +4399,9 @@ mod tests {
     #[test]
     fn statement_mutating_tail_order_by_skip_limit_apply_at_statement_level() {
         // ReturnTail itself (SET/DELETE/REMOVE/CREATE's own trailing
-        // RETURN) has no room for ORDER BY/SKIP/LIMIT -- but real Cypher
-        // still allows them here (TCK's Delete6/Remove3 "Persistence of
-        // .../remove clause side effects"), applying to the *statement*,
-        // same as pest's own grammar keeps them as siblings of tail_clause
-        // rather than nested inside the RETURN.
+        // RETURN) has no room for ORDER BY/SKIP/LIMIT -- but Cypher still
+        // allows them here, applying to the statement rather than nested
+        // inside the RETURN.
         let s =
             parse_statement("MATCH (n) SET n.x = 1 RETURN n ORDER BY n.x SKIP 1 LIMIT 2").unwrap();
         let Statement::Match {
@@ -4560,11 +4436,11 @@ mod tests {
 
     #[test]
     fn statement_bare_create_is_not_wrapped_in_match() {
-        // `CREATE (...)` with nothing else at all mirrors pest's
-        // `create_stmt_only` -- a real `Statement::Create` directly, not
-        // `Statement::Match{tail: Some(Tail::Create(...))}`. Found via a
-        // Phase 3 dry-run: `explain.rs`'s "no query plan" output depends
-        // on this exact shape distinction.
+        // `CREATE (...)` with nothing else at all produces a real
+        // `Statement::Create` directly, not
+        // `Statement::Match{tail: Some(Tail::Create(...))}`:
+        // `explain.rs`'s "no query plan" output depends on this exact
+        // shape distinction.
         let s = parse_antlr("CREATE (a);").unwrap();
         assert!(matches!(s, Statement::Create(_)));
     }
@@ -4595,10 +4471,10 @@ mod tests {
 
     #[test]
     fn multi_part_chained_with_second_one_standalone() {
-        // TCK's chained `WITH x AS y WITH y % 3 AS y` shape: the first WITH
-        // attaches to the preceding MATCH, the second has nothing
-        // attachable immediately before it (another WITH, not a fresh
-        // clause) so it becomes its own standalone `QueryClause::With`.
+        // Chained `WITH x AS y WITH y % 3 AS y`: the first WITH attaches
+        // to the preceding MATCH, the second has nothing attachable
+        // immediately before it (another WITH, not a fresh clause) so it
+        // becomes its own standalone `QueryClause::With`.
         let s = parse_multi_part_statement("MATCH (a:A) WITH a.num AS x WITH x % 3 AS x RETURN x")
             .unwrap();
         let Statement::Match { clauses, .. } = s else {
@@ -4665,12 +4541,11 @@ mod tests {
 
     #[test]
     fn multi_part_trailing_bare_create_becomes_tail_not_top_level_statement() {
-        // Regression: build_single_part_q's "bare CREATE with nothing
-        // else" special case (-> Statement::Create directly) must NOT
-        // leak out of multiPartQ's own trailing singlePartQ -- past at
-        // least one WITH boundary, a trailing CREATE is still just this
+        // `build_single_part_q`'s "bare CREATE with nothing else" special
+        // case (-> Statement::Create directly) must not leak out of
+        // multiPartQ's own trailing singlePartQ -- past at least one
+        // WITH boundary, a trailing CREATE is still just this
         // statement's Tail::Create, same as any other trailing CREATE.
-        // Previously panicked (found via a full TCK execution run).
         let s = parse_multi_part_statement("MATCH (a) WITH a CREATE (b)").unwrap();
         let Statement::Match { clauses, tail, .. } = s else {
             panic!("expected Statement::Match");

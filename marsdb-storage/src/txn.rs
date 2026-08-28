@@ -8,17 +8,13 @@ use redb::{
 
 use crate::error::StorageError;
 
-/// Either kind of redb transaction — lets a function that only ever reads
-/// (`.get()`/`.iter()`, never `.insert()`/`.remove()`) run against a real
-/// `WriteTransaction` (the crash-safety boundary for a write statement) or
-/// a `ReadTransaction` (so a read-only statement doesn't have to contend
-/// for redb's single-writer lock at all). `WriteTransaction`/
-/// `ReadTransaction` share no common trait in redb itself — `open_table`/
-/// `open_multimap_table` are inherent methods on two unrelated structs,
-/// returning different concrete types (`Table`/`ReadOnlyTable`,
-/// `MultimapTable`/`ReadOnlyMultimapTable`) — so this (and `TableHandle`/
-/// `MultimapTableHandle` below) is a small local abstraction over that,
-/// not something redb provides.
+/// Either kind of redb transaction, so a read-only function can run
+/// against a real `WriteTransaction` or a `ReadTransaction` (which avoids
+/// contending for redb's single-writer lock). redb gives `open_table` on
+/// two unrelated structs returning different concrete types (`Table`/
+/// `ReadOnlyTable`, `MultimapTable`/`ReadOnlyMultimapTable`) with no
+/// shared trait, so this and `TableHandle`/`MultimapTableHandle` below
+/// paper over that.
 #[derive(Clone, Copy)]
 pub enum Txn<'a> {
     Write(&'a WriteTransaction),
@@ -47,12 +43,9 @@ impl<'a> Txn<'a> {
     }
 }
 
-/// Exposes `get`/`iter`/`range` as plain inherent methods, not a full
-/// `redb::ReadableTable` trait impl — matching the whole trait (`first`/
-/// `last`/...) would be boilerplate for methods nothing calls. `range`
-/// was deliberately left out until a real call site needed it; v2's
-/// composite-key adjacency (prefix scans over `ADJ_OUT`/`ADJ_IN`) is that
-/// call site.
+/// Exposes `get`/`iter`/`range` as plain inherent methods rather than
+/// implementing the full `redb::ReadableTable` trait, since nothing calls
+/// the rest of it (`first`/`last`/...).
 pub enum TableHandle<'a, K: Key + 'static, V: Value + 'static> {
     Write(Table<'a, K, V>),
     Read(ReadOnlyTable<K, V>),
@@ -76,13 +69,10 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
         })
     }
 
-    /// Total entry count — O(1), redb tracks it per table. Added for the
+    /// Total entry count — O(1), redb tracks it per table. Used for the
     /// planner's start-point cardinality comparisons (an `AllNodesScan`
-    /// candidate's cost is exactly this count for `NODES`), same
-    /// "cheap count, never walk the entries" contract as
-    /// `MultimapValue::len()` in `index::match_count`.
-    // Fallible len can't back a conventional is_empty; no caller wants
-    // one (the planner compares counts, never emptiness).
+    /// candidate's cost is this count for `NODES`).
+    // Fallible len can't back a conventional is_empty; no caller needs one.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> Result<u64, StorageError> {
         Ok(match self {
@@ -91,11 +81,8 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
         })
     }
 
-    /// Key-ordered scan over a sub-range — the primitive behind composite-
-    /// key prefix reads (`ADJ_OUT`/`ADJ_IN`'s `node ++ label` expansion)
-    /// and, eventually, indexed range predicates over `PROPERTY_INDEX`
-    /// (whose order-preserving value encoding has been range-ready since
-    /// it was written).
+    /// Key-ordered scan over a sub-range — backs composite-key prefix
+    /// reads (`ADJ_OUT`/`ADJ_IN`'s `node ++ label` expansion).
     pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
         &self,
         range: impl std::ops::RangeBounds<KR> + 'k,
@@ -123,7 +110,7 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle<'a, K, V> {
         })
     }
 
-    #[allow(dead_code)] // not called by any current read path, kept for parity with TableHandle::iter
+    #[allow(dead_code)] // kept for parity with TableHandle::iter
     pub fn iter(&self) -> Result<MultimapRange<'_, K, V>, StorageError> {
         Ok(match self {
             MultimapTableHandle::Write(t) => t.iter()?,
@@ -133,8 +120,7 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle<'a, K, V> {
 
     /// Key-ordered scan over a sub-range of keys — the multimap
     /// counterpart of `TableHandle::range`, backing `PROPERTY_INDEX`
-    /// range predicates (the order-preserving value encoding has been
-    /// range-ready since it was written).
+    /// range predicates.
     pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
         &self,
         range: impl std::ops::RangeBounds<KR> + 'k,

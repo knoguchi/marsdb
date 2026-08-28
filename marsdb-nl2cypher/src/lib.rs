@@ -4,14 +4,12 @@
 //! property keys actually in use — see [`introspect_schema`]), builds a
 //! grounded prompt (see [`build_prompt`]), calls a caller-supplied
 //! [`LlmClient`], and validates the result by parsing and semantically
-//! binding it — with one repair attempt if the first response is invalid,
-//! feeding the exact validation error back (this codebase's
-//! error messages are unusually descriptive, which this leans on
-//! directly).
+//! binding it, with one repair attempt if the first response is invalid,
+//! feeding the validation error back to the model.
 //!
 //! No HTTP/LLM-SDK dependency here — bring your own [`LlmClient`]. See
-//! `examples/ollama_demo.rs` for a real, runnable one against a local
-//! Ollama instance.
+//! `examples/ollama_demo.rs` for a runnable one against a local Ollama
+//! instance.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -100,13 +98,10 @@ pub enum ExecutionPolicy {
 impl std::error::Error for Nl2CypherError {}
 
 /// Runs `MATCH (n) RETURN n` and `MATCH ()-[r]->() RETURN r` and
-/// aggregates over the results — an O(graph size) scan, same cost a
-/// dedicated schema-tracking index would still pay for a feature that
-/// only needs to run once before a translation, not per query. No
-/// dedicated schema API exists in `marsdb-graph`/`marsdb` to build this
-/// from instead (labels are interned internally but nothing public
-/// enumerates them), and building one wouldn't avoid this same scan
-/// anyway, so this stays entirely in terms of the existing public
+/// aggregates over the results — an O(graph size) scan, acceptable since
+/// this runs once before a translation, not per query. No dedicated
+/// schema API exists in `marsdb-graph`/`marsdb` to build this from
+/// instead, so it stays entirely in terms of the public
 /// `Database::execute` API.
 pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError> {
     let mut labels: std::collections::BTreeMap<String, (usize, BTreeSet<String>)> =
@@ -157,14 +152,12 @@ pub fn introspect_schema(db: &Database) -> Result<SchemaSummary, Nl2CypherError>
     })
 }
 
-/// Deliberately hand-written and kept short, not derived from
-/// `README.md` at build/runtime — every token here is a token in every
-/// prompt. Beyond what's supported, this specifically calls out the
-/// sharp edges an LLM trained on general Neo4j Cypher will otherwise
-/// reach for (the bare `-->` shorthand, multi-hop `MERGE`, `*` inside a
-/// named path) — telling the model what *not* to try is a real, standard
-/// technique for cutting down failed generations against a narrower
-/// dialect than what it was trained on.
+/// Hand-written and kept short, not derived from `README.md` at
+/// build/runtime — every token here is a token in every prompt. Calls
+/// out sharp edges an LLM trained on general Neo4j Cypher will otherwise
+/// reach for (bare `-->` shorthand, multi-hop `MERGE`, `*` inside a named
+/// path), since telling the model what not to try cuts failed
+/// generations against a narrower dialect than it was trained on.
 const CAPABILITIES: &str = "\
 MarsDB supports a subset of openCypher. Rules that matter for generating valid queries:
 - Relationships must be written explicitly as -[:TYPE]-> or -[:TYPE]-. The bare --> shorthand
@@ -244,8 +237,7 @@ pub fn build_prompt(
 }
 
 /// Strips a markdown code fence if the LLM wrapped its answer in one
-/// despite being asked not to (common enough in practice to handle
-/// defensively rather than let it silently break parsing).
+/// despite being asked not to.
 fn extract_cypher(raw: &str) -> String {
     let trimmed = raw.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
@@ -261,9 +253,8 @@ fn extract_cypher(raw: &str) -> String {
 }
 
 /// Translates `question` into Cypher against `schema`, validating syntax,
-/// variable scope, and structural types. One repair attempt on failure — not an
-/// open-ended retry loop, matching this codebase's stance throughout of
-/// erroring clearly over retrying indefinitely hoping it works.
+/// variable scope, and structural types. One repair attempt on failure,
+/// not an open-ended retry loop.
 pub fn translate(
     client: &dyn LlmClient,
     schema: &SchemaSummary,

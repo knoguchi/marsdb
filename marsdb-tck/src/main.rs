@@ -97,22 +97,17 @@ fn walk_feature_files(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Runs a `having executed:` setup block -- tries it as one `;`-separated
-/// batch first (the common case, and what a real Cypher submission would
-/// require). The openCypher TCK's own fixture convention often instead
-/// writes each statement on its own line with *no* `;` at all
+/// batch first (the common case). The TCK's own fixture convention often
+/// instead writes each statement on its own line with no `;` at all
 /// (`CREATE (:N)\nCREATE (:N)\n...`, e.g. Remove3's bulk-fixture
-/// scenarios) -- MarsDB's own `queries` grammar rule can't safely accept
-/// bare adjacency as a statement separator (`match_stmt`, one of
-/// `statement`'s alternatives, can itself match zero-width, so any
-/// repetition shaped like `(... | statement)*` is provably unbounded --
-/// confirmed by pest's own static "cannot fail and will repeat
-/// infinitely" check when this was tried at the grammar level), so this
-/// is handled here instead: on failure, split into lines and only fall
-/// back to running each one as its own statement if *every* line
-/// independently parses as one complete, self-contained statement --
-/// otherwise a real multi-line single statement (e.g. a pattern list
-/// spanning lines) would be silently, wrongly split, so this bails out
-/// and reports the original batch error instead of guessing.
+/// scenarios). MarsDB's grammar can't accept bare adjacency as a
+/// statement separator (`match_stmt` can match zero-width, so a
+/// repetition of statements would be unbounded), so it's handled here:
+/// on batch failure, split into lines and only fall back to running each
+/// one as its own statement if *every* line independently parses as a
+/// complete statement -- otherwise a real multi-line statement (e.g. a
+/// pattern list spanning lines) would be silently, wrongly split, so
+/// this bails out and reports the original batch error instead.
 fn execute_setup_block(db: &Database, cypher: &str) -> Result<(), marsdb::Error> {
     if db.execute_batch(cypher).is_ok() {
         return Ok(());
@@ -128,9 +123,8 @@ fn execute_setup_block(db: &Database, cypher: &str) -> Result<(), marsdb::Error>
         }
         return Ok(());
     }
-    // Fall through to the original batch error for an honest failure
-    // reason, not the fallback's own (misleading, since the fallback
-    // never ran) success/failure.
+    // Fall through to the original batch error -- the fallback never ran,
+    // so its own success/failure would be misleading.
     db.execute_batch(cypher).map(|_| ())
 }
 
@@ -223,11 +217,10 @@ fn unsupported(reason: String) -> marsdb::Error {
 
 fn classify_query_error(e: marsdb::Error) -> (Outcome, Option<String>) {
     match &e {
-        // Both "never parsed" and "parsed but structurally rejected"
-        // read as the same known-gap signal from the TCK harness's own
-        // point of view (see `Outcome::ParseRejected`'s doc comment) --
-        // only a `Type` error (a real value turned out the wrong shape)
-        // is different enough to fall through to `UnexpectedBehavior`.
+        // "Never parsed" and "parsed but structurally rejected" both
+        // read as the same known-gap signal (`Outcome::ParseRejected`)
+        // -- only a `Type` error (a real value turned out the wrong
+        // shape) falls through to `UnexpectedBehavior`.
         marsdb::Error::Query(QueryError::Syntax(_) | QueryError::Semantic(_)) => {
             (Outcome::ParseRejected, Some(e.to_string()))
         }
@@ -267,11 +260,10 @@ fn tck_value_to_property_value(name: &str, v: &TckValue) -> Result<PropertyValue
         ),
         // A bare map-valued parameter (`{name: 'Apa'}`) parses to the
         // same `TckValue::Node { labels: {}, .. }` shape a plain map
-        // literal *result* converts to (`tck_value::value_to_tck`'s own
-        // convention) -- empty labels is exactly what distinguishes it
-        // from a real node-valued parameter (still unsupported below,
-        // genuinely out of scope: `PropertyValue` has no `Node`/`Edge`
-        // variant, and nothing in the TCK currently needs one).
+        // literal result converts to (`tck_value::value_to_tck`) --
+        // empty labels distinguishes it from a real node-valued
+        // parameter, which stays unsupported below: `PropertyValue` has
+        // no `Node`/`Edge` variant.
         TckValue::Node { labels, props } if labels.is_empty() => PropertyValue::Map(
             props
                 .iter()

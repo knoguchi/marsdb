@@ -38,7 +38,6 @@ jobs:
       - name: Build
         run: |
           mdbook build book
-          mdbook build book/ja
       - uses: actions/upload-pages-artifact@v5
         with:
           path: book/book

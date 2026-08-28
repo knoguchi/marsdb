@@ -1,18 +1,14 @@
 //! Built-in schema-introspection procedures (`CALL db.labels()`, ...).
 //!
 //! These live in the executor, not behind `ProcedureProvider`, because
-//! they need the statement's own transaction (a provider's `call` gets
-//! only values — deliberately, so embedder procedures can't reach into
-//! storage). Dispatch order in `Executor::call_procedure`: built-ins
-//! first, then the embedder's provider — `db.*` names are reserved and
-//! not shadowable, so a query means the same thing in every deployment.
+//! they need the statement's own transaction; a provider's `call` only
+//! gets values, so embedder procedures can't reach into storage.
+//! `Executor::call_procedure` dispatches built-ins first, then the
+//! embedder's provider — `db.*` names are reserved and not shadowable.
 //!
-//! Output shapes follow the widely-used conventions (`db.labels() YIELD
-//! label`, etc.) with one extension: `db.labels`/`db.relationshipTypes`
-//! also yield a `count` column, since the O(1) statistics behind them
-//! (`NODE_LABEL_INDEX` per-key counts, `REL_TYPE_COUNTS`) make it free
-//! and the CLI's `.schema` wants it anyway. `YIELD label` alone still
-//! works for consumers expecting the conventional single column.
+//! `db.labels`/`db.relationshipTypes` also yield a `count` column beyond
+//! the conventional single column, since the backing O(1) statistics
+//! (`NODE_LABEL_INDEX`, `REL_TYPE_COUNTS`) make it free.
 
 use marsdb_graph::{GraphStore, Txn};
 

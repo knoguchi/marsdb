@@ -6,34 +6,25 @@ pub struct NodeId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdgeId(pub u64);
 
-/// A node/edge property, as persisted to redb (via `postcard`, see
-/// `encode.rs`) and used directly as MarsDB's runtime scalar type -- there
-/// is no separate "wire" representation. New variants append at the end
-/// (postcard's derive encodes an enum discriminant by declaration order),
-/// never reorder/remove an existing one, or every already-stored property
-/// silently decodes as the wrong variant.
+/// A node/edge property, persisted via `postcard` (see `encode.rs`) and
+/// used directly as MarsDB's runtime scalar type. New variants must append
+/// at the end (postcard encodes the enum discriminant by declaration
+/// order); reordering or removing one makes every already-stored property
+/// decode as the wrong variant.
 ///
-/// `Date`/`Duration` are Cypher's `DATE`/`DURATION` temporal types, added
-/// as first-class variants rather than reusing `Int`/`String` -- e.g.
-/// stashing a date as `Int(epoch_day)` would round-trip through storage
-/// fine, but a plain `Int` and a `Date` would then be indistinguishable
-/// once read back (Temporal4's "store a date, read it back, it must
-/// still print/compare/access-components as a date" scenarios need that
-/// distinction to survive the storage boundary). `LocalTime`/`Time`/
-/// `LocalDateTime`/`DateTime` (Cypher's other four temporal types) follow
-/// the same reasoning below. `Time` only accepts a *fixed* UTC offset --
-/// it carries no calendar date, so a named zone's DST-dependent offset
-/// has nothing to resolve against; `DateTime` accepts either a fixed
-/// offset or a named zone (`TzId`).
+/// `Date`/`Duration`/`LocalTime`/`Time`/`LocalDateTime`/`DateTime` are
+/// Cypher's temporal types, each a distinct variant rather than reused
+/// `Int`/`String` storage so a stored value round-trips as its own type
+/// instead of colliding with a plain number. `Time` only carries a fixed
+/// UTC offset (no calendar date to resolve a named zone's DST against);
+/// `DateTime` accepts either a fixed offset or a named zone (`TzId`).
 ///
-/// `Map` exists here for exactly one reason: a `$parameter`'s value can be
-/// map-shaped (`{name: 'Apa'}`, TCK's Map2/Map3), and query-time
-/// parameters flow in as `PropertyValue` (this is the one place a
-/// non-storable shape has to travel through). A node/edge *property*
-/// value is never actually a `Map` though -- real Cypher forbids storing
-/// one (`marsdb-query::executor::value_to_storable_property` rejects it
-/// outright before anything reaches `GraphStore`), so this variant is
-/// only ever constructed on the parameter-passing path, never persisted.
+/// `Map` exists only because a `$parameter` value can be map-shaped
+/// (`{name: 'Apa'}`); query-time parameters flow in as `PropertyValue`.
+/// A real node/edge property is never a `Map` --
+/// `marsdb-query::executor::value_to_storable_property` rejects that
+/// before it reaches `GraphStore` -- so this variant is only ever
+/// constructed on the parameter-passing path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     Null,
@@ -41,102 +32,73 @@ pub enum PropertyValue {
     Int(i64),
     Float(f64),
     String(String),
-    /// A calendar date with no time-of-day or timezone, stored as the
-    /// number of days since the Unix epoch (1970-01-01), proleptic
-    /// Gregorian. Plain `i32` (not a `chrono` type) -- keeps this crate's
-    /// storage format independent of any date library's own internal
-    /// representation (which is free to change across `chrono` versions),
-    /// and keeps comparison a plain integer compare. Conversion to/from
-    /// calendar year/month/day and ISO-8601 text lives in `marsdb-query`
-    /// (`temporal.rs`), not here -- this crate only stores the value, it
-    /// doesn't know Cypher's date grammar/semantics. `i64`, not `i32`:
-    /// Cypher's full year range (±999_999_999, ISO 8601 expanded years)
-    /// reaches ±365 billion epoch days, past `i32`. Wire-compatible with
-    /// values written as `i32`: postcard varints don't encode the width,
-    /// and the index key encoding was already 8-byte (see `index.rs`).
+    /// A calendar date with no time-of-day or timezone: days since the
+    /// Unix epoch (1970-01-01), proleptic Gregorian. Plain `i64` (not a
+    /// `chrono` type, and not `i32`) so storage stays independent of any
+    /// date library's representation and comparison is a plain integer
+    /// compare; `i64` because Cypher's expanded year range (±999_999_999)
+    /// reaches ±365 billion epoch days, past `i32`. Calendar conversion
+    /// and ISO-8601 text live in `marsdb-query::temporal`, not here.
     Date(i64),
-    /// An ISO-8601 duration (Cypher's `DURATION` type), kept in Neo4j's
-    /// own four-component normalized form rather than as a single scalar
-    /// -- months and days are *not* fungible with each other or with
-    /// seconds (a month is 28-31 days depending which month; without a
-    /// reference date, "3 months" has no fixed length in days at all), so
-    /// collapsing `duration({months: 1})` and `duration({days: 30})` into
-    /// one comparable number would silently be wrong once added to some
-    /// starting date. `nanos` always has the same sign as `seconds` (or is
-    /// `0`) -- i.e. `seconds*1_000_000_000 + nanos` is `total_nanoseconds`
-    /// truncated-towards-zero the same way Rust's integer division/`%`
-    /// already works, never a separately-signed remainder -- so
-    /// "-1.999 seconds" is `seconds: -1, nanos: -999_000_000`, not
-    /// `seconds: -2, nanos: 1_000_000`, which would make the same
-    /// duration representable two different ways.
+    /// Cypher's `DURATION`, kept as four independent components rather
+    /// than one scalar: months and days aren't fungible with seconds or
+    /// each other (a month's length in days depends which month), so
+    /// collapsing them would silently misconvert once added to a date.
+    /// `nanos` always shares `seconds`'s sign (or is `0`): "-1.999s" is
+    /// `seconds: -1, nanos: -999_000_000`, never `seconds: -2, nanos:
+    /// 1_000_000` -- one representation per duration.
     Duration {
         months: i64,
         days: i64,
         seconds: i64,
         nanos: i32,
     },
-    /// A time-of-day with no date or timezone, stored as nanoseconds since
-    /// midnight (`0..86_400_000_000_000`, always non-negative -- there's no
-    /// sign to carry the way `Date`'s epoch-day has). Cypher's `LOCAL TIME`.
+    /// Cypher's `LOCAL TIME`: nanoseconds since midnight
+    /// (`0..86_400_000_000_000`, always non-negative).
     LocalTime(i64),
-    /// A time-of-day with a *fixed* UTC offset (Cypher's `TIME`) -- named
-    /// timezones (`Europe/Stockholm`) aren't supported, only literal
-    /// `+HH:MM`-style offsets (see `marsdb-query::temporal`'s module docs
-    /// for the exact scope). `nanos_of_day` is the wall-clock reading (same
-    /// representation as `LocalTime`); `offset_seconds` is seconds *east*
-    /// of UTC. Comparison/equality use the UTC-equivalent instant-of-day
-    /// (`nanos_of_day - offset_seconds`), not the raw wall-clock reading --
-    /// two `Time`s at different offsets can represent the same instant.
+    /// Cypher's `TIME`: a fixed UTC offset only, no named timezone.
+    /// `nanos_of_day` is the wall-clock reading; `offset_seconds` is
+    /// seconds east of UTC. Comparison/equality use the UTC-equivalent
+    /// instant (`nanos_of_day - offset_seconds`), not the raw wall-clock
+    /// value, so two `Time`s at different offsets can be equal.
     Time {
         nanos_of_day: i64,
         offset_seconds: i32,
     },
-    /// A calendar date + time-of-day with no timezone (Cypher's `LOCAL
-    /// DATETIME`), stored as a naive (zone-less) instant: whole seconds
-    /// since the Unix epoch (`epoch_seconds`, signed -- a pre-1970 value is
-    /// negative) plus a `0..999_999_999` nanosecond remainder that always
-    /// stays non-negative (the sign lives entirely in `epoch_seconds`,
-    /// mirroring `Duration`'s "no separately-signed remainder" invariant).
+    /// Cypher's `LOCAL DATETIME`: a naive (zone-less) instant as whole
+    /// seconds since the Unix epoch (`epoch_seconds`, signed) plus a
+    /// `0..999_999_999` nanosecond remainder that stays non-negative --
+    /// the sign lives entirely in `epoch_seconds`.
     LocalDateTime {
         epoch_seconds: i64,
         nanos: i32,
     },
-    /// A calendar date + time-of-day with a timezone (Cypher's
-    /// `DATETIME`) -- either a *fixed* UTC offset or a named IANA zone
-    /// (`Europe/Stockholm`). `epoch_seconds`/`nanos` are the *UTC
-    /// instant* (same convention as `LocalDateTime`); `zone` is kept
-    /// only for display/round-tripping the original wall-clock reading
-    /// -- comparison/equality use the instant alone, matching real
-    /// Cypher (two `DateTime`s at the same instant but different zones
-    /// are equal, even though they print differently). A `Named` zone's
-    /// real offset at this instant is *not* cached here (the same zone
-    /// has different offsets across a DST transition) -- it's re-derived
-    /// on demand via `chrono-tz` (`marsdb-query::temporal::resolve_
-    /// offset`), this crate only stores the value, it doesn't know
-    /// Cypher's timezone-resolution semantics.
+    /// Cypher's `DATETIME`: a fixed UTC offset or a named IANA zone.
+    /// `epoch_seconds`/`nanos` are the UTC instant; `zone` is kept only
+    /// for display -- comparison/equality use the instant alone, so two
+    /// `DateTime`s at the same instant but different zones are equal. A
+    /// named zone's real offset is not cached (it varies across DST
+    /// transitions) and is re-derived on demand via `chrono-tz` in
+    /// `marsdb-query::temporal::resolve_offset`.
     DateTime {
         epoch_seconds: i64,
         nanos: i32,
         zone: TzId,
     },
-    /// A homogeneous array of scalars (real Cypher/Neo4j's own property
-    /// restriction: a stored list property can hold any of the scalar
-    /// variants above, all the same variant, never `Null`-mixed-with-a-
-    /// type, another `List`, or a map -- enforced where a `Value::List`
-    /// is converted to a storable `PropertyValue`, in `marsdb-query`, not
-    /// here; this crate just stores whatever `Vec<PropertyValue>` it's
-    /// given). Appended last (see this enum's own doc comment on why
-    /// variant order is a real, one-way storage-compat constraint).
+    /// A homogeneous scalar array: Cypher forbids mixing types, `Null`,
+    /// nested `List`s, or maps inside a stored list, enforced where a
+    /// `Value::List` converts to `PropertyValue` in `marsdb-query`, not
+    /// here. Appended last -- see this enum's own doc comment on why
+    /// variant order is a storage-compat constraint.
     List(Vec<PropertyValue>),
-    /// See this enum's own doc comment -- parameter-passing only, never a
-    /// real stored property value.
+    /// Parameter-passing only, never a real stored property value -- see
+    /// this enum's own doc comment.
     Map(BTreeMap<String, PropertyValue>),
 }
 
-/// A `DateTime`'s zone: a fixed UTC offset, or a named IANA timezone
-/// (`Europe/Stockholm`) whose real offset varies by instant (DST) and is
-/// resolved on demand, not stored -- see `PropertyValue::DateTime`'s doc
-/// comment.
+/// A `DateTime`'s zone: a fixed UTC offset, or a named IANA timezone whose
+/// real offset is resolved on demand, not stored -- see
+/// `PropertyValue::DateTime`'s doc comment.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TzId {
     Offset(i32),
@@ -174,15 +136,10 @@ pub struct AdjEntry {
     pub label_id: u32,
 }
 
-/// Composite-key layout for `ADJ_OUT`/`ADJ_IN` (v2 step 2):
-/// `(owner_node, label_id, edge_id)` tuple key -> other node id as the
-/// value. A redb tuple of fixed-width integers stays fixed-width (a
-/// byte-packed `[u8; 20]` key here measured a 2x database file — the
-/// mars-am7 erasure tax; see `tables::ADJ_OUT`'s docs) and orders
-/// component-wise, so one node's edges are contiguous and label-typed
-/// expansion is a sub-prefix range within them. `AdjEntry` stays the
-/// in-memory traversal-candidate type; only its storage layout moved
-/// from a 20-byte multimap *value* into this key shape.
+/// `ADJ_OUT`/`ADJ_IN` key: `(owner_node, label_id, edge_id)` tuple ->
+/// other node id as the value. redb orders a fixed-width tuple
+/// component-wise, so one node's edges are contiguous and a label-typed
+/// expansion is a sub-prefix range within them.
 pub(crate) type AdjKey = (u64, u32, u64);
 
 pub(crate) fn adj_key(owner: u64, label_id: u32, edge_id: u64) -> AdjKey {

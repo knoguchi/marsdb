@@ -504,8 +504,8 @@ fn return_expr_references_var(expr: &ReturnExpr, var: &str) -> bool {
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => false,
         // A function call references `var` iff any argument does -- so
         // `date('2020-01-10')` (the shape a `$param`-substituted temporal
-        // equality takes, mars-9ez) is promotable while `date(n.born)`
-        // correctly isn't. `rand()` is the one argument-free call whose
+        // equality takes) is promotable while `date(n.born)` correctly
+        // isn't. `rand()` is the one argument-free call whose
         // *value* still can't be hoisted from per-candidate to
         // per-seed-row evaluation (a fresh number each call is the whole
         // point of it), so it's treated as referencing everything; a
@@ -575,17 +575,13 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 }
 
 /// Start-point selection: decide whether the pattern's traversal should
-/// begin from its *last* endpoint instead of its first, and if so return
-/// the reversed pattern (each hop's direction flipped, node order
-/// reversed) for `build_match_plan` to compile as usual. `MATCH
-/// (a:Common)-->(b:Rare {id: 1}) ...` written from the `Common` side
-/// otherwise scans every `Common` node and expands, when starting from
-/// the one indexed `Rare` node and expanding backwards touches only the
-/// matching rows — the plan is direction-symmetric (`ADJ_IN` mirrors
-/// `ADJ_OUT`), so which endpoint seeds the traversal is a pure cost
-/// choice with identical results.
+/// begin from its *last* endpoint instead of its first, reversing hop
+/// direction and node order for `build_match_plan` to compile as usual.
+/// The plan is direction-symmetric (`ADJ_IN` mirrors `ADJ_OUT`), so
+/// which endpoint seeds the traversal is a pure cost choice with
+/// identical results.
 ///
-/// The decision is a two-sided cost estimate, all O(1) statistics
+/// Two-sided cost estimate from O(1) statistics
 /// (`label_count_in_txn`/`node_count_in_txn`/`rel_type_count_in_txn`):
 ///
 /// ```text
@@ -594,61 +590,27 @@ pub fn pattern_new_vars(pattern: &Pattern, carried_vars: &HashSet<String>) -> Ha
 /// E_A = E · out_rows_A / label_rows_A
 /// ```
 ///
-/// where `scan_rows` is what the anchor's leaf physically visits (0 for
-/// a bound Seed, the index-match count when an indexed literal-equality
-/// candidate turns the scan into a seek — the same candidates
-/// `apply_index_seeks` would fuse — else the full label count),
-/// `out_rows` is what the leaf *emits* after its pushed filters (equal
-/// to `scan_rows` for a seek; an *unindexed* literal equality keeps the
-/// scan full but credits the emitted rows with a default 1/10
-/// selectivity — see `UNINDEXED_EQ_SELECTIVITY_DIVISOR`; other
-/// uncredited filters stay at selectivity 1, their true selectivity
-/// genuinely unknowable here), `E` is the live edge count of the
-/// anchor-adjacent hop's relationship type(s), and `filtered` marks
-/// pushable predicate work priced per scanned row (a `CONTAINS`, a
-/// range, an unindexed or `$param` equality). The terms are the
-/// traversal's real work items: visit `scan_rows_A` leaf rows; evaluate
-/// the anchor's own filter once per visited row (`scan_rows_A ·
-/// filtered_A` — pushed below the Expand by `build_match_plan`, this is
-/// what anchoring *at* the filtered side buys); walk `E_A` edges, the
-/// type's total prorated by the fraction of the label the leaf emits
-/// (uniform-degree assumption); evaluate the *other* endpoint's
-/// stranded filter once per walked edge (`E_A · filtered_B`). Row
-/// scans, filter evaluations, and edge walks are weighted equally —
-/// measured on the recommendations dataset at ~0.66µs and ~0.65µs per
-/// item for the filter-eval and edge-walk halves, same order.
+/// `scan_rows` is what the anchor leaf physically visits (0 for a bound
+/// Seed, the index-match count for an indexed equality seek, else the
+/// full label count). `out_rows` is what the leaf emits after pushed
+/// filters: equal to `scan_rows` for a seek; an unindexed equality
+/// credits a default 1/10 selectivity (`UNINDEXED_EQ_SELECTIVITY_DIVISOR`),
+/// other filters stay at selectivity 1. `E` is the anchor-adjacent hop's
+/// live edge count. `filtered` marks pushable per-row predicate work
+/// (`CONTAINS`, a range, an unindexed or `$param` equality).
 ///
-/// Splitting `scan_rows` from `out_rows` is what lets an unindexed
-/// equality price correctly on *both* sides of the trade: the emitted-
-/// row credit stops a huge equality-filtered label from dragging the
-/// whole edge population into its estimate (`(m:Post {id: 100})-->
-/// (p:Person)` must anchor at Post even though Person's label is
-/// smaller — issue #208, measured 6x there and 70x on a variant whose
-/// far endpoint was unlabeled), while the still-full scan term keeps a
-/// low-selectivity equality against a tiny far endpoint reversing
-/// exactly as before.
+/// Splitting `scan_rows` from `out_rows` lets an unindexed equality
+/// price correctly on both sides: the emitted-row credit stops a large
+/// equality-filtered label from dragging the whole edge population into
+/// the estimate, while the full scan term still reverses correctly for
+/// a low-selectivity equality against a tiny far endpoint.
 ///
-/// With no filters anywhere the model degenerates to the old plain row
-/// comparison (both sides carry the same full `E`). The benchmark query
-/// that motivated the `filtered` term (`MATCH (m:Movie)<-[:RATED]-
-/// (u:User) WHERE m.title CONTAINS '...'`, 671 users vs 9,125 movies,
-/// 100k RATED edges, 3 title matches) prices as 118k written vs 200k
-/// reversed — written order, the measured-9x-faster answer. The shape
-/// the interim always-decline rule got wrong — a huge filtered label
-/// against a tiny far endpoint with few edges — now reverses, because a
-/// small `E` caps how much the stranded filter can cost.
-///
-/// Reversal fires only when the far endpoint prices strictly cheaper —
-/// ties keep written order, both for determinism and because reversal
-/// is never free to reason about.
-///
-/// Deliberately conservative, same stance as every other planner pass:
-/// only all-fixed-hop patterns are considered. A variable-length hop's
-/// own relationship-list binding (`[r*1..3]`) and named-path capture
-/// both expose traversal *order* to the user, which reversal would flip;
-/// rather than distinguishing the observable cases, any `hop_range` in
-/// the pattern disqualifies it. Callers additionally skip named-path
-/// (`p = ...`) and `shortestPath` clauses for the same reason.
+/// Reversal fires only when the far endpoint prices strictly cheaper;
+/// ties keep written order. Only all-fixed-hop patterns are considered:
+/// a variable-length hop (`[r*1..3]`) or named-path capture exposes
+/// traversal order to the user, so any `hop_range` disqualifies the
+/// pattern, and callers skip named-path/`shortestPath` clauses the same
+/// way.
 pub fn plan_reversed_pattern(
     pattern: &Pattern,
     where_clause: &Option<Expr>,
@@ -868,12 +830,12 @@ fn anchor_cost(anchor: &EndpointCost, other: &EndpointCost, edges: u64) -> u64 {
 /// index behind it: the endpoint is assumed to emit `1/10` of its
 /// scanned rows (System R's classic default for equality without
 /// statistics). Deliberately coarse — the point isn't accuracy, it's
-/// that an equality must price *better* than no filter at all: before
-/// this credit existed, an unindexed `{id: 100}` left `out_rows` at the
-/// full label count while `filtered` doubled the scan term, so the
-/// filter made its endpoint price strictly worse and start-point
-/// selection inverted (measured at 6-70x on the LDBC-style workload —
-/// see the fix's regression tests below and issue #208).
+/// that an equality must price *better* than no filter at all: without
+/// this credit, an unindexed `{id: 100}` left `out_rows` at the full
+/// label count while `filtered` doubled the scan term, so the filter
+/// made its endpoint price strictly worse and start-point selection
+/// inverted (measured at 6-70x on the LDBC-style workload; see the
+/// regression tests below).
 const UNINDEXED_EQ_SELECTIVITY_DIVISOR: u64 = 10;
 
 /// What `endpoint_start_cost` knows about starting a traversal at one
@@ -1443,8 +1405,8 @@ mod tests {
         }
     }
 
-    /// Issue #208's IS5 shape: a large label carrying an *unindexed*
-    /// literal equality versus a smaller unfiltered far label. The
+    /// A large label carrying an *unindexed* literal equality versus a
+    /// smaller unfiltered far label. The
     /// equality collapses what Big emits, so Big must stay the anchor
     /// even though Small's label is 10x smaller — before out_rows
     /// existed, the equality only doubled Big's scan term and the
@@ -1494,8 +1456,8 @@ mod tests {
         assert_eq!(reversed.start.var.as_deref(), Some("m"));
     }
 
-    /// Issue #208's IC2 shape: an equality-filtered start versus an
-    /// *unlabeled* far endpoint, with the start's adjacent hop the
+    /// An equality-filtered start versus an *unlabeled* far endpoint,
+    /// with the start's adjacent hop the
     /// larger edge population. The old model saw only the start's
     /// doubled scan term plus its full adjacent-edge count and anchored
     /// at the unlabeled end — an AllNodesScan (measured 70x slower,
@@ -1769,8 +1731,8 @@ mod tests {
     #[test]
     fn fuses_a_literal_arg_call_equality_into_a_row_expr_index_seek() {
         // `n.joined = date('2020-01-10')` -- the shape a `$param`-
-        // substituted temporal equality takes (mars-9ez). The call's
-        // arguments are all var-free, so it's evaluable once per seed row
+        // substituted temporal equality takes. The call's arguments are
+        // all var-free, so it's evaluable once per seed row
         // and must promote to an IndexSeek with a RowExpr value, not stay
         // a per-candidate Filter over the label scan.
         let store = GraphStore::open_memory().unwrap();

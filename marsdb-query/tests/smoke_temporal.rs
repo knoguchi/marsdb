@@ -1,4 +1,4 @@
-//! Smoke tests: date/time/datetime/duration construction, arithmetic, truncation -- split from the original smoke.rs.
+//! Smoke tests: date/time/datetime/duration construction, arithmetic, truncation.
 
 /// ISO 8601 expanded years end-to-end -- the exact queries of TCK
 /// Temporal10 [9]/[10], which the i64/civil-calendar date core exists
@@ -73,14 +73,12 @@ fn variable_length_unbounded_depth_cap_errors_not_truncates() {
     );
 }
 
-/// A temporal-valued `$param`, in ordinary expression position -- there's
-/// no temporal *literal* syntax to substitute one into (same "no literal
-/// syntax" gap `list_valued_parameters_...` documents for lists), so
+/// A temporal-valued `$param` in ordinary expression position -- there's
+/// no temporal *literal* syntax to substitute into, so
 /// `substitute_params` rewrites it into a call to the matching
 /// constructor (`date(...)`, `duration(...)`, ...) over its formatted
-/// string instead. All 6 temporal `PropertyValue` variants, plus nested
-/// inside a list/map -- the shape a bulk-load script binding a `$rows`
-/// param full of dated records actually needs.
+/// string. Covers all 6 temporal `PropertyValue` variants, plus nested
+/// inside a list/map (the `UNWIND $rows AS row` bulk-load shape).
 #[test]
 fn temporal_valued_parameters_substitute_into_a_constructor_call() {
     use marsdb_graph::PropertyValue;
@@ -166,8 +164,7 @@ fn temporal_valued_parameters_substitute_into_a_constructor_call() {
         );
     }
 
-    // Nested inside a list-of-maps -- exactly the `UNWIND $rows AS row`
-    // bulk-load shape this was fixed for.
+    // Nested inside a list-of-maps.
     let mut row = std::collections::BTreeMap::new();
     row.insert("born".to_string(), date(1984, 10, 11));
     let rows = PropertyValue::List(vec![PropertyValue::Map(row)]);
@@ -462,10 +459,9 @@ fn date_plus_and_minus_duration() {
 
 #[test]
 fn date_plus_duration_with_fractional_components_carries_extra_day() {
-    // Regression guard for the bug an earlier version of
-    // `add_duration_to_date` had: dropping a duration's `seconds`/`nanos`
-    // remainder outright instead of folding any *whole* extra day out of
-    // it. Temporal8 scenario [1] row 3.
+    // `add_duration_to_date` must fold a whole extra day out of the
+    // seconds/nanos remainder, not drop it outright. Temporal8 scenario
+    // [1] row 3.
     let store = GraphStore::open_memory().unwrap();
     run(
         &store,
@@ -551,7 +547,7 @@ fn duration_component_access() {
 fn stored_date_survives_the_storage_round_trip() {
     // Temporal4 scenario [1] -- a Date stored as a node property comes
     // back as the same Date (not degraded to a plain Int/String), the
-    // real reason PropertyValue got a first-class Date variant instead of
+    // reason PropertyValue got a first-class Date variant instead of
     // reusing Int/String -- see PropertyValue's own doc comment.
     let store = GraphStore::open_memory().unwrap();
     run(
@@ -654,9 +650,8 @@ fn datetime_named_timezone_construction_and_parsing() {
 }
 
 /// `TIME` has no calendar date, so a named zone's DST-dependent offset
-/// has nothing to resolve against -- unlike `DATETIME`, it still only
-/// accepts a fixed UTC offset. A real, deliberately narrow scope line,
-/// not a silent wrong answer.
+/// has nothing to resolve against -- unlike `DATETIME`, it only accepts
+/// a fixed UTC offset.
 #[test]
 fn time_named_timezone_is_rejected_not_silently_wrong() {
     let store = GraphStore::open_memory().unwrap();
@@ -675,14 +670,11 @@ fn time_named_timezone_is_rejected_not_silently_wrong() {
     );
 }
 
-/// Projecting a `Named`-zone base with an *explicit* `timezone` override
+/// Projecting a `Named`-zone base with an explicit `timezone` override
 /// shifts the wall-clock to preserve the same instant -- the target
-/// offset is resolved *for the actual target date* (which the `day`
-/// override can move to a different DST period than the base's own
-/// date), not the base's original instant. A real bug found and fixed
-/// this session: an earlier version resolved both the "from" and "to"
-/// offsets against stale/inconsistent dates, producing wrong instants.
-/// TCK's Temporal3 [9]/[10] (a representative sample of the row shapes).
+/// offset is resolved for the actual target date (which `day` can move
+/// to a different DST period than the base's own date), not the base's
+/// original instant. TCK's Temporal3 [9]/[10] (representative rows).
 #[test]
 fn datetime_shift_into_named_zone_resolves_offsets_for_the_target_date() {
     let store = GraphStore::open_memory().unwrap();
@@ -717,14 +709,11 @@ fn datetime_shift_into_named_zone_resolves_offsets_for_the_target_date() {
     );
 }
 
-/// With *no* explicit `timezone` override, a `Named`-zone base's zone
-/// identity is preserved as-is and the wall-clock is *not* shifted, even
-/// if a `day` override moves the result across a DST boundary for that
-/// same zone -- the displayed offset is simply re-resolved for the new
-/// date, the local time itself never changes. A real bug found and fixed
-/// this session: an earlier version always re-resolved and shifted
-/// whenever the zone's real offset differed for the new date, even
-/// without an explicit override. TCK's Temporal3 [10] rows 336/337.
+/// With no explicit `timezone` override, a `Named`-zone base's zone
+/// identity is preserved and the wall-clock is not shifted, even if a
+/// `day` override moves the result across a DST boundary for that zone
+/// -- the displayed offset is simply re-resolved for the new date; the
+/// local time itself never changes. TCK's Temporal3 [10] rows 336/337.
 #[test]
 fn datetime_no_override_preserves_zone_identity_without_shifting() {
     let store = GraphStore::open_memory().unwrap();
@@ -958,12 +947,9 @@ fn duration_between_mixed_types() {
     assert_eq!(temporal_str(&result.rows[0][0]), "P-27DT-21H-40M-32.142S");
 }
 
-/// Two `DateTime`s at *different* offsets -- the month/day/second
+/// Two `DateTime`s at different offsets -- the month/day/second
 /// breakdown must account for the real offset delta, not just the raw
-/// local wall-clock digits (found as a real bug: naive local-to-local
-/// subtraction here gave `P11M29DT23H59M55.999S` instead of the
-/// correct `P1YT59M55.999S`, off by exactly the 1h offset difference).
-/// Temporal10 [2].
+/// local wall-clock digits. Temporal10 [2].
 #[test]
 fn duration_between_two_datetimes_with_different_offsets_accounts_for_the_offset_delta() {
     let store = GraphStore::open_memory().unwrap();
@@ -975,10 +961,9 @@ fn duration_between_two_datetimes_with_different_offsets_accounts_for_the_offset
     assert_eq!(temporal_str(&result.rows[0][0]), "P1YT59M55.999S");
 }
 
-/// The same offset-reconciliation rule applies even in the time-only
-/// "degrade" mode (one side has no date) when *both* operands still
-/// carry a real offset (`Time`/`DateTime`) -- found as a second real
-/// bug alongside the one above.
+/// The same offset-reconciliation rule applies in the time-only
+/// "degrade" mode (one side has no date) when both operands still
+/// carry a real offset (`Time`/`DateTime`).
 #[test]
 fn duration_between_time_only_mode_still_accounts_for_offset_when_both_sides_have_one() {
     let store = GraphStore::open_memory().unwrap();
@@ -1020,11 +1005,9 @@ fn duration_in_months_days_seconds_collapse_to_a_single_bucket() {
 }
 
 /// `duration.between`'s own remainder-decomposition edge case: a
-/// negative sub-second-only difference must still round-trip through
-/// `toString` correctly (a real pre-existing invariant --
-/// `format_seconds_fraction`'s `(0, -500_000_000) -> "-0.5"` case --
-/// exercised here via the actual `duration.between` code path, not a
-/// hand-built `Duration`). Temporal10 [6].
+/// negative sub-second-only difference must round-trip through
+/// `toString` correctly, exercised via the real `duration.between` path
+/// (not a hand-built `Duration`). Temporal10 [6].
 #[test]
 fn duration_in_seconds_negative_sub_second_only_difference() {
     let store = GraphStore::open_memory().unwrap();
@@ -1110,9 +1093,7 @@ fn local_time_and_time_truncate() {
 }
 
 /// `date.truncate('week', d, {dayOfWeek: N})` -- the `dayOfWeek`
-/// override moves within the truncated result's own ISO week (found
-/// as a real bug: `apply_date_overrides` didn't recognize `dayOfWeek`
-/// at all and silently ignored it instead of applying it or erroring).
+/// override moves within the truncated result's own ISO week.
 /// Temporal9 [1].
 #[test]
 fn date_truncate_day_of_week_override() {
@@ -1140,11 +1121,9 @@ fn date_truncate_rejects_a_time_only_override_field() {
     );
 }
 
-/// A `.truncate()` map overriding *only* `nanosecond` must keep the
-/// truncated base's own millisecond/microsecond digits, not silently
-/// reset them to zero -- found as a real bug (`{nanosecond: 2}` alone
-/// was dropping the base's `.645` millisecond value entirely instead
-/// of producing `.645000002`). Temporal9 [2]-[5].
+/// A `.truncate()` map overriding only `nanosecond` must keep the
+/// truncated base's own millisecond/microsecond digits, not reset them
+/// to zero. Temporal9 [2]-[5].
 #[test]
 fn truncate_sub_second_override_keeps_the_bases_other_digits() {
     let store = GraphStore::open_memory().unwrap();

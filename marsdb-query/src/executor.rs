@@ -159,17 +159,13 @@ pub struct ExecutionOptions {
     /// found" -- MarsDB ships no built-in procedures itself, see
     /// `procedure::ProcedureProvider`'s own docs.
     pub procedures: Option<crate::procedure::Procedures>,
-    /// The statement's own `$name` parameters, verbatim -- every other
-    /// `$param` position is already resolved to a concrete `Literal`
-    /// before `Executor` ever sees the statement (`substitute_params`,
-    /// run during `marsdb::prepare_statement`, well before this point),
-    /// but a *standalone* `CALL proc` written with no parens at all (TCK's
-    /// Call1 `[2]`/`[11]`, Call2 `[3]`) resolves each declared input from
-    /// a same-named `$param` -- which declared names even exist isn't
-    /// knowable until the procedure's signature is looked up here, at
-    /// execution time (the registry itself, `procedures` above, isn't
-    /// available any earlier either), so this is the one place `Executor`
-    /// still needs the raw map instead of already-substituted AST nodes.
+    /// The statement's own `$name` parameters, verbatim. Every other
+    /// `$param` position is resolved to a concrete `Literal` before
+    /// `Executor` sees the statement, but a paren-less `CALL proc`
+    /// resolves each declared input from a same-named `$param`, and the
+    /// declared names aren't known until the procedure's signature is
+    /// looked up here at execution time -- so this is the one place
+    /// `Executor` still needs the raw map.
     pub params: HashMap<String, PropertyValue>,
 }
 
@@ -177,18 +173,12 @@ struct ExecutionGuard<'a> {
     options: &'a ExecutionOptions,
     deadline: Option<Instant>,
     relationship_expansions: Cell<u64>,
-    /// A relationship's *type* is immutable for its whole lifetime, so
-    /// `type(r)` is one of the few things real Cypher still lets a
-    /// statement read off `r` after `DELETE r` deleted it earlier in the
-    /// same statement -- unlike properties/labels (mutable, and a genuine
-    /// `DeletedEntityAccess` error, TCK's Return2 `[15]`-`[17]`), it
-    /// needs no live record at all, just whatever type it had at match
-    /// time. `delete_targets`/`delete_binding`/`delete_value` populate
-    /// this right before actually deleting each edge; `type()`'s own
-    /// evaluation (`Executor::eval_type_call`) falls back to it only when
-    /// the ordinary live lookup fails. `RefCell`, not `&mut` -- `guard`
-    /// is threaded everywhere as a shared reference, same interior-
-    /// mutability precedent `relationship_expansions` above already sets.
+    /// A relationship's type is immutable, so `type(r)` still works after
+    /// `DELETE r` earlier in the same statement, unlike properties/labels
+    /// which error on a deleted entity. `delete_targets`/`delete_binding`/
+    /// `delete_value` populate this before deleting each edge;
+    /// `eval_type_call` falls back to it when the live lookup fails.
+    /// `RefCell` because `guard` is threaded as a shared reference.
     deleted_edge_types: RefCell<HashMap<EdgeId, String>>,
 }
 
@@ -296,35 +286,26 @@ enum Binding {
     /// AS messageId`) — no graph identity, just a value along for the ride
     /// to the next `QueryPart`/the final `Tail`.
     Value(PropertyValue),
-    /// A `collect()` result carried through a `WITH` projection. Separate
-    /// from `Binding::Value` because `PropertyValue` (storage-layer) has no
-    /// list variant — lists are a query-layer-only concept, never
-    /// persisted — so a materialized `collect()` has nowhere else to live
-    /// between one `QueryPart` and the next. Elements are already-resolved
-    /// `Value`s, not `Binding`s — `UNWIND` restores graph identity on the
-    /// way back out via `value_to_binding_restore`, a separate step from
-    /// how this is stored here.
+    /// A `collect()` result carried through a `WITH` projection. Lists
+    /// are query-layer-only (`PropertyValue` has no list variant), so
+    /// this is where a materialized `collect()` lives between
+    /// `QueryPart`s. Elements are `Value`s, not `Binding`s; `UNWIND`
+    /// restores graph identity via `value_to_binding_restore`.
     List(Vec<Value>),
-    /// A map literal (`{a: 1, b: 2}`) carried through a `WITH` projection
-    /// — same reasoning as `List`: `PropertyValue` has no map variant, so
-    /// this is the only place a materialized map has to live between one
-    /// `QueryPart` and the next.
+    /// A map literal (`{a: 1, b: 2}`) carried through a `WITH` projection;
+    /// same reasoning as `List` (`PropertyValue` has no map variant).
     Map(BTreeMap<String, Value>),
     /// A named path (`p = (a)-->(b)`) or `shortestPath()` result — see
-    /// `assemble_path`/`eval_shortest_path`. `PathBinding` (not `Binding`
-    /// again) because a path element only ever needs graph identity
-    /// (`NodeId`/`EdgeId`), never any of `Binding`'s other cases — using
-    /// `Binding` itself here would make "a path containing a path" a type
-    /// state nothing ever produces or handles.
+    /// `assemble_path`/`eval_shortest_path`. `PathBinding`, not `Binding`
+    /// again: a path element only needs graph identity, and reusing
+    /// `Binding` would allow a path containing a path, a state nothing
+    /// produces or handles.
     Path(Vec<PathBinding>),
 }
 
-/// One element of a `Binding::Path`, alternating node/edge/node/.../node
-/// — the row-carried counterpart to `Value::Path`'s `PathElem` (which
-/// carries full `Node`/`Edge` records instead of just their ids, the same
-/// "keep identity in the row, resolve to a full record only when
-/// materializing for display" split every other `Binding`/`Value` pair
-/// already uses).
+/// One element of a `Binding::Path`, alternating node/edge/node/.../node.
+/// The row-carried counterpart to `Value::Path`'s `PathElem`, which
+/// carries full `Node`/`Edge` records instead of just ids.
 #[derive(Debug, Clone)]
 enum PathBinding {
     Node(NodeId),
@@ -354,24 +335,13 @@ struct VarExpandFrame {
 /// frame stack (bounded by the hop cap, so ≤ `VAR_EXPAND_DEPTH_CAP`
 /// frames), yielding each qualifying path's row as it is discovered.
 ///
-/// Two deliberate differences from the eager BFS this replaced, both
-/// only observable in ways Cypher leaves unspecified or that only fire
-/// on queries that previously did strictly more work:
-/// - **Emission order** is depth-first, not breadth-first. Row order
-///   without `ORDER BY` is unspecified; the *set* of emitted rows is
-///   identical (same reachability, same edge-isomorphism exclusions).
-/// - **The unbounded depth-cap error is discovered lazily**: a `*0..`
-///   traversal that can reach `VAR_EXPAND_DEPTH_CAP` hops still errors
-///   when the enumeration reaches such a path, so any fully-drained
-///   query behaves exactly as before — but a consumer that stops early
-///   (a satisfied `DISTINCT ... LIMIT`) may finish without ever walking
-///   the offending branch, succeeding where the eager version errored
-///   after having done all that work anyway.
-///
-/// The frontier/output-Vec `check_intermediate_rows` calls of the eager
-/// version are gone with the Vecs themselves: emitted rows are still
-/// counted by `count_stream` downstream, and `relationship_expansion`
-/// still meters every edge walked in here.
+/// Emission order is depth-first (row order without `ORDER BY` is
+/// unspecified; the emitted row *set* is unaffected). The
+/// `VAR_EXPAND_DEPTH_CAP` error on an unbounded (`*0..`) traversal is
+/// discovered only when enumeration reaches an offending path, so a
+/// consumer that stops early (`DISTINCT ... LIMIT`) can finish without
+/// ever hitting it. Emitted rows are counted by `count_stream`
+/// downstream; `relationship_expansion` meters every edge walked here.
 struct VarExpandIter<'s, 'g> {
     txn: Txn<'s>,
     guard: &'s ExecutionGuard<'g>,
@@ -657,34 +627,24 @@ pub struct Executor<'a> {
     /// Cypher's guarantee that every such call *within one query*
     /// returns the same value (see `temporal::NowSnapshot`'s docs).
     now: Cell<Option<temporal::NowSnapshot>>,
-    /// `NodeId -> Node` memo, cleared at the start of every statement --
-    /// both entry points (`execute_with_guard` and
-    /// `execute_in_write_transaction_with_guard`, see their own reset
-    /// lines) must do this, since `node_cache` is a field on `Executor`
-    /// shared by both, not private to either. Serves *every* statement:
-    /// read-only ones have one consistent snapshot for their whole
-    /// duration, and write statements stay coherent by evicting a node's
-    /// entry at every site that mutates or deletes that node's record
-    /// (`uncache_node` -- SET/REMOVE on props or labels, node DELETE).
-    /// An earlier version disabled the cache for write statements
-    /// wholesale ("the write path was never the hot case") -- wrong for
-    /// a predicate-driven bulk `DELETE r`, whose MATCH phase
-    /// label-checks both endpoint nodes of every expanded edge: with the
-    /// cache off that's a full node decode per *row* (~380ms of a ~490ms
-    /// statement on the recommendations benchmark, users re-decoded
-    /// ~150x each), with it on it's one decode per *distinct* node.
-    /// Found via a real flamegraph both times: `get_node_in_txn`'s
-    /// postcard decode of the full `NodeRecord` (every property, not
-    /// just the ones a query reads) is the dominant term, much of it the
-    /// *same* node decoded repeatedly (`RETURN n.a, n.b ORDER BY n.c`
-    /// decodes `n` three times).
+    /// `NodeId -> Node` memo, cleared at the start of every statement
+    /// (both `execute_with_guard` and
+    /// `execute_in_write_transaction_with_guard` reset it, since the
+    /// field is shared by both entry points). Read-only statements get
+    /// one consistent snapshot for their duration; write statements stay
+    /// coherent by evicting a node's entry at every site that mutates or
+    /// deletes its record (`uncache_node`). Needed even when a statement
+    /// never touches node records directly: a predicate-driven bulk
+    /// `DELETE r` label-checks both endpoint nodes of every expanded
+    /// edge in its MATCH phase, and `get_node_in_txn`'s full-record
+    /// postcard decode dominates cost when the same node gets decoded
+    /// repeatedly (e.g. `RETURN n.a, n.b ORDER BY n.c` decodes `n` three
+    /// times without caching).
     ///
-    /// Currently unbounded -- a statement that scans wide retains an
-    /// `Rc<Node>` for every node it touches until the statement ends,
-    /// where the pre-cache code decoded-and-dropped per row. On a
-    /// dataset larger than RAM this can turn a slow query into an OOM
-    /// risk; see mars-kvb for a size-capped follow-up (stop inserting
-    /// past N entries, keep serving existing hits).
+    /// Unbounded: a wide-scanning statement retains an `Rc<Node>` for
+    /// every node it touches until the statement ends, risking OOM on a
+    /// dataset larger than RAM. A size-capped cache is a possible
+    /// follow-up.
     node_cache: RefCell<HashMap<NodeId, Rc<Node>>>,
     /// Whether the executing statement is read-only. Gates the one memo
     /// entry kind that can go stale mid-write-statement: `prop_id_for`'s
@@ -866,14 +826,13 @@ impl<'a> Executor<'a> {
 
     /// Stream a read-only statement's rows to `sink` instead of
     /// materializing a `QueryResult` — bounded memory no matter how many
-    /// rows match, the bulk-export path. Only the genuinely streamable
-    /// shape is accepted: one `MATCH` clause (no `WITH` pipeline, no
-    /// `OPTIONAL`, no `shortestPath`, no named path) with a plain
-    /// `RETURN` (no aggregation, no `DISTINCT`, no `ORDER BY`; `SKIP`/
-    /// `LIMIT` are fine — they stream naturally). Anything else is a
-    /// `Semantic` error naming the blocker, NOT a silent fall-back to
-    /// materialization — an API that promises bounded memory must never
-    /// quietly break the promise. The sink returning `Break` stops the
+    /// rows match, the bulk-export path. Only a streamable shape is
+    /// accepted: one `MATCH` clause (no `WITH` pipeline, no `OPTIONAL`,
+    /// no `shortestPath`, no named path) with a plain `RETURN` (no
+    /// aggregation, no `DISTINCT`, no `ORDER BY`; `SKIP`/`LIMIT` are
+    /// fine). Anything else is a `Semantic` error naming the blocker,
+    /// not a silent fall-back to materialization, since the bounded-
+    /// memory promise must hold. The sink returning `Break` stops the
     /// scan cleanly (early termination, `Ok(())`).
     ///
     /// `max_result_rows`/`timeout`/cancellation apply per streamed row.
@@ -1024,14 +983,10 @@ impl<'a> Executor<'a> {
         crate::semantic::validate_statement(stmt)?;
         guard.checkpoint()?;
         // Same cache-generation reset as the top-level path
-        // (`execute_with_guard`) -- this is a second, separate entry
-        // point into statement execution (an explicit multi-statement
-        // `Transaction`, or a group-commit loop, calls this directly with
-        // an already-open `write_txn` instead of going through
-        // `execute`/`execute_with_options`), and `node_cache` is a field
-        // on `Executor`, not something either entry point owns privately
-        // -- skipping the reset here left the flag/map from whatever this
-        // `Executor` last did through the *other* entry point in effect.
+        // (`execute_with_guard`): this is a second entry point (an
+        // explicit multi-statement `Transaction` or a group-commit loop
+        // calls this directly with an already-open `write_txn`), and
+        // `node_cache` is shared by both entry points.
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(is_read_only(stmt));
@@ -1172,23 +1127,15 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// `CALL proc(args) [YIELD ...]` with nothing else in the statement
-    /// (TCK's Call1 `[1]`/`[2]`/`[5]`, Call2 `[2]`/`[3]`) -- unlike the
-    /// in-query form, this *is* the whole query: no outer rows to run the
-    /// call once per, and no YIELD at all means "auto-yield every output"
-    /// (`CallYield::Star`) rather than "discard everything."
-    /// `QueryClause::Call`'s own in-query handling -- calls the procedure
-    /// once per input row (TCK's Call1 `[3]`/`[4]`: even a `WHERE`-less,
-    /// output-less call still runs once per already-matched row, same as
-    /// any other reading clause). `None` (no `YIELD` at all) discards
-    /// every output and keeps `row` unchanged -- see `CallClause::
-    /// yield_items`'s own docs for why that's not the same as `Star`
-    /// (which never actually reaches here, `queryCallSt`'s grammar has no
-    /// `YIELD *` alternative). `Items` fans each input row out into one
-    /// output row per matching procedure result row (same cross-join
-    /// shape `eval_unwind` already gives its own per-row fan-out), each
-    /// carrying `row`'s own bindings forward plus the newly yielded ones,
-    /// filtered by `yieldItems`' own optional trailing `WHERE`.
+    /// `QueryClause::Call`'s in-query handling: calls the procedure once
+    /// per input row, even a `WHERE`-less, output-less call, same as any
+    /// other reading clause. No `YIELD` at all discards every output and
+    /// keeps `row` unchanged (the grammar has no `YIELD *` alternative
+    /// for the in-query form, so `CallYield::Star` never reaches here).
+    /// `Items` fans each input row out into one output row per matching
+    /// procedure result row, carrying `row`'s bindings forward plus the
+    /// newly yielded ones, filtered by `yieldItems`'s optional trailing
+    /// `WHERE`.
     fn eval_call_clause(
         &self,
         txn: Txn,
@@ -1270,13 +1217,12 @@ impl<'a> Executor<'a> {
     }
 
     /// Shared by `eval_standalone_call` and `QueryClause::Call`'s own
-    /// in-query handling -- looks up `call.name`'s signature, resolves and
-    /// type-checks its arguments against `row`'s already-bound variables
-    /// (explicit args) or `guard.options.params` (the implicit-argument
-    /// form, `call.args: None`), then invokes the provider. Returns the
-    /// signature alongside the raw output rows since both callers need it
-    /// again afterward (`sig.outputs`' names, for `YIELD *`/column
-    /// naming).
+    /// Looks up `call.name`'s signature, resolves and type-checks its
+    /// arguments against `row`'s bound variables (explicit args) or
+    /// `guard.options.params` (implicit-argument form, `call.args:
+    /// None`), then invokes the provider. Returns the signature
+    /// alongside the raw output rows since both callers need
+    /// `sig.outputs` again for `YIELD *`/column naming.
     fn call_procedure(
         &self,
         txn: Txn,
@@ -1330,11 +1276,9 @@ impl<'a> Executor<'a> {
                     .map(|a| self.eval_return_expr(txn, a, row, guard))
                     .collect::<Result<_, _>>()?
             }
-            // The implicit-argument form (`CALL proc`, no parens) --
-            // each declared input resolves from a same-named `$param`
-            // (TCK's Call1 `[11]`, Call2 `[3]`); missing is a
-            // `MissingParam`, same error real Cypher's own
-            // `ParameterMissing`/`MissingParameter` reports.
+            // Implicit-argument form (`CALL proc`, no parens): each
+            // declared input resolves from a same-named `$param`;
+            // missing is a `MissingParam` error.
             None => sig
                 .inputs
                 .iter()
@@ -1384,19 +1328,16 @@ impl<'a> Executor<'a> {
     }
 
     /// Runs CREATE patterns once per row in `rows`, returning each row's
-    /// bindings extended with whatever the CREATE patterns bound (newly
-    /// created node/edge ids, or the reused id for an already-bound
-    /// variable) -- this is what lets a trailing `RETURN` after a `MATCH
-    /// ... CREATE` tail (e.g. `MATCH (a) CREATE (a)-[:R]->(b) RETURN b`)
-    /// see the newly created `b`. Shared by a standalone `CREATE` statement
-    /// (`execute_create`, a single empty row, return value discarded -- no
-    /// RETURN is possible there) and a `MATCH ... CREATE` tail
-    /// (`execute_match`, rows carry bindings from the preceding
-    /// MATCH/WITH). The only real difference between the two is what
-    /// `resolve_or_create_node` finds already bound in a row -- nothing for
-    /// standalone CREATE, real nodes for a MATCH...CREATE tail, which is
-    /// what lets the tail form add an edge between two nodes that already
-    /// exist.
+    /// bindings extended with whatever got bound (newly created ids, or
+    /// the reused id for an already-bound variable) -- this is what
+    /// lets a trailing `RETURN` after a `MATCH ... CREATE` tail see the
+    /// newly created entities. Shared by a standalone `CREATE`
+    /// (`execute_create`, a single empty row, result discarded) and a
+    /// `MATCH ... CREATE` tail (`execute_match`, rows carry bindings
+    /// from the preceding MATCH/WITH) -- the difference is what
+    /// `resolve_or_create_node` finds already bound in a row: nothing
+    /// for standalone CREATE, real nodes for the tail form, which lets
+    /// it add an edge between two pre-existing nodes.
     fn materialize_create(
         &self,
         write_txn: &WriteTransaction,
@@ -1515,15 +1456,12 @@ impl<'a> Executor<'a> {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e)),
                 };
-                // `CREATE (n {prop: null})` never actually stores `prop`
-                // at all in real Cypher -- the same "setting to null
-                // removes/never-creates the property" rule
-                // `apply_set_item`'s own `SET n.prop = null` handling
-                // already has (see its docs), just never applied here
-                // too. Observable via `keys(n)`/property enumeration
-                // (TCK's Graph8 [8]) -- a stored `PropertyValue::Null`
-                // still shows up as a key, where a real missing property
-                // wouldn't.
+                // `CREATE (n {prop: null})` never actually stores `prop`,
+                // the same "setting to null removes/never-creates the
+                // property" rule `apply_set_item`'s `SET n.prop = null`
+                // handling uses. Observable via `keys(n)`: a stored
+                // `PropertyValue::Null` would show up as a key, where a
+                // missing property doesn't.
                 if matches!(value, Value::Null) {
                     return None;
                 }
@@ -1544,10 +1482,10 @@ impl<'a> Executor<'a> {
     }
 
     /// Runs `MERGE` once per row in `rows` (`clause.pattern.hops.len() <=
-    /// 1`, enforced at parse time — whole-pattern atomicity across
-    /// multiple simultaneously-unbound hops isn't attempted in v1: which
-    /// hop's "not found" should trigger creation of what, in what order,
-    /// gets genuinely hard to reason about correctly for longer chains).
+    /// 1`, enforced at parse time). Whole-pattern atomicity across
+    /// multiple simultaneously-unbound hops isn't supported: for longer
+    /// chains it's ambiguous which hop's "not found" should trigger
+    /// creation of what, in what order.
     fn eval_merge(
         &self,
         write_txn: &WriteTransaction,
@@ -1604,15 +1542,11 @@ impl<'a> Executor<'a> {
     ) -> Result<Vec<BindingRow>, QueryError> {
         // The bare-already-bound-start and reused-relationship-variable
         // cases are rejected at compile time (`semantic::bind_merge`),
-        // not only here -- a zero-row MATCH would otherwise skip both
-        // entirely even though real Cypher's `VariableAlreadyBound` is a
-        // structural/scope error, not a data-dependent one. A completely
-        // unconstrained, unbound token (bare `MERGE (a)`, no label/
-        // property) is real, valid Cypher -- searches for/creates any
-        // node with no constraints at all (TCK's Merge1 [1]), not an
-        // error; an earlier version of this codebase treated it as an
-        // "ambiguous shape" mistake to reject, which real Cypher's own
-        // TCK disproves.
+        // not only here -- a zero-row MATCH would otherwise skip both,
+        // even though that's a structural/scope error, not a
+        // data-dependent one. A completely unconstrained, unbound token
+        // (bare `MERGE (a)`, no label/property) is valid: it searches
+        // for/creates any node with no constraints, not an error.
         for (rel, _node) in &clause.pattern.hops {
             if rel.hop_range.is_some() {
                 return Err(QueryError::Semantic(
@@ -1621,15 +1555,10 @@ impl<'a> Executor<'a> {
             }
         }
         // `MERGE p = ...` -- give every anonymous token in the pattern a
-        // synthetic name first (same convention ordinary MATCH's own
-        // named-path capture uses, see `execute_match`'s `QueryClause::
-        // Match` arm), so `assemble_path` below has a real row binding to
-        // read at every position regardless of whether the user wrote one
-        // -- then strip those synthetic keys back out before this row
-        // becomes visible to the rest of the query. A no-`path_var` MERGE
-        // clones `clause.pattern` once here rather than working with it
-        // by reference throughout, so this function has exactly one
-        // pattern to work from either way.
+        // synthetic name first (same convention ordinary MATCH's
+        // named-path capture uses), so `assemble_path` below has a real
+        // row binding at every position, then strip those synthetic keys
+        // back out before the row is visible to the rest of the query.
         let (pattern, synthesized) = if clause.path_var.is_some() {
             name_pattern_for_path(&clause.pattern)
         } else {
@@ -1638,15 +1567,12 @@ impl<'a> Executor<'a> {
         let pattern = &pattern;
         // A MERGE pattern's own inline `{...}` property evaluating to
         // null can never be searched-or-created consistently: a null
-        // property is never equal to anything (so the search half can
-        // never find a node/edge that "has" it), but storing a
-        // property as null is equivalent to not storing it at all (see
-        // `apply_set_item`'s own SET-to-null convention) -- so the
-        // create half would silently produce something that doesn't
-        // structurally match the pattern that created it. Real Cypher's
-        // MergeReadOwnWrites error, checked once per row (a property
-        // expression can reference this row's other bindings, e.g.
-        // `MERGE (n {x: m.missing})`).
+        // property never matches anything on search, but storing null is
+        // equivalent to not storing the property at all (`apply_set_item`'s
+        // SET-to-null convention), so the create half would produce
+        // something that doesn't structurally match the search pattern.
+        // Checked once per row since a property expression can reference
+        // this row's other bindings (e.g. `MERGE (n {x: m.missing})`).
         if self.merge_pattern_has_null_property(Txn::Write(write_txn), clause, row, guard)? {
             return Err(QueryError::Semantic(
                 "MERGE pattern property is null — a MERGE's own {...} properties can never be \
@@ -1657,14 +1583,12 @@ impl<'a> Executor<'a> {
         }
 
         // Try the pattern as an ordinary MATCH first. Whatever's already
-        // bound in `row` (e.g. `a` from a preceding MATCH) becomes a Seed,
-        // not a fresh scan — build_match_plan already knows how to do
-        // this, the same mechanism every ordinary MATCH clause uses. For a
-        // one-hop pattern this already searches the *connected*
-        // sub-pattern (Expand from the resolved source, Filter by the
-        // target's own constraints), not each node independently — which
-        // is exactly the correctness property MERGE needs and gets for
-        // free by reusing this instead of inventing bespoke search logic.
+        // bound in `row` becomes a Seed, not a fresh scan -- the same
+        // `build_match_plan` mechanism every ordinary MATCH clause uses.
+        // For a one-hop pattern this searches the connected sub-pattern
+        // (Expand from the resolved source, Filter by the target's own
+        // constraints), not each node independently, which is the
+        // correctness property MERGE needs.
         let carried_vars: HashSet<String> = row.keys().cloned().collect();
         let plan = apply_index_seeks(
             build_match_plan(pattern, &None, &carried_vars)?,
@@ -1715,9 +1639,7 @@ impl<'a> Executor<'a> {
             let rel_props =
                 self.eval_props_to_values(Txn::Write(write_txn), &rel.props, &new_row, guard)?;
             // An undirected pattern (`-[r]-`) with nothing to match
-            // defaults to an outgoing relationship when creating -- real
-            // Cypher's own rule (TCK's Merge5 [11], "Use outgoing
-            // direction when unspecified").
+            // defaults to an outgoing relationship when creating.
             let (src, dst) = match rel.direction {
                 RelDirection::Right | RelDirection::Either => (start_id, node_id),
                 RelDirection::Left => (node_id, start_id),
@@ -1739,15 +1661,11 @@ impl<'a> Executor<'a> {
         Ok(vec![tag_merge_created(new_row, true)])
     }
 
-    /// Applies `ON CREATE SET`/`ON MATCH SET` to the right rows (matching
-    /// real Cypher semantics exactly: `ON CREATE` fires whenever anything
-    /// in the pattern was newly created, `ON MATCH` only when the whole
-    /// pattern already existed as-is — the single per-row
-    /// `MERGE_CREATED_KEY` tag is the correct model for this, not a
-    /// simplification of it — see `eval_optional_part`'s
-    /// `OPTIONAL_SEED_IDX_KEY` for the same hidden-tag precedent), then
-    /// strips the tag before the rows become visible to the rest of the
-    /// query.
+    /// Applies `ON CREATE SET`/`ON MATCH SET` to the right rows:
+    /// `ON CREATE` fires when the pattern was newly created, `ON MATCH`
+    /// only when it already existed as-is, tracked via the per-row
+    /// `MERGE_CREATED_KEY` tag. Strips the tag before the rows become
+    /// visible to the rest of the query.
     fn apply_merge_set(
         &self,
         write_txn: &WriteTransaction,
@@ -1786,15 +1704,12 @@ impl<'a> Executor<'a> {
     }
 
     /// `execute_match`'s general form -- `seed` is `None` for an ordinary
-    /// top-level statement (nothing carried in, same as `execute_match`'s
-    /// old fixed behavior) or `Some(row)` for a correlated `exists { MATCH
-    /// ... RETURN ... }` subquery (`eval_exists_subquery`): the outer row's
-    /// own bindings become this statement's starting `current_rows`/
-    /// `carried_vars`, so a pattern referencing an outer-bound name (`(n)
-    /// -->(m)` where `n` is already bound) seeds from it (`LogicalPlan::
-    /// Seed`) instead of scanning fresh, exactly like a later clause in an
-    /// ordinary multi-clause statement already does with an earlier
-    /// clause's bindings.
+    /// top-level statement, or `Some(row)` for a correlated
+    /// `exists { MATCH ... RETURN ... }` subquery
+    /// (`eval_exists_subquery`): the outer row's bindings become this
+    /// statement's starting `current_rows`/`carried_vars`, so a pattern
+    /// referencing an outer-bound name seeds from it (`LogicalPlan::Seed`)
+    /// instead of scanning fresh.
     fn execute_match_seeded(
         &self,
         txn: Txn,
@@ -1834,17 +1749,14 @@ impl<'a> Executor<'a> {
             _ => None,
         };
         // DISTINCT's counterpart to `final_stream_limit`: `RETURN
-        // DISTINCT ... LIMIT k` with no ORDER BY and no aggregation can
-        // stop the final MATCH pipeline as soon as SKIP+LIMIT *distinct
-        // projected rows* have appeared — a plain row-count cap can't
-        // express that (the number of raw rows needed is data-dependent),
-        // so `collect_rows_until_distinct` projects and dedups while
-        // pulling, with exactly `dedup_rows`'s key so the semantics stay
-        // `materialize_return`'s. The payoff case is a var-length
-        // traversal that revisits the same endpoints through many paths
-        // (`(p)-[:KNOWS*1..3]-(friend) RETURN DISTINCT friend... LIMIT
-        // 20`): `VarExpandIter` is lazy, so unpulled paths are never
-        // enumerated at all.
+        // DISTINCT ... LIMIT k` with no ORDER BY/aggregation can stop
+        // once SKIP+LIMIT *distinct projected rows* have appeared. A
+        // plain row-count cap can't express that since the number of raw
+        // rows needed is data-dependent, so `collect_rows_until_distinct`
+        // projects and dedups while pulling, using `dedup_rows`'s key.
+        // Pays off most for a var-length traversal that revisits the
+        // same endpoints through many paths, since `VarExpandIter` is
+        // lazy and unpulled paths are never enumerated.
         let final_distinct_limit = match (order_by, limit, tail) {
             (None, Some(limit), Some(Tail::Return(items, true))) if !has_aggregate(items) => {
                 Some((
@@ -1873,10 +1785,7 @@ impl<'a> Executor<'a> {
                     // sweep bypasses `build_match_plan_scoped`, so a
                     // part it planned would neither record its own
                     // relationships into the scope nor exclude an
-                    // earlier part's. (The aggregating-expansion fast
-                    // path needs no gate — it requires a WITH and an
-                    // empty carried row, which no shared-clause part can
-                    // satisfy.)
+                    // earlier part's.
                     let shares_clause = part.continues_clause
                         || matches!(
                             clauses.get(clause_index + 1),
@@ -1892,20 +1801,15 @@ impl<'a> Executor<'a> {
                         self.eval_shortest_path(txn, part, &current_rows, guard)?
                     } else if let Some(path_var) = &part.path_var {
                         let (named_pattern, synthesized) = name_pattern_for_path(&part.pattern);
-                        // A named path's own inline `WHERE` can reference
-                        // the path variable itself (`WHERE length(p) =
-                        // 1`, TCK's MatchWhere1 `[12]`/`[13]`) -- `p`
-                        // isn't in the row until *after* `assemble_path`
-                        // below, so (for a plain, non-`OPTIONAL` MATCH)
-                        // it can't be pushed into the plan the way an
-                        // ordinary pattern's `WHERE` is; applied as a
-                        // post-filter instead, once every row really has
-                        // `p`. `OPTIONAL MATCH` still pushes it into the
-                        // plan -- its own null-padding semantics need the
-                        // filter fused into the "did this seed row match
-                        // anything" check `eval_optional_part` does, and
-                        // a `WHERE` referencing `p` there is a narrower,
-                        // untested-by-the-TCK edge case left as-is.
+                        // A named path's inline `WHERE` can reference the
+                        // path variable itself (`WHERE length(p) = 1`);
+                        // `p` isn't in the row until `assemble_path`
+                        // below runs, so for a plain, non-`OPTIONAL`
+                        // MATCH it's applied as a post-filter instead of
+                        // pushed into the plan. `OPTIONAL MATCH` still
+                        // pushes it into the plan since its null-padding
+                        // semantics need the filter fused into
+                        // `eval_optional_part`'s match check.
                         let defer_where = !part.optional && part.where_clause.is_some();
                         let plan_where = if defer_where {
                             &None
@@ -1920,14 +1824,10 @@ impl<'a> Executor<'a> {
                             let new_vars = pattern_new_vars(&named_pattern, &carried_vars);
                             self.eval_optional_part(txn, &plan, &current_rows, &new_vars, guard)?
                         } else {
-                            // `plan_limit`'s own early-stop assumes every
-                            // emitted row is already a real, final row --
-                            // not true when the WHERE filter above got
-                            // deferred (a limited prefix could still get
-                            // filtered further below), so it's skipped
-                            // for that case (limiting instead happens
-                            // naturally via the smaller `rows` this
-                            // clause returns).
+                            // `plan_limit`'s early-stop assumes every
+                            // emitted row is already final, which isn't
+                            // true when the WHERE filter above got
+                            // deferred, so it's skipped for that case.
                             let limit = plan_limit.filter(|_| !defer_where);
                             self.eval_plan_with_limit(txn, &plan, &current_rows, guard, limit)?
                         };
@@ -2097,12 +1997,10 @@ impl<'a> Executor<'a> {
                     )?;
                 }
                 QueryClause::Merge(m) => {
-                    // MERGE always needs real `.insert`-capable write
-                    // access, whether or not the rest of the statement
-                    // would otherwise be read-only (e.g. `MERGE (n) RETURN
-                    // n`) — see `is_read_only`, which already accounts for
-                    // this by checking `clauses` too, so `txn` is
-                    // guaranteed to be `Txn::Write` here.
+                    // MERGE always needs write access, whether or not the
+                    // rest of the statement is otherwise read-only --
+                    // `is_read_only` accounts for this, so `txn` is
+                    // guaranteed `Txn::Write` here.
                     let write_txn = require_write_txn(txn);
                     current_rows = self.eval_merge(write_txn, m, &current_rows, guard)?;
                     let mut new_vars = pattern_all_vars(&m.pattern);
@@ -2119,11 +2017,8 @@ impl<'a> Executor<'a> {
                     )?;
                 }
                 // A statement-leading WITH -- no pattern was matched, so
-                // there's nothing to seed `new_vars` with beyond what the
-                // WITH clause itself projects (`apply_with_or_carry`
-                // always takes the `Some(with)` branch here, never the
-                // "no WITH, just extend carried_vars" one, since `with` is
-                // always present on this variant by construction).
+                // `new_vars` seeds with nothing beyond what WITH itself
+                // projects.
                 QueryClause::With(with) => {
                     current_rows = self.apply_with_or_carry(
                         txn,
@@ -2134,15 +2029,10 @@ impl<'a> Executor<'a> {
                         guard,
                     )?;
                 }
-                // `SET ... WITH ...` -- same real `.set_*_prop_in_txn`
-                // write access `materialize_set`'s own per-row loop
-                // already needs (guaranteed `Txn::Write` here for the
-                // same reason its own docs give). Doesn't change any
-                // row's bindings, only mutates the underlying graph --
-                // `current_rows`/`carried_vars` both pass through
-                // unchanged, the following `clause` (always a `WITH`,
-                // see `set_as_clause`'s grammar) handles its own
-                // projection/`WHERE`/`ORDER BY` normally from there.
+                // `SET ... WITH ...`: mutates the graph but doesn't
+                // change any row's bindings, so `current_rows`/
+                // `carried_vars` pass through unchanged; the following
+                // `WITH` clause handles projection/`WHERE`/`ORDER BY`.
                 QueryClause::Set(items) => {
                     let write_txn = require_write_txn(txn);
                     for row in &current_rows {
@@ -2152,10 +2042,9 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // `DELETE/DETACH DELETE ... WITH ...` -- same passthrough
-                // reasoning as `QueryClause::Set` above (see
-                // `delete_as_clause`'s grammar docs). Reuses the same
-                // `delete_binding`/`delete_value` helpers `materialize_delete`
-                // itself calls.
+                // reasoning as `QueryClause::Set` above. Reuses the
+                // `delete_binding`/`delete_value` helpers
+                // `materialize_delete` itself calls.
                 QueryClause::Delete { items, detach } => {
                     let write_txn = require_write_txn(txn);
                     self.delete_targets(txn, write_txn, items, &current_rows, *detach, guard)?;
@@ -2172,15 +2061,10 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // `CREATE ... WITH ...` -- unlike Set/Delete/Remove above,
-                // this DOES change every row's bindings (each pattern's
-                // own fresh/reused vars), so `current_rows` is replaced,
-                // not passed through, and `carried_vars` is extended
-                // directly (no bundled `.with` field on this variant to
-                // route through `apply_with_or_carry` the way `Merge`
-                // does above -- the following `WITH` is its own separate
-                // `QueryClause::With` entry, picked up by this same loop's
-                // next iteration, which needs `carried_vars` to already
-                // reflect these new names by then).
+                // this changes every row's bindings, so `current_rows` is
+                // replaced and `carried_vars` extended directly; the
+                // following `WITH` is a separate `QueryClause::With`
+                // picked up by this loop's next iteration.
                 QueryClause::Create(patterns) => {
                     let write_txn = require_write_txn(txn);
                     current_rows =
@@ -2190,16 +2074,12 @@ impl<'a> Executor<'a> {
             }
             guard.check_intermediate_rows(current_rows.len())?;
         }
-        // ORDER BY must see every matching row before LIMIT truncates —
-        // sort, then take N, not the other way around. Only pre-truncate
-        // (the v1 "doesn't short-circuit" path) when there's no ORDER BY to
-        // invalidate it; DELETE/SET+LIMIT keep their "stop after N
-        // bindings" behavior since they have no ORDER BY position in the
-        // grammar. RETURN DISTINCT is excluded too, same reasoning as
-        // ORDER BY: DISTINCT can still drop rows *after* this point, so
-        // pre-truncating the raw input here could return fewer than
-        // `limit` distinct rows even when more exist -- its LIMIT gets
-        // applied after dedup instead, below.
+        // ORDER BY must see every matching row before LIMIT truncates, so
+        // pre-truncation here only happens when there's no ORDER BY.
+        // RETURN DISTINCT is excluded for the same reason: it can still
+        // drop rows after this point, so pre-truncating could return
+        // fewer than `limit` distinct rows even when more exist -- its
+        // LIMIT is applied after dedup instead, below.
         let distinct_return = tail_is_distinct_return(tail);
         if order_by.is_none() && !distinct_return {
             let skip_n = skip.unwrap_or(0).max(0) as usize;
@@ -2210,31 +2090,20 @@ impl<'a> Executor<'a> {
                 current_rows.truncate(count.max(0) as usize);
             }
         }
-        // Delete/Set need real `.insert`/`.remove`-capable write access,
-        // not just `Txn`'s read-only `get`/`iter` — but they're only ever
-        // reached via `Executor::execute`'s write-dispatch path (see
-        // `is_read_only`), which always opens a `WriteTransaction`, so
-        // `txn` is guaranteed to be `Txn::Write` here.
         // A non-aggregating RETURN's ORDER BY can reference either a
-        // RETURN-introduced alias (`RETURN friend.id AS friendId ORDER BY
-        // friendId`) or a variable still in scope that isn't returned at
-        // all (`RETURN n.num AS prop ORDER BY n.num` — `n` itself never
-        // appears in the RETURN list) — real Cypher allows both. Sorting
-        // needs both the pre-projection bindings *and* the post-projection
-        // output columns available at once, so it happens after
+        // RETURN-introduced alias or a variable still in scope that
+        // isn't returned at all (`RETURN n.num AS prop ORDER BY n.num`).
+        // Sorting needs both the pre-projection bindings and the
+        // post-projection output columns at once, so it happens after
         // `materialize_return`, against a combined view of the two (see
-        // `apply_order_by_with_scope`) rather than either alone. The
-        // aggregating case can't use pre-projection bindings at all
-        // (grouping has already collapsed the per-row bindings by then), so
-        // it keeps sorting the post-projection output alone via
-        // `apply_order_by`, further down.
+        // `apply_order_by_with_scope`). The aggregating case has no
+        // pre-projection bindings left after grouping, so it sorts the
+        // post-projection output alone via `apply_order_by`, further down.
         let mut order_by_pre_applied = false;
         let mut result = match tail {
-            // A missing tail only ever occurs with a MERGE clause and
-            // nothing after it — a pure write, same empty result shape
-            // standalone CREATE already returns (not one blank row per
-            // `current_rows`, which a synthetic `Tail::Return(vec![])`
-            // would produce instead).
+            // A missing tail only occurs with a MERGE clause and nothing
+            // after it -- a pure write, same empty result shape
+            // standalone CREATE returns.
             None => QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -2361,12 +2230,10 @@ impl<'a> Executor<'a> {
         Ok(result)
     }
 
-    /// Applies a clause's optional trailing `WITH` (shared by both
-    /// `QueryClause::Match` and `QueryClause::Unwind`, which can each end
-    /// in one — see `QueryClause`'s docs), or, with no `WITH`, grows
-    /// `carried_vars` by `new_vars` so the next clause shares this one's
-    /// binding scope — same "no WITH means stay in scope" rule `OPTIONAL
-    /// MATCH` already gets, now uniform across clause kinds.
+    /// Applies a clause's optional trailing `WITH` (shared by
+    /// `QueryClause::Match` and `QueryClause::Unwind`), or, with no
+    /// `WITH`, grows `carried_vars` by `new_vars` so the next clause
+    /// shares this one's binding scope.
     fn apply_with_or_carry(
         &self,
         txn: Txn,
@@ -2381,20 +2248,16 @@ impl<'a> Executor<'a> {
             return Ok(rows);
         };
         // `WITH *` -- expand to every name already carried into this
-        // clause *plus* whatever this same clause's own pattern just
-        // bound (`new_vars`, e.g. MERGE's own target -- `carried_vars`
-        // alone wouldn't have that yet, since it's only ever updated at
-        // this function's very end). `with_owned` only exists to give
-        // the rest of this function a `&WithClause` with `items` already
-        // containing the expanded names, without touching any of its
-        // other fields (`order_by`/`skip`/`limit`/`distinct`/
-        // `where_clause` all stay exactly as parsed).
+        // clause plus whatever this clause's own pattern just bound
+        // (`new_vars`, e.g. MERGE's target; `carried_vars` alone
+        // wouldn't have that yet). `with_owned` exists to give the rest
+        // of this function a `&WithClause` with `items` already
+        // expanded, leaving other fields untouched.
         let with_owned;
         let with: &WithClause = if with.star {
-            // A `HashSet` union, not a plain chain -- `new_vars` can
-            // legitimately overlap with `carried_vars` (e.g. `MATCH (a)
-            // MERGE (a)-[:R]->(b)` reuses the already-bound `a`), and a
-            // raw chain would double it up into two identical columns.
+            // Union, not a chain -- `new_vars` can overlap with
+            // `carried_vars` (e.g. `MATCH (a) MERGE (a)-[:R]->(b)`), and
+            // a chain would double it into two identical columns.
             let star_items = with_star_items(carried_vars.union(&new_vars).cloned());
             let mut owned = with.clone();
             let mut items = star_items;
@@ -2412,14 +2275,11 @@ impl<'a> Executor<'a> {
             .as_ref()
             .filter(|_| has_aggregate(&with.items))
         {
-            // `materialize_aggregating_with_with_order` folds its own
-            // extra composed ORDER BY keys through the same grouping pass
-            // as `with.items` -- also covers `with.distinct` correctly
-            // without any extra handling here, since grouping already
-            // makes every output row unique by its own grouping-key
-            // columns (see that function's `RETURN`-side twin's own docs
-            // on why that makes `DISTINCT` a no-op downstream of
-            // aggregation).
+            // `materialize_aggregating_with_with_order` folds its extra
+            // composed ORDER BY keys through the same grouping pass as
+            // `with.items`; grouping already makes every output row
+            // unique by its grouping-key columns, so `with.distinct`
+            // needs no extra handling here.
             self.materialize_aggregating_with_with_order(
                 txn,
                 &with.items,
@@ -2436,9 +2296,8 @@ impl<'a> Executor<'a> {
             let mut rows = self.materialize_with(txn, with, &rows, guard)?;
             if let Some(with_order_by) = &with.order_by {
                 // Only a non-aggregating, non-`DISTINCT` WITH keeps a 1:1
-                // row correspondence with its pre-WITH input -- see
-                // `apply_order_by_bindings`'s own docs on why that's
-                // exactly when ORDER BY can also see the pre-WITH scope.
+                // row correspondence with its pre-WITH input, which is
+                // when ORDER BY can also see the pre-WITH scope.
                 rows = self.apply_order_by_bindings(
                     txn,
                     rows,
@@ -2511,35 +2370,28 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
-    /// `shortestPath((a)-[:TYPE*..N]-(b))` — a real parent-pointer BFS
-    /// between two already-bound endpoints, not a `LogicalPlan`/
-    /// `VarExpand` traversal (which only tracks final position plus a
-    /// visited set, not the hop-by-hop chain a path needs to reconstruct).
-    /// BFS visits in non-decreasing depth order, so the first time `b` is
-    /// reached is *a* shortest path — stop there and reconstruct via
-    /// parent pointers, rather than enumerating every path up to some
-    /// bound the way `VarExpand` does.
+    /// `shortestPath((a)-[:TYPE*..N]-(b))` — a parent-pointer BFS between
+    /// two already-bound endpoints, not a `LogicalPlan`/`VarExpand`
+    /// traversal (which tracks only final position and a visited set,
+    /// not the hop-by-hop chain a path needs). BFS visits in
+    /// non-decreasing depth order, so the first time `b` is reached is a
+    /// shortest path; reconstruct via parent pointers there instead of
+    /// enumerating every path up to some bound.
     ///
-    /// Both endpoints must already be bound by a preceding clause (e.g.
-    /// `MATCH (a:Person{name:'Alice'}), (b:Person{name:'Bob'}) MATCH p =
-    /// shortestPath((a)-[:KNOWS*]-(b)) RETURN p` — parser-enforced, see
-    /// `parser::validate_shortest_path_pattern`) — v1 doesn't attempt to
-    /// resolve a fresh/scanned endpoint here the way ordinary MATCH does,
-    /// since "shortest path to *any* node matching these constraints" is a
-    /// different, more ambiguous question than "shortest path between
-    /// these two specific nodes."
+    /// Both endpoints must already be bound by a preceding clause
+    /// (parser-enforced, see `parser::validate_shortest_path_pattern`):
+    /// resolving a fresh/scanned endpoint here would make "shortest path
+    /// to *any* node matching these constraints" ambiguous in a way
+    /// "shortest path between these two nodes" isn't.
     ///
-    /// Every input row always survives (unlike an ordinary pattern match,
-    /// which can produce zero rows for a non-match) — an unreachable pair
-    /// binds the path variable to `Null`, same as `OPTIONAL MATCH`'s
-    /// null-padding, rather than dropping the row. `part.optional` is
-    /// therefore a no-op here, not separately handled. Exceeding the
-    /// safety depth cap on an unbounded (`*..`) search also resolves to
-    /// `Null`, not an error — unlike `VarExpand`'s cap (which errors,
-    /// because truncating there would silently produce an *incomplete
-    /// set* of paths, a wrong-answer risk), `shortestPath()` is only ever
-    /// answering "is there a path within the searched horizon," which is
-    /// a well-defined answer either way.
+    /// Every input row survives: an unreachable pair binds the path
+    /// variable to `Null` (`OPTIONAL MATCH`-style null-padding) rather
+    /// than dropping the row, so `part.optional` is a no-op here.
+    /// Exceeding the safety depth cap on an unbounded (`*..`) search also
+    /// resolves to `Null`, not an error, unlike `VarExpand`'s cap: a
+    /// truncated `VarExpand` would silently produce an incomplete path
+    /// set, but `shortestPath()` only ever answers "is there a path
+    /// within the searched horizon," which is well-defined either way.
     fn eval_shortest_path(
         &self,
         txn: Txn,
@@ -2607,14 +2459,13 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
-    /// The BFS itself. `min_hops` is only ever 0 or 1 (`validate_shortest_
-    /// path_pattern` rejects anything higher) — deliberately: a plain
-    /// visited-set BFS can't correctly answer "shortest path of at least N
-    /// hops" for N > 1 (a node first reached at a too-early depth would
-    /// need to stay revisitable for a later, longer route to it, which a
-    /// visited-set structurally can't represent) without a different
-    /// (node, depth)-keyed algorithm. Rejecting the case outright at parse
-    /// time is safer than silently answering it wrong.
+    /// The BFS itself. `min_hops` is only ever 0 or 1
+    /// (`validate_shortest_path_pattern` rejects anything higher): a
+    /// plain visited-set BFS can't correctly answer "shortest path of at
+    /// least N hops" for N > 1, since a node reached too early would
+    /// need to stay revisitable for a later, longer route, which a
+    /// visited-set can't represent without a (node, depth)-keyed
+    /// algorithm.
     fn shortest_path_between(
         &self,
         txn: Txn,
@@ -2705,19 +2556,13 @@ impl<'a> Executor<'a> {
                     }
                 }
             } else {
-                // Real Cypher lets a `WITH x AS y WHERE ...` immediately
-                // following see *both* the pre-WITH binding (`x`) and the
-                // new alias (`y`) -- confirmed via the TCK's own
-                // `WithWhere7` scenarios. New aliases shadow same-named
-                // old bindings on conflict. Still true with `DISTINCT` --
-                // unlike aggregation, `DISTINCT` alone doesn't collapse
-                // several pre-WITH rows into one *ambiguous* group; it's
-                // a dedup applied to the *surviving*, still individually-
-                // real rows, which is why the dedup itself happens below,
-                // after this filter, not before it (TCK's WithWhere1
-                // `[2]`: `WITH DISTINCT a.name2 AS name WHERE a.name2 =
-                // 'B'` needs `a` from the row that produced each
-                // candidate `name`, not just `name` itself).
+                // `WITH x AS y WHERE ...` sees both the pre-WITH binding
+                // (`x`) and the new alias (`y`); new aliases shadow
+                // same-named old bindings on conflict. Still true with
+                // `DISTINCT`: unlike aggregation, `DISTINCT` doesn't
+                // collapse several pre-WITH rows into one ambiguous
+                // group, it dedups the surviving individual rows, so the
+                // dedup happens below, after this filter, not before.
                 for (row, new_row) in rows.iter().zip(out) {
                     let mut merged = row.clone();
                     merged.extend(new_row.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -2734,13 +2579,12 @@ impl<'a> Executor<'a> {
         Ok(out)
     }
 
-    /// `materialize_aggregating_return_with_order`'s `WITH`-side twin --
-    /// same "fold extra composed ORDER BY keys through the same grouping
-    /// pass as `with_items` themselves" approach (TCK's WithOrderBy4
-    /// `[16]`-`[18]`), just producing `Vec<BindingRow>` (preserving graph
-    /// identity for whatever clause comes after this `WITH`) instead of a
-    /// final `QueryResult` -- the extra keys' own values are only ever
-    /// used for sorting here, never carried into the output rows.
+    /// `materialize_aggregating_return_with_order`'s `WITH`-side twin:
+    /// folds extra composed ORDER BY keys through the same grouping pass
+    /// as `with_items`, but produces `Vec<BindingRow>` (preserving graph
+    /// identity for the next clause) instead of a final `QueryResult`.
+    /// The extra keys' values are used only for sorting, never carried
+    /// into the output rows.
     fn materialize_aggregating_with_with_order(
         &self,
         txn: Txn,
@@ -2837,16 +2681,14 @@ impl<'a> Executor<'a> {
             other => {
                 let value = self.eval_return_expr(txn, other, row, guard)?;
                 // `value_to_property_value` collapses Node/Edge/List/Path
-                // to Null -- fine for a bare Var (handled above, never
-                // reaches here) but wrong for any *wrapped* non-Var
-                // expression that still evaluates to one of those (a list
-                // literal/index/slice, or a CASE branch returning a bound
-                // node/edge): those need the matching real Binding kind,
-                // not a silently-nulled scalar. `Path` still falls back to
-                // Null here -- a real, separate gap (needs a `Value::Path`
-                // -> `Binding::Path` conversion this doesn't have yet),
-                // not something any currently-reachable expression form
-                // produces though.
+                // to Null -- fine for a bare Var (handled above) but
+                // wrong for a wrapped non-Var expression still
+                // evaluating to one of those (a list literal/index/
+                // slice, or a CASE branch returning a bound node/edge),
+                // which needs the matching real Binding kind instead.
+                // `Path` still falls back to Null: a `Value::Path` ->
+                // `Binding::Path` conversion doesn't exist yet, though no
+                // currently-reachable expression form hits this.
                 Ok(match value {
                     Value::Node(n) => Binding::Node(n.id),
                     Value::Edge(e) => Binding::Edge(e.id),
@@ -2869,28 +2711,23 @@ impl<'a> Executor<'a> {
         // `Some`, same length as `rows`, only for a non-aggregating,
         // non-`DISTINCT` WITH (1:1 row correspondence with the pre-WITH
         // input) -- lets ORDER BY see both the pre-WITH scope and the
-        // new aliases, matching `where_clause`'s own merge (real Cypher:
-        // `WITH a.count AS count ORDER BY a.count`, `a` isn't projected
-        // but is still a valid sort key, TCK's With4 [6]). `None` for an
-        // aggregating/`DISTINCT` WITH -- many pre-WITH rows collapse
-        // into one output row there, so no single pre-WITH scope exists
-        // to merge in.
+        // new aliases (`WITH a.count AS count ORDER BY a.count`: `a`
+        // isn't projected but is still a valid sort key). `None` for an
+        // aggregating/`DISTINCT` WITH, where many pre-WITH rows collapse
+        // into one output row and no single pre-WITH scope exists.
         pre_with_rows: Option<&[BindingRow]>,
         with_items: &[ReturnItem],
         order_by: &[(ReturnExpr, SortDir)],
         skip_limit: (Option<i64>, Option<i64>),
     ) -> Result<Vec<BindingRow>, QueryError> {
         let (skip, limit) = skip_limit;
-        // Same reasoning as `apply_order_by`'s `order_by_col` shortcut: an
-        // ORDER BY item that repeats a WITH item's expression verbatim
-        // (`WITH sum(x) AS s ORDER BY sum(x)`, TCK's WithOrderBy4 [11])
-        // refers to that already-computed item, not a fresh expression --
-        // look it up by its output name directly (works whether or not
-        // that item has an alias) rather than re-evaluating the
-        // expression, which would need pre-aggregation bindings that no
-        // longer exist at this post-`materialize_with` point (an
-        // aggregate call reaching `eval_projected_expr` always errors, by
-        // design).
+        // Same reasoning as `apply_order_by`'s `order_by_col` shortcut:
+        // an ORDER BY item that repeats a WITH item's expression
+        // verbatim (`WITH sum(x) AS s ORDER BY sum(x)`) refers to that
+        // already-computed item, not a fresh expression -- look it up by
+        // output name rather than re-evaluating, since post-
+        // `materialize_with` there are no pre-aggregation bindings left
+        // to evaluate it against.
         let order_by_output: Vec<Option<String>> = order_by
             .iter()
             .map(|(expr, _)| {
@@ -2905,10 +2742,9 @@ impl<'a> Executor<'a> {
         for (i, row) in rows.into_iter().enumerate() {
             let mut value_map = self.binding_row_to_value_map(txn, &row)?;
             if let Some(pre) = pre_with_rows {
-                // Pre-WITH names fill in gaps only -- a new alias with the
-                // same name already occupies that key in `value_map` and
-                // must keep winning (matches `materialize_with`'s own
-                // "new aliases shadow same-named old bindings" rule).
+                // Pre-WITH names fill in gaps only -- a new alias with
+                // the same name already occupies that key in `value_map`
+                // and keeps winning.
                 for (k, v) in self.binding_row_to_value_map(txn, &pre[i])? {
                     value_map.entry(k).or_insert(v);
                 }
@@ -2930,14 +2766,12 @@ impl<'a> Executor<'a> {
     }
 
     /// Sorts an already-`materialize_return`d result for a non-aggregating
-    /// `RETURN`, evaluating each ORDER BY expression against *both* the
-    /// pre-projection `BindingRow` it came from and its own projected
-    /// output columns overlaid on top — real Cypher allows ORDER BY to
-    /// reference either a RETURN alias or a still-in-scope variable that
-    /// wasn't returned at all, so neither view alone is enough (see the
-    /// call site in `execute_match`). `binding_rows` and `result.rows` are
-    /// the same length and pairwise correspond — `materialize_return`'s
-    /// non-aggregating path preserves row order 1:1 with its input.
+    /// `RETURN`, evaluating each ORDER BY expression against both the
+    /// pre-projection `BindingRow` and the projected output columns
+    /// overlaid on top: ORDER BY can reference either a RETURN alias or
+    /// a still-in-scope variable that wasn't returned, so neither view
+    /// alone is enough. `binding_rows` and `result.rows` are the same
+    /// length and pairwise correspond.
     fn apply_order_by_with_scope(
         &self,
         txn: Txn,
@@ -3029,18 +2863,13 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// `type(r)` -- unlike every other property/label access, real Cypher
-    /// still allows this after `DELETE r` deleted the relationship
-    /// earlier in the same statement (a relationship's type never
-    /// changes, so there's nothing mutable a live record could be hiding
-    /// -- unlike `labels()`/property access, which stay real
-    /// `DeletedEntityAccess` errors, TCK's Return2 `[14]`-`[17]`). Tries
-    /// the ordinary evaluation first; only on failure, and only for a
-    /// bare `Var` bound to an edge, falls back to `guard`'s cached type
-    /// from the moment it was deleted (`ExecutionGuard::
-    /// deleted_edge_types`'s own docs). Any other failure (unbound
-    /// variable, a genuinely wrong argument type, ...) propagates
-    /// unchanged.
+    /// `type(r)` -- unlike other property/label access, still allowed
+    /// after `DELETE r` deleted the relationship earlier in the same
+    /// statement, since a relationship's type never changes. Tries the
+    /// ordinary evaluation first; only on failure, and only for a bare
+    /// `Var` bound to an edge, falls back to `guard`'s cached type from
+    /// the moment it was deleted (`ExecutionGuard::deleted_edge_types`).
+    /// Any other failure propagates unchanged.
     fn eval_type_call(
         &self,
         txn: Txn,
@@ -3094,35 +2923,28 @@ impl<'a> Executor<'a> {
     /// `Binding` (via `item_binding`), then finishes each aggregating
     /// item's accumulator(s) per group. Returns one `Vec<Binding>` per
     /// output group, column-aligned with `items`. Shared by
-    /// `materialize_with` and `materialize_return` — both already take the
-    /// same `rows: &[BindingRow]` input type, so the grouping core stays
-    /// in `Binding`-space (preserving graph identity for bare-var grouping
-    /// keys) and each caller does its own thin final conversion.
+    /// `materialize_with` and `materialize_return`, so the grouping core
+    /// stays in `Binding`-space (preserving graph identity for bare-var
+    /// grouping keys) and each caller does its own thin final conversion.
     ///
-    /// An item "aggregates" (`contains_aggregate`) in one of two shapes:
-    /// purely (`count(a)`, `count(*)`, the only shape this used to
-    /// support) or composed with other expressions (`count(a) + 3`, `a,
-    /// count(a)` isn't this -- `a` is its own separate, non-aggregating
-    /// item). Either way, `Group.accs[i]` holds one `AggAcc` per
-    /// aggregate-bearing subexpression found in that item's tree
-    /// (`collect_agg_nodes`'s order — empty for a non-aggregating item,
-    /// exactly one for the purely-aggregating shape), and finishing a
-    /// composed item evaluates its whole expression tree via
-    /// `rewrite_composed_item` rather than just unwrapping a single
-    /// accumulator. `validate_return_items` (which callers must run
-    /// first) already guarantees every non-aggregate leaf inside a
-    /// composed item's tree matches some *other* item's own top-level
-    /// expression verbatim, so this function trusts that invariant rather
-    /// than re-checking it.
+    /// An item "aggregates" (`contains_aggregate`) either purely
+    /// (`count(a)`, `count(*)`) or composed with other expressions
+    /// (`count(a) + 3`; `a, count(a)` isn't this -- `a` is its own
+    /// separate, non-aggregating item). `Group.accs[i]` holds one
+    /// `AggAcc` per aggregate-bearing subexpression in that item's tree
+    /// (`collect_agg_nodes`'s order), and finishing a composed item
+    /// evaluates its whole expression tree via `rewrite_composed_item`
+    /// rather than unwrapping a single accumulator. `validate_return_items`
+    /// (which callers must run first) guarantees every non-aggregate leaf
+    /// inside a composed item's tree matches some other item's top-level
+    /// expression verbatim, so this trusts that invariant.
     ///
     /// Grouping-key lookup is a hash-map lookup (`group_index`, keyed by
-    /// `binding_hash_key`'s output — `Binding`/`PropertyValue` don't
-    /// derive `Eq`/`Hash` themselves, `PropertyValue::Float` can't, so
-    /// `HashKey` stands in for them; see its docs) into `groups`, which
-    /// stays a plain `Vec` for insertion-order-stable output when there's
-    /// no ORDER BY. O(1) average per row, not the O(rows × groups) linear
-    /// scan this used to be — see BENCHMARKS.md for the measured
-    /// before/after.
+    /// `binding_hash_key`'s output -- `HashKey` stands in since
+    /// `Binding`/`PropertyValue` don't derive `Eq`/`Hash`, `PropertyValue::
+    /// Float` can't) into `groups`, which stays a plain `Vec` for
+    /// insertion-order-stable output when there's no ORDER BY. O(1)
+    /// average per row.
     fn resolve_grouped_rows(
         &self,
         txn: Txn,
@@ -3171,13 +2993,9 @@ impl<'a> Executor<'a> {
             })
             .collect();
 
-        // Groups live in `groups` (insertion order, for stable output when
-        // there's no ORDER BY) with `group_index` as a hash-based lookup
-        // into it, keyed by a hashable stand-in for `key_bindings` (see
-        // `HashKey` — `Binding`/`PropertyValue` don't derive `Eq`/`Hash`
-        // themselves, `PropertyValue::Float` can't). O(1) average lookup
-        // per row instead of the O(groups) linear scan this replaced —
-        // see BENCHMARKS.md for the measured before/after.
+        // Groups live in `groups` (insertion order, for stable output
+        // when there's no ORDER BY), with `group_index` as a hash-based
+        // lookup into it keyed by `HashKey` (see this function's docs).
         let mut groups: Vec<Group> = Vec::new();
         let mut group_index: HashMap<Vec<Option<HashKey>>, usize> = HashMap::new();
         for row in rows {
@@ -3269,12 +3087,12 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // Global aggregate over an empty result set (no grouping-key items
-        // at all, and no rows to seed a group from) still produces exactly
-        // one output row — `count`/`count(*)` -> 0, `sum` -> 0,
-        // `avg`/`min`/`max` -> Null, `collect` -> [] — via the same
-        // fresh-accumulator `finish()` path a normal empty-contribution
-        // group already uses below, not a separate code path.
+        // Global aggregate over an empty result set (no grouping-key
+        // items, no rows to seed a group from) still produces exactly
+        // one output row -- `count`/`count(*)` -> 0, `sum` -> 0,
+        // `avg`/`min`/`max` -> Null, `collect` -> [] -- via the same
+        // fresh-accumulator `finish()` path an empty-contribution group
+        // uses below.
         let no_key_items = items.iter().all(|item| contains_aggregate(&item.expr));
         if groups.is_empty() && no_key_items {
             groups.push(Group {
@@ -3311,18 +3129,15 @@ impl<'a> Executor<'a> {
 
     /// Finishing half of a composed aggregate item (`count(a) + 3`):
     /// rewrites `expr`'s tree into an equivalent one `eval_projected_expr`
-    /// can evaluate without any further graph access, replacing every
+    /// can evaluate with no further graph access, replacing every
     /// aggregate-bearing subexpression with a synthetic `Var` referencing
-    /// its now-finished accumulator's value in `subst` (consumed from
-    /// `accs` in `collect_agg_nodes`'s order, the same order `fresh_accs`/
-    /// the per-row fold loop in `resolve_grouped_rows` built them in), and
-    /// every non-aggregate `Var`/`Prop` leaf with a synthetic `Var`
-    /// referencing whichever *other* item's own grouping-key `Binding` it
-    /// structurally matches (`validate_return_items` already guarantees
-    /// exactly one such match exists — never reached otherwise). Each
-    /// substituted value gets its own fresh, guaranteed-unique slot name
-    /// (`subst.len()` at insertion time), so nothing here can collide with
-    /// a real Cypher identifier the user wrote.
+    /// its finished accumulator's value in `subst` (consumed from `accs`
+    /// in `collect_agg_nodes`'s order), and every non-aggregate `Var`/
+    /// `Prop` leaf with a synthetic `Var` referencing whichever other
+    /// item's grouping-key `Binding` it structurally matches
+    /// (`validate_return_items` guarantees exactly one match exists).
+    /// Each substituted value gets a fresh, unique slot name (`subst.len()`
+    /// at insertion time) so nothing collides with a real identifier.
     fn rewrite_composed_item(
         &self,
         txn: Txn,
@@ -3428,22 +3243,16 @@ impl<'a> Executor<'a> {
                     .transpose()?
                     .map(Box::new),
             ),
-            // `where_clause`/`project` are deliberately left untouched
-            // (cloned verbatim), not recursed into -- they run once per
-            // *element* of `source`'s own already-rewritten result, in a
-            // scope `eval_projected_expr`'s own `ListComp`/`Quantifier`
-            // handling builds itself (the outer `subst` map plus a fresh
-            // binding for `var`, per element). Rewriting a `Var`/`Prop`
-            // leaf in here the same way `source` gets rewritten would
-            // wrongly try to resolve the comprehension's own *local* loop
-            // variable (`x`/`ok`) as if it had to be some other item's
-            // grouping key -- there's no such item, since it's not an
-            // outer reference at all (found via TCK's List11 [3]: `ALL(ok
-            // IN collect(...) WHERE ok)` panicked trying to resolve `ok`
-            // this way). `validate_composed_expr`'s own `ListComp` arm
-            // already guarantees `project` has no aggregate to substitute
-            // in the first place; `where_clause` is the same documented
-            // scope gap `contains_aggregate` has everywhere else.
+            // `where_clause`/`project` are left untouched (cloned
+            // verbatim), not recursed into -- they run once per element
+            // of `source`'s already-rewritten result, in a scope
+            // `eval_projected_expr`'s `ListComp`/`Quantifier` handling
+            // builds itself. Rewriting a `Var`/`Prop` leaf here the same
+            // way `source` is rewritten would wrongly try to resolve the
+            // comprehension's local loop variable (`x`/`ok`) as some
+            // other item's grouping key, since it isn't an outer
+            // reference at all. `validate_composed_expr`'s `ListComp`
+            // arm guarantees `project` has no aggregate to substitute.
             ReturnExpr::ListComp {
                 var,
                 source,
@@ -3517,14 +3326,12 @@ impl<'a> Executor<'a> {
 
     /// WITH's HAVING-equivalent — evaluated against the already-projected/
     /// grouped row, same as ORDER BY. Never pushed into the planner (see
-    /// `WithExpr`'s docs).
-    /// `Option<bool>` — `None` is Cypher's "unknown" (see `compare()`'s
-    /// docs), propagated through `AND`/`OR`/`NOT` via `and3`/`or3`/`map`
-    /// instead of collapsing to `false` partway through. Every call site
-    /// filters a row by checking `== Some(true)` — unknown behaves like
-    /// `false` for filtering purposes, but *only* at that final step, not
-    /// internally, since `AND`/`OR`'s truth tables need to tell "false"
-    /// and "unknown" apart to combine correctly.
+    /// `WithExpr`'s docs). `Option<bool>`: `None` is Cypher's "unknown"
+    /// (see `compare()`'s docs), propagated through `AND`/`OR`/`NOT` via
+    /// `and3`/`or3`/`map` rather than collapsing to `false` early —
+    /// their truth tables need to tell "false" and "unknown" apart.
+    /// Every call site filters by checking `== Some(true)`, where unknown
+    /// behaves like `false` only at that final step.
     fn eval_with_expr(
         &self,
         txn: Txn,
@@ -3552,16 +3359,15 @@ impl<'a> Executor<'a> {
                 self.eval_return_expr(txn, e, row, guard)?,
                 Value::Null
             )),
-            // Unlike an ordinary MATCH's own `WHERE` (`Expr`), which folds
-            // a bare pattern predicate into `Expr::Pattern` at parse time
-            // (`return_expr_to_expr`), `WithExpr` has no such folding --
-            // `WITH ... WHERE a.id = 0 AND (a)-->(b)` embeds it straight
-            // as a `ReturnExpr::PatternPredicate` inside `Bare`/`And`/`Or`.
-            // Special-cased here (rather than in `eval_return_expr`, which
-            // errors on it -- a pattern predicate is only ever meaningful
-            // as a predicate, never as a real projected value) so `WITH
-            // ... WHERE` gets the same existential-search semantics MATCH's
-            // own `WHERE` already has (TCK's WithWhere4 `[2]`).
+            // Unlike an ordinary MATCH's `WHERE` (`Expr`), which folds a
+            // bare pattern predicate into `Expr::Pattern` at parse time,
+            // `WithExpr` has no such folding -- `WITH ... WHERE a.id = 0
+            // AND (a)-->(b)` embeds it as a `ReturnExpr::PatternPredicate`
+            // inside `Bare`/`And`/`Or`. Special-cased here rather than in
+            // `eval_return_expr` (which errors on it, since a pattern
+            // predicate is only ever meaningful as a predicate) so `WITH
+            // ... WHERE` gets the same existential-search semantics
+            // MATCH's own `WHERE` has.
             WithExpr::Bare(ReturnExpr::PatternPredicate(pattern)) => {
                 Some(self.eval_pattern_predicate_exists(txn, pattern, row, guard)?)
             }
@@ -3569,23 +3375,17 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// `WHERE (n)-[:REL]->()` etc (TCK's Pattern1) -- existential: true
-    /// iff at least one real match of `pattern` exists, with every
-    /// already-bound named endpoint (`n`, and `m` in `(n)-->(m)` when `m`
-    /// is also bound by an earlier MATCH) held fixed to this row's own
-    /// binding rather than searched freely. `semantic::
-    /// validate_pattern_predicate` already rejected any named endpoint
-    /// that ISN'T already bound (real Cypher's `UndefinedVariable`), so
-    /// every named var here is safe to seed. Reuses the exact same
-    /// `build_match_plan` "already-bound var -> Seed, not a fresh scan"
-    /// mechanism `eval_merge`'s own "try as an ordinary MATCH first" half
-    /// already relies on -- for a one-hop pattern this is a real
-    /// connected-subgraph search (Expand + Filter), not an isolated
-    /// per-node check. `Some(1)`-limited: existence is all that's needed,
-    /// so there's no reason to enumerate every match. Shared by `Expr::
-    /// Pattern` (an ordinary MATCH's own WHERE) and `WithExpr::Bare`'s
-    /// `PatternPredicate` case (a WITH's own WHERE) -- same semantics
-    /// either way, just reached from two different expression shapes.
+    /// `WHERE (n)-[:REL]->()` etc -- existential: true iff at least one
+    /// real match of `pattern` exists, with every already-bound named
+    /// endpoint held fixed to this row's own binding rather than
+    /// searched freely (`semantic::validate_pattern_predicate` already
+    /// rejects any named endpoint that isn't already bound, so every
+    /// named var here is safe to seed). Reuses the same `build_match_plan`
+    /// "already-bound var -> Seed, not a fresh scan" mechanism
+    /// `eval_merge`'s "try as an ordinary MATCH first" half relies on.
+    /// `Some(1)`-limited: existence is all that's needed. Shared by
+    /// `Expr::Pattern` (an ordinary MATCH's WHERE) and `WithExpr::Bare`'s
+    /// `PatternPredicate` case (a WITH's WHERE).
     fn eval_pattern_predicate_exists(
         &self,
         txn: Txn,
@@ -3600,15 +3400,13 @@ impl<'a> Executor<'a> {
         Ok(!found.is_empty())
     }
 
-    /// `exists { MATCH ... RETURN ... }`'s "full" form (TCK's
-    /// ExistentialSubquery2/3) -- runs `stmt` (always a `Statement::Match`,
-    /// `semantic::validate_statement` rejects anything else reaching here
-    /// and rejects every mutating clause inside it, so this only ever sees
-    /// a real read-only pipeline) correlated against `row` via
+    /// `exists { MATCH ... RETURN ... }`'s "full" form -- runs `stmt`
+    /// (always a `Statement::Match`; `semantic::validate_statement`
+    /// rejects anything else, and every mutating clause, so this only
+    /// sees a read-only pipeline) correlated against `row` via
     /// `execute_match_seeded`, then checks whether it produced at least
-    /// one output row -- the inner RETURN's own projected *values* are
-    /// never inspected, only whether the row exists at all, same as
-    /// `eval_pattern_predicate_exists`/`Expr::Exists` above.
+    /// one output row. The inner RETURN's projected values are never
+    /// inspected, only whether a row exists.
     fn eval_exists_subquery(
         &self,
         txn: Txn,
@@ -3647,15 +3445,13 @@ impl<'a> Executor<'a> {
 
     /// Evaluates an `OPTIONAL MATCH` part with left-outer-join semantics:
     /// every outer row survives, whether or not the optional pattern
-    /// matched anything for it. Must wrap the *whole* subplan rather than
-    /// null-padding inside `Expand`/`VarExpand` themselves — baking it in
+    /// matched anything for it. Must wrap the whole subplan rather than
+    /// null-padding inside `Expand`/`VarExpand` themselves: baking it in
     /// there would turn every default (non-optional) `Expand` into a
-    /// left-outer-join too (breaking existing inner-join semantics), and
-    /// would mis-handle multi-hop optional patterns: IS7's optional
-    /// pattern is 2 hops, and per-hop null-padding would emit one
-    /// null-padded row per *hop-1* match even when hop 2 also matched,
-    /// instead of collapsing to exactly one row per outer row that had
-    /// zero end-to-end matches.
+    /// left-outer-join too, and would mis-handle multi-hop optional
+    /// patterns by emitting one null-padded row per hop-1 match even when
+    /// a later hop also matched, instead of collapsing to one row per
+    /// outer row with zero end-to-end matches.
     ///
     /// Implementation: tag each outer row with its index, evaluate the
     /// subplan once over the whole tagged batch (a single seed, not one
@@ -3739,16 +3535,13 @@ impl<'a> Executor<'a> {
 
     /// `eval_plan_with_limit`'s `RETURN DISTINCT` counterpart (see
     /// `final_distinct_limit` in `execute_match_seeded`): pulls the
-    /// pipeline only until `cap` *distinct projected* rows exist,
+    /// pipeline only until `cap` distinct projected rows exist,
     /// projecting each streamed row through the RETURN `items` and
-    /// deduping by exactly `dedup_rows`'s key (`eval_return_expr` →
-    /// `value_hash_key` per item), so which rows count as distinct is
-    /// decided by the same machinery `materialize_return` will apply to
-    /// what this returns. Duplicate-projecting rows are dropped here —
-    /// `materialize_return` would drop them anyway — which keeps the
-    /// returned Vec at `cap` rows. The projections are evaluated again
-    /// downstream for the kept rows; that re-evaluation is `cap` rows,
-    /// not the stream.
+    /// deduping by `dedup_rows`'s key, so which rows count as distinct
+    /// matches what `materialize_return` will apply downstream.
+    /// Duplicate-projecting rows are dropped here, keeping the returned
+    /// Vec at `cap` rows; the projections are re-evaluated downstream,
+    /// but only for those `cap` kept rows.
     fn collect_rows_until_distinct(
         &self,
         txn: Txn,
@@ -3780,10 +3573,11 @@ impl<'a> Executor<'a> {
         Ok(kept)
     }
 
-    /// Build a pull-based row pipeline. Each iterator owns only its current
-    /// row (plus one relationship fan-out at an Expand), so scan/filter/
-    /// expand chains no longer allocate a Vec at every logical-plan node.
-    /// Blocking clause boundaries still collect this stream explicitly.
+    /// Build a pull-based row pipeline. Each iterator owns only its
+    /// current row (plus one relationship fan-out at an Expand), so
+    /// scan/filter/expand chains avoid allocating a Vec at every
+    /// logical-plan node. Blocking clause boundaries still collect this
+    /// stream explicitly.
     fn stream_plan<'s>(
         &'s self,
         txn: Txn<'s>,
@@ -4043,15 +3837,11 @@ impl<'a> Executor<'a> {
     /// ```
     ///
     /// Counts/collects in a tight loop over `neighbors_in_txn` instead of
-    /// materializing a `BindingRow` per intermediate path. Motivation is
-    /// measured, not assumed: the same algorithm hand-rolled runs in ~1ms
-    /// where the generic pipeline takes ~100ms on the recommendations
-    /// dataset (`marsdb/examples/csr_falsifier.rs`) -- the row machinery,
-    /// not storage, is ~99% of that query's time; the first (2-hop count)
-    /// entry measured ~25x end-to-end on that suite.
+    /// materializing a `BindingRow` per intermediate path, avoiding the
+    /// row machinery that otherwise dominates this query shape's cost.
     ///
-    /// Deliberately conservative: returns `Ok(None)` (generic path) for
-    /// ANY shape it doesn't fully recognize. What it accepts:
+    /// Returns `Ok(None)` (falling back to the generic path) for any
+    /// shape it doesn't fully recognize. What it accepts:
     /// - plan = `[Filter*] Expand([Filter*] Expand(leaf))` or
     ///   `[Filter*] Expand(leaf)`, every expansion single-typed (or
     ///   untyped) and directed (no `Either`), leaf free of any
@@ -4083,12 +3873,11 @@ impl<'a> Executor<'a> {
         // When this MATCH is the statement's final clause and the tail is
         // a plain (non-aggregating, non-DISTINCT) RETURN whose ORDER
         // BY/SKIP/LIMIT ride on the count column, the hint lets the loop
-        // sort groups and keep only skip+limit of them BEFORE building
+        // sort groups and keep only skip+limit of them before building
         // any rows -- the generic tail then re-sorts and slices that tiny
         // prefix exactly (same key, same tie order), so semantics are
-        // unchanged while the 6k-groups-for-a-LIMIT-5 case stops
-        // materializing 6k rows. Measured motivation: inception's
-        // remaining ~40ms was almost entirely this tail.
+        // unchanged while a large-groups-for-a-small-LIMIT case avoids
+        // materializing every group's rows.
         tail_hint: Option<(&ReturnExpr, SortDir, usize)>,
         guard: &ExecutionGuard<'_>,
     ) -> Result<Option<FastCountResult>, QueryError> {
@@ -4182,9 +3971,8 @@ impl<'a> Executor<'a> {
             Collect(&'p str), // mid-node property name
         }
         let mut cols: Vec<OutCol<'_>> = Vec::with_capacity(with.items.len());
-        // The grouping key: either the chain's far end (collaborative
-        // filtering) or its origin (matrix_review_counts groups by the
-        // seed and counts its expansions).
+        // The grouping key is either the chain's far end or its origin
+        // (grouping by the seed node and counting its own expansions).
         let mut group_seen = false;
         let mut group_by_origin = false;
         let mut count_seen = false;
@@ -4319,11 +4107,10 @@ impl<'a> Executor<'a> {
             .collect::<Result<_, _>>()?;
 
         // Seed nodes. For a filtered scan/seek leaf, enumerate candidate
-        // ids directly and evaluate the leaf's predicates against ONE
+        // ids directly and evaluate the leaf's predicates against one
         // reused row buffer -- the generic stream builds a fresh
-        // `HashMap` row per candidate, which for an unindexed predicate
-        // over a big label (matrix_review_counts: `title CONTAINS` over
-        // 9k movies) was the query's remaining cost. Any leaf shape this
+        // `HashMap` row per candidate, which dominates cost for an
+        // unindexed predicate over a large label. Any leaf shape this
         // doesn't cover falls back to the generic stream.
         let mut seeds = Vec::new();
         let mut leaf_preds = Vec::new();
@@ -4347,12 +4134,11 @@ impl<'a> Executor<'a> {
         };
         match leaf_candidates {
             Some(candidates) => {
-                // All-simple-predicate leaves (`var.prop <op> literal`,
-                // matrix's `title CONTAINS ...`) evaluate through one
-                // pre-opened NODES handle and the shared `compare` --
-                // no per-candidate table open, no probe row, no
-                // `eval_expr` dispatch. Anything else keeps the probe-row
-                // route below.
+                // All-simple-predicate leaves (`var.prop <op> literal`)
+                // evaluate through one pre-opened NODES handle and the
+                // shared `compare` -- no per-candidate table open, no
+                // probe row, no `eval_expr` dispatch. Anything else keeps
+                // the probe-row route below.
                 let simple: Option<Vec<(&PropAccess, CompareOp, &Literal)>> = leaf_preds
                     .iter()
                     .map(|pred| match pred {
@@ -4606,32 +4392,6 @@ impl<'a> Executor<'a> {
         Self::count_stream(Box::new(stream), guard)
     }
 
-    /// `LogicalPlan::IndexSeek`'s streaming operator -- same cross-join-
-    /// against-`seed` shape as `stream_scan`, but the id list comes from
-    /// one exact-match `PROPERTY_INDEX` lookup instead of a label scan.
-    /// `row_limit` bounds the lookup itself the same way `stream_scan`'s
-    /// does -- a non-unique index can still match far more nodes than a
-    /// `LIMIT` needs, so the same "ask storage for at most the budget,
-    /// not everything" reasoning applies, just against `PROPERTY_INDEX`
-    /// instead of `NODE_LABEL_INDEX`.
-    ///
-    /// `spec.value` is either fixed for the whole seek (a literal, or a
-    /// `$param` already resolved to one -- looked up once, reused across
-    /// every seed row, same as before this `enum` existed) or row-
-    /// dependent (`IndexSeekValue::RowExpr`, e.g. `row.field` from an
-    /// enclosing `UNWIND`) -- re-evaluated and re-looked-up for each seed
-    /// row, since a different row can mean a different lookup value. This
-    /// is the fix for what was previously *always* a `NodeByLabelScan` +
-    /// `Filter` for that shape (`planner::apply_index_seeks` only
-    /// recognized a literal-valued equality, never a per-row one) -- an
-    /// O(label size) scan repeated per incoming row, the exact pattern a
-    /// bulk import's relationship-creation pass hits hardest.
-    /// `IndexRangeSeek` evaluation: one bounded index scan, reused
-    /// across every seed row (same cross-join shape as
-    /// `stream_index_seek`'s `Fixed` arm). The residual `Filter` the
-    /// planner keeps above this node applies the exact predicate; this
-    /// stream only narrows candidates.
-    #[allow(clippy::too_many_arguments)]
     /// `EdgeTypeScan` evaluation: a demand-driven sequential sweep of
     /// the whole `EDGES` table (chunked `EdgeScanCursor`, raw record
     /// bytes in hand), binding the full single-hop pattern per matching
@@ -4640,6 +4400,7 @@ impl<'a> Executor<'a> {
     /// (no storage get), then endpoint label checks through the
     /// statement node cache. Matches accumulate so later seed rows
     /// replay them (same cross-join contract as every other leaf).
+    #[allow(clippy::too_many_arguments)]
     fn stream_edge_type_scan<'s>(
         &'s self,
         txn: Txn<'s>,
@@ -4927,6 +4688,19 @@ impl<'a> Executor<'a> {
         Self::count_stream(Box::new(stream), guard)
     }
 
+    /// `LogicalPlan::IndexSeek`'s streaming operator -- same cross-join-
+    /// against-`seed` shape as `stream_scan`, but the id list comes from
+    /// one exact-match `PROPERTY_INDEX` lookup instead of a label scan.
+    /// `row_limit` bounds the lookup the same way `stream_scan`'s does,
+    /// since a non-unique index can still match far more nodes than a
+    /// `LIMIT` needs.
+    ///
+    /// `spec.value` is either fixed for the whole seek (a literal, or a
+    /// `$param` already resolved to one, looked up once and reused
+    /// across every seed row) or row-dependent (`IndexSeekValue::
+    /// RowExpr`, e.g. `row.field` from an enclosing `UNWIND`),
+    /// re-evaluated and re-looked-up for each seed row since a
+    /// different row can mean a different lookup value.
     fn stream_index_seek<'s>(
         &'s self,
         txn: Txn<'s>,
@@ -5068,12 +4842,10 @@ impl<'a> Executor<'a> {
     /// returned `VarExpandIter`, which enumerates paths one at a time so
     /// a downstream consumer that stops early (`RETURN DISTINCT ...
     /// LIMIT k` with no ORDER BY, see `collect_rows_until_distinct`)
-    /// never pays for the paths it doesn't pull. This used to be an
-    /// eager BFS materializing every path into a `Vec` before anything
-    /// downstream ran — on a var-length hop over a high-degree graph
-    /// that Vec IS the query's cost (~1M paths for `[:KNOWS*1..3]` at
-    /// avg degree ~100), so laziness here is what makes any early
-    /// termination above worth having.
+    /// never pays for the paths it doesn't pull. On a var-length hop
+    /// over a high-degree graph, the full path set can be the query's
+    /// dominant cost, so this laziness is what makes early termination
+    /// worthwhile.
     fn expand_variable_iter<'s, 'g>(
         &'s self,
         txn: Txn<'s>,
@@ -5116,10 +4888,9 @@ impl<'a> Executor<'a> {
         });
         // `[:TYPE* {year: 1988}]` -- evaluated once here (constant across
         // the whole traversal, not per-candidate; the values can
-        // reference this row's own already-bound variables, same as a
-        // fixed hop's inline props already can) and checked against each
-        // candidate edge's own stored properties during expansion (TCK's
-        // Match4 `[5]`).
+        // reference this row's already-bound variables, same as a fixed
+        // hop's inline props) and checked against each candidate edge's
+        // stored properties during expansion.
         let rel_props = spec
             .rel_props
             .iter()
@@ -5130,16 +4901,15 @@ impl<'a> Executor<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let unbounded = spec.max_hops.is_none();
         let effective_max = spec.max_hops.unwrap_or(VAR_EXPAND_DEPTH_CAP);
-        // Real Cypher's edge-isomorphism rule (no relationship repeated
-        // within one MATCH pattern) applies across the *whole* pattern, not
-        // just within this hop's own traversal -- seed the excluded set with
-        // whatever edges earlier fixed hops of this same pattern already
-        // bound, so this traversal can't walk back over one of them (see
-        // `LogicalPlan::VarExpand`'s docs; found via TCK's Match5 `[27]`).
-        // Complementary direction: an *earlier variable-length* hop's own
-        // traversed-edge set (deposited under its own `exclude_edge_var`,
-        // see `LogicalPlan::VarExpand`'s docs) -- union every such row's
-        // `Binding::Path` edge ids in too (TCK's Match4 `[7]`).
+        // The edge-isomorphism rule (no relationship repeated within one
+        // MATCH pattern) applies across the whole pattern, not just this
+        // hop's own traversal -- seed the excluded set with whatever
+        // edges earlier fixed hops of this pattern already bound, so
+        // this traversal can't walk back over one of them (see
+        // `LogicalPlan::VarExpand`'s docs). Complementary direction: an
+        // earlier variable-length hop's own traversed-edge set
+        // (deposited under its own `exclude_edge_var`) is unioned in via
+        // every such row's `Binding::Path` edge ids too.
         let seed_used_edges: HashSet<EdgeId> = spec
             .exclude_edge_vars
             .iter()
@@ -5317,29 +5087,14 @@ impl<'a> Executor<'a> {
                 Value::Null
             )),
             Expr::GeneralBare(e) => self.eval_return_expr_bool3(txn, e, row, guard)?,
-            // `WHERE (n)-[:REL]->()` etc (TCK's Pattern1) -- existential:
-            // true iff at least one real match of `pattern` exists, with
-            // every already-bound named endpoint (`n`, and `m` in `(n)-->
-            // (m)` when `m` is also bound by an earlier MATCH) held fixed
-            // to this row's own binding rather than searched freely.
-            // `semantic::bind_pattern_predicate` already rejected any
-            // named endpoint that ISN'T already bound (real Cypher's
-            // UndefinedVariable), so every named var here is safe to seed.
-            // Reuses the exact same `build_match_plan` "already-bound var
-            // -> Seed, not a fresh scan" mechanism `eval_merge`'s own
-            // "try as an ordinary MATCH first" half already relies on --
-            // for a one-hop pattern this is a real connected-subgraph
-            // search (Expand + Filter), not an isolated per-node check.
-            // `Some(1)`-limited: existence is all that's needed, so
-            // there's no reason to enumerate every match.
+            // `WHERE (n)-[:REL]->()` etc -- see `eval_pattern_predicate_exists`.
             Expr::Pattern(pattern) => {
                 Some(self.eval_pattern_predicate_exists(txn, pattern, row, guard)?)
             }
-            // `exists { (n)-->(m) WHERE ... }` (TCK's ExistentialSubquery1,
-            // the "simple" form) -- same existential search as `Pattern`
-            // above, just with its own inline `where?` threaded straight
-            // into `build_match_plan`, same as an ordinary `MATCH ...
-            // WHERE ...` (not evaluated as a separate post-filter step).
+            // `exists { (n)-->(m) WHERE ... }`, the "simple" form -- same
+            // existential search as `Pattern` above, with its own inline
+            // `where?` threaded straight into `build_match_plan`, same as
+            // an ordinary `MATCH ... WHERE ...` (not a post-filter step).
             Expr::Exists {
                 pattern,
                 where_clause,
@@ -5356,19 +5111,16 @@ impl<'a> Executor<'a> {
                 )?;
                 Some(!found.is_empty())
             }
-            // `exists { MATCH ... RETURN ... }` (TCK's
-            // ExistentialSubquery2/3, the "full" form) -- runs the nested
-            // statement correlated against `row` (`execute_match_seeded`)
-            // and checks whether it produced at least one output row.
+            // `exists { MATCH ... RETURN ... }`, the "full" form -- runs
+            // the nested statement correlated against `row`
+            // (`execute_match_seeded`) and checks whether it produced at
+            // least one output row.
             Expr::ExistsSubquery(stmt) => Some(self.eval_exists_subquery(txn, stmt, row, guard)?),
             // See `Expr::EdgeNotInSet`'s own docs -- `edge_var` is always
-            // a real `Binding::Edge` (a fixed hop's own filter var, the
-            // only thing this gets generated for) and `edge_set_var` is
-            // always the `Binding::Path` `expand_variable_row` deposits
-            // for *every* variable-length hop, unconditionally (see
-            // `LogicalPlan::VarExpand::exclude_edge_var`'s own docs) --
-            // never anything else, so there's no null/wrong-kind case to
-            // handle here the way `VarEq` above has to.
+            // a real `Binding::Edge` and `edge_set_var` is always the
+            // `Binding::Path` deposited for every variable-length hop,
+            // so there's no null/wrong-kind case to handle here the way
+            // `VarEq` above has to.
             Expr::EdgeNotInSet {
                 edge_var,
                 edge_set_var,
@@ -5419,20 +5171,16 @@ impl<'a> Executor<'a> {
             .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
         match binding {
             // A missing *property key* on an existing node/edge is a real,
-            // legal "absent" (-> null downstream) -- but a missing
-            // *node/edge record* means it was deleted earlier in this same
-            // statement (`deleted_entity_access`'s docs), which is a real
-            // error (`MATCH (n) DELETE n RETURN n.num` -- TCK's Return2
-            // scenario [15]), not a silent null. These are two different
-            // kinds of "missing" and must not be collapsed into one.
+            // legal "absent" (-> null downstream), but a missing
+            // *node/edge record* means it was deleted earlier in this
+            // same statement (`deleted_entity_access`'s docs), which is a
+            // real error, not a silent null. These are different kinds
+            // of "missing" and must not be collapsed into one.
             //
-            // Per-property read path (v2 step 1b): a node already
-            // materialized in this statement's cache answers from the map;
-            // otherwise this reads ONE directory entry from the stored
-            // record -- no full decode, no name resolution, no cache
-            // population (repeat per-prop reads are ~a point lookup each,
-            // cheaper than materializing a whole record to answer one of
-            // them). The nested Option from `get_node_prop_in_txn`
+            // Per-property read path: a node already materialized in
+            // this statement's cache answers from the map; otherwise
+            // this reads one directory entry from the stored record, no
+            // full decode. The nested Option from `get_node_prop_in_txn`
             // preserves the deleted-vs-absent split above.
             Binding::Node(id) => {
                 // Safe for write statements too: every node-mutating
@@ -5468,22 +5216,15 @@ impl<'a> Executor<'a> {
             // A WITH-projected scalar (or list/map) has no scalar `.prop`
             // to access via this path — e.g. `WITH message.id AS
             // messageId` then `messageId.foo` isn't meaningful. Treat as
-            // absent rather than erroring, consistent with how a missing
-            // property already behaves. `Binding::Map` specifically *does*
-            // have real `.prop` access, just not through this method (its
-            // values aren't always a scalar `PropertyValue`) — see
-            // `lookup_prop_value`, which `ReturnExpr::Prop` actually calls.
-            // A `Binding::Value` holding a `Date`/`Duration` also has real
-            // `.prop` access (`d.year`, etc) — also handled there, not
-            // here, for the same "not always a scalar `PropertyValue`"
-            // reason (well, it always *is* one here, but `lookup_prop_value`
-            // is where that access actually happens either way).
+            // absent rather than erroring, consistent with a missing
+            // property. `Binding::Map` and a `Binding::Value` holding a
+            // `Date`/`Duration` do have real `.prop` access, just not
+            // through this method — see `lookup_prop_value`, which
+            // `ReturnExpr::Prop` actually calls.
             Binding::Value(_) | Binding::List(_) | Binding::Map(_) => Ok(None),
             // Unlike the others, a path is a real type error, not just an
-            // "absent" property -- real Cypher's `InvalidArgumentType`
-            // (TCK's MatchWhere1 `[14]`: `MATCH r = (n)-[*]->() WHERE
-            // r.name = 'apa'`). Property access never had a meaning for a
-            // path to begin with (it's not a graph-object-shaped value).
+            // "absent" property: property access never had a meaning for
+            // a path (it's not a graph-object-shaped value).
             Binding::Path(_) => Err(QueryError::Type(format!(
                 "'{}' is a path — property access requires a node, relationship, or map",
                 pa.var
@@ -5492,24 +5233,19 @@ impl<'a> Executor<'a> {
     }
 
     /// `ReturnExpr::Prop`'s own lookup -- unlike `lookup_prop` (used by
-    /// pattern-level `WHERE`, which only ever compares a real node/edge
+    /// pattern-level `WHERE`, which only compares a real node/edge
     /// property against a `Literal`), a map's value can be any `Value`
-    /// shape (nested list/map/node), not just a scalar `PropertyValue`,
-    /// so this returns the wider type and handles `Binding::Map` itself
-    /// rather than collapsing through `lookup_prop`. A `Binding::Value`
-    /// holding a `Date`/`Duration` is handled here too, for the same
-    /// reason -- `d.year`/`d.months`/etc are real component accessors
-    /// (Temporal5's whole scenario shape, `WITH v.date AS d ... RETURN
-    /// d.year`), not a stored property `lookup_prop` could ever find.
+    /// shape, not just a scalar `PropertyValue`, so this returns the
+    /// wider type and handles `Binding::Map` itself. A `Binding::Value`
+    /// holding a `Date`/`Duration` is handled here too, since
+    /// `d.year`/`d.months`/etc are real component accessors, not a
+    /// stored property `lookup_prop` could find.
     ///
     /// Only a node, relationship, map, or temporal value has any `.prop`
-    /// to access at all -- a plain scalar (`Bool`/`Int`/`Float`/`String`)
-    /// or a `List` is a real type error here (real Cypher's own
-    /// `InvalidArgumentType` is raised at *compile* time; this codebase's
-    /// `Kind` system can't see through a WITH-projected value's real
-    /// runtime shape to catch it any earlier -- see `infer_expr`'s own
-    /// `Kind::Scalar` docs -- so it surfaces here instead), not a silent
-    /// `null` (TCK's Graph6 [9] / Map1 [6]). `null` itself is exempt --
+    /// to access at all: a plain scalar or a `List` is a type error here
+    /// (this codebase's `Kind` system can't see through a WITH-projected
+    /// value's runtime shape to catch it at compile time, so it surfaces
+    /// here instead), not a silent `null`. `null` itself is exempt,
     /// real Cypher's null propagation rule, not a type error.
     fn lookup_prop_value(
         &self,
@@ -5593,28 +5329,23 @@ impl<'a> Executor<'a> {
     }
 
     /// An aggregating `RETURN`'s own `ORDER BY`, when at least one key
-    /// doesn't verbatim/alias-match any item -- `RETURN me.age AS age,
-    /// count(you.age) AS cnt ORDER BY age + count(you.age)` (TCK's
-    /// ReturnOrderBy6). Folds those extra keys through the *same*
-    /// grouping pass as `items` themselves, as synthetic unreturned extra
-    /// items (reusing `resolve_grouped_rows`/`rewrite_composed_item`
-    /// exactly as a composed RETURN item would, including an aggregate
-    /// call that appears *only* in the ORDER BY key, nowhere in `items`
-    /// -- real Cypher allows that too, it just needs to fold consistently
-    /// with `items`' own implicit grouping, not literally reuse one of
-    /// their accumulators), then uses their per-group values as
-    /// additional sort keys before stripping them back off. Degrades to
-    /// exactly the ordinary "sort by already-computed columns" behavior
-    /// when every key does verbatim/alias-match (`extra_exprs` empty) --
+    /// doesn't verbatim/alias-match any item (`RETURN me.age AS age,
+    /// count(you.age) AS cnt ORDER BY age + count(you.age)`). Folds those
+    /// extra keys through the same grouping pass as `items` themselves,
+    /// as synthetic unreturned extra items (reusing
+    /// `resolve_grouped_rows`/`rewrite_composed_item` exactly as a
+    /// composed RETURN item would, including an aggregate call that
+    /// appears only in the ORDER BY key), then uses their per-group
+    /// values as additional sort keys before stripping them back off.
+    /// Degrades to ordinary "sort by already-computed columns" behavior
+    /// when every key verbatim/alias-matches (`extra_exprs` empty), so
     /// callers can route every aggregating-`RETURN`-with-`ORDER-BY` case
-    /// through this one function rather than branching on whether extras
-    /// are actually needed.
+    /// through this one function.
     ///
-    /// `DISTINCT` isn't handled here -- deliberately: grouping already
-    /// makes every output row unique by its own grouping-key columns (two
-    /// groups can't have the same grouping key and still be different
-    /// groups), so `RETURN DISTINCT` combined with aggregation is
-    /// provably always a no-op downstream of this function regardless.
+    /// `DISTINCT` isn't handled here: grouping already makes every
+    /// output row unique by its grouping-key columns, so `RETURN
+    /// DISTINCT` combined with aggregation is always a no-op downstream
+    /// of this function.
     fn materialize_aggregating_return_with_order(
         &self,
         txn: Txn,
@@ -5696,13 +5427,11 @@ impl<'a> Executor<'a> {
     }
 
     /// `SKIP`/`LIMIT` accept any expression, not just a literal integer
-    /// (`SKIP $n`, `SKIP toInteger(rand()*9)` -- TCK's `ReturnSkipLimit1
-    /// [2]`/`[3]`) -- evaluated exactly once here, against an empty row,
-    /// since no pattern variable can be in scope at a statement's own
-    /// SKIP/LIMIT (an `UnboundVariable` error from `eval_return_expr`
-    /// below is exactly the right outcome if one is referenced). Params
-    /// are already resolved to concrete `Literal`s by this point (see
-    /// `params::substitute_params`).
+    /// (`SKIP $n`, `SKIP toInteger(rand()*9)`) -- evaluated exactly once
+    /// here, against an empty row, since no pattern variable can be in
+    /// scope at a statement's own SKIP/LIMIT (an `UnboundVariable` error
+    /// from `eval_return_expr` below is the right outcome if one is
+    /// referenced).
     fn resolve_skip_limit(
         &self,
         txn: Txn,
@@ -5793,11 +5522,11 @@ impl<'a> Executor<'a> {
                 };
                 for (when, then) in whens {
                     let when_value = self.eval_return_expr(txn, when, row, guard)?;
-                    // Deliberately reuses the same Null == Null -> true
-                    // convention as `compare()` below, not standard
-                    // three-valued NULL logic — IS7's `CASE r WHEN null
-                    // THEN false ELSE true END` depends on this exact
-                    // semantics to detect an OPTIONAL MATCH non-match.
+                    // Reuses the same Null == Null -> true convention as
+                    // `compare()` below, not standard three-valued NULL
+                    // logic: `CASE r WHEN null THEN false ELSE true END`
+                    // depends on this to detect an OPTIONAL MATCH
+                    // non-match.
                     let matched = match &test_value {
                         Some(tv) => value_eq(tv, &when_value),
                         None => matches!(when_value, Value::Literal(Literal::Bool(true))),
@@ -5960,13 +5689,11 @@ impl<'a> Executor<'a> {
                         )))
                     }
                     // `r:TYPE` -- a relationship has exactly one type, so
-                    // this is just an equality check, not a set-membership
-                    // one; a conjunctive `r:A:B` (only reachable from
-                    // general expression position, never real Cypher's own
-                    // pattern-level `WHERE` -- relationships can't carry
-                    // more than one type) is trivially always false unless
-                    // every listed name is the same one type (TCK's Graph5
-                    // "Node and edge label expressions" [2]).
+                    // this is an equality check, not set-membership; a
+                    // conjunctive `r:A:B` (only reachable from general
+                    // expression position, never a pattern-level `WHERE`)
+                    // is trivially false unless every listed name is the
+                    // same one type.
                     Binding::Edge(id) => {
                         let edge = deleted_entity_access(GraphStore::get_edge_in_txn(txn, *id)?)?;
                         Ok(Value::Literal(Literal::Bool(
@@ -6006,24 +5733,19 @@ impl<'a> Executor<'a> {
 
     /// `[p = (n)-->() | p]` / `[(n)-[:T]->(b) | b.name]` -- enumerates
     /// every match of `pattern` against the graph (already-bound named
-    /// endpoints in `row` held fixed, exactly like `Expr::Pattern`'s own
-    /// existential search reuses `build_match_plan`'s "already-bound var
-    /// -> Seed, not a fresh scan" mechanism) and projects `projection`
-    /// against each match's own resulting row, collecting into a
-    /// `Value::List`. No limit on `eval_plan_with_limit` here (unlike
-    /// `Expr::Pattern`'s `Some(1)`) -- a comprehension needs every match,
-    /// not just whether one exists.
+    /// endpoints in `row` held fixed, reusing `build_match_plan`'s
+    /// "already-bound var -> Seed, not a fresh scan" mechanism) and
+    /// projects `projection` against each match's resulting row,
+    /// collecting into a `Value::List`. No limit on `eval_plan_with_limit`
+    /// here, unlike `Expr::Pattern`'s `Some(1)`, since a comprehension
+    /// needs every match, not just whether one exists.
     ///
-    /// A named path (`path_var: Some`) reuses `execute_match`'s own
-    /// `name_pattern_for_path`/`assemble_path` pair verbatim -- same
-    /// "synthesize internal names for any unnamed hop, assemble the path
-    /// from those, then strip the synthesized keys (and the reserved
-    /// variable-length-hop segment key, if any) back out" approach a real
-    /// `MATCH p = ...` clause already uses, including over a single
-    /// variable-length hop (TCK's Pattern2 `[9]`) -- also reuses
-    /// `validate_named_path_pattern`'s own restriction on anything wider
-    /// (a variable-length hop mixed with another hop) for the same reason
-    /// it already applies to `MATCH`.
+    /// A named path (`path_var: Some`) reuses `execute_match`'s
+    /// `name_pattern_for_path`/`assemble_path` pair: synthesize internal
+    /// names for any unnamed hop, assemble the path from those, then
+    /// strip the synthesized keys back out, same as a real `MATCH p =
+    /// ...` clause. Also reuses `validate_named_path_pattern`'s
+    /// restriction against mixing a variable-length hop with another hop.
     fn eval_pattern_comprehension(
         &self,
         txn: Txn,
@@ -6080,19 +5802,14 @@ impl<'a> Executor<'a> {
     /// shared by `materialize_delete` (`DELETE`/`DETACH DELETE` as a
     /// statement tail) and `execute_match`'s own `QueryClause::Delete`
     /// (`DELETE ... WITH ...` mid-pattern). Edges are deleted immediately
-    /// (no ordering constraint), but nodes are only *collected* into
+    /// (no ordering constraint), but nodes are only collected into
     /// `pending_nodes` and deleted in a second pass, after every target
-    /// across every row has contributed its own edges -- not deleted
-    /// inline the way `delete_binding`/`delete_value` used to. A single
-    /// non-`DETACH` `DELETE` naming *several* targets that collectively
-    /// cover all of a node's edges (e.g. `DELETE pathColls.key[0],
-    /// pathColls.key[1]`, two paths sharing a node, each contributing one
-    /// of its two incident edges) must succeed -- deleting inline would
-    /// try to delete the first path's node while the second path's edge
-    /// (not yet processed) was still attached, a real bug found via TCK's
-    /// Delete5 `[7]` once `{key: collect(p)}`-shaped composed expressions
-    /// could reach this code path at all (previously rejected outright at
-    /// compile time, before general aggregate composition was supported).
+    /// across every row has contributed its own edges, not deleted
+    /// inline. This matters when a single non-`DETACH` `DELETE` names
+    /// several targets that collectively cover all of a node's edges
+    /// (e.g. two paths sharing a node, each contributing one of its two
+    /// incident edges): deleting inline would try to delete the first
+    /// path's node while the second path's edge was still attached.
     fn delete_targets(
         &self,
         txn: Txn,
@@ -6105,17 +5822,17 @@ impl<'a> Executor<'a> {
         let mut deleted_edges = HashSet::new();
         let mut pending_nodes = HashSet::new();
         // All-bare-variable target lists (`DELETE r`, `DELETE r, a, b` --
-        // by far the common case, and the only shape a predicate-driven
-        // bulk delete produces) never evaluate anything between edge
+        // the common case, and the only shape a predicate-driven bulk
+        // delete produces) never evaluate anything between edge
         // deletions, so the edge ids can be collected across every row
         // first and deleted in one `delete_edges_in_txn` batch: one
         // `WriteCtx` and one label-name resolution per distinct type,
-        // instead of a whole-edge fetch plus a fresh `WriteCtx` (and its
-        // table opens) per edge. Observably identical to deleting
-        // inline -- with no expression evaluation in the loop there is no
-        // read that could distinguish "deleted already" from "deleted at
-        // the end", and `guard`'s deleted-edge-type bookkeeping is only
-        // consulted by later statements. Any computed target (`list[0]`,
+        // instead of a whole-edge fetch plus a fresh `WriteCtx` per edge.
+        // Observably identical to deleting inline, since with no
+        // expression evaluation in the loop there is no read that could
+        // distinguish "deleted already" from "deleted at the end", and
+        // `guard`'s deleted-edge-type bookkeeping is only consulted by
+        // later statements. Any computed target (`list[0]`,
         // `map.key`, ...) falls back to the per-edge path below, whose
         // immediate deletes are what let a later target's evaluation
         // correctly error via `deleted_entity_access` on touching an
@@ -6145,20 +5862,19 @@ impl<'a> Executor<'a> {
         } else {
             for row in rows {
                 for target in targets {
-                    // A bare variable (`DELETE r, a, b`, by far the common
-                    // case) deletes by the raw id already sitting in the row's
+                    // A bare variable (`DELETE r, a, b`, the common case)
+                    // deletes by the raw id already sitting in the row's
                     // `Binding` -- no existence check, no property fetch.
-                    // That's what lets `DELETE r, a, b` work when two rows of
-                    // the same undirected match both reference the same `a`/
-                    // `b`/`r` (real, from TCK's Delete4 `[1]`): the second
-                    // row's own dedup lookup must succeed even though the
-                    // first row already deleted them. Anything else (`list[0]`,
-                    // `map.key`, a whole path variable's *elements* accessed
-                    // computedly, ...) has no such raw shortcut and goes
-                    // through real evaluation instead -- which correctly does
-                    // still error via `deleted_entity_access` if it tries to
-                    // read a property off something already gone, since that's
-                    // a genuine access, not just a re-statement of identity.
+                    // That's what lets `DELETE r, a, b` work when two rows
+                    // of the same undirected match both reference the
+                    // same `a`/`b`/`r`: the second row's dedup lookup
+                    // must succeed even though the first row already
+                    // deleted them. Anything else (`list[0]`, `map.key`,
+                    // a path variable's elements accessed computedly)
+                    // has no such raw shortcut and goes through real
+                    // evaluation, which still correctly errors via
+                    // `deleted_entity_access` on a genuine access to
+                    // something already gone.
                     if let ReturnExpr::Var(name) = target {
                         let binding = row
                             .get(name)
@@ -6198,18 +5914,16 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// `ret`, when present, is evaluated *after* the physical delete runs,
-    /// not before — real Cypher's own DELETE+RETURN TCK scenarios agree on
-    /// this ordering: `MATCH (n) DELETE n RETURN n.num` must raise a
-    /// `DeletedEntityAccess` error (TCK's Return2 scenarios [15]/[17]), not
-    /// silently return the pre-delete value. `lookup_prop`/
-    /// `binding_to_value` (via `deleted_entity_access`) already turn "the
-    /// bound id's record is gone" into a proper `QueryError` rather than a
-    /// silent null or a panic, which is exactly what makes deleting first
-    /// safe here — every other real DELETE+RETURN shape (`count(*)`,
-    /// `sum(num)` off a WITH-projected scalar, a literal, a null OPTIONAL
-    /// MATCH binding) never touches the just-deleted entity's live record
-    /// at all, so this ordering changes nothing for them.
+    /// `ret`, when present, is evaluated after the physical delete runs,
+    /// not before: `MATCH (n) DELETE n RETURN n.num` must raise a
+    /// `DeletedEntityAccess` error, not silently return the pre-delete
+    /// value. `lookup_prop`/`binding_to_value` (via
+    /// `deleted_entity_access`) already turn "the bound id's record is
+    /// gone" into a proper `QueryError`, which is what makes deleting
+    /// first safe here -- every other DELETE+RETURN shape (`count(*)`,
+    /// an aggregate off a WITH-projected scalar, a literal, a null
+    /// OPTIONAL MATCH binding) never touches the just-deleted entity's
+    /// live record, so this ordering changes nothing for them.
     fn materialize_delete(
         &self,
         txn: Txn,
@@ -6280,18 +5994,15 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// `<match_stmt> UNION [ALL] <match_stmt> ...` — every part shares the
-    /// same `txn` (one snapshot for a read-only union, one write
-    /// transaction otherwise — see `is_read_only`'s own `Union` handling)
-    /// but no bindings: each part is `execute_match`'d completely
-    /// independently, matching real Cypher's own scoping. Column names
-    /// must match exactly across every part (real Cypher's
-    /// `DifferentColumnsInUnion` — checked here, once each part's real
-    /// `QueryResult.columns` is in hand, rather than statically, since
+    /// `<match_stmt> UNION [ALL] <match_stmt> ...` — every part shares
+    /// the same `txn` (one snapshot for a read-only union, one write
+    /// transaction otherwise) but no bindings: each part is
+    /// `execute_match`'d completely independently. Column names must
+    /// match exactly across every part, checked here once each part's
+    /// `QueryResult.columns` is in hand rather than statically, since
     /// nothing else in this codebase infers a `RETURN` list's column
-    /// names without evaluating it). `all: false` (plain `UNION`) dedups
-    /// the combined rows via the same `dedup_rows` `RETURN DISTINCT`
-    /// already uses; `all: true` keeps every row.
+    /// names without evaluating it. `all: false` (plain `UNION`) dedups
+    /// the combined rows via `dedup_rows`; `all: true` keeps every row.
     fn materialize_union(
         &self,
         txn: Txn,
@@ -6363,10 +6074,8 @@ impl<'a> Executor<'a> {
                     .get(&pa.var)
                     .ok_or_else(|| QueryError::UnboundVariable(pa.var.clone()))?;
                 // `SET` on a null binding is a documented no-op, same as
-                // `DELETE`/`REMOVE` on one -- an `OPTIONAL MATCH` that found
-                // nothing pads its variables with null (found via TCK's
-                // Set1/Set3 "Ignore null when setting property/label"
-                // scenarios).
+                // `DELETE`/`REMOVE` on one -- an `OPTIONAL MATCH` that
+                // found nothing pads its variables with null.
                 if matches!(binding, Binding::Value(PropertyValue::Null)) {
                     return Ok(());
                 }
@@ -6387,20 +6096,16 @@ impl<'a> Executor<'a> {
                 )));
                 }
                 let value = self.eval_return_expr(txn, expr, row, guard)?;
-                // `SET n.prop = null` *removes* the property in real Cypher
-                // (found via TCK's Set2 "Set a Property to Null" scenarios,
-                // which this codebase previously couldn't parse at all --
-                // `SET` had no trailing RETURN to observe the result with, so
-                // this bug was never exercised until that gap closed).
-                // Storing a literal `PropertyValue::Null` instead is
-                // observably different: `n.prop` still shows up as a
-                // (nulled-out) key when a caller enumerates a node's own
-                // props (e.g. this RETURN's own node-to-string rendering),
-                // where a real missing property wouldn't. The RHS being
-                // `null` is now a *runtime* fact (it's any `ReturnExpr`, not
-                // just the `Literal::Null` token), not something checkable
-                // from the AST alone -- `SET n.prop = coalesce(x, null)`
-                // must remove the property too if `x` turns out null.
+                // `SET n.prop = null` removes the property in real
+                // Cypher. Storing a literal `PropertyValue::Null` instead
+                // is observably different: `n.prop` would still show up
+                // as a (nulled-out) key when a caller enumerates a
+                // node's props, where a real missing property wouldn't.
+                // The RHS being `null` is a runtime fact (it's any
+                // `ReturnExpr`, not just the `Literal::Null` token), not
+                // something checkable from the AST alone -- `SET n.prop
+                // = coalesce(x, null)` must remove the property too if
+                // `x` turns out null.
                 if let Some(id) = node_id {
                     self.uncache_node(id);
                 }
@@ -6483,8 +6188,7 @@ impl<'a> Executor<'a> {
                 // A map literal is the common case, but real Cypher also
                 // allows `SET r = a`/`SET r += a` where `a` is itself a
                 // bound node/relationship -- copies its properties, same
-                // as a map built from them would (TCK's Merge6 [6]/
-                // Merge7 [4], "Copying properties from node").
+                // as a map built from them would.
                 let entries = match map_value {
                     Value::Map(entries) => entries,
                     Value::Node(n) => n
@@ -6507,8 +6211,7 @@ impl<'a> Executor<'a> {
                 // `SET n = {...}` (`merge: false`) replaces every existing
                 // property -- delete whatever's already there first, not
                 // just overwrite the map's own keys, or a key n already
-                // had that the map doesn't mention would wrongly survive
-                // (TCK's Set4 [2]/[3]/[4]).
+                // had that the map doesn't mention would wrongly survive.
                 if !merge {
                     let existing_keys: Vec<String> = if let Some(id) = node_id {
                         deleted_entity_access(GraphStore::get_node_in_txn(txn, id)?)?
@@ -6536,9 +6239,8 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // Either way, apply the map's own entries -- a `null`
-                // value removes that one key (real Cypher's rule, same
-                // "null means remove" convention `SetItem::Prop` already
-                // has -- TCK's Set5 [4]), anything else sets it.
+                // value removes that one key (same "null means remove"
+                // convention `SetItem::Prop` uses), anything else sets it.
                 for (key, entry_value) in entries {
                     if matches!(entry_value, Value::Null) {
                         if let Some(id) = node_id {
@@ -6573,14 +6275,6 @@ impl<'a> Executor<'a> {
     }
 }
 
-/// `materialize_delete`'s bare-variable fast path -- deletes straight off
-/// the row's raw `Binding` (just an id), no existence check and no
-/// property fetch, so re-referencing an already-deleted-this-statement
-/// entity by identity (a later row of the same multi-row `DELETE`) is a
-/// silent dedup no-op, not an error. Mirrors `delete_value`'s shape
-/// (including the path/null/type-error handling) but over `Binding`/
-/// `PathBinding` (raw ids) instead of `Value`/`PathElem` (fully
-/// materialized records).
 /// Deletes edge `id`, first stashing its (immutable, so safe to cache)
 /// type into `guard` -- see `ExecutionGuard::deleted_edge_types`'s own
 /// docs for why. The lookup can't fail with a real error here: `id` was
@@ -6652,6 +6346,14 @@ fn collect_delete_binding(
     Ok(())
 }
 
+/// `materialize_delete`'s bare-variable fast path -- deletes straight off
+/// the row's raw `Binding` (just an id), no existence check and no
+/// property fetch, so re-referencing an already-deleted-this-statement
+/// entity by identity (a later row of the same multi-row `DELETE`) is a
+/// silent dedup no-op, not an error. Mirrors `delete_value`'s shape
+/// (including the path/null/type-error handling) but over `Binding`/
+/// `PathBinding` (raw ids) instead of `Value`/`PathElem` (fully
+/// materialized records).
 fn delete_binding(
     executor: &Executor<'_>,
     txn: Txn,
@@ -6775,9 +6477,7 @@ fn apply_remove_item(
                     GraphStore::remove_edge_prop_in_txn(write_txn, *id, &pa.prop)?;
                     executor.count(|s| s.properties_set += 1);
                 }
-                // Same null-is-a-no-op rule DELETE already follows (found
-                // via TCK's Remove1 "Ignore null when removing property"
-                // scenarios).
+                // Same null-is-a-no-op rule DELETE already follows.
                 Binding::Value(PropertyValue::Null) => {}
                 Binding::Value(_) | Binding::List(_) | Binding::Map(_) | Binding::Path(_) => {
                     return Err(QueryError::UnboundVariable(format!(
@@ -6799,9 +6499,7 @@ fn apply_remove_item(
                         executor.count(|s| s.labels_removed += 1);
                     }
                 }
-                // Same null-is-a-no-op rule as the property arm above
-                // (found via TCK's Remove2 "Ignore null when removing a
-                // node label" scenario).
+                // Same null-is-a-no-op rule as the property arm above.
                 Binding::Value(PropertyValue::Null) => {}
                 _ => {
                     return Err(QueryError::UnboundVariable(format!(
@@ -6833,23 +6531,20 @@ fn tail_is_distinct_return(tail: &Option<Tail>) -> bool {
     }
 }
 
-/// A statement never mutates anything iff it's a `MATCH ... RETURN` with no
-/// `DELETE`/`DETACH DELETE`/`SET` tail *and* no `MERGE` clause anywhere in
-/// it (`MERGE (n) RETURN n` has a `Tail::Return`, but still writes whenever
-/// it has to create — checking `tail` alone here would be a real bug, not
-/// just an incomplete check: it would send a MERGE-that-creates through a
-/// `ReadTransaction`, which has no `.insert`). `Statement::Create` and
-/// every other `Tail` variant always write. Confirmed by tracing every
-/// function reachable from pattern/WHERE/WITH evaluation: none of them
-/// ever call a table-mutating `*_in_txn` method for a `Tail::Return`
-/// statement with no `MERGE` clause (a label-filtered scan looks up an
-/// existing label id, it never allocates one — allocation only happens in
-/// `create_node_in_txn`/`create_edge_in_txn`). `Executor::execute` uses
-/// this to decide whether to open a `ReadTransaction` (no contention with
-/// concurrent readers or a concurrent writer) or a `WriteTransaction`.
-/// Returns whether executing `stmt` can mutate the graph. Public so callers
-/// which execute generated or otherwise untrusted Cypher can enforce a
-/// read-only policy using the same classification as the executor.
+/// Returns whether executing `stmt` can mutate the graph. Public so
+/// callers that execute generated or otherwise untrusted Cypher can
+/// enforce a read-only policy using the same classification as the
+/// executor.
+///
+/// A statement never mutates anything iff it's a `MATCH ... RETURN` with
+/// no `DELETE`/`DETACH DELETE`/`SET` tail and no `MERGE` clause anywhere
+/// in it (`MERGE (n) RETURN n` has a `Tail::Return`, but still writes
+/// whenever it has to create, so checking `tail` alone would send a
+/// MERGE-that-creates through a `ReadTransaction`, which has no
+/// `.insert`). `Statement::Create` and every other `Tail` variant always
+/// write. `Executor::execute` uses this to decide whether to open a
+/// `ReadTransaction` (no contention with concurrent readers or a
+/// concurrent writer) or a `WriteTransaction`.
 pub fn is_read_only(stmt: &Statement) -> bool {
     if let Statement::Union { parts, .. } = stmt {
         return parts.iter().all(is_read_only);
@@ -6940,22 +6635,16 @@ pub(crate) fn with_item_output_name((i, item): (usize, &ReturnItem)) -> String {
         .unwrap_or_else(|| default_column_name(&item.expr, i))
 }
 
-/// True iff `expr` contains an aggregate call anywhere inside it, at any
-/// depth — used to reject an aggregate nested inside another aggregate's
-/// argument, or inside a non-aggregate expression's `CASE`/`Call`
-/// arguments (an aggregate must be a return item's *entire* top-level
-/// expression — see `validate_return_items`).
 /// Collects every aggregate-bearing subexpression in `expr` (a `CountStar`
 /// or an aggregate-named `Call`), in a fixed pre-order -- the same
 /// traversal `contains_aggregate` uses, just gathering references instead
-/// of stopping at the first `true`. Doesn't recurse *into* a found node's
+/// of stopping at the first `true`. Doesn't recurse into a found node's
 /// own arguments (an aggregate's argument is folded per-row as a whole,
 /// not decomposed further -- see `resolve_grouped_rows`). The resulting
 /// order is what makes a composed item's per-row folding
 /// (`resolve_grouped_rows`) and its per-group finishing
 /// (`Executor::rewrite_composed_item`) agree on which accumulator is
-/// which, without needing to name or otherwise identify individual
-/// aggregate calls within one item's expression tree.
+/// which, without needing to name individual aggregate calls.
 fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
     match expr {
         ReturnExpr::CountStar => out.push(expr),
@@ -7045,6 +6734,11 @@ fn collect_agg_nodes<'a>(expr: &'a ReturnExpr, out: &mut Vec<&'a ReturnExpr>) {
     }
 }
 
+/// True iff `expr` contains an aggregate call anywhere inside it, at any
+/// depth -- used to reject an aggregate nested inside another aggregate's
+/// argument, or inside a non-aggregate expression's `CASE`/`Call`
+/// arguments (an aggregate must be a return item's entire top-level
+/// expression — see `validate_return_items`).
 pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
     match expr {
         ReturnExpr::CountStar => true,
@@ -7070,8 +6764,8 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
         }
         // `where_clause` isn't checked -- same scope limitation as
         // `UnwindClause`'s own filter, which never routes through this
-        // check either; the source/project halves are the ones a real
-        // TCK scenario nests an aggregate in (`size([x IN collect(r) ...])`).
+        // check either; the source/project halves are where an
+        // aggregate can legitimately nest (`size([x IN collect(r) ...])`).
         ReturnExpr::ListComp {
             source, project, ..
         } => contains_aggregate(source) || project.as_deref().is_some_and(contains_aggregate),
@@ -7103,11 +6797,6 @@ pub(crate) fn contains_aggregate(expr: &ReturnExpr) -> bool {
     }
 }
 
-/// True iff any item's top-level expression is an aggregate call —
-/// `materialize_with`/`materialize_return` dispatch to the grouping path
-/// iff this is true, otherwise the existing row-at-a-time path runs
-/// completely unchanged (zero perf/behavior impact on non-aggregating
-/// queries).
 /// `try_fast_expand_expand_count`'s direction support: single concrete
 /// direction only — `Either` needs the two-call-plus-dedupe treatment the
 /// generic path does, out of the fast path's scope.
@@ -7149,17 +6838,17 @@ fn plan_contains_expansion(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// True iff any item's top-level expression is an aggregate call —
+/// `materialize_with`/`materialize_return` dispatch to the grouping path
+/// iff this is true, otherwise the existing row-at-a-time path runs
+/// unchanged.
 pub(crate) fn has_aggregate(items: &[ReturnItem]) -> bool {
     // `contains_aggregate`, not a narrower "is the item's whole top-level
     // expression itself an aggregate call" check -- an aggregate nested
-    // inside a wrapping expression (`1 + count(x)`, real Cypher composition
-    // -- see `resolve_grouped_rows`) still needs to route to the grouping
-    // path, both to actually compute it and so `validate_return_items` gets
-    // a chance to reject an invalid composition with a clear error. A
-    // narrower top-level-only check here would let such a query silently
-    // take the ordinary per-row path instead (iterating `rows` directly,
-    // which is empty for an empty MATCH), producing the wrong row count
-    // instead of the right (or correctly rejected) one.
+    // inside a wrapping expression (`1 + count(x)`, real Cypher composition)
+    // still needs to route to the grouping path, both to compute it and so
+    // `validate_return_items` gets a chance to reject an invalid
+    // composition with a clear error.
     items.iter().any(|item| contains_aggregate(&item.expr))
 }
 
@@ -7221,19 +6910,15 @@ fn contains_rand_call(expr: &ReturnExpr) -> bool {
 
 /// `RETURN *`/`RETURN DISTINCT *` resolved into the equivalent concrete
 /// item list -- one bare-`Var` item per currently-bound name, sorted
-/// alphabetically (real Cypher's own `RETURN *` column order, confirmed
-/// against the TCK's own multi-variable scenarios, not introduction
-/// order). Shared by `semantic.rs` (`scope.keys()`) and this file's own
-/// `execute_match` (`carried_vars`) -- each already has its own accurate
-/// bound-name set on hand at the point `Tail::ReturnStar` is reached, so
-/// resolving it there (rather than via a separate whole-AST-mutation
-/// pass before execution) needs no `&mut Statement` ripple through
-/// `Executor::execute`'s public signature. Real Cypher's own
-/// `NoVariablesInScope` compile-time error when nothing is bound at all
-/// (TCK's Return7 `[2]`, `MATCH () RETURN *`). `WITH *` doesn't share this
-/// restriction -- an empty `WITH *` is a legal, if useless, "carry forward
-/// nothing" no-op (TCK's Create3 `[2]`/`[3]`: `MATCH () CREATE () WITH *
-/// CREATE ()`, every token anonymous) -- see `with_star_items` below.
+/// alphabetically (real Cypher's `RETURN *` column order, not
+/// introduction order). Shared by `semantic.rs` (`scope.keys()`) and
+/// this file's `execute_match` (`carried_vars`) -- each already has its
+/// own accurate bound-name set on hand at the point `Tail::ReturnStar`
+/// is reached, so resolving it there needs no `&mut Statement` ripple
+/// through `Executor::execute`'s public signature. Errors when nothing
+/// is bound at all (`MATCH () RETURN *`). `WITH *` doesn't share this
+/// restriction -- an empty `WITH *` is a legal, if useless, "carry
+/// forward nothing" no-op -- see `with_star_items` below.
 pub(crate) fn return_star_items(
     names: impl Iterator<Item = String>,
 ) -> Result<Vec<ReturnItem>, QueryError> {
@@ -7267,23 +6952,21 @@ fn star_items(mut names: Vec<String>) -> Vec<ReturnItem> {
 /// Validates a RETURN/WITH item list before any row is processed. Two
 /// checks, both real Cypher compile-time errors:
 ///
-/// - Every aggregate call (found anywhere -- not just a return item's
+/// - Every aggregate call (found anywhere, not just a return item's
 ///   whole top-level expression, since `RETURN a, count(a) + 3`-style
-///   composition is real Cypher, TCK's Return6 `[2]` etc) has the right
-///   number of arguments, doesn't nest another aggregate inside its own
-///   argument (`NestedAggregation`), and isn't given a non-deterministic
-///   argument like `rand()` (`NonConstantExpression`).
-/// - Once *any* item aggregates, every other item's own non-aggregate
-///   leaf (a bare `Var`/`Prop` used outside any aggregate call) must
-///   match some *other* item's whole top-level expression verbatim
-///   (`AmbiguousAggregationExpression`, TCK's Return6 `[20]`/`[21]`) --
-///   real Cypher's rule that a value used alongside an aggregate must
-///   itself be an explicit grouping key, not just something that happens
-///   to be in scope. A literal/param is always fine (same value on every
-///   row, nothing to group by). This is checked by recursing into every
-///   item whose expression contains an aggregate anywhere, stopping at
-///   each aggregate-bearing subexpression itself (its own argument
-///   doesn't need to be grouping-key-safe -- it's folded per row).
+///   composition is real Cypher) has the right number of arguments,
+///   doesn't nest another aggregate inside its own argument, and isn't
+///   given a non-deterministic argument like `rand()`.
+/// - Once any item aggregates, every other item's own non-aggregate leaf
+///   (a bare `Var`/`Prop` used outside any aggregate call) must match
+///   some other item's whole top-level expression verbatim -- a value
+///   used alongside an aggregate must itself be an explicit grouping
+///   key, not just something in scope. A literal/param is always fine
+///   (same value on every row, nothing to group by). Checked by
+///   recursing into every item whose expression contains an aggregate
+///   anywhere, stopping at each aggregate-bearing subexpression itself
+///   (its own argument doesn't need to be grouping-key-safe, it's
+///   folded per row).
 pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryError> {
     for item in items {
         if contains_aggregate(&item.expr) {
@@ -7293,16 +6976,16 @@ pub(crate) fn validate_return_items(items: &[ReturnItem]) -> Result<(), QueryErr
     Ok(())
 }
 
-/// Whether `expr` (a leaf found inside some *other* composed expression)
-/// refers to `item` -- either structurally (`item.expr == *expr`) or, for
-/// a bare `Var`, by `item`'s own output *alias* (`RETURN me.age AS age
-/// ... ORDER BY age + count(...)`, TCK's ReturnOrderBy6 `[2]`: `age`
-/// alone doesn't structurally equal `me.age`, but it's still exactly
-/// item `age`'s value). Shared by `validate_composed_expr`'s compile-time
-/// check and `Executor::rewrite_composed_item`'s matching runtime lookup
-/// -- both need to agree on what counts as "the same grouping key,"
-/// including this by-alias case, or one would accept what the other
-/// can't actually evaluate.
+/// Whether `expr` (a leaf found inside some other composed expression)
+/// refers to `item` -- either structurally (`item.expr == *expr`) or,
+/// for a bare `Var`, by `item`'s own output alias (`RETURN me.age AS age
+/// ... ORDER BY age + count(...)`: `age` alone doesn't structurally
+/// equal `me.age`, but it's still exactly item `age`'s value). Shared by
+/// `validate_composed_expr`'s compile-time check and
+/// `Executor::rewrite_composed_item`'s matching runtime lookup -- both
+/// need to agree on what counts as "the same grouping key," including
+/// this by-alias case, or one would accept what the other can't
+/// evaluate.
 pub(crate) fn item_matches_leaf(expr: &ReturnExpr, index: usize, item: &ReturnItem) -> bool {
     item.expr == *expr
         || matches!(expr, ReturnExpr::Var(name) if *name == with_item_output_name((index, item)))
@@ -7339,10 +7022,7 @@ pub(crate) fn validate_composed_expr(
                 // `count(rand())` etc -- an aggregate's argument must be
                 // deterministic per row for grouping/re-execution to have
                 // well-defined semantics, which `rand()` (a fresh value on
-                // every call, see its own docs) fundamentally breaks. Real
-                // Cypher rejects this at compile time (TCK's Return6
-                // [15], `NonConstantExpression`), not just "whatever value
-                // it happens to produce."
+                // every call) breaks. Rejected at compile time.
                 if contains_rand_call(arg) {
                     return Err(QueryError::Semantic(format!(
                         "aggregate function '{name}' can't take a non-deterministic expression \
@@ -7369,11 +7049,9 @@ pub(crate) fn validate_composed_expr(
         };
     }
     // `Lit`/`HasLabel`/`PatternPredicate`/`PatternComprehension` need no
-    // check here: a literal is the same value on every row (nothing to
-    // group by), and the other three are opaque leaves for this same
-    // reason `contains_aggregate`/`collect_agg_nodes` treat them that way
-    // (see their own docs) -- not reachable with real content to check
-    // since none can themselves contain an aggregate.
+    // check here: a literal is the same value on every row, and the
+    // other three are opaque leaves for the same reason
+    // `contains_aggregate`/`collect_agg_nodes` treat them that way.
     match expr {
         ReturnExpr::Case { test, whens, else_ } => {
             if let Some(t) = test.as_deref() {
@@ -7419,18 +7097,14 @@ pub(crate) fn validate_composed_expr(
         // `source` may itself be a (possibly composed) aggregate --
         // `[x IN collect(p) | head(nodes(x))]` aggregates once per group
         // to build the list, then the comprehension iterates its result
-        // normally (TCK's List12 [4]/[5], real and required) -- recursed
-        // into below via the generic `Call`/`Arith`/etc. machinery, same
-        // as any other composed leaf. `project`, in contrast, runs once
-        // *per element* of that already-built list -- an aggregate
-        // there has no defined semantics at all (real Cypher flatly
-        // rejects it, TCK's List12 [7], "Fail when using aggregation in
-        // list comprehension") and `resolve_grouped_rows` has no
-        // "fold once per group, then run per element" fold shape for it
-        // anyway, so it's checked directly here rather than falling
-        // through to the generic recursion below, which would otherwise
-        // validate (and `rewrite_composed_item` would then evaluate) a
-        // nested aggregate as if it were an ordinary composed leaf.
+        // normally -- recursed into below via the generic
+        // `Call`/`Arith`/etc. machinery, same as any other composed
+        // leaf. `project`, in contrast, runs once per element of that
+        // already-built list, where an aggregate has no defined
+        // semantics and `resolve_grouped_rows` has no "fold once per
+        // group, then run per element" shape for it, so it's checked
+        // directly here rather than falling through to the generic
+        // recursion below.
         ReturnExpr::ListComp {
             source,
             project,
@@ -7482,17 +7156,15 @@ pub(crate) fn validate_composed_expr(
 }
 
 /// Same rules as `validate_composed_expr` (reused directly, first), plus
-/// one more real Cypher only enforces for an ORDER BY key specifically,
-/// not for a RETURN/WITH item's own composed expression: every
-/// aggregate-bearing subexpression found anywhere in it must itself
-/// verbatim/alias-match some existing RETURN/WITH item (TCK's
-/// WithOrderBy4 `[14]`, "Fail on sorting by a non-projected aggregation
-/// on an expression" -- `ORDER BY sum(x)` when the WITH only computes
-/// `min(x)`, a *different* aggregate over the same argument, is a real
-/// compile-time error, not "just fold it separately"). A RETURN/WITH
+/// one more that real Cypher only enforces for an ORDER BY key, not for
+/// a RETURN/WITH item's own composed expression: every aggregate-bearing
+/// subexpression found anywhere in it must itself verbatim/alias-match
+/// some existing RETURN/WITH item -- `ORDER BY sum(x)` when the WITH
+/// only computes `min(x)`, a different aggregate over the same argument,
+/// is a compile-time error, not "just fold it separately". A RETURN/WITH
 /// item's own composed expression has no such restriction -- `RETURN a,
-/// count(a) + sum(b)` folds both `count(a)` and `sum(b)` fresh as part of
-/// evaluating that one item, with nothing else either needs to match.
+/// count(a) + sum(b)` folds both `count(a)` and `sum(b)` fresh as part
+/// of evaluating that one item, with nothing else to match.
 pub(crate) fn validate_order_by_composed_expr(
     expr: &ReturnExpr,
     items: &[ReturnItem],
@@ -7533,11 +7205,7 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
         ),
         // A path's identity is its exact node/edge sequence, in order --
         // same graph-identity-by-id convention as the `Node`/`Edge` arms
-        // above, just walked element-by-element (found via TCK's
-        // Pattern2 [8]: `WITH [p = (n)-->() | p] AS ps, count(b) AS c`
-        // makes `ps` -- a list of paths -- an implicit GROUP BY key,
-        // real Cypher's own rule that every non-aggregate WITH/RETURN
-        // item groups by).
+        // above, just walked element-by-element.
         Binding::Path(elems) => HashKey::List(
             elems
                 .iter()
@@ -7566,12 +7234,10 @@ fn binding_hash_key(b: &Binding) -> Result<HashKey, QueryError> {
 /// Projects one of `ProcedureProvider::call`'s raw output rows (positional,
 /// `sig.outputs.len()` values in that order) down to whatever `yield_items`
 /// actually asked for -- `YIELD *` keeps every output under its own name;
-/// an explicit item list picks out just those (by the procedure's own
-/// declared name, not any rename yet) and pairs each with its `AS` alias
-/// if it had one, same output order the `YIELD` itself was written in
-/// (TCK's Call5 `[3]`: order is irrelevant to the *result*, but this still
-/// preserves whatever order was written, which `materialize_return`-style
-/// column ordering downstream expects to already be correct).
+/// an explicit item list picks out just those (by the procedure's declared
+/// name, not any rename yet) and pairs each with its `AS` alias if it had
+/// one, in the order the `YIELD` was written, which `materialize_return`-
+/// style column ordering downstream expects to already be correct.
 fn project_call_row(
     sig: &ProcedureSignature,
     proc_row: &[Value],
@@ -7593,17 +7259,15 @@ fn project_call_row(
     }
 }
 
-/// Coarse compile-time-shaped argument-type check (TCK's Call2
-/// `[5]`/`[6]`: passing a `BOOLEAN` where `INTEGER` is declared must
-/// error, even against an empty mock table that would otherwise just
-/// silently return zero rows). `Value::Null` always matches regardless of
-/// declared type -- every signature this codebase's own callers declare
-/// is nullable (`INTEGER?` etc, TCK's Call4), and there's no dedicated
-/// non-null marker to check against anyway. An unrecognized type name is
-/// tolerated (accepts anything) rather than rejected -- this is a coarse
-/// sanity check for the handful of type names TCK's own procedures
-/// actually declare (`INTEGER`/`FLOAT`/`NUMBER`/`STRING`/`BOOLEAN`), not a
-/// full type system.
+/// Coarse compile-time-shaped argument-type check: passing a `BOOLEAN`
+/// where `INTEGER` is declared must error, even against an empty mock
+/// table that would otherwise silently return zero rows. `Value::Null`
+/// always matches regardless of declared type, since every signature
+/// this codebase's callers declare is nullable (`INTEGER?` etc) and
+/// there's no dedicated non-null marker to check against. An
+/// unrecognized type name is tolerated (accepts anything) rather than
+/// rejected -- this is a coarse sanity check for a handful of type
+/// names, not a full type system.
 fn value_matches_declared_type(value: &Value, declared: &str) -> bool {
     if matches!(value, Value::Null) {
         return true;
@@ -7711,14 +7375,14 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
                 // are exposed via a fresh synthesized binding name (same
                 // `fresh()` mechanism as every other anonymous token
                 // here, so multiple variable-length hops in one pattern
-                // each get their own, no collision -- TCK's Match6
-                // `[17]`), read by `planner::build_match_plan` (its
-                // `VarExpand`'s `path_segment_var`) and `assemble_path`.
-                // The user's own real rel-list variable, if this hop had
-                // one (`p = (a)-[r*1..3]->(b)`, TCK's Match9 `[9]`), is
-                // preserved separately in `rel_list_var` rather than lost
-                // to this overwrite -- `var` itself is always this hop's
-                // internal path-segment bookkeeping name from here on.
+                // each get their own, no collision), read by
+                // `planner::build_match_plan` (its `VarExpand`'s
+                // `path_segment_var`) and `assemble_path`. The user's
+                // real rel-list variable, if this hop had one (`p = (a)
+                // -[r*1..3]->(b)`), is preserved separately in
+                // `rel_list_var` rather than lost to this overwrite --
+                // `var` itself is always this hop's internal
+                // path-segment bookkeeping name from here on.
                 rel.rel_list_var = rel.var.take();
                 rel.var = Some(fresh(&mut counter, &mut synthesized));
                 rel.capture_path_segment = true;
@@ -7737,13 +7401,10 @@ fn name_pattern_for_path(pattern: &Pattern) -> (Pattern, HashSet<String>) {
 
 /// Assembles a `Binding::Path` from `pattern`'s (fully-named, via
 /// `name_pattern_for_path`) start/hop variables, in pattern order. Falls
-/// back to `Binding::Value(Null)` — never errors — if any position isn't a
+/// back to `Binding::Value(Null)`, never errors, if any position isn't a
 /// real node/edge binding, which only happens when this row came from
-/// `OPTIONAL MATCH` null-padding (every position `name_pattern_for_path`
-/// named is guaranteed present in the row either way, as a real binding or
-/// as `Binding::Value(Null)`, so "missing key" isn't a case this needs to
-/// handle) — same "no match survives as Null, not a dropped row" outcome
-/// `OPTIONAL MATCH` already gives every other variable.
+/// `OPTIONAL MATCH` null-padding -- same "no match survives as Null, not
+/// a dropped row" outcome `OPTIONAL MATCH` gives every other variable.
 fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
     let Some(start_id) = path_node_id(pattern.start.var.as_deref(), row) else {
         return Binding::Value(PropertyValue::Null);
@@ -7776,10 +7437,10 @@ fn assemble_path(pattern: &Pattern, row: &BindingRow) -> Binding {
 }
 
 /// `[r:TYPE*1..3]`'s own `r` -- real Cypher binds the traversed
-/// relationships as a *list*, fully materialized (not just ids the way
+/// relationships as a list, fully materialized (not just ids the way
 /// `path_segment_var`'s cheaper `Binding::Path` segment stays), since
-/// `Binding::List` -- like every other post-projection value shape --
-/// only ever holds already-resolved `Value`s (TCK's Match4 `[1]`/`[6]`).
+/// `Binding::List`, like every other post-projection value shape, only
+/// ever holds already-resolved `Value`s.
 fn segment_edges_to_list(txn: Txn, segment: &[PathBinding]) -> Result<Binding, QueryError> {
     let edges = segment
         .iter()
@@ -7850,12 +7511,11 @@ fn reconstruct_path(
 /// non-aggregate `ReturnExpr` form produces one except `Var`, which takes
 /// the bare-variable path instead), and a bare `collect()` result is
 /// routed to `Binding::List` before reaching here (see `has_aggregate`) --
-/// both still fall back to `Null` rather than needing a fallible signature
-/// for an unreachable case. `Value::List` genuinely *can* reach here now,
-/// though (`WITH n.numbers + [4] AS x` -- a real computed list expression,
-/// not a bare `collect()`, once list-valued properties round-trip through
-/// `lookup_prop_value` as real `Value::List`s) -- recurses per-element,
-/// same as `value_to_storable_property`'s own list handling.
+/// both fall back to `Null` rather than needing a fallible signature for
+/// an unreachable case. `Value::List` can reach here though (`WITH
+/// n.numbers + [4] AS x`, a real computed list expression, not a bare
+/// `collect()`) -- recurses per-element, same as
+/// `value_to_storable_property`'s own list handling.
 fn value_to_property_value(v: &Value) -> PropertyValue {
     match v {
         Value::Null => PropertyValue::Null,
@@ -7871,17 +7531,13 @@ fn value_to_property_value(v: &Value) -> PropertyValue {
 /// `eval_props_to_values`'s stricter cousin of `value_to_property_value`
 /// above -- a CREATE/SET prop value that evaluates to a node/edge/path/map
 /// is a real, reportable error (`None` here), not a silent `Null`.
-/// `value_to_property_value`'s silent-`Null` fallback is correct at *its*
-/// call sites (a WITH-projected scalar, where those shapes genuinely can't
-/// occur — see its own doc comment) but was never meant for CREATE/SET's
-/// prop value, where writing one of those is a real, everyday mistake
-/// (`CREATE (n {tags: some_node})`) that should say so, not silently store
-/// `null`. `Value::List` *is* storable (`PropertyValue::List`, real
-/// Cypher/Neo4j's own "homogeneous array property" shape) -- recurses
-/// per-element, so a list containing something unstorable (a nested list
-/// isn't rejected here, since no TCK scenario tests that restriction and
-/// nothing about `PropertyValue::List`'s own storage format requires it,
-/// but a node/edge/path/map element still correctly fails the whole list).
+/// `value_to_property_value`'s silent-`Null` fallback is correct at its
+/// call sites (a WITH-projected scalar, where those shapes can't occur)
+/// but not for CREATE/SET's prop value, where writing one of those
+/// (`CREATE (n {tags: some_node})`) is a real, everyday mistake that
+/// should say so. `Value::List` is storable (`PropertyValue::List`) and
+/// recurses per-element, so a node/edge/path/map element inside a list
+/// still fails the whole list (a nested list isn't rejected here).
 fn value_to_storable_property(v: &Value) -> Option<PropertyValue> {
     match v {
         Value::Null => Some(PropertyValue::Null),
@@ -7901,14 +7557,12 @@ fn value_to_storable_property(v: &Value) -> Option<PropertyValue> {
 /// `PropertyValue` back into a real `Value`, the read-time counterpart
 /// every property-access site (`lookup_prop_value`, `binding_to_value`,
 /// `eval_projected_expr`'s node/edge prop arms) needs. A scalar wraps as
-/// `Value::Property` exactly as before; `PropertyValue::List` becomes a
-/// genuine `Value::List` (not `Value::Property(PropertyValue::List(_))`)
-/// so every existing list operation (`size()`, `tail()`, indexing, `IN`,
-/// `UNWIND`, ...) -- all of which pattern-match on `Value::List`
-/// specifically -- works transparently on a property-sourced list the
-/// same as a list literal/`collect()` result, with no special-casing
-/// needed anywhere else. `PropertyValue::Null` collapses to `Value::Null`,
-/// matching every other property-read site's existing null convention.
+/// `Value::Property`; `PropertyValue::List` becomes a genuine
+/// `Value::List` (not `Value::Property(PropertyValue::List(_))`) so every
+/// list operation that pattern-matches on `Value::List` (`size()`,
+/// `tail()`, indexing, `IN`, `UNWIND`) works transparently on a
+/// property-sourced list, same as a list literal/`collect()` result.
+/// `PropertyValue::Null` collapses to `Value::Null`.
 fn property_value_to_value(pv: PropertyValue) -> Value {
     match pv {
         PropertyValue::Null => Value::Null,
@@ -7921,14 +7575,13 @@ fn property_value_to_value(pv: PropertyValue) -> Value {
 
 /// A bound `NodeId`/`EdgeId` whose record is no longer in the store means
 /// exactly one thing within a single statement's transaction: it was
-/// deleted earlier in this same statement (e.g. `MATCH (n) DELETE n RETURN
-/// n.num` -- real Cypher's `DeletedEntityAccess` error, TCK's Return2
-/// scenarios [15]/[16]/[17]). Nothing else can cause a `None` here --
-/// there's no concurrent deletion mid-statement, and a `Binding::Node`/
-/// `Edge` only ever gets constructed from an id a prior MATCH/CREATE/MERGE
-/// in this same transaction actually found or made. Centralized here
-/// (rather than each of `binding_to_value`/`resolve_path_elems`/
-/// `lookup_prop` re-deriving the message) so the wording stays one place.
+/// deleted earlier in this same statement (e.g. `MATCH (n) DELETE n
+/// RETURN n.num`). Nothing else can cause a `None` here -- there's no
+/// concurrent deletion mid-statement, and a `Binding::Node`/`Edge` only
+/// ever gets constructed from an id a prior MATCH/CREATE/MERGE in this
+/// same transaction actually found or made. Centralized here (rather
+/// than each of `binding_to_value`/`resolve_path_elems`/`lookup_prop`
+/// re-deriving the message) so the wording stays one place.
 fn deleted_entity_access<T>(record: Option<T>) -> Result<T, QueryError> {
     record.ok_or_else(|| {
         QueryError::UnboundVariable(
@@ -8003,12 +7656,10 @@ fn neighbors_for_direction(
 /// `<expr>.prop` where `<expr>` isn't a bare row variable (`ReturnExpr::
 /// PropOf`, e.g. `startNode(r).id`, `head(nodes(p)).name`, `{a: 1}.a`) --
 /// unlike `lookup_prop_value`'s `Prop(PropAccess)` arm, there's no row/txn
-/// lookup to do here, `v` already *is* the fully-evaluated base value, so
+/// lookup to do here, `v` already is the fully-evaluated base value, so
 /// this reads straight off it. Same node/edge/map/temporal-value-or-error
-/// shape as `lookup_prop_value`, minus the "unbound variable" case (there's
-/// no variable name to report -- a `PropOf` base that evaluates to
-/// `Value::Null` propagates `Null` here the same way a bound-but-null row
-/// variable's own `.prop` access already does).
+/// shape as `lookup_prop_value`, minus the "unbound variable" case, since
+/// there's no variable name to report.
 fn property_of_value(v: &Value, prop: &str) -> Result<Value, QueryError> {
     match v {
         Value::Node(n) => Ok(n

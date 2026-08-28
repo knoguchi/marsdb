@@ -19,10 +19,9 @@ pub(crate) fn intern_prop(ctx: &mut WriteCtx, prop: &str) -> Result<u32, GraphEr
 
 /// A prop-id -> name resolver over one pre-opened `ID_TO_PROP` handle —
 /// for record decode (`encode::decode_node`/`decode_edge`), which resolves
-/// one id per property per record. Opening the table once here instead of
-/// per resolution matters because table opens were themselves a measured
-/// hot cost (mars-3va, 23.67% of a bulk load) — a resolver that re-opened
-/// per prop would reintroduce exactly that.
+/// one id per property per record. Opening the table once here, not once
+/// per resolution, matters because table opens are a measured hot cost on
+/// bulk loads.
 ///
 /// Only for read paths that hold no `WriteCtx` — inside a `WriteCtx`-based
 /// write method, `ID_TO_PROP` may already be open on the same transaction

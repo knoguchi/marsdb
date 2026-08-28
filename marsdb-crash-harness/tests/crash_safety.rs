@@ -1,23 +1,18 @@
 //! Level-1 crash-safety check: process-crash durability (OS stays up,
-//! page cache intact) -- NOT real power-loss (page cache lost too, only
-//! `fsync`'d bytes survive). That's a different failure mode needing real
-//! fault injection (e.g. `dm-flakey`); this only proves "if the OS
-//! survives, a killed-mid-write MarsDB file isn't corrupted and never
-//! loses an acknowledged commit."
+//! page cache intact), not power-loss (needs real fault injection, e.g.
+//! `dm-flakey`). Proves a killed-mid-write MarsDB file isn't corrupted
+//! and never loses an acknowledged commit.
 //!
-//! Spawns `crash_child` (see `src/bin/crash_child.rs`), lets it commit a
+//! Spawns `crash_child` (`src/bin/crash_child.rs`), lets it commit a
 //! random number of `CREATE (:Counter {n: N})` transactions, SIGKILLs it
-//! at an unpredictable point, then reopens the same file fresh and
-//! checks the invariant: whatever `Counter.n` values exist must be
-//! exactly the contiguous prefix `{1, 2, ..., K}` -- no gaps (a
-//! transaction that should have been all-or-nothing left a partial
-//! record) and no duplicates (a commit got recorded twice). This doesn't
-//! require synchronizing with the child's actual commit completion
-//! (racy and unnecessary) -- it only asserts on what's structurally true
-//! regardless of exactly which commit the kill landed on.
+//! at an unpredictable point, then reopens the file and checks that the
+//! surviving `Counter.n` values are exactly the contiguous prefix
+//! `{1, ..., K}`: no gaps (a partial transaction) and no duplicates (a
+//! commit recorded twice). No synchronization with the child's commit
+//! completion is needed -- the invariant holds regardless of which
+//! commit the kill lands on.
 //!
-//! Ignored by default (spawns/kills real processes in a loop, slower
-//! than the rest of the suite) -- run explicitly:
+//! Ignored by default (spawns/kills real processes in a loop) -- run:
 //!     cargo test -p marsdb-crash-harness --test crash_safety -- --ignored --nocapture
 
 use std::io::{BufRead, BufReader};
@@ -42,10 +37,9 @@ fn kill_mid_write_never_corrupts_or_loses_an_acknowledged_commit() {
             .spawn()
             .expect("spawn crash_child");
 
-        // Randomize the kill point across runs -- let a varying number of
-        // acknowledged commits happen first, then also race the next one
-        // (don't wait for its "OK" line) so kills land at different
-        // points in the write path run over run, not always the same one.
+        // Vary the kill point across runs: read a varying number of "OK"
+        // lines first, then don't wait for the next one, so kills land
+        // at different points in the write path run over run.
         let mut reader = BufReader::new(child.stdout.take().expect("child stdout"));
         let mut line = String::new();
         let commits_before_kill = (run % 7) + 1;

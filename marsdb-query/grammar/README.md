@@ -59,7 +59,7 @@ Not upstream-worthy — no basis in `openCypher.bnf`. Present here because
 MarsDB supports them:
 
 - **`EXPLAIN <statement>`** — describe the plan without running it. Grammar
-  only; `EXPLAIN` doesn't yet wrap `CALL`.
+  only; `EXPLAIN` doesn't wrap `CALL`.
 - **`CREATE INDEX ON :Label(prop) [UNIQUE]`** — the older single-property
   index syntax, not real Cypher's newer `CREATE INDEX FOR (n:Label) ON
   (n.prop)`.
@@ -69,8 +69,8 @@ MarsDB supports them:
 - **`;`-separated multi-statement batches** — `CREATE (a); CREATE (b);` as
   one textual submission (`parse_many`). Not a Cypher concept; needed for
   this crate's own multi-statement API.
-- **`BEGIN` / `COMMIT` / `ROLLBACK`** — session-transaction statements
-  (issue #142); `BEGIN TRANSACTION` is an accepted alias for `BEGIN`.
+- **`BEGIN` / `COMMIT` / `ROLLBACK`** — session-transaction statements;
+  `BEGIN TRANSACTION` is an accepted alias for `BEGIN`.
   Not in the grammar at all: recognized textually by `parse_antlr`
   before ANTLR runs (a whole statement that is exactly one of these
   keyword forms can never be valid Cypher otherwise), same

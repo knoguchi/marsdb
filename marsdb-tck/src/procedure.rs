@@ -1,15 +1,12 @@
 //! Mock-procedure support for `CALL` scenarios (`clauses/call/*.feature`)
 //! -- each scenario's own `And there exists a procedure ...` step(s)
-//! (parsed into `gherkin::ProcedureFixture`) become a tiny fixed lookup
-//! table: `TckProcedureProvider::call` filters that table's rows by
-//! equality against the actual call arguments (on the declared input
-//! columns only) and projects the declared output columns, confirmed
-//! against every vendored `clauses/call/*.feature` scenario (e.g. Call5
-//! `[8]`'s `CALL test.my.proc('Stefan', 1) YIELD *` only returns the one
-//! row whose `name`/`id` columns match). This is a fixture-driven test
-//! double, not a real procedure implementation -- MarsDB itself has no
-//! built-in procedures (see `marsdb_query::ProcedureProvider`'s own
-//! docs).
+//! (parsed into `gherkin::ProcedureFixture`) become a fixed lookup table:
+//! `TckProcedureProvider::call` filters that table's rows by equality
+//! against the actual call arguments (on the declared input columns
+//! only) and projects the declared output columns. This is a
+//! fixture-driven test double, not a real procedure implementation --
+//! MarsDB itself has no built-in procedures (see
+//! `marsdb_query::ProcedureProvider`'s own docs).
 
 use std::collections::HashMap;
 
@@ -51,9 +48,8 @@ impl TckProcedureProvider {
     /// Own error type is plain `String` (a fixture-parsing/lookup
     /// problem, not a real Cypher runtime error) -- `call` above wraps it
     /// in the `__unsupported__`-prefixed `QueryError::Semantic` sentinel
-    /// `main.rs`'s own `classify_setup_error`/`unsupported` already use
-    /// for "this is a harness gap, not the engine getting something
-    /// wrong."
+    /// `main.rs`'s `classify_setup_error`/`unsupported` also use to mark
+    /// a harness gap rather than an engine bug.
     fn call_inner(&self, name: &str, args: &[Value]) -> Result<Vec<Vec<Value>>, String> {
         let fx = self
             .procs
@@ -101,8 +97,8 @@ impl TckProcedureProvider {
 /// `TckValue` -> a real `marsdb_query::Value` a procedure call can return
 /// -- only the scalar/list shapes any vendored `clauses/call/*.feature`
 /// fixture table actually uses (TCK's Call1-6 never declare a node/rel/
-/// map-typed procedure column); anything else is a clear error rather
-/// than a silent wrong conversion.
+/// map-typed procedure column); anything else is an error rather than a
+/// silent wrong conversion.
 fn tck_to_call_value(v: &TckValue) -> Result<Value, String> {
     Ok(match v {
         TckValue::Null => Value::Null,
@@ -121,16 +117,16 @@ fn tck_to_call_value(v: &TckValue) -> Result<Value, String> {
 }
 
 /// Equality used to filter a fixture table's rows by the actual call
-/// arguments -- `value_to_tck` normalizes `arg` regardless of whether it's
-/// a literal or a property-sourced value (`Value::Literal`/`Value::
-/// Property` both reach this from different call sites: an explicit
-/// argument expression's own evaluation, or a `PropertyValue` looked up
-/// by name for the implicit-argument form, TCK's Call2 `[3]`), and real
-/// Cypher's own numeric equality crosses INTEGER/FLOAT (TCK's Call3
-/// `[5]`/`[6]`: an `INTEGER` argument matches a `FLOAT?`-declared
-/// column's `42.0` row) -- `tck_eq`'s derived-`PartialEq` fallback
-/// wouldn't give either of those for free (different `Value` shapes,
-/// different `TckScalar` variants).
+/// arguments -- `value_to_tck` normalizes `arg` regardless of whether
+/// it's a literal or a property-sourced value (`Value::Literal`/
+/// `Value::Property` both reach this, from an explicit argument
+/// expression or a `PropertyValue` looked up by name for the
+/// implicit-argument form, TCK's Call2 `[3]`), and real Cypher's numeric
+/// equality crosses INTEGER/FLOAT (TCK's Call3 `[5]`/`[6]`: an `INTEGER`
+/// argument matches a `FLOAT?`-declared column's `42.0` row) -- the
+/// derived-`PartialEq` fallback `tck_eq` falls back to wouldn't give
+/// either of those for free (different `Value` shapes, different
+/// `TckScalar` variants).
 fn call_values_equal(arg: &Value, cell: &TckValue) -> bool {
     let arg = value_to_tck(arg);
     match (&arg, cell) {

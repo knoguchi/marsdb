@@ -1,23 +1,11 @@
-/// Typed error taxonomy, in three tiers that reflect *when* the problem
-/// was knowable:
-///
-/// - [`Syntax`](QueryError::Syntax): the query text itself is malformed —
-///   never reached planning/execution at all (`parser.rs`, including
-///   `pest`'s own grammar failures).
-/// - [`Semantic`](QueryError::Semantic): the query text parsed fine but
-///   describes something structurally invalid — knowable from the query
-///   alone, no data/parameters needed (an unsupported pattern shape, an
-///   aggregate nested somewhere it can't be, `EXPLAIN EXPLAIN`, ...).
-/// - [`Type`](QueryError::Type): only knowable once a real value (from
-///   stored data or a `$parameter`) is in hand and turns out to be the
-///   wrong shape (arithmetic on a non-number, indexing a non-list, a
-///   `date({...})` field of the wrong type, ...).
-///
-/// Callers that only need "did it work" (most of this codebase) keep
-/// using `Display`/`?` as before — this tiering exists for callers that
-/// want to react differently to "you wrote something illegal" vs "the
-/// data didn't match what the query assumed" (an application surfacing
-/// user-facing messages, or `ExecutionOutcome`'s telemetry categories).
+/// Typed error taxonomy, in three tiers reflecting *when* the problem was
+/// knowable: [`Syntax`](QueryError::Syntax) (malformed query text),
+/// [`Semantic`](QueryError::Semantic) (parses fine, structurally invalid
+/// independent of data), and [`Type`](QueryError::Type) (only knowable
+/// once a stored or parameter value turns out the wrong shape). Most
+/// callers just use `Display`/`?`; the tiering is for callers that need
+/// to distinguish "illegal query" from "data didn't match" (e.g.
+/// user-facing messages or telemetry categories).
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     #[error("syntax error: {0}")]

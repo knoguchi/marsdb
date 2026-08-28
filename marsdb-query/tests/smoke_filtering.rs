@@ -1,4 +1,4 @@
-//! Smoke tests: WHERE, ORDER BY, SKIP, LIMIT, DISTINCT -- split from the original smoke.rs.
+//! Smoke tests: WHERE, ORDER BY, SKIP, LIMIT, DISTINCT.
 
 mod common;
 #[allow(unused_imports)]
@@ -97,12 +97,9 @@ fn limit_clause_pushed_into_scan_edge_cases() {
     assert_eq!(run(&store, "MATCH (n) RETURN n LIMIT 2").rows.len(), 2);
 }
 
-/// `WHERE a:A` -- a user-typed label predicate directly in pattern-level
-/// `WHERE`, not just the planner-synthesized form multi-label node
-/// patterns already used internally.
-/// Real Cypher's `WITH x AS y WHERE ...` sees *both* the pre-WITH
-/// binding (`x`) and the new alias (`y`) -- the WHERE isn't scoped to
-/// only the projected/aliased row the way a later clause is.
+/// `WITH x AS y WHERE ...` sees both the pre-WITH binding (`x`) and the
+/// new alias (`y`) -- the WHERE isn't scoped to only the
+/// projected/aliased row the way a later clause is.
 #[test]
 fn with_where_sees_both_pre_and_post_with_bindings() {
     let store = GraphStore::open_memory().unwrap();
@@ -157,6 +154,9 @@ fn with_where_is_not_null() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// `WHERE a:A` -- a user-typed label predicate directly in pattern-level
+/// `WHERE`, not just the planner-synthesized form multi-label node
+/// patterns already use internally.
 #[test]
 fn where_label_predicate_filters_by_label() {
     let store = GraphStore::open_memory().unwrap();
@@ -488,8 +488,8 @@ fn order_by_multi_key_against_aliases_not_raw_bindings() {
     run(&store, "CREATE (b:Person {name: 'Alice', age: 30})");
     run(&store, "CREATE (c:Person {name: 'Bob', age: 25})");
 
-    // Sort keys are aliases (personAge/person_name), not raw pattern vars —
-    // this is the shape every IS-query ORDER BY actually uses.
+    // Sort keys are aliases (personAge/person_name), not raw pattern
+    // vars, matching the shape every IS-query ORDER BY uses.
     let result = run(
         &store,
         "MATCH (n:Person) RETURN n.age AS personAge, n.name AS person_name ORDER BY personAge DESC, person_name ASC",
@@ -960,13 +960,10 @@ fn with_where_bare_label_predicate() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// `WHERE (n)-[:REL]->()` used as a boolean predicate (TCK's Pattern1) --
-/// existential: true iff a real match exists, without binding a fresh
-/// row per match (unlike an ordinary `MATCH`). Covers the existential/
-/// negated/conjunction shapes and the two-already-bound-endpoints shape
-/// (`(n)-->(m)`, both `n`/`m` from an outer `MATCH (n), (m)`); the
-/// compile-time rejection of a pattern predicate introducing a brand
-/// new, never-bound variable is `pattern_predicate_introducing_new_variable_is_rejected` below.
+/// `WHERE (n)-[:REL]->()` as a boolean predicate (TCK's Pattern1): true
+/// iff a match exists, without binding a row per match. Covers
+/// existential/negated/conjunction shapes and the two-bound-endpoints
+/// shape (`(n)-->(m)`, both `n`/`m` from an outer `MATCH (n), (m)`).
 #[test]
 fn pattern_predicate_in_where() {
     let store = GraphStore::open_memory().unwrap();
@@ -1002,12 +999,10 @@ fn pattern_predicate_in_where() {
 
 #[test]
 fn with_where_comparison_followed_by_order_by_still_parses() {
-    // Regression: widening `return_expr` to include an optional trailing
-    // comparison broke `with_comparison`'s own separate `return_expr ~
-    // compare_op ~ literal` shape (used by WITH's own WHERE) -- the
-    // return_expr operand greedily swallowed the whole `y > 10` itself,
-    // leaving nothing for with_comparison's own trailing compare_op to
-    // match. Fixed by narrowing with_comparison's LHS to add_expr.
+    // Regression: widening `return_expr` to include a trailing
+    // comparison broke `with_comparison`'s own WHERE shape -- its
+    // operand greedily swallowed `y > 10`, leaving nothing for the
+    // trailing compare_op to match.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Item {idx: 20})");
     run(&store, "CREATE (:Item {idx: 5})");
@@ -1021,9 +1016,8 @@ fn with_where_comparison_followed_by_order_by_still_parses() {
 
 /// Real Cypher accepts `ASCENDING`/`DESCENDING` as full-word spellings of
 /// `ASC`/`DESC` -- the grammar's `sort_dir` rule tried `^"ASC"` before
-/// `^"ASCENDING"`, so it matched just the `ASC` prefix and left `ENDING`
-/// dangling as a syntax error (longest alternative must come first in a
-/// pest `|` alternation).
+/// `^"ASCENDING"`, matching just the prefix and leaving `ENDING` dangling
+/// (longest alternative must come first in a pest `|` alternation).
 #[test]
 fn order_by_accepts_ascending_and_descending_spellings() {
     let store = GraphStore::open_memory().unwrap();
@@ -1068,11 +1062,10 @@ fn with_distinct_dedups_projected_rows_before_order_by_and_limit() {
 #[test]
 fn return_expr_or_immediately_before_order_by_does_not_swallow_order() {
     // Regression: a bare `^"OR"` keyword has no word-boundary check, so
-    // it happily matched the first two letters of `ORDER`, mis-parsing
-    // `RETURN x OR y ORDER BY z` as `RETURN (x OR y OR DER) BY z` --
-    // caught because `y ORDER BY y` (nothing between the boolean
-    // expression and the ORDER BY clause) is exactly what a `RETURN`
-    // item's own trailing structure looks like.
+    // it matched the first two letters of `ORDER`, mis-parsing `RETURN x
+    // OR y ORDER BY z` as `RETURN (x OR y OR DER) BY z` -- caught by
+    // `y ORDER BY y`, where nothing sits between the boolean expression
+    // and ORDER BY.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Item {idx: 2})");
     run(&store, "CREATE (:Item {idx: 1})");
@@ -1106,14 +1099,11 @@ fn is_not_null_pattern_where_excludes_missing_property() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// `MATCH ... WHERE n.name IN [x IN labels(b) | toLower(x)]` -- `IN` used
-/// directly as a bare WHERE predicate (no comparison operator), needing
-/// `general_bare_expr`'s widening from raw `add_expr` to
-/// `null_predicate_expr`. Also caught a separate, pre-existing bug this
-/// surfaced: `labels()`/`keys()` were both mis-typed as `Kind::Scalar` in
-/// semantic inference (they return a *list* of strings in real Cypher),
-/// wrongly rejecting `[x IN labels(n) | ...]`'s otherwise-valid list
-/// comprehension source.
+/// `IN` used directly as a bare WHERE predicate (no comparison operator)
+/// -- needs `general_bare_expr`'s widening from `add_expr` to
+/// `null_predicate_expr`. Also caught `labels()`/`keys()` mis-typed as
+/// `Kind::Scalar` in semantic inference, which wrongly rejected this
+/// list comprehension.
 #[test]
 fn in_as_bare_where_predicate_with_labels_list_comprehension() {
     let store = GraphStore::open_memory().unwrap();
@@ -1135,10 +1125,9 @@ fn in_as_bare_where_predicate_with_labels_list_comprehension() {
 
 #[test]
 fn list_comprehension_bare_where_now_parses() {
-    // Regression: previously `filter_expr`'s WHERE reused WithExpr, which
-    // only ever wrapped a single Compare -- a bare boolean value (`WHERE
-    // x`/`WHERE true`) failed to parse. Now that boolean logic is a real
-    // ReturnExpr, this works.
+    // Regression: `filter_expr`'s WHERE reused WithExpr, which only ever
+    // wrapped a single Compare -- a bare boolean value (`WHERE x`/`WHERE
+    // true`) failed to parse.
     let store = GraphStore::open_memory().unwrap();
     let result = run(
         &store,
@@ -1152,9 +1141,9 @@ fn list_comprehension_bare_where_now_parses() {
 
 #[test]
 fn quantifier_bare_where_now_parses() {
-    // Just the parsing gap this task fixes -- none() on an empty list is
-    // vacuously true regardless of the WHERE condition (real Cypher
-    // semantics, already covered by quantifier_none_on_empty_list_is_true).
+    // Parsing gap only -- none() on an empty list is vacuously true
+    // regardless of the WHERE condition (already covered by
+    // quantifier_none_on_empty_list_is_true).
     let store = GraphStore::open_memory().unwrap();
     let result = run(
         &store,
@@ -1168,7 +1157,7 @@ fn quantifier_bare_where_now_parses() {
 fn where_clause_equality_fuses_into_index_seek() {
     // Unlike an inline pattern property (already covered by
     // create_index_then_lookup_via_index_seek), a WHERE-clause equality
-    // compiles to a separate outer Filter -- apply_index_seeks' newer
+    // compiles to a separate outer Filter -- apply_index_seeks'
     // predicate-extraction pass is what finds it.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {email: 'alice@x.com', age: 30})");
@@ -1185,12 +1174,10 @@ fn where_clause_equality_fuses_into_index_seek() {
 
 #[test]
 fn with_where_compares_two_variables_not_just_a_variable_against_a_literal() {
-    // `WithExpr::Compare`'s RHS used to be `Literal`-only -- `WHERE a = b`
-    // (comparing two bound node/property values against each other)
-    // couldn't parse at all. A self-loop is the only fixed-pattern shape
-    // that produces two identical node bindings without needing the
-    // unsupported comma-separated cross-join `MATCH (a), (b)` the real
-    // TCK scenario for this uses.
+    // `WHERE a = b` compares two bound node/property values -- a
+    // self-loop is the only fixed-pattern shape producing two identical
+    // node bindings without the unsupported comma-separated cross-join
+    // `MATCH (a), (b)` the real TCK scenario uses.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (n:S)-[:R]->(n)"); // self-loop: a == b
     run(&store, "CREATE (:S)-[:R]->(:S)"); // not a self-loop: a != b
@@ -1229,15 +1216,9 @@ fn with_where_variable_against_literal_still_works() {
 
 #[test]
 fn order_by_desc_sorts_lists_correctly() {
-    // Real bug found while widening UNWIND's source to a general
-    // expression (a previous session change): nested list literals like
-    // `[[], ['a'], [1, 'a'], ...]` couldn't parse at all before that fix,
-    // so this query -- and the list-vs-list ORDER BY path it exercises --
-    // had never actually run. `compare_non_null` had no `Value::List` arm,
-    // silently falling through to its scalar-only `_ => Ordering::Equal`
-    // catch-all, so ORDER BY on a list column was a silent no-op
-    // (stable-sort-over-always-Equal preserves input order) regardless of
-    // ASC/DESC. Exact scenario + expected order from TCK's ReturnOrderBy1
+    // `compare_non_null` had no `Value::List` arm, falling through to a
+    // scalar-only `_ => Ordering::Equal` catch-all -- ORDER BY on a list
+    // column was a no-op regardless of ASC/DESC. TCK's ReturnOrderBy1
     // `[10]`.
     let store = GraphStore::open_memory().unwrap();
     let result = run(

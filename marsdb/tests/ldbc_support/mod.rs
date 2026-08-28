@@ -4,7 +4,7 @@
 //! The schema and statement stream are derived from a third-party
 //! benchmark (orneryd/Mimir's `ldbc-style-benchmark.bench.ts`, itself an
 //! informal imitation of LDBC SNB) so results stay comparable across
-//! engines — this is NOT the official LDBC SNB data generator and nothing
+//! engines. This is NOT the official LDBC SNB data generator and nothing
 //! here is an official LDBC benchmark result. The original's
 //! `Math.random()` KNOWS pairing is replaced by a fixed-seed LCG, so a
 //! given scale factor always produces the identical graph.
@@ -113,7 +113,7 @@ pub const TAGS: &[&str] = &[
 pub const BROWSERS: &[&str] = &["Chrome", "Firefox", "Safari", "Edge"];
 
 /// Same constants as `rand`'s `Pcg`-family seed mixer, used purely as a
-/// fixed-seed 64-bit LCG (top bits used for the modulo) — the point is
+/// fixed-seed 64-bit LCG (top bits used for the modulo). The point is
 /// determinism, not statistical quality.
 pub struct Lcg(pub u64);
 

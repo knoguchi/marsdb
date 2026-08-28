@@ -7,8 +7,7 @@
 //! storage lands, this API is the interface that stays while the
 //! transpose disappears.
 //!
-//! Type inference is strict, per the precision discipline everywhere
-//! else in this codebase: a column must be one consistent Arrow type
+//! Type inference is strict: a column must be one consistent Arrow type
 //! over every row or the export fails with a typed error naming the
 //! column — no silent Int→Float promotion (it corrupts |int| > 2^53),
 //! no stringifying entities. Rules:

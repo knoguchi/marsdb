@@ -32,14 +32,11 @@ pub(crate) fn resolve_label(txn: Txn, label_id: u32) -> Result<String, GraphErro
 /// label has never been used, meaning no rows can reference it. Read-only —
 /// see `resolve_label`'s doc comment for why this takes `Txn`.
 ///
-/// `LABEL_TO_ID` is created lazily by `intern_label`'s own write path —
-/// against a database that has never created a single node/edge, the
-/// table doesn't exist yet, and a `ReadTransaction`'s `open_table` (unlike
-/// a `WriteTransaction`'s, which auto-creates) errors on that rather than
-/// treating it as empty. That specific error is exactly "not found" here,
-/// not a real failure — found via a real test (`create_index` against a
-/// property that was never interned hit the equivalent gap in
-/// `lookup_prop_id`; this is the same latent issue in its label counterpart).
+/// `LABEL_TO_ID` is created lazily by `intern_label`'s own write path, so
+/// against a database that has never created a node/edge the table doesn't
+/// exist yet. A `ReadTransaction`'s `open_table` errors on a missing table
+/// rather than treating it as empty (unlike a `WriteTransaction`'s, which
+/// auto-creates); that error is treated as "not found" here, not a failure.
 pub(crate) fn lookup_label_id(txn: Txn, label: &str) -> Result<Option<u32>, GraphError> {
     let l2i = match txn.open_table(marsdb_storage::tables::LABEL_TO_ID) {
         Ok(table) => table,

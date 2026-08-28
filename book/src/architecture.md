@@ -30,33 +30,28 @@ metadata when the file is created or first opened by a version-aware
 build, and refuses to open a database written by a newer unsupported
 format.
 
-A from-scratch storage engine (page format, B-tree, crash recovery) as
-an alternate `marsdb-storage` backend independent of redb is on the
-[roadmap](https://github.com/knoguchi/marsdb#roadmap), not built yet —
-the trait boundary in `marsdb-storage` exists specifically so a second
-backend could slot in later without touching `marsdb-graph`/
-`marsdb-query`.
-
 ## Query execution
 
 Query execution compiles Cypher to a small Gremlin-shaped logical IR
 (`AllNodesScan`, `NodeByLabelScan`, `Seed`, `Expand`, `VarExpand`,
 `Filter`, `IndexSeek`) so a future Gremlin frontend could target the same
-executor. The parser is ANTLR4-generated (`marsdb-query/grammar/`),
-replacing an earlier hand-rolled `pest` grammar.
+executor. The parser is ANTLR4-generated (`marsdb-query/grammar/`).
 
 The logical read plan runs as a pull-based row stream through node-ID
-scans, filters, and relationship expansions. A non-aggregating,
-non-distinct `RETURN ... LIMIT k` without `ORDER BY` stops that pipeline
-after `k` rows, so downstream limits avoid unnecessary expansions.
-Clause boundaries and inherently blocking operations still materialize:
-`WITH`, optional-match reconciliation, variable-length traversal results
-for each input row, aggregation, `DISTINCT`, mutations, and the public
-`QueryResult`. Use `ExecutionOptions` to put hard ceilings on
-intermediate rows, result rows, relationship expansions, and elapsed
-time.
+scans, filters, relationship expansions, and variable-length traversals
+(each input row's paths enumerate lazily too). A non-aggregating
+`RETURN ... LIMIT k` without `ORDER BY` stops that pipeline after `k`
+rows — or, with `DISTINCT`, after `k` *distinct projected* rows, so
+`MATCH (p)-[:KNOWS*1..3]-(f) RETURN DISTINCT f ... LIMIT 20` stops
+traversing the moment 20 distinct endpoints exist instead of enumerating
+every path first. Clause boundaries and inherently blocking operations
+still materialize: `WITH`, optional-match reconciliation, aggregation,
+anything under `ORDER BY`, mutations, and the public `QueryResult`. Use
+`ExecutionOptions` to put hard ceilings on intermediate rows, result
+rows, relationship expansions, and elapsed time.
 
-There is not yet a general cost-based optimizer. Two targeted
+There is no general cost-based optimizer. It's on the
+[roadmap](https://github.com/knoguchi/marsdb#roadmap). Two targeted
 optimizations complement streaming: a direct `MATCH (n[:Label])
 RETURN ... LIMIT k` scan pushes the limit into storage; and every
 `ORDER BY ... LIMIT k` site uses a top-k partial selection

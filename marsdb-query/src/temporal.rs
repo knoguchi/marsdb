@@ -1,27 +1,23 @@
 //! Calendar math and ISO-8601 text conversion for `PropertyValue::Date`/
-//! `PropertyValue::Duration` -- kept out of `marsdb-graph` deliberately
-//! (that crate stores the value, it doesn't know Cypher's construction/
-//! formatting rules -- see `PropertyValue`'s own doc comment) and out of
-//! `executor.rs` (which owns *dispatching* to these, not the arithmetic
-//! itself, matching the split `apply_arith`/`compare` already have from
-//! e.g. the planner).
+//! `PropertyValue::Duration`. Kept out of `marsdb-graph` (which stores the
+//! value but doesn't know Cypher's construction/formatting rules) and out
+//! of `executor.rs` (which dispatches to these, not the arithmetic
+//! itself).
 //!
-//! Scope, honestly: `DATE` (calendar year/month/day, ISO week-date, and
-//! ordinal/quarter-date construction forms), `DURATION`, `LOCAL TIME`,
-//! `TIME`, `LOCAL DATETIME`, and `DATETIME` are all supported -- but
-//! `TIME`/`DATETIME` only accept a *fixed* UTC offset (`'+01:00'`,
-//! `{timezone: '+01:00'}`), never a named timezone (`'Europe/Stockholm'`)
-//! -- that needs a real IANA timezone database, deliberately out of
-//! scope (no DST/zone-rule awareness anywhere in this module). See the
-//! README's "Cypher coverage" section for the exact list of what that
-//! leaves out of TCK's `expressions/temporal` suite.
+//! `DATE` (calendar year/month/day, ISO week-date, and ordinal/quarter-date
+//! construction forms), `DURATION`, `LOCAL TIME`, `TIME`, `LOCAL DATETIME`,
+//! and `DATETIME` are all supported. `TIME`/`DATETIME` only accept a fixed
+//! UTC offset (`'+01:00'`, `{timezone: '+01:00'}`), never a named timezone
+//! (`'Europe/Stockholm'`) -- that needs a real IANA timezone database, out
+//! of scope for this module. See the README's "Cypher coverage" section
+//! for the exact gaps.
 
 use chrono::{LocalResult, NaiveDateTime, Offset, TimeZone, Timelike};
 
-/// A `DateTime`'s zone -- a plain, `marsdb_graph`-independent mirror of
-/// `PropertyValue::DateTime`'s own `zone: marsdb_graph::model::TzId`
-/// field (same reasoning as `DurationParts` below: this module doesn't
-/// depend on `marsdb_graph`), translated at the `executor.rs` boundary.
+/// A `DateTime`'s zone -- a plain mirror of `PropertyValue::DateTime`'s
+/// `zone: marsdb_graph::model::TzId` field, independent of `marsdb_graph`
+/// since this module doesn't depend on that crate; translated at the
+/// `executor.rs` boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TzId {
     Offset(i32),
@@ -30,15 +26,13 @@ pub enum TzId {
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
-/// Average Gregorian month length in days (365.2425 / 12) -- Neo4j's own
+/// Average Gregorian month length in days (365.2425 / 12), Neo4j's
 /// documented conversion factor for folding a fractional month (e.g. the
 /// `0.75` in `duration({months: 0.75})`) down into days, since "0.75
-/// months" has no exact length in days without a reference date. Only
-/// ever applied to the *fractional remainder* of a month count, never the
-/// whole-number part (a whole month always stays a whole month in the
-/// normalized representation, added/subtracted from a `Date` via real
-/// calendar month arithmetic in `add_duration_to_date`, not this
-/// average).
+/// months" has no exact length without a reference date. Only applied to
+/// the fractional remainder of a month count -- a whole month stays a
+/// whole month, applied to a `Date` via real calendar arithmetic in
+/// `add_duration_to_date`.
 const AVG_MONTH_DAYS: f64 = 365.2425 / 12.0;
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
@@ -46,12 +40,10 @@ const NANOS_PER_SEC: i128 = 1_000_000_000;
 // ---------------------------------------------------------------------
 // Proleptic-Gregorian civil-calendar core (Howard Hinnant's algorithms)
 // ---------------------------------------------------------------------
-// Pure i64 integer math, deliberately not chrono: chrono's `NaiveDate`
-// caps years at ±262_143, far short of Cypher's ±999_999_999 (ISO 8601
-// expanded years -- TCK Temporal10 [9]/[10] exercises the full range).
-// chrono remains only for `capture_now` and named-IANA-zone resolution
-// (which is inherently bounded by chrono-tz's own range; a named zone at
-// year ±10^9 has no meaningful IANA data anyway). Epoch-day origin is
+// Pure i64 integer math, not chrono: chrono's `NaiveDate` caps years at
+// ±262_143, far short of Cypher's ±999_999_999 (ISO 8601 expanded years).
+// chrono remains only for `capture_now` and named-IANA-zone resolution,
+// inherently bounded by chrono-tz's own range. Epoch-day origin is
 // 1970-01-01, same as `std::time::UNIX_EPOCH`.
 
 /// Cypher's documented year range (java.time's, which real Cypher
@@ -186,12 +178,10 @@ pub fn epoch_day_from_ymd(year: i64, month: u32, day: u32) -> Option<i64> {
 
 /// A single captured instant, pre-derived into every shape a no-arg
 /// `date()`/`localtime()`/`time()`/`localdatetime()`/`datetime()` call
-/// needs -- real Cypher guarantees every such call *within the same
-/// query* returns the same value (so `duration.between(date(), date())`
-/// is always `PT0S`, never a few-microseconds-off nonzero duration from
-/// two independent `now()` reads); capturing one `chrono::Utc::now()`
-/// and deriving every field from it (not one `now()` call per field)
-/// is what makes that guarantee hold even within a single construction.
+/// needs. Cypher guarantees every such call within the same query returns
+/// the same value (`duration.between(date(), date())` is always `PT0S`),
+/// which holds only because one `chrono::Utc::now()` capture derives
+/// every field, rather than one `now()` call per field.
 #[derive(Clone, Copy)]
 pub struct NowSnapshot {
     pub epoch_day: i64,
@@ -228,12 +218,11 @@ pub fn format_date(epoch_day: i64) -> String {
 /// Parses every date string form MarsDB supports: the plain calendar
 /// forms `YYYY-MM-DD`/`YYYYMMDD`/`YYYY-MM`/`YYYYMM`/`YYYY` (missing
 /// month/day default to `1`), ISO week-date `YYYY-Www[-D]`/`YYYYWww[D]`
-/// (missing day defaults to `1`), ordinal-date `YYYY-DDD`/`YYYYDDD`
-/// (see `parse_week_or_ordinal_date`), and ISO 8601 expanded years --
-/// an explicit leading sign with up to 9 year digits
-/// (`'-999999999-01-01'`, `'+999999999-12-31'`, TCK Temporal10
-/// [9]/[10]). The sign is stripped here and applied to whichever year
-/// field the body then parses (calendar, week, or ordinal alike).
+/// (missing day defaults to `1`), ordinal-date `YYYY-DDD`/`YYYYDDD` (see
+/// `parse_week_or_ordinal_date`), and ISO 8601 expanded years -- an
+/// explicit leading sign with up to 9 year digits (`'-999999999-01-01'`,
+/// `'+999999999-12-31'`). The sign is stripped here and applied to
+/// whichever year field the body then parses.
 pub fn parse_date(s: &str) -> Option<i64> {
     let s = s.trim();
     // The compact forms below use byte offsets because their grammar is
@@ -278,8 +267,8 @@ pub fn parse_date(s: &str) -> Option<i64> {
 
 /// ISO week-date (`YYYY-Www[-D]` / `YYYYWww[D]`, day defaults to `1` when
 /// omitted) and ordinal-date (`YYYY-DDD` / `YYYYDDD`) string forms --
-/// `None` for anything not matching one of these two shapes (the plain
-/// calendar forms fall through to `parse_date`'s own parsing).
+/// `None` for anything not matching, falling through to `parse_date`'s
+/// plain calendar parsing.
 fn parse_week_or_ordinal_date(s: &str, year_sign: i64) -> Option<i64> {
     if let Some((y, rest)) = s.split_once('-') {
         if let Some(w) = rest.strip_prefix('W') {
@@ -320,12 +309,10 @@ fn parse_week_or_ordinal_date(s: &str, year_sign: i64) -> Option<i64> {
 
 /// `d.<prop>` component access for a `Date` -- the "forward" (date ->
 /// components) half of ISO week/quarter calendar math; the "backward"
-/// half (`week`/`dayOfWeek`/`quarter`/`dayOfQuarter`/`ordinalDay` ->
-/// date) lives in `epoch_day_from_week_fields`/`epoch_day_from_ordinal_
-/// fields`/`epoch_day_from_quarter_fields` below. Returns `None` for any
-/// property name this doesn't recognize (the caller treats that the same
-/// as a missing property, matching every other `.prop` access in this
-/// codebase).
+/// half lives in `epoch_day_from_week_fields`/`epoch_day_from_ordinal_
+/// fields`/`epoch_day_from_quarter_fields` below. `None` for an
+/// unrecognized property name, treated as a missing property by the
+/// caller.
 pub fn date_component(epoch_day: i64, prop: &str) -> Option<i64> {
     let (y, m, d) = civil_from_days(epoch_day);
     Some(match prop {
@@ -348,9 +335,9 @@ pub fn date_component(epoch_day: i64, prop: &str) -> Option<i64> {
 /// Constructs an epoch-day from ISO week-date fields -- the inverse of
 /// `date_component`'s `"weekYear"`/`"week"`/`"dayOfWeek"` accessors.
 /// `week_year` is the ISO week-numbering year, not necessarily the
-/// calendar year of the resulting date (they diverge near a year
-/// boundary -- e.g. week-year 1817 week 1 day 2 is calendar date
-/// 1816-12-31, TCK's Temporal1 [1]).
+/// calendar year of the resulting date -- they diverge near a year
+/// boundary (e.g. week-year 1817 week 1 day 2 is calendar date
+/// 1816-12-31).
 pub fn epoch_day_from_week_fields(week_year: i64, week: u32, day_of_week: i64) -> Option<i64> {
     if !(MIN_YEAR..=MAX_YEAR).contains(&week_year)
         || !(1..=7).contains(&day_of_week)
@@ -386,28 +373,17 @@ pub fn epoch_day_from_quarter_fields(year: i64, quarter: u32, day_of_quarter: i6
 }
 
 /// Adds a `Duration` to a `Date` via real calendar month arithmetic
-/// (`checked_add_months`/`checked_sub_months`, which clamps to the
-/// shorter month's last day -- e.g. Jan 31 + 1 month = Feb 28/29, not an
-/// error and not Mar 3) followed by a plain day offset. `negate`: `true`
-/// for `date - duration` (real Cypher's other overload), reusing the same
-/// function rather than duplicating it with `-` in every arithmetic
-/// expression.
+/// (clamping to the shorter month's last day -- e.g. Jan 31 + 1 month =
+/// Feb 28/29, not an error and not Mar 3) followed by a plain day offset.
+/// `negate`: `true` for `date - duration`.
 ///
-/// `seconds`/`nanos` can't shift a `Date` by a fraction of a day (it has
-/// no time-of-day to carry a remainder into), but they're *not* simply
-/// dropped either -- any *whole* extra day they add still counts: e.g.
-/// `duration({months: 0.5, days: 14.5, hours: 16.5, ...})` normalizes to
-/// `days: 29` plus a `seconds`/`nanos` remainder equivalent to ~34 hours,
-/// and that 34 hours contributes one more whole day (34h > 24h) on top of
-/// the 29 -- verified against Temporal8's fractional-duration date-
-/// arithmetic scenario, which is exactly the case that exposed this (an
-/// earlier version of this function dropped `seconds`/`nanos` outright
-/// and was a day off). `seconds/86_400` (truncated towards zero, so a
-/// negative duration's extra day is subtracted, not added) is the whole-
-/// day count; anything finer than that is genuinely discarded, matching
-/// "adding a Duration to a value with less precision than the Duration
-/// provides truncates to that lower precision" -- Date's precision floor
-/// is one day.
+/// `seconds`/`nanos` can't shift a `Date` by a fraction of a day, but
+/// aren't simply dropped: any whole extra day they add still counts (e.g.
+/// a duration normalizing to `days: 29` plus a ~34-hour remainder
+/// contributes one more whole day on top of the 29). `seconds/86_400`
+/// (truncated towards zero, so a negative duration's extra day is
+/// subtracted, not added) is the whole-day count; anything finer is
+/// discarded -- Date's precision floor is one day.
 pub fn add_duration_to_date(
     epoch_day: i64,
     months: i64,
@@ -435,16 +411,15 @@ pub fn add_duration_to_date(
 }
 
 /// The four independently-signed components of a normalized `Duration`,
-/// matching `PropertyValue::Duration`'s own fields exactly -- a plain
-/// tuple alias, not a re-export of the `PropertyValue` variant itself,
-/// since this module deliberately doesn't depend on `marsdb_graph` (see
-/// this file's top-of-module doc comment on the crate split).
+/// matching `PropertyValue::Duration`'s own fields -- a plain tuple
+/// alias rather than a re-export, since this module doesn't depend on
+/// `marsdb_graph`.
 pub type DurationParts = (i64, i64, i64, i32);
 
 /// Raw, not-yet-normalized inputs to `duration({...})`/`duration('...')`
 /// construction -- one `f64` per Cypher map key (`0.0` when absent), kept
-/// as a struct (not 10 positional `f64` args) so call sites read as
-/// `years: 12.0, ..Default::default()` rather than an unlabeled tuple.
+/// as a struct so call sites read as `years: 12.0, ..Default::default()`
+/// rather than an unlabeled tuple.
 #[derive(Default, Clone, Copy)]
 pub struct DurationFields {
     pub years: f64,
@@ -461,17 +436,13 @@ pub struct DurationFields {
 
 /// Folds raw (possibly fractional, possibly negative) field values into
 /// `PropertyValue::Duration`'s normalized `(months, days, seconds,
-/// nanos)` form. The cascade only ever flows one direction -- years into
-/// months, a fractional month's remainder into days (via `AVG_MONTH_DAYS`
-/// -- the only place that average is used), a fractional day's remainder
-/// into seconds, sub-second fields into nanoseconds -- matching Neo4j's
-/// own documented normalization, verified line-by-line against every
-/// `duration(...)` example in the TCK's Temporal1/Temporal2 feature
-/// files. Never the other direction (seconds never cascade *into* days --
-/// `duration({hours: 40})` stays `PT40H`, not `P1DT16H`; a "day" isn't a
-/// fixed number of hours once timezones/DST exist, so real Cypher never
-/// makes that assumption even though MarsDB's own `Date` type is
-/// timezone-naive).
+/// nanos)` form. The cascade only flows one direction -- years into
+/// months, a fractional month's remainder into days (via
+/// `AVG_MONTH_DAYS`), a fractional day's remainder into seconds,
+/// sub-second fields into nanoseconds -- matching Neo4j's documented
+/// normalization. Never the other direction: seconds never cascade into
+/// days (`duration({hours: 40})` stays `PT40H`, not `P1DT16H`), since a
+/// "day" isn't a fixed number of hours once timezones/DST exist.
 pub fn normalize_duration(f: DurationFields) -> DurationParts {
     let months_f = f.years * 12.0 + f.months;
     let days_f = f.weeks * 7.0 + f.days;
@@ -486,9 +457,8 @@ pub fn normalize_duration(f: DurationFields) -> DurationParts {
 }
 
 /// Shared cascade core for both `normalize_duration` (raw map/string
-/// fields) and `scale_duration` (multiply/divide by a scalar) -- the only
-/// difference between the two callers is what they pass as `seconds_f`/
-/// `extra_nanos`, not the cascade logic itself.
+/// fields) and `scale_duration` (multiply/divide by a scalar) -- callers
+/// differ only in what they pass as `seconds_f`/`extra_nanos`.
 fn cascade(months_f: f64, days_f: f64, seconds_f: f64, extra_nanos: i128) -> DurationParts {
     let whole_months = months_f.trunc();
     let frac_months = months_f - whole_months;
@@ -496,27 +466,22 @@ fn cascade(months_f: f64, days_f: f64, seconds_f: f64, extra_nanos: i128) -> Dur
     let whole_days = days_f2.trunc();
     let frac_days = days_f2 - whole_days;
     let seconds_f2 = seconds_f + frac_days * 86_400.0;
-    // `.round()` here (not `.trunc()`) -- `seconds_f2` is a continuous
-    // quantity built from several multiplications/additions (e.g. the
-    // `0.75` months -> `71509.5` seconds case), so it can land a
-    // few-ULP hair off the exact value; rounding to the nearest whole
-    // nanosecond recovers the exact intended value, whereas truncating
-    // would occasionally drop a real nanosecond that FP noise pushed
-    // just under the integer.
+    // `.round()`, not `.trunc()`: `seconds_f2` is a continuous quantity
+    // built from several multiplications/additions, so it can land a
+    // few-ULP hair off the exact value; rounding recovers the intended
+    // nanosecond that truncating could drop.
     let total_ns = (seconds_f2 * NANOS_PER_SEC as f64).round() as i128 + extra_nanos;
     let seconds = (total_ns / NANOS_PER_SEC) as i64;
     let nanos = (total_ns % NANOS_PER_SEC) as i32;
     (whole_months as i64, whole_days as i64, seconds, nanos)
 }
 
-/// Component-wise `a + b` -- *not* a re-cascade through `normalize_
-/// duration` (months/days add directly, no re-derivation via
-/// `AVG_MONTH_DAYS`), matching the TCK's "add two already-normalized
-/// durations" examples, which sum months and days independently and only
-/// ever carry between `seconds`/`nanos` (via the exact `i128` total,
-/// avoiding the sign-mismatch bug a naive `a.nanos + b.nanos` would hit
-/// when the two operands' `seconds` signs differ). Returns `None` if any
-/// component would overflow its persisted integer representation.
+/// Component-wise `a + b` -- not a re-cascade through `normalize_
+/// duration`: months/days add directly (no re-derivation via
+/// `AVG_MONTH_DAYS`), and only `seconds`/`nanos` carry between each other,
+/// via the exact `i128` total, avoiding the sign-mismatch bug a naive
+/// `a.nanos + b.nanos` would hit when the operands' `seconds` signs
+/// differ. `None` if any component overflows its persisted representation.
 pub fn add_duration(a: DurationParts, b: DurationParts) -> Option<DurationParts> {
     let months = a.0.checked_add(b.0)?;
     let days = a.1.checked_add(b.1)?;
@@ -545,13 +510,11 @@ pub fn sub_duration(a: DurationParts, b: DurationParts) -> Option<DurationParts>
 
 /// `duration * factor` / `duration / factor` (`factor` is `1.0 / n` for
 /// division) -- re-cascades through the same `AVG_MONTH_DAYS`-based logic
-/// `normalize_duration` uses (scaling a whole month by a non-integer
-/// factor produces a fractional month again, e.g. `P1M / 2` needs to
-/// become "15.2 days", not stay a fractional month), so this calls the
-/// shared `cascade` directly with `months`/`days` pre-multiplied and the
-/// exact `seconds`+`nanos` total pre-multiplied as one `i128` quantity
-/// (truncated, same "no phantom sub-nanosecond digit" reasoning as
-/// `normalize_duration`'s `extra_nanos`).
+/// `normalize_duration` uses, since scaling a whole month by a
+/// non-integer factor produces a fractional month again (`P1M / 2` must
+/// become "15.2 days", not stay a fractional month). Calls the shared
+/// `cascade` directly with `months`/`days` and the exact `seconds`+`nanos`
+/// total pre-multiplied as one `i128` quantity.
 pub fn scale_duration(a: DurationParts, factor: f64) -> DurationParts {
     let months_f = a.0 as f64 * factor;
     let days_f = a.1 as f64 * factor;
@@ -562,32 +525,25 @@ pub fn scale_duration(a: DurationParts, factor: f64) -> DurationParts {
 
 /// `d.<prop>` component access for a `Duration` -- every field (`years`,
 /// `quarters`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`,
-/// `milliseconds`, `microseconds`, `nanoseconds`) is simply the *whole
-/// duration re-expressed in that one unit alone*, truncated towards zero
-/// -- not a calendar-style "the months-of-year part" breakdown. E.g. for
-/// `duration({years: 1, months: 4, ...})` (16 total months), `d.years` is
-/// `16 / 12 = 1` and `d.months` is `16` itself, not `4`. Verified against
-/// every field in Temporal5's "accessors for duration" scenario. The
-/// `*OfX` fields (`monthsOfYear`, `secondsOfMinute`, ...) are each the
-/// same computation's *remainder* instead of its quotient -- literally
-/// "what `d.<prop>` would be, mod the next unit up".
-/// `seconds`/`nanos` are stored the same way real Cypher's own `Duration`
-/// stores them (mirroring Java's `Duration`): `seconds` carries the whole
-/// sign, `nanos` is always non-negative (0..999_999_999) -- see
-/// `PropertyValue::Duration`'s own docs. Component accessors must read
-/// off *these two raw fields directly*, not recombine them into one
-/// signed total and re-split -- that would silently reintroduce a
-/// negative `nanos` (`-23H-59M-59.9S`'s stored form is `seconds: -86400,
-/// nanos: 100_000_000`; re-splitting `-86399.9s` via truncating division
-/// gives the wrong `seconds: -86399, nanosecondsOfSecond: -900_000_000`
-/// instead, TCK's Temporal10 `[1]`). `hours`/`minutes`/`seconds` (and
-/// their `-OfHour`/`-OfMinute` cousins) only ever divide `seconds` itself
-/// (never touch `nanos` -- a whole hour/minute can't hide inside a
-/// sub-second remainder); `milliseconds`/`microseconds`/`nanoseconds`
-/// (the fine-grained *totals*, not `-OfSecond` splits) are the one place
-/// that legitimately combines both fields, since `nanos`' own
-/// always-non-negative convention means simple addition (not `total_ns`
-/// division-then-truncation) already gives the right signed result.
+/// `milliseconds`, `microseconds`, `nanoseconds`) is the whole duration
+/// re-expressed in that one unit alone, truncated towards zero -- not a
+/// calendar-style "months-of-year part" breakdown (16 total months gives
+/// `d.years == 1` and `d.months == 16`, not `4`). The `*OfX` fields
+/// (`monthsOfYear`, `secondsOfMinute`, ...) are each the same
+/// computation's remainder instead of its quotient.
+///
+/// `seconds`/`nanos` are stored the way Java's `Duration` stores them:
+/// `seconds` carries the whole sign, `nanos` is always non-negative
+/// (0..999_999_999) -- see `PropertyValue::Duration`'s docs. Accessors
+/// must read these two raw fields directly, not recombine into one
+/// signed total and re-split, which would reintroduce a negative `nanos`
+/// (`-23H-59M-59.9S` is stored as `seconds: -86400, nanos: 100_000_000`;
+/// re-splitting via truncating division gives the wrong
+/// `seconds: -86399, nanosecondsOfSecond: -900_000_000`).
+/// `hours`/`minutes`/`seconds` only ever divide `seconds` (never touch
+/// `nanos`); `milliseconds`/`microseconds`/`nanoseconds` are the one
+/// place that combines both fields, since `nanos`' always-non-negative
+/// convention makes simple addition already give the right signed result.
 pub fn duration_component(
     months: i64,
     days: i64,
@@ -623,13 +579,10 @@ pub fn duration_component(
 
 /// Renders `(months, days, seconds, nanos)` as MarsDB's canonical
 /// ISO-8601 duration text -- always in `PnYnMnDTnHnMn.fS` order (never
-/// `W`, even though `duration({weeks: 1})` accepts it as an *input*
-/// unit -- weeks fold into `days` during normalization and never come
-/// back out, matching every `toString(duration(...))` example in the
-/// TCK). Each component is a straight divmod of the sign-independent
+/// `W`: weeks fold into `days` during normalization and never come back
+/// out). Each component is a straight divmod of the sign-independent
 /// whole -- a negative `months`/`days`/`seconds` prints its own `-`
-/// (`P-6M-15D...`), not one shared sign prefix, matching the TCK's mixed-
-/// sign examples exactly (see Temporal8's duration-subtraction table).
+/// (`P-6M-15D...`), not one shared sign prefix.
 pub fn format_duration(months: i64, days: i64, seconds: i64, nanos: i32) -> String {
     if months == 0 && days == 0 && seconds == 0 && nanos == 0 {
         return "PT0S".to_string();
@@ -713,14 +666,7 @@ fn format_seconds_fraction(secs: i64, nanos: i32) -> String {
 /// each `n` an optional-sign decimal) into raw `DurationFields`, then
 /// normalizes the same way `duration({...})` does -- construction from
 /// text and from a map are the same operation once the units are pulled
-/// apart, see `normalize_duration`'s docs.
-///
-/// Deliberately does *not* handle the alternative "combined date-time"
-/// duration representation (`P2012-02-02T14:37:21.545`, ISO-8601's other
-/// duration syntax) -- a real gap (see the README), not a silent
-/// misparse: that string doesn't match `P` followed by number+letter
-/// pairs, so this returns `None`, the same "reject, don't guess" outcome
-/// `parse_date` gives an unsupported date string form.
+/// apart.
 pub fn parse_duration(s: &str) -> Option<DurationParts> {
     let s = s.trim();
     let s = s.strip_prefix('P')?;
@@ -762,16 +708,14 @@ pub fn parse_duration(s: &str) -> Option<DurationParts> {
 }
 
 /// ISO-8601's alternate "combined date-time" duration representation
-/// (`P<date>T<time>`, e.g. `P2012-02-02T14:37:21.545` -- date/time
-/// formatted exactly like a calendar date/time-of-day, but each field
-/// means "this many years/months/days/hours/minutes/seconds", not an
-/// actual calendar date -- no day-of-month validity check, `P2012-13-40`
-/// is a legal 12-year-13-month-40-day duration under this form. TCK's
-/// Temporal2 `[7]`. Only matches when `date_part` genuinely has this
-/// shape (plain `N-N-N`, no unit letters) -- an ordinary `PnYnMnD`
-/// string never does, and a negative duration's leading `-` makes the
-/// first split empty rather than a valid number, so neither can be
-/// mistaken for this form.
+/// (`P<date>T<time>`, e.g. `P2012-02-02T14:37:21.545`) -- date/time
+/// formatted like a calendar date/time-of-day, but each field means
+/// "this many years/months/days/hours/minutes/seconds", not an actual
+/// calendar date: no day-of-month validity check, `P2012-13-40` is a
+/// legal 12-year-13-month-40-day duration under this form. Only matches
+/// when `date_part` has this shape (plain `N-N-N`, no unit letters) --
+/// an ordinary `PnYnMnD` string never does, and a negative duration's
+/// leading `-` makes the first split empty rather than a valid number.
 fn parse_combined_date_time_duration(
     date_part: &str,
     time_part: Option<&str>,
@@ -806,11 +750,10 @@ fn parse_combined_date_time_duration(
 
 /// Hand-scans `"12Y5M1.5D"`-style text into `(value, unit_letter)` pairs
 /// -- no regex dependency for a grammar this small (a sign, digits, an
-/// optional `.digits`, then exactly one unit letter), matching this
-/// codebase's other hand-rolled small parsers (e.g. `marsdb-tck`'s
-/// `CellParser`). The entire input must match: returning a successfully
-/// parsed prefix would make malformed text such as `P1Ygarbage` silently
-/// construct a one-year duration.
+/// optional `.digits`, then exactly one unit letter). The entire input
+/// must match: returning a successfully parsed prefix would make
+/// malformed text such as `P1Ygarbage` silently construct a one-year
+/// duration.
 fn scan_number_unit_pairs(s: &str) -> Option<Vec<(f64, char)>> {
     let mut out = Vec::new();
     let chars: Vec<char> = s.chars().collect();
@@ -929,10 +872,9 @@ fn parse_seconds_fraction(s: &str) -> Option<(u32, u32)> {
 /// Splits a time-of-day-with-offset string into `(time_part,
 /// offset_part)` -- the offset marker is a trailing `Z` or the first
 /// `+`/`-` at index >= 1 (a bare time-of-day's own components are
-/// digits/`:`/`.` only, so that's always the offset sign, never
-/// something inside the time itself). Only ever called on the *time*
-/// half of a combined date+time string (after splitting on `T`), never
-/// the date half, which legitimately contains `-`.
+/// digits/`:`/`.` only). Only called on the time half of a combined
+/// date+time string (after splitting on `T`), never the date half, which
+/// legitimately contains `-`.
 fn split_time_offset(s: &str) -> (&str, Option<&str>) {
     if let Some(stripped) = s.strip_suffix('Z') {
         return (stripped, Some("Z"));
@@ -989,22 +931,19 @@ pub fn parse_offset_seconds(s: &str) -> Option<i32> {
     Some(sign * (h * 3600 + m * 60 + sec))
 }
 
-/// `localtime('21:40:32.142')` -- a bare time-of-day, no offset allowed
-/// (a trailing `Z`/`+HH:MM` makes the whole string fail the strict
-/// digit/`:`/`.`-only parse above and correctly return `None`, the same
-/// "reject, don't guess" stance as every other malformed-input case in
-/// this module).
+/// `localtime('21:40:32.142')` -- a bare time-of-day, no offset allowed.
+/// A trailing `Z`/`+HH:MM` fails the strict digit/`:`/`.`-only parse
+/// above and correctly returns `None`.
 pub fn parse_local_time(s: &str) -> Option<i64> {
     parse_time_of_day(s.trim())
 }
 
-/// `time('21:40:32.142+01:00')` -- a time-of-day *with* a required
-/// offset. Returns `None` if the string has no offset at all, or if it
-/// carries a bracketed named-zone suffix (`[Europe/Stockholm]`) -- the
-/// caller (`Executor::call_builtin`'s `"time"` arm) checks for `[`
-/// itself first and raises a specific "named zones aren't supported"
-/// error rather than this generic parse failure, but this function
-/// still refuses to silently ignore/misparse the bracket if called
+/// `time('21:40:32.142+01:00')` -- a time-of-day with a required offset.
+/// Returns `None` if the string has no offset, or carries a bracketed
+/// named-zone suffix (`[Europe/Stockholm]`) -- the caller
+/// (`Executor::call_builtin`'s `"time"` arm) checks for `[` itself first
+/// and raises a specific "named zones aren't supported" error, but this
+/// function still refuses to silently misparse the bracket if called
 /// directly.
 pub fn parse_time(s: &str) -> Option<(i64, i32)> {
     let s = s.trim();
@@ -1012,10 +951,9 @@ pub fn parse_time(s: &str) -> Option<(i64, i32)> {
         return None;
     }
     let (time_part, offset_part) = split_time_offset(s);
-    // A missing offset defaults to UTC (`+00:00`) -- real Cypher's
-    // `time()` falls back to the statement's default time zone rather
-    // than rejecting the string outright (TCK's Temporal10: `time('14:30')`
-    // is a valid, offset-less argument).
+    // A missing offset defaults to UTC (`+00:00`) -- `time()` falls back
+    // to the statement's default time zone rather than rejecting the
+    // string outright.
     let offset_seconds = match offset_part {
         Some(part) => parse_offset_seconds(part)?,
         None => 0,
@@ -1039,8 +977,7 @@ pub fn local_time_component(nanos_of_day: i64, prop: &str) -> Option<i64> {
 
 /// Formats an offset as Cypher's canonical text: `Z` for UTC, else
 /// `[+-]HH:MM` (extended with `:SS` only when the offset has a non-zero
-/// seconds component -- real offsets are almost always whole minutes,
-/// but the TCK's timezone grep found at least one `-02:05:07` example).
+/// seconds component).
 pub fn format_offset(offset_seconds: i32) -> String {
     if offset_seconds == 0 {
         return "Z".to_string();
@@ -1058,11 +995,7 @@ pub fn format_offset(offset_seconds: i32) -> String {
 }
 
 /// `HH:MM` always; `:SS` only if seconds/nanos are non-zero; `.fraction`
-/// only if nanos is non-zero (trailing zeros trimmed) -- matches every
-/// `toString(localtime(...))`/`toString(time(...))` example in the TCK,
-/// where `'21:40'` (no seconds given) prints without `:00`, but
-/// `'21:40:32'` (seconds given, even if it were `:00`... though no TCK
-/// example actually exercises that edge) prints with it.
+/// only if nanos is non-zero (trailing zeros trimmed).
 fn format_time_of_day(nanos_of_day: i64) -> String {
     let hour = nanos_of_day / 3_600_000_000_000;
     let minute = (nanos_of_day / 60_000_000_000) % 60;
@@ -1116,7 +1049,7 @@ pub fn combine_epoch_day_and_nanos_of_day(epoch_day: i64, nanos_of_day: i64) -> 
 }
 
 /// Combines an `(epoch_day, nanos_of_day)` pair into `LocalDateTime`'s
-/// own `(epoch_seconds, nanos)` storage shape -- shared by `<type>.
+/// `(epoch_seconds, nanos)` storage shape -- shared by `<type>.
 /// truncate()`'s date+time recombination step.
 pub fn combine_date_and_time(epoch_day: i64, nanos_of_day: i64) -> (i64, i32) {
     (
@@ -1127,9 +1060,7 @@ pub fn combine_date_and_time(epoch_day: i64, nanos_of_day: i64) -> (i64, i32) {
 
 /// Calendar + time-of-day fields for `localdatetime({...})`/
 /// `datetime({...})`'s map constructors -- bundled into one struct (not
-/// 7 positional args) purely to stay under clippy's argument-count cap,
-/// matching this codebase's established convention for that lint (see
-/// e.g. `executor.rs`'s `VarExpandSpec`/`IndexSeekSpec`).
+/// 7 positional args) to stay under clippy's argument-count cap.
 pub struct CalendarDateTime {
     pub year: i64,
     pub month: u32,
@@ -1153,12 +1084,11 @@ pub fn local_date_time_from_fields(f: CalendarDateTime) -> Option<(i64, i32)> {
 }
 
 /// Same as `local_date_time_from_fields`, but the wall-clock reading is
-/// in the given zone -- for a fixed `Offset`, subtracts it to get the
-/// UTC instant `DateTime` actually stores (see its doc comment); for a
-/// `Named` zone, resolves the real, DST-aware offset for *this specific*
-/// local date-time via `chrono-tz` (the same zone can mean a different
-/// offset on a different date, which is why this needs the full
-/// calendar context `resolve_offset` alone doesn't have).
+/// in the given zone -- for a fixed `Offset`, subtracts it to get the UTC
+/// instant `DateTime` actually stores; for a `Named` zone, resolves the
+/// real DST-aware offset for this specific local date-time via
+/// `chrono-tz`, since the same zone can mean a different offset on a
+/// different date.
 pub fn date_time_from_fields(f: CalendarDateTime, zone: &TzId) -> Option<(i64, i32)> {
     match zone {
         TzId::Offset(offset_seconds) => {
@@ -1179,8 +1109,7 @@ pub fn date_time_from_fields(f: CalendarDateTime, zone: &TzId) -> Option<(i64, i
 /// Parses `YYYY-MM-DDTHH:MM:SS.fff` (and the compact/date-only-precision
 /// variants `parse_date` already supports for the date half) into a
 /// naive `(epoch_seconds, nanos)` instant. A date-only string (no `T`)
-/// is also accepted, reading as midnight -- real Cypher's
-/// `localdatetime('-999999999-01-01')` (TCK Temporal10 [10]).
+/// is also accepted, reading as midnight.
 pub fn parse_local_date_time(s: &str) -> Option<(i64, i32)> {
     let s = s.trim();
     let (date_part, time_part) = match s.split_once('T') {
@@ -1287,11 +1216,9 @@ pub fn format_local_date_time(epoch_seconds: i64, nanos: i32) -> String {
 
 /// `Time`/`LocalTime` + `Duration` -- wraps at the 24h boundary (`Time`/
 /// `LocalTime` have no calendar, so there's no "next day" to carry
-/// into). Real Cypher truncates a Duration's calendar components
-/// (`months`/`days`) when adding it to a time-only value -- only
-/// `seconds`/`nanos` apply -- rather than erroring, so this never fails
-/// (`Option` elsewhere in this module means "can overflow"; wrapping
-/// never can).
+/// into). Truncates a Duration's calendar components (`months`/`days`)
+/// when adding to a time-only value -- only `seconds`/`nanos` apply --
+/// rather than erroring, so this never fails.
 pub fn add_duration_to_time(nanos_of_day: i64, seconds: i64, nanos: i32, negate: bool) -> i64 {
     let (seconds, nanos) = if negate {
         (-seconds, -nanos)
@@ -1305,18 +1232,14 @@ pub fn add_duration_to_time(nanos_of_day: i64, seconds: i64, nanos: i32, negate:
 const NANOS_PER_DAY: i64 = SECONDS_PER_DAY * 1_000_000_000;
 
 /// `LocalDateTime`/`DateTime` + `Duration` -- real calendar month
-/// arithmetic on the date part (same `checked_add_months`/
-/// `checked_sub_months` clamping as `add_duration_to_date`), then
-/// `days`/`seconds`/`nanos` added as one exact nanosecond count that
-/// carries across day boundaries (unlike `Date`, which has no time-of-
-/// day to carry *into* -- a `LocalDateTime`/`DateTime` does, so nothing
-/// here gets truncated the way `add_duration_to_date`'s `seconds`/
-/// `nanos` do). Operates on the *local* wall-clock reading -- `DateTime`
+/// arithmetic on the date part (same clamping as `add_duration_to_date`),
+/// then `days`/`seconds`/`nanos` added as one exact nanosecond count that
+/// carries across day boundaries. Unlike `Date`, a `LocalDateTime`/
+/// `DateTime` has a time-of-day to carry into, so nothing here gets
+/// truncated. Operates on the local wall-clock reading -- `DateTime`
 /// callers pass `epoch_seconds + offset_seconds` in and subtract
 /// `offset_seconds` back out of the result, so month/day arithmetic
-/// happens against the calendar the user actually wrote, not the UTC
-/// instant (matches real Cypher: `datetime({..., timezone: '+05:00'})
-/// + duration({months: 1})` advances the *local* month).
+/// happens against the calendar the user wrote, not the UTC instant.
 pub fn add_duration_to_local_date_time(
     epoch_seconds: i64,
     existing_nanos: i32,
@@ -1359,18 +1282,15 @@ pub fn add_duration_to_local_date_time(
 }
 
 pub fn format_date_time(epoch_seconds: i64, nanos: i32, zone: &TzId) -> String {
-    // The *displayed* wall-clock reading is the local (offset-adjusted)
+    // The displayed wall-clock reading is the local (offset-adjusted)
     // one, not the stored UTC instant -- `DateTime` round-trips through
-    // `toString`/reparse showing the original offset's time-of-day, per
-    // the TCK's own examples (e.g. `datetime({..., timezone: '+01:00'})`
-    // prints that same `+01:00` wall-clock hour back, not the UTC one).
+    // `toString`/reparse showing the original offset's time-of-day.
     let offset_seconds = resolve_offset(zone, epoch_seconds);
     let local_epoch_seconds = epoch_seconds + offset_seconds as i64;
     let zone_suffix = match zone {
         TzId::Offset(_) => String::new(),
-        // Real Cypher's `toString()` round-trips the zone name alongside
-        // its resolved offset (`+02:00[Europe/Stockholm]`), not just the
-        // offset alone -- TCK's Temporal1 [10].
+        // `toString()` round-trips the zone name alongside its resolved
+        // offset (`+02:00[Europe/Stockholm]`), not just the offset alone.
         TzId::Named(name) => format!("[{name}]"),
     };
     format!(
@@ -1384,15 +1304,12 @@ pub fn format_date_time(epoch_seconds: i64, nanos: i32, zone: &TzId) -> String {
 /// Resolves a `TzId`'s real UTC offset (seconds east of UTC) at a given
 /// UTC instant -- `Offset`'s value directly, or a `Named` zone's real,
 /// DST-aware offset via `chrono-tz`'s embedded IANA database (the same
-/// zone name resolves to a *different* offset depending on which instant
-/// this is called with -- there's no single fixed "the" offset for a
-/// named zone, e.g. TCK's Temporal1 [10] resolves `Europe/Stockholm` to
-/// `+01:00` in October and `+02:00` in July). Falls back to UTC (`0`)
-/// for a zone name that fails to parse -- should never happen for a
-/// value MarsDB itself constructed (every `Named` zone is validated via
-/// `parse_timezone_name` before being stored), but this function can't
-/// return an error, so degrade gracefully rather than panic on a
-/// hypothetical corrupt/foreign-written value.
+/// zone name resolves to a different offset depending on which instant
+/// this is called with, e.g. `Europe/Stockholm` is `+01:00` in October
+/// and `+02:00` in July). Falls back to UTC (`0`) for a zone name that
+/// fails to parse -- should never happen for a value MarsDB itself
+/// constructed, but this function can't return an error, so it degrades
+/// gracefully rather than panicking on a hypothetical corrupt value.
 pub fn resolve_offset(zone: &TzId, epoch_seconds: i64) -> i32 {
     match zone {
         TzId::Offset(o) => *o,
@@ -1411,13 +1328,11 @@ pub fn parse_timezone_name(s: &str) -> Option<chrono_tz::Tz> {
     s.parse().ok()
 }
 
-/// Given a *local* (wall-clock) naive date-time and a named zone,
-/// resolves the true UTC `(epoch_seconds, offset_seconds)` -- the
-/// overwhelming common case is `LocalResult::Single`; a DST fall-back
-/// repeated hour (`Ambiguous`) takes the earlier instant, a DST
-/// spring-forward gap (`None`, the local time never occurred) has no
-/// valid mapping and fails -- real Cypher doesn't define a specific
-/// tie-break for either, and no TCK scenario lands in one.
+/// Given a local (wall-clock) naive date-time and a named zone, resolves
+/// the true UTC `(epoch_seconds, offset_seconds)`. The common case is
+/// `LocalResult::Single`; a DST fall-back repeated hour (`Ambiguous`)
+/// takes the earlier instant; a DST spring-forward gap (`None`, the
+/// local time never occurred) has no valid mapping and fails.
 fn utc_from_local_and_named_zone(naive: NaiveDateTime, tz: chrono_tz::Tz) -> Option<(i64, i32)> {
     let dt = match tz.from_local_datetime(&naive) {
         LocalResult::Single(dt) => dt,
@@ -1489,28 +1404,21 @@ fn shift_months(dt: CivilDateTime, months: i64) -> CivilDateTime {
 /// Shared core of `duration.between`/`.inMonths`/`.inDays`/
 /// `.inSeconds`: `(months, shifted_remaining_ns, raw_total_ns)`.
 ///
-/// If *either* operand has no calendar date (`a_date`/`b_date` is
-/// `None` -- a bare `LocalTime`/`Time`), both operands' dates are
-/// disregarded entirely (not even treated as a shared reference day --
-/// verified against the TCK's own `date(...)` vs `localtime(...)`
-/// examples, which produce a plain small time-of-day difference, never
-/// a huge multi-year value derived from the date side's real calendar
-/// date) -- `months` is always `0` in that case, and both the "raw" and
-/// "month-shifted" totals collapse to the same plain time-of-day delta.
+/// If either operand has no calendar date (`a_date`/`b_date` is `None` --
+/// a bare `LocalTime`/`Time`), both operands' dates are disregarded
+/// entirely, not even treated as a shared reference day: `months` is
+/// always `0`, and both the "raw" and "month-shifted" totals collapse to
+/// the same plain time-of-day delta.
 ///
 /// Otherwise: `months` is the real calendar month count between the two
-/// full date-times (`months_between_datetimes_offset_aware`); `shifted_remaining_ns`
-/// is the exact elapsed time between `from` *shifted forward by that
-/// many months* and `to` (what `duration.between` bucket-splits into
-/// days/seconds/nanos on top of `months` -- verified against the TCK to
-/// NOT be a further calendar-date subtraction, just total elapsed time
-/// re-divided by a day's worth of nanoseconds); `raw_total_ns` is the
-/// plain, unshifted elapsed time between the two original instants
-/// (what `.inDays`/`.inSeconds` use instead, discarding the month
-/// optimization entirely -- confirmed by the TCK: `.inDays` on a
-/// date+time target still reports a bare whole-day count with the
-/// sub-day remainder silently truncated away, not carried as a
-/// remaining `T...` component).
+/// full date-times (`months_between_datetimes_offset_aware`);
+/// `shifted_remaining_ns` is the exact elapsed time between `from`
+/// shifted forward by that many months and `to` (what `duration.between`
+/// bucket-splits into days/seconds/nanos on top of `months`, not a
+/// further calendar-date subtraction); `raw_total_ns` is the plain,
+/// unshifted elapsed time between the two original instants, what
+/// `.inDays`/`.inSeconds` use instead, discarding the month optimization
+/// entirely.
 fn to_utc_instant_ns(dt: CivilDateTime, zone: &TzId) -> i128 {
     match zone {
         TzId::Offset(o) => civil_total_ns(dt) - *o as i128 * NANOS_PER_SEC,
@@ -1595,17 +1503,15 @@ fn between_components(
         _ => {
             let diff = match (a_zone, b_zone) {
                 (Some(az), Some(bz)) => {
-                    // Both sides resolved against the *same* reference
-                    // date -- "time-only mode" means the date each
-                    // operand happens to carry is disregarded (see this
-                    // function's module docs), so `a`/`b` must not each
-                    // pull in their own, potentially wildly different,
-                    // real date (that only cancels out in `bt - at` when
-                    // it's identical on both sides; a real, previously-
-                    // caught regression when this used `a_date`/`b_date`
-                    // independently). Only matters for resolving a
-                    // `Named` zone's DST-dependent offset -- a fixed
-                    // `Offset` doesn't care what date it's given at all.
+                    // Both sides resolve against the same reference date:
+                    // "time-only mode" disregards the date each operand
+                    // happens to carry (see this function's doc comment),
+                    // so `a`/`b` must not each pull in their own,
+                    // potentially different, real date -- that only
+                    // cancels out in `bt - at` when identical on both
+                    // sides. Only matters for a `Named` zone's
+                    // DST-dependent offset -- a fixed `Offset` doesn't
+                    // care what date it's given.
                     let ref_date = a_date.or(b_date);
                     let at = time_to_utc_nanos(a_time.unwrap_or(0), az, ref_date);
                     let bt = time_to_utc_nanos(b_time.unwrap_or(0), bz, ref_date);
@@ -1727,7 +1633,7 @@ pub fn truncate_date_unit(epoch_day: i64, unit: &str) -> Option<i64> {
 }
 
 /// Moves `epoch_day` to the given ISO weekday (`1`=Monday..`7`=Sunday)
-/// *within its own ISO week* -- the `dayOfWeek` override key on a
+/// within its own ISO week -- the `dayOfWeek` override key on a
 /// `.truncate('week', ...)` result (`date.truncate('week', d,
 /// {dayOfWeek: 2})` is "the Tuesday of `d`'s week"), not general
 /// week-date construction from a `{year, week, dayOfWeek}` triple with
@@ -1957,9 +1863,9 @@ mod tests {
         assert_eq!(format_date(diff), "1972-04-27");
     }
 
-    /// The fractional-duration case that exposed `add_duration_to_date`
-    /// dropping `seconds`/`nanos` outright instead of folding whole extra
-    /// days out of them -- see that function's doc comment.
+    /// A fractional-duration case where whole extra days from
+    /// `seconds`/`nanos` must be folded into the date -- see
+    /// `add_duration_to_date`'s doc comment.
     #[test]
     fn date_plus_fractional_duration_carries_extra_day_from_seconds() {
         let x = epoch_day_from_ymd(1984, 10, 11).unwrap();
@@ -2067,7 +1973,7 @@ mod tests {
         assert!(epoch_day_from_ymd(2000, 2, 29).is_some());
     }
 
-    /// TCK Temporal10 [9]: the full-range duration.between.
+    /// The full-range duration.between.
     #[test]
     fn duration_between_spans_the_full_year_range() {
         let a = parse_date("-999999999-01-01").unwrap();
@@ -2076,9 +1982,8 @@ mod tests {
         assert_eq!(format_duration_parts(parts), "P1999999998Y11M30D");
     }
 
-    /// TCK Temporal10 [10]: the full-range duration.inSeconds (whose
-    /// nanosecond total overflows i64 -- the i128 core's own regression
-    /// test).
+    /// The full-range duration.inSeconds, whose nanosecond total
+    /// overflows i64 -- a regression test for the i128 core.
     #[test]
     fn duration_in_seconds_spans_the_full_year_range() {
         let (a_secs, a_nanos) = parse_local_date_time("-999999999-01-01").unwrap();

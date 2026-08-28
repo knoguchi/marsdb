@@ -1,7 +1,7 @@
-//! Cypher-level BEGIN/COMMIT/ROLLBACK (issue #142) — the session layer
-//! `Database::execute`/`execute_batch` put in front of the executor. The
-//! caller-owned `Database::begin_transaction` API has its own coverage;
-//! these tests are about the *statement* surface: session state
+//! Cypher-level BEGIN/COMMIT/ROLLBACK: the session layer
+//! `Database::execute`/`execute_batch` puts in front of the executor.
+//! `Database::begin_transaction` (the caller-owned API) has its own
+//! coverage; these tests cover the *statement* surface: session state
 //! transitions, error semantics (execution errors abort, parse errors
 //! don't), and batch interaction.
 
@@ -72,9 +72,9 @@ fn begin_transaction_is_an_alias_for_begin() {
     db.execute("CREATE (:N)").unwrap();
     db.execute("COMMIT").unwrap();
     assert_eq!(count(&db), 1);
-    // Only the exact two-word form -- anything longer (e.g. a READ ONLY
-    // qualifier MarsDB doesn't have) still goes to the real parser and
-    // fails there.
+    // Only the exact two-word form is special-cased; anything longer
+    // (e.g. READ ONLY, which MarsDB doesn't support) falls through to
+    // the real parser and fails there.
     assert!(db.execute("BEGIN TRANSACTION READ ONLY").is_err());
 }
 
@@ -100,8 +100,8 @@ fn an_execution_error_aborts_the_whole_transaction() {
     let db = Database::in_memory().unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
-    // Runtime failure: `m` is unbound. The session transaction must be
-    // aborted -- its earlier CREATE can never be committed.
+    // Runtime failure: `m` is unbound. The session transaction aborts,
+    // so its earlier CREATE can never be committed.
     assert!(db.execute("MATCH (n:Person) DELETE m").is_err());
     assert!(db.execute("COMMIT").is_err(), "transaction should be gone");
     assert_eq!(count(&db), 0);
@@ -112,7 +112,7 @@ fn a_parse_error_does_not_abort_the_transaction() {
     let db = Database::in_memory().unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("CREATE (:Person {name: 'Alice'})").unwrap();
-    // Never parsed, never ran, nothing partial to protect against -- an
+    // Never parsed, never ran, nothing partial to protect against: an
     // interactive session's typo shouldn't nuke its transaction.
     assert!(db.execute("CREATE (:Person {").is_err());
     db.execute("COMMIT").unwrap();
@@ -158,7 +158,7 @@ fn batch_failure_inside_a_transaction_aborts_it() {
         .execute_batch("BEGIN; CREATE (:N); MATCH (n) DELETE m; COMMIT")
         .is_err());
     assert_eq!(count(&db), 0);
-    // Session must be clean again -- no dangling open transaction.
+    // Session must be clean again: no dangling open transaction.
     assert!(db.execute("COMMIT").is_err());
     db.execute("CREATE (:N)").unwrap();
     assert_eq!(count(&db), 1);
@@ -199,14 +199,12 @@ fn idle_timeout_rolls_back_and_reports_on_the_next_statement() {
 
 #[test]
 fn activity_refreshes_the_idle_clock() {
-    // The three sleeps must together exceed the limit (proving activity
-    // resets the idle clock rather than the clock measuring total
-    // transaction age) while each individual gap stays well under it.
-    // The margin between one gap and the limit is deliberately large
-    // (600ms): `thread::sleep` only guarantees a *minimum*, and a loaded
-    // CI runner can overshoot by hundreds of ms — a 200ms-limit/50ms-gap
-    // version of this test flaked on the macOS runner with a measured
-    // idle of 201.4ms.
+    // The three sleeps together must exceed the limit (proving activity
+    // resets the idle clock, not total transaction age) while each gap
+    // stays well under it. The margin is deliberately large (600ms):
+    // `sleep` only guarantees a minimum, and a loaded CI runner can
+    // overshoot by hundreds of ms. A 200ms-limit/50ms-gap version of
+    // this test flaked with a measured 201.4ms idle.
     let db = Database::in_memory().unwrap();
     db.set_session_transaction_timeout(Some(std::time::Duration::from_millis(1000)));
     db.execute("BEGIN").unwrap();

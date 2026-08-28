@@ -18,31 +18,27 @@ mod viz;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::in_memory()?;
 
-    // execute_batch runs a `;`-separated batch, one transaction per
-    // statement -- the whole batch is parsed up front (a syntax error
-    // anywhere means nothing runs), but a runtime failure partway
-    // through stops there, leaving earlier statements committed. See
-    // Database::execute_batch's docs for the exact semantics.
+    // execute_batch parses the whole `;`-separated batch up front (a
+    // syntax error anywhere means nothing runs) but commits one
+    // transaction per statement, so a runtime failure partway through
+    // leaves earlier statements committed. See Database::execute_batch.
     db.execute_batch(
         "CREATE (:Product {sku: 'A100', name: 'Widget', price: 9.99}); \
          CREATE (:Product {sku: 'B200', name: 'Gadget', price: 19.99}); \
          CREATE (:Product {sku: 'C300', name: 'Gizmo', price: 4.50})",
     )?;
 
-    // A value from outside the program -- a request parameter, a config
-    // value, whatever. Passing it as a $parameter instead of formatting
-    // it into the query string means it's never parsed as Cypher syntax
-    // at all, so there's no query-shape it could accidentally change --
-    // the same reason you'd use a bound parameter in any SQL driver.
+    // Pass external values as a $parameter rather than formatting them
+    // into the query string: a parameter is never parsed as Cypher
+    // syntax, so it can't change the query's shape (same reason to use
+    // a bound parameter in any SQL driver).
     let min_price = 10.0;
     let mut params = HashMap::new();
     params.insert("minPrice".to_string(), PropertyValue::Float(min_price));
 
-    // ORDER BY only resolves against RETURN's projected column names, not
-    // raw pattern variables -- `ORDER BY p.price` would fail with
-    // "unbound variable: p" here, since the projected columns are named
-    // "name"/"price" (via AS), not "p". Alias whatever you want to sort
-    // by.
+    // ORDER BY resolves against RETURN's projected column names, not raw
+    // pattern variables: `ORDER BY p.price` would fail here since the
+    // projected columns are aliased "name"/"price", not "p".
     let result = db.execute_with_params(
         "MATCH (p:Product) WHERE p.price >= $minPrice \
          RETURN p.name AS name, p.price AS price ORDER BY price",

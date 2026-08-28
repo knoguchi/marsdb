@@ -203,9 +203,9 @@ ORDER BY, where the pipeline stops as soon as LIMIT-many distinct
 projected rows exist — variable-length paths enumerate lazily, so at avg
 degree ~100 IC1 walks a few hundred of its ~1M possible `*1..3` paths
 instead of all of them (643 ms → 1.84 ms when this landed; IC5 71 ms →
-714 µs). The remaining heavy rows are honest whole-graph work — the three
-aggregations and IC3's var-length-to-filter join must see every row by
-design — and are the standing optimizer targets.
+714 µs). The three aggregations and IC3's var-length-to-filter join must
+see every row by design. Those remaining heavy rows are the standing
+optimizer targets.
 
 Reproduce: `cargo bench -p marsdb --bench ldbc_style_ops`. Correctness:
 `cargo test -p marsdb --test ldbc_style` (SF 0.005 in the default suite)
@@ -243,10 +243,10 @@ rows and `email` matching exactly one, both compared against
 | Only `country` (low selectivity — no better option exists) | 44.1 ms |
 | Both `country` and `email` (planner picks `email`) | 12.0 µs |
 
-~3,675x — this is the real, measured version of the same comparison
-originally done ad hoc while building the feature (44ms → microseconds),
-now a real, repeatable `criterion` benchmark instead of a one-off
-scratch measurement.
+~3,675x. This is the same comparison originally done ad hoc while
+building the feature, 44ms down to microseconds. It now runs as a
+repeatable `criterion` benchmark instead of a one-off scratch
+measurement.
 
 `LIMIT` pushed into a non-unique index seek's own storage lookup
 (`stream_index_seek`'s budget-aware `storage_limit`, stops the multimap
@@ -415,11 +415,11 @@ scan it should filter) — both already landed, see `CHANGELOG.md`.
 - The Neo4j comparison above covers one dataset *load*, nothing else —
   no query-latency comparison, no other dataset, no JanusGraph/Neptune/
   other graph database.
-- No benchmarks yet for `CASE`/function calls (`coalesce()`/`toInteger()`)
-  in isolation — they're cheap scalar operations exercised inside the
+- No benchmarks for `CASE`/function calls (`coalesce()`/`toInteger()`)
+  in isolation. They're cheap scalar operations exercised inside the
   `WITH`-chaining query above, but not measured standalone.
 - No benchmarks for `REMOVE`, `SET`-label, or the `STARTS WITH`/`ENDS
-  WITH`/`CONTAINS` string predicates yet.
+  WITH`/`CONTAINS` string predicates.
 
 ## v2 format changes: end-to-end gate (recommendations dataset, 2026-08-08)
 
@@ -438,17 +438,13 @@ runs per side, both reported.
 
 Notes, measured not asserted:
 
-- Read win is 1.16x, not the 1.5-2.5x projected from the pre-#157
-  flamegraph — that projection used a stale denominator (the 40% decode
-  share was measured *before* the node decode cache shipped and absorbed
-  the repeat-decode portion). No post-#157 read flamegraph existed when
-  the projection was made.
+- Read win is 1.16x, not the 1.5-2.5x originally projected. That
+  projection used a stale denominator: the 40% decode share was measured
+  before the node decode cache shipped and absorbed the repeat-decode
+  portion, and no newer flamegraph existed at projection time.
 - Load is slightly slower (property-name interning adds table writes on
   every create). Acceptable; group commit still dominates.
 - File size: first cut of the composite adjacency key byte-packed it as
-  `&[u8]` and measured a **2x database file** (145.9MB) — the same
-  fixed-width-erasure tax measured on the (since-abandoned) hand-rolled
-  storage-engine branch (mars-am7, +34%) — fixed by switching to redb
-  tuple keys
-  `(u64, u32, u64)` before merge. Recorded because it's the second time
-  this exact mistake was made in this codebase.
+  `&[u8]` and measured a **2x database file** (145.9MB), the same
+  fixed-width-erasure tax as byte-packed composite keys generally.
+  Fixed by switching to redb tuple keys `(u64, u32, u64)` before merge.

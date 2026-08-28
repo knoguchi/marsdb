@@ -1,8 +1,6 @@
 //! Thin trait boundary over redb. `marsdb-graph` talks to this crate, never to
 //! `redb` directly, so the underlying embedded KV engine could be swapped
-//! without touching graph/query code. (A hand-rolled replacement engine was
-//! prototyped and abandoned -- redb stays; the boundary remains because it
-//! costs nothing and keeps the dependency surface honest.)
+//! without touching graph/query code.
 
 pub mod tables;
 
@@ -24,8 +22,8 @@ use std::path::Path;
 
 /// Version of the MarsDB-owned tables and record encodings. This is separate
 /// from redb's own file-format version.
-// v2 (2026-08): directory record format — interned u32 prop-id keys with
-// per-property offsets replace the v1 whole-blob postcard map (see
+// v2: directory record format — interned u32 prop-id keys with
+// per-property offsets, replacing v1's whole-blob postcard map (see
 // marsdb-graph/src/encode.rs). v1 files are rejected cleanly; the
 // documented path is export from a v1 build, reimport here.
 pub const CURRENT_FORMAT_VERSION: u64 = 2;
@@ -57,16 +55,12 @@ impl StorageEngine {
     /// new, still-empty database" as an error.
     fn from_db(db: redb::Database) -> Result<Self, StorageError> {
         let write_txn = db.begin_write()?;
-        // Distinguishes "brand-new file" (no tables at all -- `from_db`
-        // commits table setup and the version marker atomically, so a
-        // crash can't produce a half-initialized state) from a
-        // pre-versioning v1-era file (has data tables, but no
-        // `schema_version` key). The latter used to be silently adopted
-        // and stamped with the current version -- correct when the marker
-        // was introduced (the layouts were identical then), but wrong
-        // ever since format 2 changed the record encoding: stamping a
-        // real v1 file as 2 makes its records decode as garbage later
-        // instead of failing cleanly at open.
+        // Distinguishes "brand-new file" (no tables at all; table setup and
+        // the version marker commit atomically, so a crash can't leave a
+        // half-initialized state) from a pre-versioning v1-era file (has
+        // data tables but no `schema_version` key). The latter must be
+        // rejected, not stamped with the current version: v1's whole-blob
+        // record encoding would decode as garbage under format 2.
         let is_fresh = write_txn.list_tables()?.next().is_none()
             && write_txn.list_multimap_tables()?.next().is_none();
         {
@@ -367,12 +361,10 @@ mod tests {
         assert!(matches!(source.backup_to(&path), Err(StorageError::Io(_))));
     }
 
-    /// Guards against the exact bug this pair of methods once had recurring
-    /// the next time a table is added to `tables.rs`: rather than hardcoding
-    /// the current table list a second time, this asks redb itself what
-    /// tables exist on each side and compares, so a table added to
-    /// `from_db` but forgotten in `backup_to` (or vice versa) fails here
-    /// instead of silently losing data on the next real backup.
+    /// Asks redb what tables exist on each side and compares, rather than
+    /// hardcoding the table list a second time — catches a table added to
+    /// `from_db` but forgotten in `backup_to` (or vice versa) instead of
+    /// silently losing data on a real backup.
     #[test]
     fn backup_copies_every_table_that_exists_in_the_source() {
         use redb::{MultimapTableHandle as _, TableHandle as _};
