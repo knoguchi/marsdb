@@ -30,7 +30,7 @@ marsdb-storage   thin boundary over the embedded KV engine (redb)
 ```mermaid
 flowchart BT
     storage["marsdb-storage — thin boundary over redb"]
-    graph["marsdb-graph — records, encoding, indexes, CRUD"]
+    graphc["marsdb-graph — records, encoding, indexes, CRUD"]
     query["marsdb-query — Cypher → AST → plan → executor"]
     core["marsdb — Database, Transaction, sessions"]
     cli["marsdb-cli — the mars binary"]
@@ -38,8 +38,8 @@ flowchart BT
     py["marsdb-python — PyO3"]
     redb[("redb — B-tree file, MVCC")]
     storage --> redb
-    graph --> storage
-    query --> graph
+    graphc --> storage
+    query --> graphc
     core --> query
     cli --> core
     capi --> core
