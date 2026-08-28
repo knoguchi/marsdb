@@ -1,14 +1,11 @@
 //! Converts a literal-Cypher bulk-load dump (statements of the shape
 //! `UNWIND [<huge literal list>] AS row ...`) into a parameterized form
-//! (`UNWIND $rows AS row ...` + a serialized `$rows` param), and writes the
-//! result to a file for `profile_load.rs` to replay.
+//! (`UNWIND $rows AS row ...` + a serialized `$rows` param) for
+//! `profile_load.rs` to replay.
 //!
-//! Split into its own binary (rather than folded into `profile_load.rs`)
-//! so a flamegraph of the replay phase isn't buried under the conversion
-//! phase's cost -- the conversion phase re-parses/evaluates every original
-//! literal once (the same ANTLR-parse-dominated cost `--nl`/temporal-params
-//! work already root-caused), which would dominate any profile it's part
-//! of and hide whatever's actually happening during replay.
+//! Split into its own binary so a flamegraph of the replay phase isn't
+//! buried under the conversion phase's cost: re-parsing every literal
+//! once would dominate any profile it's part of.
 //!
 //! Usage: `cargo run -p marsdb --example convert_only --release -- \
 //!   <schema.cypher> <data.cypher> <out.postcard>`, then

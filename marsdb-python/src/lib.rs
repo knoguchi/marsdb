@@ -1,11 +1,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict, PyList};
 
-// PEP 249-inspired exception hierarchy (the useful subset, not the
-// ceremony): everything raised by MarsDB derives from `marsdb.Error`, so
-// `except marsdb.Error` catches all of it, and the subclasses expose the
-// engine's own error taxonomy (`QueryError`/`GraphError` variants) that
-// the old flat RuntimeError threw away — programs can catch selectively
+// PEP 249-inspired exception hierarchy: everything raised by MarsDB
+// derives from `marsdb.Error`, so `except marsdb.Error` catches all of
+// it, while the subclasses expose the engine's own error taxonomy
+// (`QueryError`/`GraphError` variants) so programs can catch selectively
 // instead of string-matching messages.
 pyo3::create_exception!(
     marsdb,

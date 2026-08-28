@@ -1,13 +1,9 @@
-//! A small, purpose-built parser for the openCypher TCK's fixed Gherkin
-//! step vocabulary -- not a general Cucumber/Gherkin engine. The real
-//! vocabulary (confirmed by grepping every line-start across all 220
-//! vendored files, not assumed) is small and fixed; a real Gherkin
-//! dependency would be solving a much bigger problem than this needs.
+//! Purpose-built parser for the openCypher TCK's fixed Gherkin step
+//! vocabulary, not a general Cucumber/Gherkin engine.
 //!
-//! A malformed or unrecognized step never panics here -- it becomes an
-//! `Err` for that one scenario (reported as `RunnerUnsupported` by the
-//! runner), never a crash that would take down the whole file's other
-//! scenarios.
+//! A malformed or unrecognized step becomes an `Err` for that one
+//! scenario (reported as `RunnerUnsupported`), not a panic that would
+//! take down the rest of the file.
 
 #[derive(Debug, Clone)]
 pub enum InitialGraph {
@@ -16,10 +12,9 @@ pub enum InitialGraph {
     Named(String),
 }
 
-/// A `Then` assertion. `AnyError` deliberately doesn't capture *which*
-/// error type the TCK expects (`SyntaxError`/`TypeError`/etc.) -- see the
-/// crate-level docs on why: `QueryError` has no such taxonomy, and
-/// matching it isn't in scope.
+/// A `Then` assertion. `AnyError` doesn't capture which error type the
+/// TCK expects (`SyntaxError`/`TypeError`/etc.) -- `QueryError` has no
+/// such taxonomy to match against.
 #[derive(Debug, Clone)]
 pub enum Expected {
     Rows {
@@ -47,37 +42,31 @@ pub struct Scenario {
     pub procedures: Vec<ProcedureFixture>,
     pub query: String,
     pub expected: Expected,
-    /// The raw `Then a <Kind>Error should be raised...` line, when
-    /// `expected` is `AnyError` -- kept alongside the deliberately-generic
-    /// `Expected::AnyError` (see its docs) purely for diagnostics that need
-    /// to distinguish `SyntaxError` from other kinds (`TypeError`,
-    /// `ArgumentError`, etc), not for normal scenario running.
+    /// Raw `Then a <Kind>Error should be raised...` line, kept alongside
+    /// `Expected::AnyError` for diagnostics that need the specific error
+    /// kind -- not used by normal scenario running.
     pub expected_error_line: Option<String>,
 }
 
 /// `And there exists a procedure NAME(in1 :: TYPE1, ...) :: (out1 ::
 /// TYPE1, ...):` plus its own `| in1 | ... | out1 | ... |` mock-result
-/// table (TCK's own convention: the header always lists every declared
-/// input name followed by every declared output name, in declared order
-/// -- confirmed by grepping every vendored `clauses/call/*.feature`
-/// signature+table pair). `header`/`rows` are kept as raw cell text,
-/// parsed by the caller (`procedure::TckProcedureProvider`) the same way
-/// an expected-result cell is (`tck_value::parse_cell`) -- this module
-/// only extracts structure, never interprets values.
+/// table. The TCK's convention: the header lists every declared input
+/// name followed by every declared output name, in declared order.
+/// `header`/`rows` are kept as raw cell text; this module only extracts
+/// structure, values are parsed by the caller (`procedure::TckProcedureProvider`,
+/// via `tck_value::parse_cell`).
 #[derive(Debug, Clone)]
 pub struct ProcedureFixture {
     pub name: String,
     pub input_names: Vec<String>,
     /// Each input's declared type text (`INTEGER?`, `NUMBER?`, ...), same
     /// order as `input_names` -- passed through to `ProcedureSignature::
-    /// input_types` for `Executor`'s own coarse argument-type check (TCK's
-    /// Call2 `[5]`/`[6]`).
+    /// input_types` for `Executor`'s coarse argument-type check.
     pub input_types: Vec<String>,
     pub output_names: Vec<String>,
     /// Column names, in table order (not necessarily `input_names ++
     /// output_names`, even though every vendored fixture happens to write
-    /// it that way -- looked up by name, not position, to stay correct
-    /// either way).
+    /// it that way) -- looked up by name, not position.
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
 }
@@ -104,8 +93,7 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
             continue;
         }
         if trimmed.starts_with('@') {
-            // A tag line immediately preceding a Scenario: -- not used for
-            // any filtering decision in v1, just skipped.
+            // A tag line before Scenario: -- not used for filtering, skipped.
             cursor.pos += 1;
             continue;
         }
@@ -118,13 +106,11 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
             continue;
         }
         if trimmed.starts_with("Background:") {
-            // A shared setup block every `Scenario:`/`Scenario Outline:`
-            // in this file implicitly runs before its own steps (real
-            // Gherkin semantics) -- if it fails to parse, fall back to no
-            // background rather than failing the whole file; each
-            // scenario then fails on its own missing `Given` instead of
-            // silently mis-running (same degrade-gracefully stance as
-            // every other unrecognized-step case here).
+            // Shared setup every Scenario:/Scenario Outline: in this file
+            // runs before its own steps. If it fails to parse, fall back
+            // to no background rather than failing the whole file --
+            // each scenario then fails on its own missing `Given` instead
+            // of silently mis-running.
             background = parse_background(&mut cursor).unwrap_or_default();
             continue;
         }
@@ -135,9 +121,9 @@ pub fn parse_feature(content: &str) -> Vec<Result<Scenario, String>> {
     out
 }
 
-/// `Given .../And having executed:` steps only -- confirmed by grepping
-/// every vendored `Background:` block, none use params/procedures/other
-/// step shapes `parse_scenario`'s own loop handles.
+/// `Given .../And having executed:` steps only -- no vendored
+/// `Background:` block uses params/procedures/other step shapes
+/// `parse_scenario`'s own loop handles.
 fn parse_background(cursor: &mut Cursor) -> Result<(Option<InitialGraph>, Vec<String>), String> {
     cursor.pos += 1; // consume the `Background:` line itself
     let mut initial_graph = None;
@@ -236,15 +222,9 @@ impl<'a> Cursor<'a> {
 }
 
 /// Splits one `| a | b |` table row into cells, honoring Cucumber's own
-/// cell-level escaping (`\|` -> a literal `|`, `\\` -> a literal `\`, `\n`
-/// -> a literal newline) -- a separate escape layer *underneath* the
-/// Cypher string-literal escaping `tck_value::parse_cell` does on a
-/// cell's content afterward. Without this, a cell like `'a\\bcn5t...'`
-/// (Cucumber-escaped `\\` for one real backslash) reached `parse_cell`
-/// still double-escaped, corrupting the expected value it parsed to --
-/// caught the same way the earlier `\n`/`\t` fix in `tck_value.rs` was:
-/// a real query's actual output was correct, but structurally didn't
-/// match the (mis-parsed) expected value.
+/// cell-level escaping (`\|` -> `|`, `\\` -> `\`, `\n` -> a newline) -- a
+/// separate escape layer underneath the Cypher string-literal escaping
+/// `tck_value::parse_cell` does on a cell's content afterward.
 fn split_table_row(line: &str) -> Vec<String> {
     let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     let mut cells = Vec::new();
@@ -274,10 +254,10 @@ fn split_table_row(line: &str) -> Vec<String> {
 }
 
 /// Parses one `Scenario:`/`Scenario Outline:` block. For an outline, the
-/// returned `Scenario` is a *template* -- `query`/`setup_cypher`/`expected`
+/// returned `Scenario` is a template -- `query`/`setup_cypher`/`expected`
 /// still contain literal `<placeholder>` tokens -- paired with the
-/// `Examples:` table (header + data rows) needed to expand it into real
-/// scenarios; see `expand_outline`, called by `parse_feature`.
+/// `Examples:` table needed to expand it into real scenarios; see
+/// `expand_outline`, called by `parse_feature`.
 type Examples = (Vec<String>, Vec<Vec<String>>);
 
 fn parse_scenario(
@@ -309,10 +289,9 @@ fn parse_scenario(
         let line = raw.trim();
         if line.is_empty() {
             cursor.pos += 1;
-            // A blank line ends the scenario only once we've already
-            // captured its primary assertion -- blank lines can appear
-            // *within* a scenario's own step sequence too (rare, but
-            // tolerated rather than assumed absent).
+            // A blank line ends the scenario only once its primary
+            // assertion is already captured -- blank lines can also
+            // appear within a scenario's own step sequence.
             if seen_first_then {
                 if let Some(next) = cursor.peek_trimmed() {
                     if next.starts_with("Scenario:")
@@ -372,18 +351,16 @@ fn parse_scenario(
             if !is_control && query.is_none() {
                 query = Some(block);
             }
-            // A control query's own When/Then pair (used upstream to
-            // observe side effects indirectly) is intentionally not
-            // captured as this scenario's `query`/`expected` -- side
-            // effects aren't asserted in v1 (see crate docs).
+            // A control query's own When/Then pair isn't captured as this
+            // scenario's `query`/`expected` -- side effects aren't
+            // asserted in v1 (see crate docs).
         } else if let Some(rest) = line.strip_prefix("Then the result should be") {
             cursor.pos += 1;
             // Always parsed (to consume its table and keep the cursor in
-            // sync), but only *kept* the first time -- a scenario with a
-            // trailing "When executing control query:" has a second
-            // "Then the result should be ..." block of its own, which
-            // must not clobber the primary query's already-captured
-            // expectation.
+            // sync) but only kept the first time -- a trailing "When
+            // executing control query:" has its own second "Then the
+            // result should be ..." block, which must not clobber the
+            // primary query's already-captured expectation.
             let parsed = parse_result_expectation(rest, cursor);
             if expected.is_none() {
                 expected = Some(parsed);
@@ -418,8 +395,8 @@ fn parse_scenario(
     }
 
     // A `Background:` block's own `Given .../And having executed:` run
-    // before the scenario's own -- real Gherkin semantics. A scenario
-    // that has no `Given` of its own inherits the background's.
+    // before the scenario's own -- a scenario with no `Given` of its own
+    // inherits the background's.
     let initial_graph = initial_graph
         .or_else(|| background.0.clone())
         .ok_or("scenario has no Given ... graph step")?;
@@ -450,14 +427,11 @@ fn parse_procedure_fixture(line: &str, cursor: &mut Cursor) -> Result<ProcedureF
         .trim()
         .trim_end_matches(':')
         .trim();
-    // `name(inputs) :: (outputs)` -- the inputs list can itself contain
-    // `::` (once per parameter, `name :: STRING?, in :: INTEGER?`), so the
-    // split point is the first `::` *after* the inputs list's own closing
-    // `)`, not the first `::` anywhere in the line (which would land
-    // inside the first parameter's own type instead). No signature this
-    // grammar needs to parse nests parens within a parameter's type
-    // (`INTEGER?`/`STRING?`/`NUMBER?`/`FLOAT?` only), so a plain `find`
-    // for the matching `)` (not a depth-counting scan) is enough.
+    // The inputs list can itself contain `::` (once per parameter, `name
+    // :: STRING?, in :: INTEGER?`), so split on the first `::` *after*
+    // the inputs list's own closing `)`, not the first `::` anywhere in
+    // the line. No parameter type nests parens, so a plain `find` for
+    // the matching `)` (not a depth-counting scan) is enough.
     let open = rest
         .find('(')
         .ok_or_else(|| format!("procedure signature missing '(': {line:?}"))?;
@@ -515,9 +489,7 @@ fn parse_procedure_params(text: &str) -> Result<(Vec<String>, Vec<String>), Stri
 /// Expands a `Scenario Outline:` template into one real `Scenario` per
 /// `Examples:` data row -- real Cucumber semantics: every `<col>` token
 /// anywhere in the scenario's steps is a literal find-and-replace against
-/// that row's value for `col`, not just in the query text (an expected-
-/// result cell or a parameter value could reference one too, even if no
-/// vendored file currently does).
+/// that row's value for `col`, not just in the query text.
 fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenario, String>> {
     let (header, rows) = examples;
     rows.iter()
@@ -558,9 +530,7 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
                     .collect(),
                 // No vendored outline scenario references a `<col>` token
                 // inside its own procedure fixture text, so a plain clone
-                // (not `subst`) is correct today -- if a future one did,
-                // this would need to change to match `setup_cypher`/
-                // `params`'s own substitution above.
+                // (not `subst`) is correct here.
                 procedures: template.procedures.clone(),
                 query: subst(&template.query),
                 expected,
@@ -571,8 +541,8 @@ fn expand_outline(template: Scenario, examples: &Examples) -> Vec<Result<Scenari
 }
 
 fn strip_given(line: &str) -> Option<&str> {
-    // Always the scenario's first step in every vendored file -- never an
-    // "And ..." continuation, confirmed by grepping the real vocabulary.
+    // Always the scenario's first step in every vendored file, never an
+    // "And ..." continuation.
     line.strip_prefix("Given ")
 }
 

@@ -29,10 +29,8 @@ type Scope = HashMap<String, Kind>;
 
 pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
     match statement {
-        // Session-level statements bind nothing and reference nothing --
-        // whether one is *valid right now* (e.g. `COMMIT` with no open
-        // transaction) is session state, which is `marsdb::Database`'s
-        // to check, not a static property of the statement.
+        // Session-level statements bind and reference nothing; whether one
+        // is valid right now is session state, checked by `marsdb::Database`.
         Statement::Begin | Statement::Commit | Statement::Rollback => Ok(()),
         Statement::Create(patterns) => {
             let mut scope = Scope::new();
@@ -45,12 +43,10 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
         // plain identifiers.
         Statement::CreateIndex { .. } => Ok(()),
         Statement::Explain(inner) => validate_statement(inner),
-        // Each part is independently scoped (no bindings shared across a
-        // UNION boundary), so each just gets its own ordinary validation
-        // pass -- the one UNION-specific check (every part's columns must
-        // match) needs each part's real, evaluated `QueryResult.columns`,
-        // which doesn't exist yet at this pre-execution stage, so it lives
-        // in `executor::materialize_union` instead.
+        // Each part is independently scoped (no bindings cross a UNION
+        // boundary). The column-match check needs each part's evaluated
+        // `QueryResult.columns`, not available here, so it lives in
+        // `executor::materialize_union` instead.
         Statement::Union { parts, .. } => {
             for part in parts {
                 validate_statement(part)?;
@@ -63,30 +59,20 @@ pub fn validate_statement(statement: &Statement) -> Result<(), QueryError> {
             order_by,
             ..
         } => validate_match_clauses(clauses, tail, order_by, Scope::new(), true),
-        // Always an empty starting scope -- a standalone CALL *is* the
-        // whole statement, nothing precedes it to shadow (unlike
-        // `QueryClause::Call`'s own in-query form, TCK's Call1 `[15]`).
+        // A standalone CALL is the whole statement, so it starts from an
+        // empty scope -- nothing precedes it to shadow.
         Statement::StandaloneCall(call) => validate_call_clause(call, &mut Scope::new()),
     }
 }
 
-/// `CALL proc.name(args) [YIELD ...]` -- no procedure registry is
-/// available at this pass (see `executor::ExecutionOptions::procedures`'s
-/// own docs for why arity/existence/argument-type checks have to happen
-/// at execution time instead, once the registry is on hand), so this only
-/// covers what's knowable from AST structure alone: an aggregate inside
-/// an argument expression (real Cypher's `InvalidAggregation`, TCK's
-/// Call1 `[16]`) and a `YIELD` output name that's already bound --
-/// shadowing an outer variable or repeating an earlier item's own output
-/// name within the same `YIELD` are the same check, since `scope` is
-/// mutated as each item is processed (real Cypher's
-/// `VariableAlreadyBound`, TCK's Call1 `[15]`, Call5 `[5]`/`[6]`).
-/// `CallYield::Star` is never reached with a non-empty `scope` in
-/// practice -- the in-query grammar (`queryCallSt`) has no `YIELD *`
-/// alternative at all (only `standaloneCall` does), so it can't shadow
-/// anything; nothing here needs a procedure's real output names to bind
-/// into scope for it either way, since a standalone call is the whole
-/// statement.
+/// `CALL proc.name(args) [YIELD ...]`. No procedure registry exists at this
+/// pass, so arity/existence/argument-type checks happen at execution time
+/// instead (see `executor::ExecutionOptions::procedures`). This only
+/// checks what's knowable from AST structure: an aggregate used as a CALL
+/// argument, and a `YIELD` output name that shadows an outer variable or
+/// repeats an earlier item's own output name in the same `YIELD`.
+/// `CallYield::Star` only appears in the standalone-call grammar, which has
+/// no bindings to shadow.
 fn validate_call_clause(call: &CallClause, scope: &mut Scope) -> Result<(), QueryError> {
     if let Some(args) = &call.args {
         for arg in args {
@@ -117,12 +103,10 @@ fn validate_call_clause(call: &CallClause, scope: &mut Scope) -> Result<(), Quer
 }
 
 /// The body of `Statement::Match`'s own validation, factored out so
-/// `Expr::ExistsSubquery` (a nested `exists { MATCH ... RETURN ... }`, TCK's
-/// ExistentialSubquery2/3) can reuse it correlated against the enclosing
-/// scope instead of a fresh one, with `allow_mutation: false` -- real
-/// Cypher only allows *reading* clauses inside `exists {}` (an updating
-/// clause there is a compile-time `InvalidClauseComposition`, TCK's
-/// ExistentialSubquery2 `[3]`).
+/// `Expr::ExistsSubquery` (a nested `exists { MATCH ... RETURN ... }`) can
+/// reuse it correlated against the enclosing scope instead of a fresh one,
+/// with `allow_mutation: false` -- an `exists {}` body may only contain
+/// reading clauses, never an updating one.
 fn validate_match_clauses(
     clauses: &[QueryClause],
     tail: &Option<Tail>,
@@ -196,10 +180,9 @@ fn validate_match_clauses(
                     bind_create_pattern(pattern, &mut scope)?;
                 }
             }
-            // A procedure is opaque to MarsDB -- it might write, same
-            // conservative reasoning `executor::is_read_only` already
-            // applies -- so it's rejected inside `exists {}` too, even
-            // though no current TCK scenario combines the two.
+            // A procedure is opaque to MarsDB and might write, so it's
+            // rejected inside `exists {}` too (same reasoning as
+            // `executor::is_read_only`).
             QueryClause::Call(call) => {
                 reject_mutation("CALL")?;
                 validate_call_clause(call, &mut scope)?;
@@ -213,12 +196,9 @@ fn validate_match_clauses(
     if let Some(order_by) = order_by {
         let mut order_scope = input_scope;
         order_scope.extend(output_scope);
-        // Real Cypher: an aggregate in RETURN's ORDER BY is only
-        // legal when RETURN itself is aggregating (the ORDER BY
-        // then runs against the already-collapsed grouped rows,
-        // same as its own WITH/RETURN items would) -- otherwise
-        // it's a compile-time `InvalidAggregation` error (TCK's
-        // ReturnOrderBy2 [14]), not a runtime one.
+        // An aggregate in RETURN's ORDER BY is only legal when RETURN
+        // itself is aggregating -- the ORDER BY then runs against the
+        // already-collapsed grouped rows.
         let tail_items: Option<&[ReturnItem]> = match tail {
             Some(Tail::Return(items, _)) => Some(items),
             _ => None,
@@ -226,25 +206,11 @@ fn validate_match_clauses(
         let tail_aggregates = tail_items.is_some_and(crate::executor::has_aggregate);
         for (expr, _) in order_by {
             if tail_aggregates {
-                // An ORDER BY item that repeats a RETURN item's
-                // expression *or own alias* (`RETURN sum(x) AS s
-                // ORDER BY sum(x)` / `ORDER BY s`, TCK's
-                // WithOrderBy4 [11]/`ReturnOrderBy3`/
-                // `WithSkipLimit1 [2]`) refers to that
-                // already-aggregated item, not a fresh expression
-                // -- its kind is already known from
-                // `output_scope`, and re-running `infer_expr` on
-                // it would need pre-aggregation bindings (like
-                // `x`'s row) that no longer exist post-grouping.
-                // Unlike `validate_composed_expr`'s own *nested*-
-                // leaf check just below, this whole-expression
-                // match doesn't exclude aggregating items -- an
-                // aggregate's own alias referenced *directly* (not
-                // buried inside a larger expression) is exactly
-                // "reuse this item's already-finished value",
-                // which `materialize_aggregating_return_with_
-                // order`'s matching top-level lookup (executor.rs)
-                // handles the same way.
+                // An ORDER BY item repeating a RETURN item's expression or
+                // own alias (`RETURN sum(x) AS s ORDER BY sum(x)`/`ORDER BY
+                // s`) refers to that already-aggregated item -- its kind is
+                // known from `output_scope`, and pre-aggregation bindings
+                // no longer exist to re-run `infer_expr` against.
                 if tail_items
                     .unwrap()
                     .iter()
@@ -253,17 +219,11 @@ fn validate_match_clauses(
                 {
                     continue;
                 }
-                // Not a verbatim match -- may still be a *composed*
-                // expression (an aggregate combined with other
-                // values, or a plain non-aggregate expression
-                // referencing a pre-aggregation variable, TCK's
-                // ReturnOrderBy6) that `resolve_grouped_rows`/
-                // `rewrite_composed_item` (executor.rs) can
-                // evaluate the same way a composed RETURN item
-                // would -- validated the same way, by the same
-                // function, rather than `infer_expr` against a
-                // scope that structurally can't have pre-
-                // aggregation bindings in it anymore.
+                // Not a verbatim match -- may still be a composed expression
+                // (an aggregate combined with other values, or a plain
+                // expression referencing a pre-aggregation variable) that
+                // `resolve_grouped_rows`/`rewrite_composed_item` (executor.rs)
+                // can evaluate the same way a composed RETURN item would.
                 crate::executor::validate_order_by_composed_expr(expr, tail_items.unwrap())?;
                 continue;
             }
@@ -283,13 +243,10 @@ fn bind_unwind(clause: &UnwindClause, scope: &mut Scope) -> Result<(), QueryErro
     let source_kind = infer_expr(&clause.source.0, scope)?;
     let element_kind = match source_kind {
         Kind::List(element) => *element,
-        // `Scalar` is deliberately not rejected here -- most function
-        // calls (`infer_expr`'s own `Call` arm) type as `Scalar` even
-        // when they in fact return a list at runtime (this codebase's
-        // `Kind` system doesn't model every builtin's real return shape),
-        // so treating it as "unknown, defer to the real runtime
-        // Value::List check in eval_unwind" avoids rejecting legitimate
-        // queries the semantic layer just can't see through.
+        // `Scalar` isn't rejected: most function calls type as `Scalar`
+        // even when they return a list at runtime (the `Kind` system
+        // doesn't model every builtin's return shape), so this defers to
+        // the real `Value::List` check in `eval_unwind`.
         Kind::Unknown | Kind::Scalar => Kind::Unknown,
         other => {
             return Err(semantic(format!(
@@ -307,15 +264,11 @@ fn bind_unwind(clause: &UnwindClause, scope: &mut Scope) -> Result<(), QueryErro
 
 fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError> {
     let pattern = &clause.pattern;
-    // A bare already-bound node with no relationship at all (`MATCH (a)
-    // MERGE (a)`) does nothing real -- not searching for or creating
-    // anything, just re-stating a var that already exists. A bound start
-    // node used as a relationship endpoint (`MATCH (a) MERGE (a)-[:T]->
-    // (b)`) stays legitimate -- only checked when there are no hops at
-    // all. Checked here (compile time, TCK's Merge1 [15]), not only at
-    // runtime -- a zero-row MATCH would otherwise skip this entirely
-    // even though real Cypher's `VariableAlreadyBound` is a
-    // structural/scope error, not a data-dependent one.
+    // A bare already-bound node with no relationship (`MATCH (a) MERGE (a)`)
+    // does nothing real -- just re-states a var that already exists. A bound
+    // start node used as a relationship endpoint stays legitimate, so this
+    // only fires when there are no hops. Checked at compile time rather than
+    // only at runtime, since a zero-row MATCH would otherwise skip it.
     if pattern.hops.is_empty() {
         if let Some(var) = &pattern.start.var {
             if pattern.start.labels.is_empty()
@@ -330,20 +283,16 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
         }
     }
     // Same reasoning as CREATE's own node check -- MERGE might need to
-    // *create* any node its pattern names, so an already-bound node can't
-    // also carry a new label/property predicate (TCK's Merge5 [22]). The
-    // hopless-and-predicate-free case just above has its own, more
-    // specific message; this covers every other node token, start and hop
-    // ends alike.
+    // create any node its pattern names, so an already-bound node can't
+    // also carry a new label/property predicate. Covers every node token
+    // besides the hopless-and-predicate-free case handled above.
     check_no_new_predicates_on_bound_node(&pattern.start, scope, "MERGE")?;
     for (_, node) in &pattern.hops {
         check_no_new_predicates_on_bound_node(node, scope, "MERGE")?;
     }
-    // Unlike a node endpoint (which can legitimately reference an
-    // already-bound node to search/create from), MERGE never reuses an
-    // already-bound relationship as its own pattern token -- there's no
-    // "search using this specific existing edge" mode (TCK's Merge5
-    // [26]).
+    // Unlike a node endpoint, MERGE never reuses an already-bound
+    // relationship as its own pattern token -- there's no "search using
+    // this specific existing edge" mode.
     for (rel, _) in &pattern.hops {
         if let Some(var) = &rel.var {
             if scope.contains_key(var) {
@@ -354,9 +303,8 @@ fn bind_merge(clause: &MergeClause, scope: &mut Scope) -> Result<(), QueryError>
             }
         }
         // Same reasoning as CREATE's own check -- MERGE might need to
-        // *create* this relationship on no-match, and a brand new edge
-        // with no type (or more than one -- which one would it get?) is
-        // meaningless (TCK's Merge5 [24]).
+        // create this relationship on no-match, and a brand new edge with
+        // no type or more than one type is meaningless.
         if rel.rel_types.len() != 1 {
             return Err(semantic(
                 "MERGE requires exactly one explicit relationship type (e.g. -[:KNOWS]->) -- an \
@@ -381,9 +329,8 @@ fn bind_match_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), QueryE
     }
     for (rel, node) in &pattern.hops {
         if let Some(var) = &rel.var {
-            // A variable-length hop's own `rel.var` binds a *list* of
-            // relationships (`[r:TYPE*1..3]`), not a single edge --
-            // TCK's Match4 `[1]`/`[6]`.
+            // A variable-length hop's `rel.var` binds a list of
+            // relationships (`[r:TYPE*1..3]`), not a single edge.
             let kind = if rel.hop_range.is_some() {
                 Kind::List(Box::new(Kind::Edge))
             } else {
@@ -410,11 +357,10 @@ fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), Query
         if let Some(var) = &node.var {
             bind_kind(scope, var, Kind::Node, "CREATE node")?;
         }
-        // Unlike MATCH (where an untyped/multi-typed hop just means "any
-        // of these"), CREATE always makes exactly one new relationship,
-        // and a brand new edge needs exactly one type -- real Cypher
-        // requires a single explicit `:TYPE` here, never inferred,
-        // defaulted, or a `|`-alternative list.
+        // Unlike MATCH (where an untyped/multi-typed hop means "any of
+        // these"), CREATE always makes exactly one new relationship, which
+        // needs exactly one explicit `:TYPE` -- never inferred, defaulted,
+        // or a `|`-alternative list.
         if rel.rel_types.len() != 1 {
             return Err(semantic(
                 "CREATE requires exactly one explicit relationship type (e.g. -[:KNOWS]->) -- \
@@ -429,15 +375,12 @@ fn bind_create_pattern(pattern: &Pattern, scope: &mut Scope) -> Result<(), Query
     Ok(())
 }
 
-/// Mirrors `Executor::resolve_or_create_node`'s already-bound rejection
-/// at compile time -- a node token naming a variable already in `scope`
-/// either does nothing real (`is_bare`: no relationship, no new
-/// labels/props -- `MATCH (a) CREATE (a)`) or would silently drop
-/// user-written labels/props onto an existing node (any hop count --
-/// `MATCH (a) CREATE (a {x: 1})`). Checked here, not only at runtime --
-/// a zero-row MATCH would otherwise skip this entirely even though real
-/// Cypher's `VariableAlreadyBound` is a structural/scope error, not a
-/// data-dependent one (TCK's Create1 [13]/[14]).
+/// Mirrors `Executor::resolve_or_create_node`'s already-bound rejection at
+/// compile time -- a node token naming a variable already in `scope`
+/// either does nothing real (`is_bare`: `MATCH (a) CREATE (a)`) or would
+/// silently drop user-written labels/props onto an existing node
+/// (`MATCH (a) CREATE (a {x: 1})`). Checked here rather than only at
+/// runtime, since a zero-row MATCH would otherwise skip it.
 fn check_create_node_not_already_bound(
     node: &NodePattern,
     scope: &Scope,
@@ -459,15 +402,12 @@ fn check_create_node_not_already_bound(
 }
 
 /// Shared by CREATE (via `check_create_node_not_already_bound` above) and
-/// MERGE (`bind_merge`, for each of its own node endpoints) -- both might
-/// need to *create* a node the pattern names, so a variable already bound
-/// to an *existing* node can't also carry a new label/property predicate
-/// (would silently drop it on match, or ambiguously decide whether it
-/// applies on create) (TCK's Create1 `[19]`/Merge5 `[22]`). Unlike
-/// `check_create_node_not_already_bound`, this alone doesn't also cover
-/// the "no relationship and no predicates at all" case -- CREATE and
-/// MERGE phrase that differently (MERGE's own bare-node check lives in
-/// `bind_merge`, keyed off `pattern.hops.is_empty()` the same way).
+/// MERGE (`bind_merge`, for each node endpoint) -- both might need to
+/// create a node the pattern names, so a variable already bound to an
+/// existing node can't also carry a new label/property predicate (would
+/// silently drop it on match, or ambiguously decide whether it applies on
+/// create). Doesn't cover the "no relationship and no predicates" case --
+/// CREATE and MERGE each check that separately.
 fn check_no_new_predicates_on_bound_node(
     node: &NodePattern,
     scope: &Scope,
@@ -502,11 +442,10 @@ fn apply_with(with: &Option<WithClause>, scope: &mut Scope) -> Result<(), QueryE
 }
 
 fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
-    // `WITH *` -- `input` already reflects this same clause's own new
-    // bindings (`bind_match_pattern`/`bind_unwind`/`bind_merge` all
-    // mutate `scope` before calling `apply_with`), so no union with
-    // anything else is needed here, unlike `executor::
-    // apply_with_or_carry`'s own `carried_vars`/`new_vars` split.
+    // `WITH *`: `input` already reflects this clause's own new bindings
+    // (`bind_match_pattern`/`bind_unwind`/`bind_merge` mutate `scope`
+    // before calling `apply_with`), so no union with anything else is
+    // needed here.
     let with_owned;
     let with: &WithClause = if with.star {
         let star_items = crate::executor::with_star_items(input.keys().cloned());
@@ -522,12 +461,10 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
     crate::executor::validate_return_items(&with.items)?;
     let mut projected = Scope::new();
     for (index, item) in with.items.iter().enumerate() {
-        // Unlike RETURN (where an unaliased expression just gets an
-        // auto-generated column name, e.g. `RETURN 1+1`), every WITH
-        // item that isn't a bare variable reference must have an
-        // explicit `AS alias` -- real Cypher's `NoExpressionAlias`
-        // error. A bare `Var` needs none since its own name already is
-        // the alias (`WITH a` carries `a` forward as itself).
+        // Unlike RETURN (which auto-names an unaliased expression), every
+        // WITH item that isn't a bare variable reference needs an
+        // explicit `AS alias`. A bare `Var` needs none since `WITH a`
+        // already carries `a` forward as itself.
         if item.alias.is_none() && !matches!(item.expr, ReturnExpr::Var(_)) {
             return Err(semantic(
                 "WITH requires an alias (AS ...) for every item except a bare variable reference",
@@ -542,15 +479,11 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         }
     }
     if let Some(expr) = &with.where_clause {
-        // Real Cypher lets `WITH x AS y WHERE ...` see both the pre-WITH
-        // binding (`x`) and the new alias (`y`) -- matches the merged-row
-        // evaluation `executor::materialize_with` does at runtime for the
-        // same reason (see its docs). Only aggregation collapses rows
-        // ambiguously here, not `DISTINCT` -- `WHERE` runs *before*
-        // `DISTINCT`'s own dedup (`materialize_with` filters first, then
-        // dedups the survivors), so every row WHERE sees still has its
-        // own single, unambiguous pre-WITH binding (TCK's WithWhere1
-        // `[2]`: `WITH DISTINCT a.name2 AS name WHERE a.name2 = 'B'`).
+        // `WITH x AS y WHERE ...` sees both the pre-WITH binding (`x`) and
+        // the new alias (`y`) -- matches `executor::materialize_with`'s
+        // merged-row evaluation. Only aggregation collapses rows here, not
+        // `DISTINCT`: WHERE runs before DISTINCT's dedup, so every row it
+        // sees still has its own unambiguous pre-WITH binding.
         if crate::executor::has_aggregate(&with.items) {
             validate_with_expr(expr, &projected)?;
         } else {
@@ -560,18 +493,14 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
         }
     }
     if let Some(order_by) = &with.order_by {
-        // Same `InvalidAggregation` rule as RETURN's own ORDER BY (see the
-        // `Statement::Match` arm above) -- TCK's WithOrderBy2 [25].
+        // Same InvalidAggregation rule as RETURN's own ORDER BY above.
         let with_aggregates = crate::executor::has_aggregate(&with.items);
-        // Real Cypher lets a non-aggregating, non-`DISTINCT` `WITH`'s own
-        // `ORDER BY` see both the pre-WITH scope and the new aliases, not
-        // just the projected names (`WITH a.count AS count ORDER BY
-        // a.count` -- `a` isn't projected but is still a valid sort key,
-        // TCK's With4 [6]/WithSkipLimit3 [3]/Return4 [9,11]) -- same
-        // merged-scope reasoning `where_clause` above already has, and
-        // for the identical reason: aggregation/`DISTINCT` both collapse
-        // many pre-WITH rows into one output row, so there's no single
-        // pre-WITH scope left to fall back to there.
+        // A non-aggregating, non-DISTINCT WITH's ORDER BY sees both the
+        // pre-WITH scope and the new aliases, not just the projected names
+        // (`WITH a.count AS count ORDER BY a.count` -- `a` isn't projected
+        // but is still a valid sort key). Aggregation/DISTINCT both
+        // collapse many pre-WITH rows into one output row, so there's no
+        // single pre-WITH scope left to fall back to there.
         let order_scope = if with_aggregates || with.distinct {
             projected.clone()
         } else {
@@ -580,19 +509,12 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
             merged
         };
         for (expr, _) in order_by {
-            // Repeating a WITH item's expression *or own alias* verbatim
-            // (see the matching comment on the RETURN side) -- WithOrderBy4
-            // [11]/WithSkipLimit1 [2]. Applies to `DISTINCT` too, not just
-            // aggregation: both collapse many pre-WITH rows into one
-            // output row (that's exactly why `order_scope` above is
-            // `projected`-only for either), so a `DISTINCT`-only `WITH`'s
-            // `ORDER BY` needs the same shortcut to see its own item's
-            // alias instead of failing to resolve a pre-WITH variable it
-            // doesn't have access to (TCK's WithOrderBy2 [24] -- previously
-            // this shortcut only fired `if with_aggregates`, a real gap: a
-            // non-aggregating `DISTINCT` WITH's `order_scope` was *also*
-            // narrowed to `projected`-only above, just without this
-            // matching escape hatch).
+            // Repeating a WITH item's expression or own alias verbatim
+            // (see the matching RETURN-side check) applies to DISTINCT
+            // too, not just aggregation: both collapse many pre-WITH rows
+            // into one output row, narrowing `order_scope` to `projected`
+            // only, so a DISTINCT-only WITH's ORDER BY needs the same
+            // escape hatch to see its own item's alias.
             if (with_aggregates || with.distinct)
                 && with
                     .items
@@ -603,16 +525,12 @@ fn project_with(with: &WithClause, input: &Scope) -> Result<Scope, QueryError> {
                 continue;
             }
             if with_aggregates {
-                // Not a verbatim match -- may still be a *composed*
-                // expression `resolve_grouped_rows`/`rewrite_composed_
-                // item` (executor.rs) can evaluate the same way a
-                // composed WITH item would, same reasoning as the
-                // matching RETURN-side check above (TCK's WithOrderBy4
-                // [16]-[18]). A `DISTINCT`-only (non-aggregating) WITH has
-                // no such per-group evaluator to fall back to, so that
-                // case still just falls through to `infer_expr` below,
-                // which correctly fails on anything past its own
-                // `projected`-only scope.
+                // Not a verbatim match -- may still be a composed
+                // expression `resolve_grouped_rows`/`rewrite_composed_item`
+                // (executor.rs) can evaluate the same way a composed WITH
+                // item would. A DISTINCT-only (non-aggregating) WITH has no
+                // such per-group evaluator, so that case falls through to
+                // `infer_expr` below against its `projected`-only scope.
                 crate::executor::validate_order_by_composed_expr(expr, &with.items)?;
                 continue;
             }
@@ -722,14 +640,11 @@ fn project_return(items: &[ReturnItem], scope: &Scope) -> Result<Scope, QueryErr
 /// (the `DELETE ... WITH ...` mid-statement form) -- same target-kind rules
 /// either way.
 fn validate_delete_target(expr: &ReturnExpr, scope: &Scope) -> Result<(), QueryError> {
-    // Some shapes can *never* evaluate to a node/relationship/path, by
-    // construction, regardless of what any variable inside them turns out
-    // to hold at runtime -- rejected immediately here rather than only once
-    // a row actually reaches `delete_value` (which a `MATCH` matching zero
-    // rows would skip entirely, real Cypher's own `InvalidArgumentType` is
-    // independent of whether any data exists -- TCK's Delete5 `[9]`,
-    // `DELETE 1 + 1`). `null` is the one literal exempt, since deleting it
-    // is a documented no-op, not a type error.
+    // Some shapes can never evaluate to a node/relationship/path,
+    // regardless of runtime data, so they're rejected here rather than
+    // only once a row reaches `delete_value` (a zero-row MATCH would
+    // otherwise skip the check). `null` is exempt: deleting it is a
+    // documented no-op, not a type error.
     if !matches!(expr, ReturnExpr::Lit(Literal::Null))
         && matches!(
             expr,
@@ -755,13 +670,11 @@ fn validate_delete_target(expr: &ReturnExpr, scope: &Scope) -> Result<(), QueryE
         ));
     }
     let kind = infer_expr(expr, scope)?;
-    // `Scalar` is deliberately not rejected here, same reasoning as
-    // `bind_unwind`'s: a map/list access (`nodes.key`, `friends[0]`) types
-    // as `Scalar` in this codebase's `Kind` system even when it legitimately
-    // holds a `Node`/`Edge`/`Path` at runtime (TCK's Delete5 `[3]`/`[5]`
-    // scenarios are exactly this shape) -- only a confidently-wrong kind
-    // (a real number/string/bool/map) is rejected here, everything else
-    // defers to the runtime `QueryError::Type` in `delete_value`.
+    // `Scalar` isn't rejected, same reasoning as `bind_unwind`'s: a
+    // map/list access (`nodes.key`, `friends[0]`) types as `Scalar` even
+    // when it holds a Node/Edge/Path at runtime. Only a confidently-wrong
+    // kind is rejected here; everything else defers to the runtime
+    // `QueryError::Type` in `delete_value`.
     if !matches!(
         kind,
         Kind::Node | Kind::Edge | Kind::Path | Kind::Unknown | Kind::Scalar
@@ -797,17 +710,13 @@ fn validate_remove_item(item: &RemoveItem, scope: &Scope) -> Result<(), QueryErr
     }
 }
 
-/// An aggregate function (`count(a)`, etc) is never legal inside a
-/// pattern-level `WHERE` -- real Cypher's `InvalidAggregation` at compile
-/// time (TCK's MatchWhere1 `[15]`: `MATCH (a) WHERE count(a) > 10`), not
-/// something a zero-row `MATCH` could otherwise silently skip checking
-/// (aggregates only ever make sense as a `RETURN`/`WITH` item's own
-/// top-level expression, evaluated once *after* every row has already
-/// been matched-and-filtered -- a `WHERE` predicate runs per-row, before
-/// any such collapsing exists). `infer_expr` itself stays permissive
-/// (same "any recognized function call" treatment every other function
-/// gets) since it's shared with `RETURN`/`WITH` items, where an aggregate
-/// *is* legal -- this is the pattern-`WHERE`-specific half of that check.
+/// An aggregate function is never legal inside a pattern-level `WHERE`:
+/// aggregates only make sense as a RETURN/WITH item's top-level
+/// expression, evaluated once after every row is matched and filtered,
+/// while a WHERE predicate runs per-row before any such collapsing
+/// exists. `infer_expr` itself stays permissive since it's shared with
+/// RETURN/WITH items, where an aggregate is legal -- this is the
+/// WHERE-specific half of the check.
 fn reject_aggregate_in_where(expr: &ReturnExpr) -> Result<(), QueryError> {
     if crate::executor::contains_aggregate(expr) {
         return Err(semantic(
@@ -853,12 +762,10 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
         }
         Expr::Pattern(pattern) => validate_pattern_predicate(pattern, scope),
         // Unlike `Pattern` above (existential-only, never introduces a
-        // variable), `exists {}`'s pattern *can* introduce brand-new
-        // node/relationship variables (TCK's ExistentialSubquery1 `[2]`'s
-        // `m`), so it reuses `bind_match_pattern` against a scoped copy --
-        // same reasoning as `PatternComprehension`'s own handling
-        // (`infer_expr`, below) -- these bindings are local to the
-        // `exists {}` block, they don't leak into the enclosing scope.
+        // variable), `exists {}`'s pattern can introduce new
+        // node/relationship variables, so it reuses `bind_match_pattern`
+        // against a scoped copy -- these bindings are local to the
+        // `exists {}` block and don't leak into the enclosing scope.
         Expr::Exists {
             pattern,
             where_clause,
@@ -870,14 +777,11 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             }
             Ok(())
         }
-        // `exists { MATCH ... RETURN ... }` (TCK's ExistentialSubquery2/3)
-        // -- correlated against the enclosing scope (`scope.clone()`, same
-        // reasoning as `Exists` above), reusing `validate_match_clauses`
-        // with `allow_mutation: false`. Only `Statement::Match` is a valid
-        // shape here (real Cypher's `exists {}` body is always
-        // MATCH/UNWIND/WITH-only, never a bare CREATE or UNION) -- anything
-        // else the grammar happened to parse inside it is rejected with a
-        // clear error rather than silently mishandled.
+        // `exists { MATCH ... RETURN ... }` -- correlated against the
+        // enclosing scope, same reasoning as `Exists` above, reusing
+        // `validate_match_clauses` with `allow_mutation: false`. Only
+        // `Statement::Match` is a valid shape here (never a bare CREATE
+        // or UNION).
         Expr::ExistsSubquery(stmt) => {
             let Statement::Match {
                 clauses,
@@ -893,25 +797,19 @@ fn validate_pattern_expr(expr: &Expr, scope: &Scope) -> Result<(), QueryError> {
             validate_match_clauses(clauses, tail, order_by, scope.clone(), false)
         }
         // Never reaches here: synthesized by the planner (`build_match_
-        // plan`), well after this pass already validated the original
-        // parsed AST -- no surface syntax constructs this directly (see
-        // its own doc comment).
+        // plan`) after this pass already validated the original parsed
+        // AST. No surface syntax constructs this directly.
         Expr::EdgeNotInSet { .. } => {
             unreachable!("Expr::EdgeNotInSet is only ever synthesized by the planner")
         }
     }
 }
 
-/// `WHERE (n)-[r:REL]->(m)` etc (TCK's Pattern1) -- every named endpoint
-/// must already be bound; unlike `bind_match_pattern` (a real MATCH's own
-/// pattern, which introduces new variables), a pattern predicate never
-/// does -- real Cypher's `UndefinedVariable` for anything it doesn't
-/// recognize (TCK's Pattern1 [10] outline, `MATCH (n) WHERE (n)-[r]->(a)
-/// RETURN n` with `a` never bound elsewhere). `require_kind`'s own
-/// `lookup` already produces exactly that "references undefined
-/// variable" error for an unbound name, so no separate check is needed.
-/// An anonymous (var-less) token is always fine, same as any ordinary
-/// MATCH pattern.
+/// `WHERE (n)-[r:REL]->(m)` etc -- every named endpoint must already be
+/// bound; unlike `bind_match_pattern` (a real MATCH pattern, which
+/// introduces new variables), a pattern predicate never does. `require_kind`'s
+/// `lookup` already produces an "undefined variable" error for an unbound
+/// name. An anonymous (var-less) token is always fine.
 fn validate_pattern_predicate(pattern: &Pattern, scope: &Scope) -> Result<(), QueryError> {
     if let Some(var) = &pattern.start.var {
         require_kind(scope, var, &Kind::Node, "pattern predicate node")?;
@@ -946,13 +844,11 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
             infer_expr(e, scope)?;
             Ok(())
         }
-        // Same reasoning as `executor::eval_with_expr`'s matching special
-        // case: `WithExpr` has no `Expr::Pattern`-equivalent folding, so a
-        // bare pattern predicate reaches here as `ReturnExpr::
-        // PatternPredicate` inside `Bare` -- validated the same way
-        // ordinary MATCH's own WHERE already validates one (TCK's
-        // WithWhere4 `[2]`), not `infer_expr`'s generic (and therefore
-        // rejecting) handling.
+        // `WithExpr` has no `Expr::Pattern`-equivalent folding, so a bare
+        // pattern predicate reaches here as `ReturnExpr::PatternPredicate`
+        // inside `Bare` -- validated the same way ordinary MATCH's own
+        // WHERE validates one, not `infer_expr`'s generic (rejecting)
+        // handling. Matches `executor::eval_with_expr`'s special case.
         WithExpr::Bare(ReturnExpr::PatternPredicate(pattern)) => {
             validate_pattern_predicate(pattern, scope)
         }
@@ -963,23 +859,13 @@ fn validate_with_expr(expr: &WithExpr, scope: &Scope) -> Result<(), QueryError> 
     }
 }
 
-/// `(min, max)` argument count for a built-in function name (aggregates
-/// included, case-insensitively matched same as everywhere else this
-/// codebase dispatches on a function name) -- `max: None` means unbounded
-/// (`coalesce` only). `None` for a name this doesn't recognize at all --
-/// the "unknown function" error further down in `infer_expr` still
-/// covers that case, this only ever narrows an already-known function.
+/// `(min, max)` argument count for a built-in function name, case-
+/// insensitively matched. `max: None` means unbounded (`coalesce` only).
+/// `None` for an unrecognized name -- `infer_expr`'s "unknown function"
+/// error covers that case; this only narrows an already-known function.
 ///
-/// Checked once, compile-time, before any per-argument work: real
-/// Cypher's `InvalidNumberOfArguments` is knowable from the call's AST
-/// shape alone, no data needed, so it belongs in the same "Semantic, not
-/// Type" bucket `CYPHER_COVERAGE.md`'s error taxonomy already documents
-/// -- not a runtime error some call sites already produced ad hoc
-/// (`range()`/`replace()`/`duration.between()`/`*.truncate()`), and
-/// others (`datetime.fromepoch()`, most everything else) never checked
-/// at all, silently reading a plain missing argument as `Type` error
-/// with the wrong type reported (`{:?}` of `None`, not "no such
-/// argument").
+/// Checked once at compile time, before any per-argument work, since
+/// argument count is knowable from the call's AST shape alone.
 fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
     Some(match name.to_ascii_lowercase().as_str() {
         "count" | "sum" | "avg" | "min" | "max" | "collect" => (1, Some(1)),
@@ -987,13 +873,9 @@ fn function_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "coalesce" => (1, None),
         "tointeger" | "tostring" | "tofloat" | "toboolean" => (1, Some(1)),
         "date" | "localtime" | "time" | "localdatetime" | "datetime" => (0, Some(1)),
-        // 0 args in the ordinary case, but real Cypher also accepts
-        // exactly 1 -- if it's `null`, the call propagates `null` rather
-        // than erroring (TCK's Temporal4 `[13]`, tests this uniformly
-        // across the whole family even though these functions have no
-        // real parameter otherwise; the runtime's own `now_or_null`
-        // already implements this). `rand()` has no such exception --
-        // real Cypher's `rand()` is always exactly 0 args.
+        // 0 args ordinarily, but also accepts exactly 1: a `null` argument
+        // propagates `null` rather than erroring (`now_or_null`
+        // implements this). `rand()` has no such exception -- always 0 args.
         "date.transaction"
         | "date.statement"
         | "date.realtime"
@@ -1059,30 +941,17 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_property_owner(scope, &access.var)?;
             Kind::Scalar
         }
-        // `<expr>.prop` where `<expr>` isn't a bare variable -- same
-        // permissive stance as `Prop` above (the real node/relationship/
-        // map/temporal-value-or-error check is a runtime one, see
-        // `executor::property_of_value`); only checks that the base
-        // expression itself is well-formed (e.g. no unbound variable
-        // inside it).
+        // `<expr>.prop` where `<expr>` isn't a bare variable -- the real
+        // type check is a runtime one (`executor::property_of_value`);
+        // this only checks the base expression is well-formed.
         ReturnExpr::PropOf(base, _) => {
             infer_expr(base, scope)?;
             Kind::Scalar
         }
-        // `null` specifically types as `Unknown`, not `Scalar` -- real
-        // Cypher's `null` is compatible with *any* type (it's not "some
-        // scalar that happens to be null," it's the universal "unknown
-        // value" every type check already treats `Unknown` as compatible
-        // with). Using `Scalar` here used to force a pile of individual
-        // "Scalar tolerated too, not just Unknown" call-site exceptions
-        // (`Index`, `type()`, `nodes()`/`relationships()`/`length()`) just
-        // to let `null` through checks that already handle `Unknown` for
-        // free -- and still didn't cover every site (`bind_kind` reusing
-        // an already-bound `null` variable as a node/relationship pattern
-        // token, TCK's Path1 `[1]`/Path2 `[3]`: `WITH null AS a OPTIONAL
-        // MATCH p = (a)-[r]->()`). A real, non-null scalar (`1`, `'x'`,
-        // `true`) still types as `Scalar` -- only the literal `null`
-        // keyword changes.
+        // `null` types as `Unknown`, not `Scalar`: it's compatible with
+        // any type, and every check here already treats `Unknown` as
+        // compatible with everything, avoiding per-site "Scalar tolerated
+        // too" exceptions. A non-null scalar still types as `Scalar`.
         ReturnExpr::Lit(Literal::Null) => Kind::Unknown,
         ReturnExpr::Lit(_) | ReturnExpr::CountStar => Kind::Scalar,
         ReturnExpr::Call { name, args, .. } => {
@@ -1157,20 +1026,14 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                         Kind::List(Box::new(Kind::Edge))
                     }
                     // Unlike `keys`/`labels`/`id`/`size`/`exists` (each
-                    // polymorphic over several kinds, so left to the
-                    // runtime's own `QueryError::Type` below), `type()`
-                    // only ever accepts a relationship -- checked here so
-                    // `MATCH (r) RETURN type(r)` (`r` a *node*, from the
-                    // pattern itself) is a compile-time error even when
-                    // the `MATCH` matches zero rows, not only a runtime
-                    // one a zero-row match would silently skip (TCK's
-                    // Graph4 [7]).
+                    // polymorphic over several kinds, left to the runtime's
+                    // `QueryError::Type`), `type()` only accepts a
+                    // relationship -- checked here so it's a compile-time
+                    // error even when the MATCH matches zero rows.
                     "type" => {
-                        // `Scalar` tolerated too, not just `Unknown` -- a
-                        // `null`-valued argument types as `Scalar` in this
-                        // imprecise `Kind` system, and `type(null)` is
-                        // `null` at runtime (`call_builtin`'s own early
-                        // null check), not an error (TCK's Graph4 `[3]`).
+                        // `Scalar` tolerated too: a `null`-valued argument
+                        // types as `Scalar`, and `type(null)` is `null` at
+                        // runtime, not an error.
                         if let Some(kind) = arg_kinds.first() {
                             if !matches!(kind, Kind::Edge | Kind::Scalar | Kind::Unknown) {
                                 return Err(semantic(format!(
@@ -1181,10 +1044,8 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                         }
                         Kind::Scalar
                     }
-                    // Same compile-time-checkable-input-kind reasoning as
-                    // `type()` just above -- both only ever accept a
-                    // relationship, and return the node at its
-                    // start/end.
+                    // Same reasoning as `type()` above -- both only accept
+                    // a relationship, and return the node at its start/end.
                     "startnode" | "endnode" => {
                         if let Some(kind) = arg_kinds.first() {
                             require_compatible_kind(
@@ -1196,29 +1057,18 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
                         Kind::Node
                     }
                     // `keys`/`labels`/`properties`/`id`/`size`/`exists`
-                    // accept a node, relationship, or (for keys/
-                    // properties/size) a map/list/string too, depending on
-                    // the specific function -- narrower than what the
-                    // runtime (`executor::call_builtin`'s own arms) already
-                    // enforces with a clear `QueryError::Type`, so no
-                    // additional structural check is added here beyond
-                    // "the call itself is a recognized function."
-                    // `keys`/`labels` each return a *list* of strings, not
-                    // a scalar -- real Cypher needs this to be `Kind::
-                    // List` so `[x IN labels(n) | ...]`'s own source-kind
-                    // check (`list_element`) doesn't wrongly reject a
-                    // perfectly good list comprehension source (TCK's
-                    // List12 [6]).
+                    // accept several kinds depending on the function --
+                    // left to `executor::call_builtin`'s own runtime
+                    // `QueryError::Type`, no additional check needed here.
+                    // `keys`/`labels` return a list of strings, not a
+                    // scalar: `Kind::List` so `[x IN labels(n) | ...]`'s
+                    // source-kind check (`list_element`) doesn't wrongly
+                    // reject a valid list comprehension source.
                     "keys" | "labels" => Kind::List(Box::new(Kind::Scalar)),
-                    // Unlike `id`/`exists` (genuinely polymorphic over
-                    // node/relationship, left to the runtime's own
-                    // `QueryError::Type`), `size()` never accepts a `Path`
-                    // -- `size_builtin` has no arm for one, and (unlike a
-                    // wrong `Scalar`) a `Path`-kinded argument is knowable
-                    // here without ever running a row, so real Cypher
-                    // makes this compile-time (TCK's List6 `[5]`) rather
-                    // than something a zero-row `MATCH` could silently
-                    // skip checking at all.
+                    // Unlike `id`/`exists`, `size()` never accepts a
+                    // `Path` -- knowable here without running a row, so
+                    // checked at compile time rather than left to a
+                    // zero-row MATCH silently skipping it.
                     "size" => {
                         if let Some(Kind::Path) = arg_kinds.first() {
                             return Err(semantic(
@@ -1265,21 +1115,14 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
         ReturnExpr::Arith(left, op, right) => {
             let lk = infer_expr(left, scope)?;
             let rk = infer_expr(right, scope)?;
-            // `+` alone also means real Cypher's list concatenation/
-            // append/prepend (`[1,2] + [3]`, `[1,2] + 3`, `3 + [1,2]`) --
-            // `-`/`*`/`/`/`%` have no defined meaning for a list, so
-            // those still reject one outright via `require_scalarish`.
-            // The resulting element kind unifies whichever side(s) are
-            // themselves a list with the other operand's own kind (an
-            // append/prepend puts that whole value in as one more element)
-            // -- not hardcoded to `Scalar`, which would wrongly forget a
-            // concatenated node/relationship list's real element kind
-            // (`[a] + collect(n) + [b]` must still type as `List(Node)`,
-            // not `List(Scalar)`, or a later `CREATE` off one of its
-            // elements gets rejected at compile time even though it's a
-            // real node -- TCK's Match4 `[4]`). `unify_many` already
-            // widens to `Unknown` on any real mismatch, same safe fallback
-            // every other composed-kind check here uses.
+            // `+` also means list concatenation/append/prepend (`[1,2] +
+            // [3]`, `[1,2] + 3`, `3 + [1,2]`); `-`/`*`/`/`/`%` have no
+            // list meaning, so those reject one via `require_scalarish`.
+            // The element kind unifies whichever side is a list with the
+            // other operand's kind rather than hardcoding `Scalar`, which
+            // would wrongly forget a concatenated node/relationship list's
+            // real element kind (`[a] + collect(n) + [b]` must type as
+            // `List(Node)`, not `List(Scalar)`).
             if *op == ArithOp::Add && (matches!(lk, Kind::List(_)) || matches!(rk, Kind::List(_))) {
                 let elem = |k: Kind| match k {
                     Kind::List(inner) => *inner,
@@ -1308,29 +1151,19 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_scalarish(&infer_expr(index, scope)?, "list index")?;
             match infer_expr(base, scope)? {
                 Kind::List(element) => *element,
-                // `map['key']` -- real Cypher's dynamic map-field access
-                // (`apply_index`'s own runtime already fully supports
-                // this, only this compile-time check was too narrow).
-                // The result could be any value the map happens to hold
-                // at that key -- `Kind::Scalar`, same imprecise fallback
-                // `keys`/`labels`/etc already use elsewhere, not worth a
-                // per-key type model.
+                // `map['key']` -- dynamic map-field access. The result
+                // could be any value the map holds at that key, so
+                // `Kind::Scalar`, the same imprecise fallback `keys`/
+                // `labels`/etc use elsewhere.
                 Kind::Map => Kind::Scalar,
-                // `Scalar` is deliberately tolerated here too, not just
-                // `Unknown` -- a `null`-valued base types as `Scalar` in
-                // this imprecise `Kind` system (see `ReturnExpr::Lit`'s
-                // own arm), and indexing into `null` is `null` at
-                // runtime (`apply_index`'s own early check), not an
-                // error. A genuinely wrong scalar (e.g. a bound integer)
-                // still gets `apply_index`'s real `QueryError::Type` at
-                // runtime -- same "defer to the runtime check" tolerance
-                // every other `Kind::Scalar` case in this module already
-                // gives.
+                // `Scalar` tolerated too: a `null`-valued base types as
+                // `Scalar`, and indexing into `null` is `null` at runtime,
+                // not an error. A genuinely wrong scalar still gets
+                // `apply_index`'s real `QueryError::Type` at runtime.
                 Kind::Unknown | Kind::Scalar => Kind::Unknown,
                 // `n['name']` -- dynamic property access on a node/
-                // relationship, same as `n.name`'s static form (TCK's
-                // Graph7 `[1]`-`[3]`); `apply_index`'s own runtime already
-                // supports this via `property_of_value`.
+                // relationship, same as `n.name`'s static form;
+                // `apply_index` supports this via `property_of_value`.
                 Kind::Node | Kind::Edge => Kind::Scalar,
                 other => {
                     return Err(semantic(format!(
@@ -1425,29 +1258,22 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
             require_graph(scope, var, "(n:Label) target")?;
             Kind::Scalar
         }
-        // Real validation (undefined-variable checks etc) happens via
-        // `validate_pattern_predicate` once `return_expr_to_expr` folds
-        // this into `Expr::Pattern` -- reaching `infer_expr` at all means
-        // it's in a position `Expr`-folding never runs (RETURN/WITH item,
-        // function arg, ...), a real compile-time error (TCK's List6 [6]
-        // "Fail for size() on pattern predicates" expects a SyntaxError
-        // regardless of whether any row ever reaches evaluation -- found
-        // via the TCK: the executor's own runtime rejection only fires
-        // per-row, silently never triggering on an empty result set).
+        // Real validation happens via `validate_pattern_predicate` once
+        // `return_expr_to_expr` folds this into `Expr::Pattern`. Reaching
+        // `infer_expr` at all means it's in a position that folding never
+        // runs (RETURN/WITH item, function arg, ...), a compile-time
+        // error rather than a runtime rejection that a zero-row MATCH
+        // could silently skip.
         ReturnExpr::PatternPredicate(_) => {
             return Err(QueryError::Semantic(
                 "a pattern predicate (`(n)-->()` etc) can only be used inside WHERE".into(),
             ))
         }
         // Unlike `PatternPredicate` (existential-only, never introduces a
-        // variable -- `validate_pattern_predicate`'s `require_kind`
-        // checks, not `bind_kind`), a pattern comprehension is allowed to
-        // introduce brand-new node/relationship variables (TCK's
-        // Pattern2 `[4]`/`[5]`), so it reuses `bind_match_pattern` (same
-        // "new var -> fresh binding, already-bound var -> compatibility
-        // check" logic a real `MATCH` pattern gets) against a scoped
-        // copy -- these bindings are local to the projection, they don't
-        // leak into the enclosing RETURN/WITH scope.
+        // variable), a pattern comprehension can introduce new
+        // node/relationship variables, so it reuses `bind_match_pattern`
+        // against a scoped copy -- these bindings are local to the
+        // projection and don't leak into the enclosing RETURN/WITH scope.
         ReturnExpr::PatternComprehension {
             path_var,
             pattern,
@@ -1478,15 +1304,12 @@ fn infer_expr(expr: &ReturnExpr, scope: &Scope) -> Result<Kind, QueryError> {
 fn list_element(kind: Kind, context: &str) -> Result<Kind, QueryError> {
     match kind {
         Kind::List(element) => Ok(*element),
-        // `Scalar` is deliberately not rejected here, same reasoning as
-        // `bind_unwind`'s own matching widening: a property access
-        // (`n.numbers`) always types as `Kind::Scalar` in this codebase's
-        // `Kind` system, even when it legitimately holds a `List` at
-        // runtime now that list-valued properties are supported (TCK's
-        // Set1 [5], `[i IN n.numbers | i / 2.0]`) -- only a confidently-
-        // wrong kind (a real node/edge/map/path) is rejected here,
-        // everything else defers to the real runtime `Value::List` check
-        // in `eval_return_expr`'s own `ListComp`/`Quantifier` arms.
+        // `Scalar` isn't rejected, same reasoning as `bind_unwind`'s
+        // widening: a property access (`n.numbers`) types as `Kind::
+        // Scalar` even when it holds a `List` at runtime (list-valued
+        // properties are supported). Only a confidently-wrong kind is
+        // rejected here; everything else defers to the runtime `Value::
+        // List` check in `eval_return_expr`'s `ListComp`/`Quantifier` arms.
         Kind::Unknown | Kind::Scalar => Ok(Kind::Unknown),
         other => Err(semantic(format!(
             "{context} is {}, not a list",
@@ -1536,10 +1359,8 @@ fn require_compatible_kind(
 }
 
 /// `length()`/`nodes()`/`relationships()`'s shared argument check --
-/// `Kind::Path`, or `Scalar` (a `null`-valued argument types as `Scalar`
-/// in this imprecise `Kind` system, and all three are `null` at runtime
-/// for a `null` argument -- `call_builtin`'s own early null check, not an
-/// error, TCK's Path1 `[1]`/Path2 `[3]`), or `Unknown`.
+/// `Kind::Path`, or `Scalar` (a `null` argument types as `Scalar` and all
+/// three return `null` at runtime for it, not an error), or `Unknown`.
 fn require_path_or_null(actual: &Kind, context: &str) -> Result<(), QueryError> {
     if matches!(actual, Kind::Path | Kind::Scalar | Kind::Unknown) {
         return Ok(());
@@ -1569,12 +1390,9 @@ fn require_property_owner(scope: &Scope, var: &str) -> Result<(), QueryError> {
     // the current runtime semantics. The binder resolves the name here;
     // the exact property/component remains data-dependent.
     let kind = lookup(scope, var, "property access")?;
-    // `Path` is the one kind that's *never* valid here, knowable without
-    // ever running a row -- real Cypher's `InvalidArgumentType` at
-    // compile time (TCK's MatchWhere1 `[14]`: `MATCH r = (n)-[*]->()
-    // WHERE r.name = 'apa'`), not something a zero-row `MATCH` (unbounded
-    // `[*]` against an empty graph, here) could silently skip checking by
-    // never actually evaluating the predicate.
+    // `Path` is the one kind that's never valid here, knowable without
+    // running a row, so checked at compile time rather than left to a
+    // zero-row MATCH silently skipping it.
     if matches!(kind, Kind::Path) {
         return Err(semantic(format!(
             "'{var}' is a path — property access requires a node, relationship, or map"
@@ -1646,17 +1464,13 @@ fn semantic(message: impl Into<String>) -> QueryError {
 
 /// `WHERE (n)` / `WHERE (n)-->()`-shaped bare-expression predicates
 /// (`Expr::GeneralBare`/`WithExpr::Bare`) -- a node/relationship/list/map/
-/// path can *never* be a valid boolean predicate regardless of what data
-/// the query runs against (`MATCH (n) WHERE (n) RETURN n`'s `(n)` is a
-/// bare node reference, not a pattern predicate), so this is checked here
-/// rather than left to `value_to_bool3`'s runtime error -- a zero-row
-/// `MATCH` would otherwise never evaluate the predicate at all and the
-/// query would wrongly "succeed" (TCK's Pattern1 `[11]`, `InvalidArgumentType`
-/// expected "at compile time"). `Scalar`/`Unknown` both pass -- a `Scalar`
-/// could still turn out to be a non-boolean scalar (a string/int
-/// variable), which stays a real runtime `value_to_bool3` error, same
-/// tolerance every other `Kind::Scalar` check in this module already
-/// gives.
+/// path can never be a valid boolean predicate regardless of runtime data
+/// (`MATCH (n) WHERE (n) RETURN n`'s `(n)` is a bare node reference, not
+/// a pattern predicate), so this is checked here rather than left to
+/// `value_to_bool3`'s runtime error, which a zero-row MATCH would
+/// otherwise never trigger. `Scalar`/`Unknown` both pass -- a `Scalar`
+/// could still turn out non-boolean at runtime, a real `value_to_bool3`
+/// error.
 fn require_boolean_predicate_kind(kind: &Kind, context: &str) -> Result<(), QueryError> {
     match kind {
         Kind::Scalar | Kind::Unknown => Ok(()),

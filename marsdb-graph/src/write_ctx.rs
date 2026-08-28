@@ -3,37 +3,26 @@
 //! reopening its own tables on every call.
 //!
 //! redb errors at runtime (`TableAlreadyOpen`) on a second live handle to
-//! the same table from one `WriteTransaction` -- the old code (each helper
-//! calling `write_txn.open_table(...)` itself, scoped in a block so the
-//! handle drops before the next call) dodged that by never holding two
-//! handles to the same table at once. `WriteCtx` inverts that: within one
-//! `*_in_txn` call, every table it touches is opened at most once and
-//! reused for the rest of that call.
+//! the same table from one `WriteTransaction`. `WriteCtx` avoids that by
+//! ensuring each table it touches is opened at most once and reused for
+//! the rest of the call, even when several helper functions in that call
+//! each need the same table (e.g. `create_node_in_txn` needs `NODES` for
+//! the insert and `index::on_node_created` needs `INDEX_DEFS`,
+//! `PROPERTY_INDEX`, `ID_TO_LABEL`, `ID_TO_PROP` on top).
 //!
-//! Lazy (`Option` per table, opened on first access), not eager (every
-//! table opened up front): measured against a real 9,771-statement bulk
-//! load, eager-open-all-12 was slower than the original code (4.89s ->
-//! 6.35s) for calls that only ever touch a handful of the 12 tables (e.g.
-//! `set_edge_prop_in_txn` only ever needs `edges`) -- eagerly opening the
-//! other ~8 unused tables costs more than the redundant opens it was
-//! meant to save. Lazy access means a call only ever pays for the tables
-//! it actually uses, same as the pre-`WriteCtx` code did, while still
-//! caching across the *multiple* opens one call used to do (e.g.
-//! `create_node_in_txn` used to open `NODES` once for the insert and
-//! `NODE_LABEL_INDEX` once per label; `index::on_node_created` then
-//! opened `INDEX_DEFS`/`PROPERTY_INDEX`/`ID_TO_LABEL`/`ID_TO_PROP` again
-//! on top).
+//! Lazy (`Option` per table, opened on first access), not eager: most
+//! calls only touch a handful of the 12 tables (`set_edge_prop_in_txn`
+//! only needs `edges`), and a bulk-load benchmark showed eagerly opening
+//! all 12 up front costs more than the redundant opens it would save.
 //!
-//! Scoped to one `*_in_txn` call, not one whole transaction/statement/
-//! group -- see mars-3va's history for why: extending this across a
-//! transaction requires every *read* that can happen while a write is in
-//! flight (the whole `eval_return_expr` tree -- property lookups, list
-//! ops, `existsPattern` subqueries) to also route through the same cached
-//! handles, or a `Txn::Write(write_txn)` read elsewhere in the same
-//! transaction hits the exact `TableAlreadyOpen` this exists to avoid.
-//! That's a real redesign of the read+write path across `marsdb-graph`
-//! and `marsdb-query`'s executor, not a contained change -- out of scope
-//! here.
+//! Scoped to one `*_in_txn` call, not a whole transaction: extending the
+//! cache across a transaction would require every read that can happen
+//! mid-write (property lookups, list ops, `existsPattern` subqueries in
+//! the executor's `eval_return_expr` tree) to also route through these
+//! same cached handles, or a `Txn::Write` read elsewhere in the same
+//! transaction hits the same `TableAlreadyOpen` this exists to avoid --
+//! a larger redesign of the read+write path across `marsdb-graph` and
+//! `marsdb-query`'s executor.
 
 use marsdb_storage::WriteTransaction;
 use redb::{MultimapTable, Table};

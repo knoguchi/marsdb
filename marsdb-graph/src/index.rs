@@ -31,12 +31,10 @@ fn index_prefix(label_id: u32, prop_id: u32) -> [u8; 8] {
 
 /// Order-preserving byte encoding of a single `PropertyValue`, for use as
 /// a `PROPERTY_INDEX` key suffix. Lexicographic byte comparison matches
-/// real value ordering *within one type* (needed for a future range scan,
-/// not used yet — MVP only does exact-match lookups) — a leading type tag
-/// keeps different types from ever comparing as equal or interleaving.
-/// `Duration` has no meaningful total order (see `PropertyValue::Duration`'s
-/// own doc comment) — its encoding is only guaranteed consistent for
-/// equality, not real ordering, which is fine since nothing orders by it.
+/// real value ordering *within one type*; a leading type tag keeps
+/// different types from ever comparing as equal or interleaving.
+/// `Duration` has no meaningful total order, so its encoding is only
+/// guaranteed consistent for equality, not ordering.
 pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
     match v {
         PropertyValue::Null => vec![0x00],
@@ -133,15 +131,13 @@ pub(crate) fn encode_index_value(v: &PropertyValue) -> Vec<u8> {
             out.extend_from_slice(&nanos.to_be_bytes());
             out
         }
-        // No real ordering across two lists is defined/needed (same
-        // "consistent for equality, not real ordering" carve-out
-        // `Duration` above already has) -- MVP indexing only does exact-
-        // match lookups. Each element's own encoding is length-prefixed
-        // so two different lists can never collide onto the same byte
-        // string (e.g. `["ab", "c"]` vs `["a", "bc"]`, which otherwise
-        // concatenate to visually-different but genuinely ambiguous byte
-        // runs once strings' own raw-UTF-8, non-length-prefixed encoding
-        // is stacked back to back).
+        // No real ordering across lists is defined (same equality-only
+        // carve-out `Duration` has above). Each element's own encoding is
+        // length-prefixed so two different lists can never collide onto
+        // the same byte string (e.g. `["ab", "c"]` vs `["a", "bc"]`,
+        // which otherwise concatenate to ambiguous byte runs once
+        // strings' raw-UTF-8, non-length-prefixed encoding is stacked
+        // back to back).
         PropertyValue::List(items) => {
             let mut out = vec![0x0B];
             for item in items {
@@ -253,31 +249,17 @@ pub fn lookup_index_def(txn: Txn, label: &str, prop: &str) -> Result<Option<Inde
     }
 }
 
-/// Exact-match lookup: every node currently indexed under `(label, prop) =
-/// value`, up to `limit` of them if given. Caller (the planner, in a
-/// later change) is responsible for checking `lookup_index_def` first —
-/// this returns an empty result, not an error, if no such index exists
-/// (matching a genuinely-empty index would look the same, and this
-/// function has no way to tell those apart itself without the same
-/// lookup its caller likely already did). `limit` bounds the underlying
-/// multimap iterator itself (`.take(limit)` before collecting, not a
-/// truncate after) — same real fix this same class of bug needed for
-/// `NODE_LABEL_INDEX` (see `GraphStore::all_nodes_limited_in_txn`'s
-/// history): truncating *after* `collect()` would still walk every
-/// matching entry first, defeating the point of a `LIMIT` push-down.
-/// Range lookup over one indexed `(label, prop)`: every node whose
-/// stored value falls inside `[lo, hi]` (each side optional, each
-/// independently inclusive/exclusive), in index order. The result is a
-/// deliberate SUPERSET for numeric bounds: Cypher compares ints and
-/// floats cross-type, and the index stores them in two adjacent
+/// Range lookup over one indexed `(label, prop)`: every node whose stored
+/// value falls inside `[lo, hi]` (each side optional, each independently
+/// inclusive/exclusive), in index order, up to `limit` if given. The
+/// result is a deliberate SUPERSET for numeric bounds: Cypher compares
+/// ints and floats cross-type, and the index stores them in two adjacent
 /// type-tagged regions, so a numeric bound scans BOTH regions with the
 /// bound converted per region — widened outward where the i64<->f64
 /// conversion is lossy (|v| > 2^53), never narrowed. Callers keep the
-/// original predicate as a residual filter for exactness; this
-/// function's job is to shrink the candidate set from "whole label" to
-/// "roughly the range", not to be the final answer. Non-numeric bounds
-/// scan their single type region (cross-type comparison is null in
-/// Cypher, so same-type is already the complete answer; the residual
+/// original predicate as a residual filter for exactness. Non-numeric
+/// bounds scan their single type region (cross-type comparison is null
+/// in Cypher, so same-type is already the complete answer; the residual
 /// filter still runs).
 pub fn lookup_range(
     txn: Txn,
@@ -309,15 +291,15 @@ pub fn lookup_range(
     }
 }
 
+/// One scan region over full `PROPERTY_INDEX` keys — `(start, end)`.
+type KeyRegion = (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>);
+
 /// Resumable cursor over one indexed range — the demand-driven form of
 /// `lookup_range`: each `next_chunk` re-seeks past the last `(key,
 /// node)` it returned (O(log n) per refill) and pulls at most
 /// `chunk_size` more ids, so a `LIMIT`ed consumer that stops early
 /// never pays for the rest of the range. Region semantics (numeric
 /// superset, widening) are `range_regions`'s — see `lookup_range`.
-/// One scan region over full `PROPERTY_INDEX` keys — `(start, end)`.
-type KeyRegion = (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>);
-
 pub struct IndexRangeCursor {
     regions: Vec<KeyRegion>,
     region_index: usize,
@@ -521,6 +503,12 @@ fn range_regions(
     vec![(start, end)]
 }
 
+/// Exact-match lookup: every node currently indexed under `(label, prop) =
+/// value`, up to `limit` of them if given. Returns an empty result, not an
+/// error, if no such index exists — check `lookup_index_def` first to
+/// distinguish that from "index, no match". `limit` bounds the underlying
+/// multimap iterator itself (`.take(limit)` before collecting), so it
+/// doesn't walk past the entries it needs.
 pub fn lookup_exact(
     txn: Txn,
     label: &str,
@@ -560,12 +548,10 @@ pub fn lookup_exact(
 
 /// Cheap, exact cardinality of `(label, prop) = value` under a declared
 /// index — the stat the query planner uses to pick the most selective
-/// candidate when several indexed equality conjuncts are available for the
-/// same scan (see `marsdb_query::planner::apply_index_seeks`). O(1): redb's
-/// `MultimapValue::len()` reports a count it already tracks per key, so
-/// this never walks the matching entries themselves, unlike `lookup_exact`.
-/// Returns 0 if no such index/value exists (same "caller already checked
-/// `lookup_index_def`" contract as `lookup_exact`).
+/// candidate among several indexed equality conjuncts on the same scan.
+/// O(1): redb's `MultimapValue::len()` already tracks a count per key, so
+/// this never walks the matching entries, unlike `lookup_exact`. Returns
+/// 0 if no such index/value exists, same contract as `lookup_exact`.
 pub fn match_count(
     txn: Txn,
     label: &str,
@@ -585,10 +571,9 @@ pub fn match_count(
 }
 
 /// Every declared index whose label is in `label_ids`, as `(label_id,
-/// prop_id, prop_name, IndexDef)`. `INDEX_DEFS` is scanned in full (not a
-/// prefix-range query — `TableHandle` only exposes `get`/`iter`, and the
-/// number of *declared indexes* is expected to be small, unlike node
-/// counts) and filtered in memory.
+/// prop_id, prop_name, IndexDef)`. `INDEX_DEFS` is scanned in full and
+/// filtered in memory — the number of declared indexes is expected to be
+/// small, unlike node counts.
 fn indexes_for_labels(
     ctx: &mut WriteCtx,
     label_ids: &[u32],
@@ -631,11 +616,8 @@ fn indexes_for_labels(
 
 /// `labels::resolve_label`/`props::resolve_prop` equivalents reading
 /// directly from an already-open `WriteCtx` handle, instead of opening
-/// `ID_TO_LABEL`/`ID_TO_PROP` again via `Txn` (which `WriteCtx` already
-/// holds open -- a second live handle to the same table would be
-/// `TableAlreadyOpen`). Small deliberate duplication, not a shared helper
-/// with the `Txn`-based versions -- those stay untouched for the read
-/// path (see `WriteCtx`'s own docs).
+/// `ID_TO_LABEL`/`ID_TO_PROP` again via `Txn` — a second live handle to a
+/// table `WriteCtx` already holds open would be `TableAlreadyOpen`.
 pub(crate) fn resolve_label_ctx(ctx: &mut WriteCtx, label_id: u32) -> Result<String, GraphError> {
     let value = ctx.id_to_label()?.get(label_id)?.ok_or_else(|| {
         GraphError::CorruptData(format!("label id {label_id} has no interned string"))

@@ -65,10 +65,9 @@ pub fn substitute_params(
 }
 
 /// `CallClause::args: None` (the implicit-argument form, `CALL proc` with
-/// no parens) has nothing to substitute here -- each declared input
-/// resolves from a same-named `$param` at execution time instead (see
-/// `ExecutionOptions::params`'s own docs for why that can't happen this
-/// early, before the procedure's signature is even known).
+/// no parens) has nothing to substitute here — each declared input
+/// resolves from a same-named `$param` at execution time instead, once
+/// the procedure's signature is known.
 fn substitute_call_clause(
     call: &mut CallClause,
     params: &HashMap<String, PropertyValue>,
@@ -119,10 +118,9 @@ fn substitute_query_clause(
 }
 
 /// Shared by every `SetItem` list this file substitutes into (`SET`'s own
-/// `QueryClause`/`Tail` forms, and `MERGE`'s `ON CREATE`/`ON MATCH SET`)
-/// -- `Labels` has no `$param`-able position (a label name is always a
-/// bare identifier), `Prop`/`MapAssign` both carry exactly one
-/// `ReturnExpr` value to recurse into.
+/// `QueryClause`/`Tail` forms, and `MERGE`'s `ON CREATE`/`ON MATCH SET`).
+/// `Labels` has no `$param`-able position; `Prop`/`MapAssign` each carry
+/// one `ReturnExpr` value to recurse into.
 fn substitute_set_item(
     item: &mut SetItem,
     params: &HashMap<String, PropertyValue>,
@@ -260,10 +258,8 @@ fn substitute_expr(
         Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
         Expr::VarEq(_, _) => {}
-        // Same "just variable names, no `$param`-able position" reasoning
-        // as `VarEq` above -- also planner-synthesized only, never
-        // present in the AST `substitute_params` runs against at all
-        // (built during planning, well after this pass).
+        // Just variable names, like `VarEq` above; also planner-synthesized
+        // only, never present in the AST this pass runs against.
         Expr::EdgeNotInSet { .. } => {}
         Expr::GeneralCompare(lhs, _, rhs) => {
             substitute_return_expr(lhs, params)?;
@@ -346,16 +342,10 @@ fn substitute_return_expr(
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
         ReturnExpr::PatternPredicate(pattern) => substitute_pattern(pattern, params)?,
-        // A list-valued `$param` can't substitute into a bare `Literal`
-        // (no `Literal::List` -- there's no list *literal* syntax in
-        // Cypher for one to mean, see `cypher.pest`'s docs) the way a
-        // scalar one does, so this replaces the *whole* `ReturnExpr::Lit`
-        // node with a `ReturnExpr::ListLit` instead, recursively (a param
-        // list can itself contain nested lists) -- everything downstream
-        // (indexing, `IN`, iteration, ...) already handles `ListLit` like
-        // any other list-valued expression, so nothing else needs to know
-        // this value originated from a parameter rather than `[1, 2, 3]`
-        // literal syntax.
+        // No `Literal::List` (no list-literal syntax in Cypher), so a
+        // list-valued `$param` replaces the whole node with a
+        // `ReturnExpr::ListLit` instead, recursively — everything
+        // downstream already handles `ListLit` like any other list.
         ReturnExpr::Lit(Literal::Param(name)) => {
             let value = params
                 .get(name)
@@ -497,19 +487,13 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
         PropertyValue::Int(i) => Literal::Int(*i),
         PropertyValue::Float(f) => Literal::Float(*f),
         PropertyValue::String(s) => Literal::String(s.clone()),
-        // `Literal` has no temporal variant (there's no temporal *literal*
-        // syntax in Cypher -- see cypher.pest's docs: a date/duration is
-        // always built via `date(...)`/`duration(...)`), so a Date/
-        // Duration bound in from Rust as a `$param` has nowhere to
-        // substitute to *here specifically* -- this function only produces
-        // a bare `Literal`, for the one spot that structurally requires
-        // one (pattern-level `Expr::Compare`'s RHS, `n.prop = $x`). In
-        // ordinary expression position, a temporal-valued `$param`
-        // substitutes into a `ReturnExpr::Call` (e.g. `date("...")`)
-        // instead -- see `property_value_to_return_expr`, not this
-        // function. Erroring here (not silently dropping to Null) is the
-        // same "a real gap should say so, not produce a plausible-looking
-        // wrong answer" stance `apply_arith` already documents.
+        // `Literal` has no temporal variant (Cypher builds dates/durations
+        // via `date(...)`/`duration(...)`, never literal syntax), so a
+        // temporal `$param` has nowhere to substitute in this function,
+        // which only produces a bare `Literal` for the one spot that
+        // structurally requires one (`Expr::Compare`'s RHS, `n.prop = $x`).
+        // In ordinary expression position it substitutes into a
+        // `ReturnExpr::Call` instead — see `property_value_to_return_expr`.
         PropertyValue::Date(_)
         | PropertyValue::Duration { .. }
         | PropertyValue::LocalTime(_)
@@ -521,29 +505,17 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
                  pattern-level property comparison (only in ordinary expression position)"
             )))
         }
-        // Same "no literal syntax to substitute to" gap as the temporal
-        // variants above -- there's no `Literal::List`. A list-valued
-        // `$param` used in ordinary expression position (`RETURN $x`,
-        // `WHERE y IN $x`, ...) substitutes into a `ReturnExpr::ListLit`
-        // instead (`property_value_to_return_expr`, used by
-        // `substitute_return_expr`'s own `Lit` arm, not this function) --
-        // reaching here at all means a list-valued param was used
-        // somewhere a bare `Literal` is structurally required (only
-        // pattern-level `Expr::Compare`'s RHS, `n.prop = $x`), which
-        // doesn't have an equivalent list-valued shape to fall back to
-        // either (comparing a scalar property against a list isn't
-        // meaningful).
+        // Same gap as the temporal variants: no `Literal::List`. Reaching
+        // here means a list-valued param was used where a bare `Literal`
+        // is structurally required (`Expr::Compare`'s RHS), which has no
+        // meaningful list-valued fallback either.
         PropertyValue::List(_) => {
             return Err(QueryError::Type(format!(
                 "${name}: a list-valued query parameter can't be used here (only in ordinary \
                  expression position, not a pattern-level property comparison)"
             )))
         }
-        // Same "no literal syntax to substitute to" gap as `List` above --
-        // there's no `Literal::Map` either. A map-valued `$param` used in
-        // ordinary expression position substitutes into a `ReturnExpr::
-        // MapLit` instead (`property_value_to_return_expr`, not this
-        // function).
+        // Same gap as `List` above: no `Literal::Map`.
         PropertyValue::Map(_) => {
             return Err(QueryError::Type(format!(
                 "${name}: a map-valued query parameter can't be used here (only in ordinary \
@@ -554,12 +526,9 @@ fn property_value_to_literal(name: &str, pv: &PropertyValue) -> Result<Literal, 
 }
 
 /// Converts a parameter's stored `PropertyValue` into the `ReturnExpr`
-/// that should replace a `ReturnExpr::Lit(Literal::Param(name))` node --
-/// a bare `Literal` for a scalar value (delegates to
-/// `property_value_to_literal`), a `ReturnExpr::ListLit` for a list value
-/// (recursively -- a param list can itself contain nested lists/maps), or
-/// a `ReturnExpr::MapLit` for a map value (same recursion, TCK's Map2/
-/// Map3, Unwind1 `[6]`/`[14]`).
+/// that should replace a `ReturnExpr::Lit(Literal::Param(name))` node: a
+/// bare `Literal` for a scalar (`property_value_to_literal`), or a
+/// recursive `ReturnExpr::ListLit`/`MapLit` for a list/map value.
 fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<ReturnExpr, QueryError> {
     Ok(match pv {
         PropertyValue::List(items) => ReturnExpr::ListLit(
@@ -575,13 +544,11 @@ fn property_value_to_return_expr(name: &str, pv: &PropertyValue) -> Result<Retur
                 .collect::<Result<Vec<_>, QueryError>>()?,
         ),
         // `property_value_to_literal`'s temporal arm can't represent these
-        // (no `Literal::Date`/etc -- there's no temporal *literal* syntax
-        // in Cypher). But ordinary expression position -- unlike a bare
-        // pattern-level `Literal` -- allows a `ReturnExpr::Call`, and every
-        // temporal constructor already accepts its own formatted string
-        // back (that's exactly what makes `toString()` round-trip), so a
-        // temporal-valued param becomes a call to the matching constructor
-        // over its formatted string here, instead of erroring.
+        // (no temporal literal syntax in Cypher). Ordinary expression
+        // position allows a `ReturnExpr::Call`, and every temporal
+        // constructor accepts its own formatted string back, so a
+        // temporal-valued param becomes a call to the matching
+        // constructor over its formatted string instead of erroring.
         PropertyValue::Date(d) => temporal_call("date", crate::temporal::format_date(*d)),
         PropertyValue::Duration {
             months,

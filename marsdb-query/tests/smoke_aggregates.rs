@@ -1,4 +1,4 @@
-//! Smoke tests: count/collect/avg/sum/percentile and grouping semantics -- split from the original smoke.rs.
+//! Smoke tests: count/collect/avg/sum/percentile and grouping semantics.
 
 mod common;
 #[allow(unused_imports)]
@@ -178,10 +178,10 @@ fn order_by_aggregate_without_aggregating_return_or_with_is_a_semantic_error() {
 }
 
 /// An ORDER BY item that repeats a RETURN/WITH item's expression verbatim
-/// refers to that already-aggregated item, not a fresh expression -- must
-/// not be re-evaluated against pre-aggregation bindings (which no longer
-/// exist post-grouping). Real, previously-broken TCK scenarios: WithOrderBy4
-/// [11] (aliased, still matched by expression) and ReturnOrderBy3 (unaliased).
+/// refers to that already-aggregated item, not a fresh expression -- it
+/// must not be re-evaluated against pre-aggregation bindings, which no
+/// longer exist post-grouping. TCK WithOrderBy4 [11] (aliased, matched by
+/// expression) and ReturnOrderBy3 (unaliased).
 #[test]
 fn order_by_repeats_an_aggregating_return_or_with_item_verbatim() {
     let store = GraphStore::open_memory().unwrap();
@@ -242,13 +242,10 @@ fn order_by_aggregate_not_matching_any_aggregating_item_is_an_error() {
     assert!(err.to_string().to_lowercase().contains("aggregat"));
 }
 
-/// TCK ReturnOrderBy6 [2]/[3]: an aggregating RETURN's own ORDER BY key
-/// can be *composed* (an aggregate combined with other values), as long
-/// as every non-aggregate leaf is an explicit grouping key -- either the
-/// item's own expression verbatim, or (unlike a plain composed RETURN
-/// item) its output *alias*, and every aggregate call in it matches some
-/// existing item (`age + count(you.age)` and `me.age + count(you.age)`
-/// both use `count(you.age)`, item1's own expression verbatim).
+/// TCK ReturnOrderBy6 [2]/[3]: an aggregating RETURN's composed ORDER BY
+/// key is legal as long as every non-aggregate leaf is an explicit
+/// grouping key (its own expression or output alias) and every aggregate
+/// call in it matches an existing item.
 #[test]
 fn return_order_by_composed_aggregate_expression_sorts_by_the_computed_value() {
     // me.age=100 has 1 outgoing KNOWS (combined value 101); me.age=1 has
@@ -316,23 +313,12 @@ fn integer_sum_overflow_returns_error_instead_of_panicking() {
     assert!(err.to_string().contains("sum() integer overflow"));
 }
 
-/// A nested aggregate inside an arithmetic expression (`1 + count(x)`) is
-/// a real, deliberate rejection, not a silent wrong answer -- `Arith`
-/// existing at all made this reachable for the first time (previously
-/// `count(x)` could only ever be a return item's entire expression, so
-/// there was nothing to wrap it in), and it needs `has_aggregate` to
-/// route the query to the grouping path at all before
-/// `validate_return_items` gets a chance to reject it; a narrower check
-/// (only detecting an aggregate as the item's *entire* top-level
-/// expression) silently returned the wrong row count instead of erroring
-/// -- see `has_aggregate`'s own doc comment for the real scenario this
-/// caught.
 #[test]
 fn aggregate_composed_with_arithmetic_computes_per_group() {
     // TCK clauses/return Return6 [2]/[9]: an aggregate doesn't need to be
-    // a return item's *entire* top-level expression -- `count(n) + 3`,
-    // `count(*) * 10` etc are real Cypher, evaluated once per group with
-    // the aggregate's finished value substituted in.
+    // a return item's entire top-level expression -- `count(n) + 3`,
+    // `count(*) * 10` etc are evaluated once per group with the
+    // aggregate's finished value substituted in.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE ()");
 
@@ -841,10 +827,9 @@ fn with_where_filters_without_aggregation() {
 fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
     use std::collections::BTreeMap;
 
-    // Not literal IC1 text/fixtures (out of scope, same as the IS1-7 plan's
-    // deferral of IC fixtures) -- a hand-crafted shape combining grouping,
-    // WITH...WHERE, ORDER BY, LIMIT, and collect() together in one query,
-    // since no single mechanic test above exercises that combination.
+    // Not literal IC1 fixtures -- a hand-crafted shape combining grouping,
+    // WITH...WHERE, ORDER BY, LIMIT, and collect() in one query, since no
+    // single test above exercises that combination.
     let store = GraphStore::open_memory().unwrap();
     let names = ["Alice", "Bob", "Carol", "Dave"];
     let mut people = Vec::new();
@@ -895,11 +880,10 @@ fn ldbc_ic_shaped_grouping_having_orderby_limit_collect_checkpoint() {
 
 #[test]
 fn unwind_collected_nodes_restores_graph_identity() {
-    // The whole point of value_to_binding_restore: a node that went into
-    // collect() as a Value::Node must come back out of UNWIND as a real
-    // Binding::Node, not just a display value -- provable by traversing
-    // further (m.name) after the UNWIND, which only works with real graph
-    // identity, not a frozen snapshot value.
+    // value_to_binding_restore: a node collected as a Value::Node must
+    // come back out of UNWIND as a real Binding::Node, not a display
+    // value -- confirmed here by traversing further (m.name) after the
+    // UNWIND.
     let store = GraphStore::open_memory().unwrap();
     run(
         &store,
@@ -918,25 +902,13 @@ fn unwind_collected_nodes_restores_graph_identity() {
     assert_eq!(names, vec!["Bob".to_string(), "Carol".to_string()]);
 }
 
-/// The node cache's reset (clear + enable/disable based on
-/// `is_read_only`) must happen on *every* statement-execution entry
-/// point, not just `execute`/`execute_with_options` -- `Executor` has a
-/// second, separate entry point (`execute_in_write_transaction`, used by
-/// an explicit multi-statement `Transaction` or a group-commit loop with
-/// an already-open `WriteTransaction`), and `node_cache` is a field on
-/// `Executor` shared by both, not private to either. A read via
-/// `execute` leaves the cache populated and enabled; a write via
-/// `execute_in_write_transaction` on the *same* `Executor` right after
-/// must not inherit that state.
-/// The Expand->Expand->count(*) fast path must produce byte-identical
-/// results to the generic pipeline. Same collaborative-filtering query
-/// run twice: once in the exact fast-path shape, once with a `WHERE`
-/// predicate the recognizer doesn't accept (forcing the generic path) —
-/// the two must agree on rows AND order. The fixture deliberately
-/// includes the two semantic traps: a duplicate parallel edge (rec == m
-/// must be counted when reached via a *different* edge) and the
-/// single-edge user (whose only path back is the same edge, excluded by
-/// edge isomorphism).
+/// The Expand->Expand->count(*) fast path must match the generic
+/// pipeline byte-for-byte. Same query run twice: once in the exact
+/// fast-path shape, once with a `WHERE` predicate the recognizer doesn't
+/// accept (forcing the generic path) -- rows and order must agree. The
+/// fixture includes two traps: a duplicate parallel edge (rec == m
+/// counted when reached via a different edge) and a single-edge user
+/// (its only path back is its own edge, excluded by edge isomorphism).
 #[test]
 fn fast_expand_count_matches_generic_path() {
     let store = GraphStore::open_memory().unwrap();
@@ -945,11 +917,9 @@ fn fast_expand_count_matches_generic_path() {
         "CREATE (m:Movie {title: 'Target'}), (x:Movie {title: 'X'}), (y:Movie {title: 'Y'}), \
          (u1:User {name: 'u1'}), (u2:User {name: 'u2'}), (u3:User {name: 'u3'})",
     );
-    // u1 rates Target and X; u2 rates Target, X, Y; u3 rates ONLY Target
-    // (isomorphism: contributes nothing). u2 also rates Target TWICE
-    // (parallel edge): the second edge makes Target itself reachable as a
-    // recommendation via a different edge — must be counted, not
-    // special-cased away.
+    // u1 rates Target and X; u2 rates Target, X, Y plus a duplicate
+    // Target edge (must count via the different edge, not be
+    // special-cased away); u3 rates only Target (isomorphism: excluded).
     for stmt in [
         "MATCH (u:User {name:'u1'}), (m:Movie {title:'Target'}) CREATE (u)-[:RATED]->(m)",
         "MATCH (u:User {name:'u1'}), (m:Movie {title:'X'}) CREATE (u)-[:RATED]->(m)",
@@ -967,8 +937,8 @@ fn fast_expand_count_matches_generic_path() {
         "MATCH (m:Movie {title: 'Target'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \
          WITH rec, count(*) AS c ORDER BY c DESC LIMIT 5 RETURN rec.title, c",
     );
-    // Same query with a recognizer-defeating (but semantically inert)
-    // WHERE — routes through the generic pipeline.
+    // Same query with a recognizer-defeating, semantically inert WHERE,
+    // routing through the generic pipeline.
     let generic = run(
         &store,
         "MATCH (m:Movie {title: 'Target'})<-[:RATED]-(u:User)-[:RATED]->(rec:Movie) \

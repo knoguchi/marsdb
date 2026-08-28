@@ -260,6 +260,9 @@ Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 
+- Row-slot executor refactor: replace the read path's per-row
+  `HashMap<String, Binding>` with plan-time-resolved slot indices
+  (see [`docs/design/row-slots.md`](docs/design/row-slots.md))
 - Gremlin frontend targeting the existing IR
 - Composite indexes (single-property indexes already exist) with
   transactional maintenance

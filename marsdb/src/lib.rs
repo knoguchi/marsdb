@@ -46,8 +46,8 @@ pub enum Error {
 pub struct Database {
     store: marsdb_graph::GraphStore,
     /// The Cypher-level session transaction (`BEGIN`/`COMMIT`/`ROLLBACK`
-    /// statements, issue #142 — MarsDB extension, openCypher has no
-    /// transaction statements). `BEGIN` opens it, every subsequent
+    /// statements — a MarsDB extension, openCypher has no transaction
+    /// statements). `BEGIN` opens it, every subsequent
     /// `execute`/`execute_batch` statement runs inside it (reads included,
     /// so they see the transaction's own writes), `COMMIT`/`ROLLBACK`
     /// close it. One per `Database` handle — the handle *is* the session;
@@ -287,17 +287,16 @@ impl Database {
 
     /// Idle limit for the Cypher-level session transaction
     /// (`BEGIN`/`COMMIT`/`ROLLBACK` -- see `session_txn`'s docs). `None`
-    /// (the default, matching what real deployments ship for their
-    /// equivalent knobs) disables it. When set, a session transaction
-    /// idle longer than `limit` is rolled back by the next statement to
+    /// (the default) disables it. When set, a session transaction idle
+    /// longer than `limit` is rolled back by the next statement to
     /// arrive, which returns [`Error::SessionTransactionTimedOut`];
-    /// statements after that run normally. There is no background timer
-    /// -- an abandoned transaction with *no* further traffic on this
-    /// handle keeps holding redb's single writer, so an embedder mixing
-    /// session transactions with caller-owned
-    /// [`Database::begin_transaction`] handles across threads should set
-    /// this AND expect the reclaim to happen on the next session-layer
-    /// statement, not on a clock.
+    /// statements after that run normally. There is no background timer:
+    /// an abandoned transaction with no further traffic on this handle
+    /// keeps holding redb's single writer until then, so an embedder
+    /// mixing session transactions with caller-owned
+    /// [`Database::begin_transaction`] handles across threads should
+    /// expect the reclaim on the next session-layer statement, not on a
+    /// clock.
     pub fn set_session_transaction_timeout(&self, limit: Option<std::time::Duration>) {
         *self
             .session_txn_timeout
@@ -377,16 +376,14 @@ impl Database {
     /// `QueryResult` per statement in order.
     ///
     /// The whole batch is parsed up front — a syntax error anywhere in it
-    /// means nothing runs at all. Execution, though, is one transaction
-    /// per statement (same crash-safety model as a single `execute()`
-    /// call) — unless the batch itself opens one: `BEGIN`/`COMMIT`/
-    /// `ROLLBACK` statements work in a batch exactly as they do fed one
-    /// at a time (`session_txn`'s docs), so `"BEGIN; CREATE (a);
-    /// CREATE (b); COMMIT"` is one atomic unit. If a statement fails at
-    /// *run* time (e.g. an unbound variable), this returns `Err`
-    /// immediately rather than continuing: outside a transaction every
-    /// statement before it is already committed and stays that way;
-    /// inside one, the whole open transaction is aborted.
+    /// means nothing runs at all. Execution is one transaction per
+    /// statement (same crash-safety model as a single `execute()` call),
+    /// unless the batch itself opens one via `BEGIN`/`COMMIT`/`ROLLBACK`
+    /// (`session_txn`'s docs), so `"BEGIN; CREATE (a); CREATE (b);
+    /// COMMIT"` is one atomic unit. A run-time failure (e.g. an unbound
+    /// variable) returns `Err` immediately: outside a transaction every
+    /// earlier statement stays committed; inside one, the whole open
+    /// transaction is aborted.
     pub fn execute_batch(&self, cypher: &str) -> Result<Vec<QueryResult>, Error> {
         let stmts = marsdb_query::parse_many(cypher)?;
         let options = ExecutionOptions::default();
@@ -397,14 +394,11 @@ impl Database {
     }
 
     /// Same as [`execute_batch`](Self::execute_batch), but commits once
-    /// every `group_size` statements instead of once per statement — the
-    /// group-commit pattern real databases use for bulk loads, trading
-    /// crash-safety granularity for throughput. Each commit is an fsync;
-    /// on a 9,771-statement real-world load script, `execute_batch` took
-    /// 69.1s, `execute_batch_grouped` took 13.4s at `group_size: 100` and
-    /// 12.1s at `group_size: 9771` (measured, not estimated) — most of the
-    /// win is already there by a few hundred statements per group; there's
-    /// little reason to go larger just to shrink the group count further.
+    /// every `group_size` statements instead of once per statement,
+    /// trading crash-safety granularity for throughput (each commit is an
+    /// fsync). Most of the throughput win is already there by a few
+    /// hundred statements per group; little reason to go larger just to
+    /// shrink the group count further.
     ///
     /// If a statement fails, the group it's in is rolled back in full —
     /// not partially applied — while every earlier group that already
@@ -494,13 +488,10 @@ impl Transaction<'_> {
 
     /// `Database::execute_prepared_statement`'s transactional twin: run an
     /// already-parsed statement (`marsdb::parse`) inside this transaction.
-    /// The motivating case is a bulk loader re-executing one statement
-    /// with per-row `params` — parsing once instead of per row roughly
-    /// halves the per-statement cost of `execute_with_params` in that
-    /// loop. The AST is cloned per execution (parameter substitution
-    /// mutates it in place), and the abort-on-error contract matches
-    /// every other `Transaction::execute*`: any failure closes the whole
-    /// transaction.
+    /// Useful for a bulk loader re-executing one statement with per-row
+    /// `params`, parsing once instead of per row. The AST is cloned per
+    /// execution (parameter substitution mutates it in place); the
+    /// abort-on-error contract matches every other `Transaction::execute*`.
     pub fn execute_prepared_statement(
         &mut self,
         stmt: &Statement,

@@ -1,26 +1,22 @@
 //! End-to-end coverage of LDBC SNB Interactive's 7 short-read queries
 //! (IS1-IS7, from `ldbc/ldbc_snb_interactive_v1_impls`), run through
 //! `$param` substitution against one shared, hand-crafted fixture matching
-//! enough of the LDBC schema shape to exercise each query for real —
-//! this is the actual target the 8-step feature push
-//! (multi-label/params/functions+CASE/ORDER BY/undirected/variable-length/
-//! WITH-chaining/OPTIONAL MATCH+VarEq) was building toward, not just
+//! enough of the LDBC schema shape to exercise each query, not just
 //! shape-mirroring unit tests for the individual mechanics (those live in
 //! `smoke.rs`).
 //!
-//! Not the real LDBC SF0.1 datagen output — that's Java/Spark tooling,
-//! explicitly out of scope. Small enough to eyeball, big enough that a
-//! forgotten label or wrong direction produces a wrong *count*, not just a
-//! panic — see `hop_node_first_label_is_actually_filtered` and
-//! `multi_label_create_and_match` in smoke.rs for the exact bugs this
-//! discipline caught during development.
+//! Not the real LDBC SF0.1 datagen output; that's Java/Spark tooling, out
+//! of scope. Small enough to eyeball, big enough that a forgotten label
+//! or wrong direction produces a wrong *count*, not just a panic: see
+//! `hop_node_first_label_is_actually_filtered` and
+//! `multi_label_create_and_match` in smoke.rs for examples.
 
 use std::collections::{BTreeMap, HashMap};
 
 use marsdb_graph::{GraphStore, NodeId, PropertyValue};
 use marsdb_query::{parse, substitute_params, Executor, Literal, QueryResult, Value};
 
-#[allow(dead_code)] // fixture fields kept for clarity/reuse even where a given test doesn't touch them directly
+#[allow(dead_code)] // fixture fields kept even where a given test doesn't touch them directly
 struct Fixture {
     store: GraphStore,
     alice: NodeId,
@@ -82,7 +78,7 @@ fn build_fixture() -> Fixture {
     let mut comment1_props = BTreeMap::new();
     comment1_props.insert("id".into(), PropertyValue::Int(101));
     comment1_props.insert("creationDate".into(), PropertyValue::Int(2_100));
-    // No `content` — exercises IS4's coalesce(content, imageFile).
+    // No `content`: exercises IS4's coalesce(content, imageFile).
     comment1_props.insert("imageFile".into(), PropertyValue::String("pic.png".into()));
     let comment1 = store
         .create_node(&["Comment", "Message"], comment1_props)
@@ -101,7 +97,7 @@ fn build_fixture() -> Fixture {
     let comment2 = store
         .create_node(&["Comment", "Message"], comment2_props)
         .unwrap();
-    // Replies to comment1, not post1 directly — exercises IS6's REPLY_OF*0..
+    // Replies to comment1, not post1 directly: exercises IS6's REPLY_OF*0..
     // walking more than one hop to reach the root Post.
     store
         .create_edge("REPLY_OF", comment2, comment1, BTreeMap::new())
@@ -189,9 +185,8 @@ fn is1_profile_of_a_person() {
 #[test]
 fn is3_friends_of_a_person() {
     let f = build_fixture();
-    // Real IS3 uses `-[r:KNOWS]-` (undirected) since KNOWS is symmetric —
-    // querying from Bob (the target of the stored directed edge) must
-    // still find Alice.
+    // IS3's KNOWS is symmetric, matched via undirected `-[r:KNOWS]-`;
+    // querying from Bob, the stored edge's target, must still find Alice.
     let result = run_with_params(
         &f.store,
         "MATCH (n:Person {id: $id})-[r:KNOWS]-(friend) \
@@ -207,7 +202,7 @@ fn is3_friends_of_a_person() {
 #[test]
 fn is4_content_of_a_message() {
     let f = build_fixture();
-    // comment1 has no `content`, only `imageFile` — coalesce must pick it.
+    // comment1 has no `content`, only `imageFile`; coalesce must pick it.
     let result = run_with_params(
         &f.store,
         "MATCH (m:Message {id: $id}) RETURN coalesce(m.content, m.imageFile) AS messageContent",
@@ -259,8 +254,8 @@ fn is6_forum_of_a_message() {
 #[test]
 fn is2_recent_messages_of_a_person() {
     let f = build_fixture();
-    // Real IS2 keys off $personId as the message *author*; our fixture's
-    // Bob authored comment1, which replies to post1 -- REPLY_OF*0.. from
+    // IS2 keys off $personId as the message *author*; our fixture's Bob
+    // authored comment1, which replies to post1 -- REPLY_OF*0.. from
     // comment1 reaches post1 in one hop.
     let result = run_with_params(
         &f.store,

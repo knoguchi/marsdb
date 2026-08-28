@@ -438,17 +438,13 @@ runs per side, both reported.
 
 Notes, measured not asserted:
 
-- Read win is 1.16x, not the 1.5-2.5x projected from the pre-#157
-  flamegraph — that projection used a stale denominator (the 40% decode
-  share was measured *before* the node decode cache shipped and absorbed
-  the repeat-decode portion). No post-#157 read flamegraph existed when
-  the projection was made.
+- Read win is 1.16x, not the 1.5-2.5x originally projected. That
+  projection used a stale denominator: the 40% decode share was measured
+  before the node decode cache shipped and absorbed the repeat-decode
+  portion, and no newer flamegraph existed at projection time.
 - Load is slightly slower (property-name interning adds table writes on
   every create). Acceptable; group commit still dominates.
 - File size: first cut of the composite adjacency key byte-packed it as
-  `&[u8]` and measured a **2x database file** (145.9MB) — the same
-  fixed-width-erasure tax measured on the (since-abandoned) hand-rolled
-  storage-engine branch (mars-am7, +34%) — fixed by switching to redb
-  tuple keys
-  `(u64, u32, u64)` before merge. Recorded because it's the second time
-  this exact mistake was made in this codebase.
+  `&[u8]` and measured a **2x database file** (145.9MB), the same
+  fixed-width-erasure tax as byte-packed composite keys generally.
+  Fixed by switching to redb tuple keys `(u64, u32, u64)` before merge.

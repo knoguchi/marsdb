@@ -6,8 +6,8 @@ use common::*;
 use marsdb_graph::GraphStore;
 use marsdb_query::{parse, Executor, Value};
 
-/// Real Cypher's two comment forms (`//` line, `/* */` block) -- a real
-/// grammar gap found via the openCypher TCK's own fixture text, which
+/// Cypher's two comment forms (`//` line, `/* */` block) -- a grammar
+/// gap found via the openCypher TCK's own fixture text, which
 /// pervasively annotates `CREATE` blocks this way.
 #[test]
 fn line_and_block_comments_are_ignored() {
@@ -127,8 +127,8 @@ fn case_when_then_else() {
 
 #[test]
 fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
-    // Documents the deliberate convention CASE relies on for IS7: a missing
-    // property compared against `null` in a WHEN arm matches.
+    // CASE's convention for IS7: a missing property compared against
+    // `null` in a WHEN arm matches.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (a:Person {name: 'Alice'})"); // no `age` prop
     let result = run(
@@ -141,13 +141,13 @@ fn case_null_equals_null_is_true_not_standard_three_valued_logic() {
     }
 }
 
-/// Real Cypher's "searched CASE" form -- no subject expression, each
-/// `WHEN` carries its own full boolean condition (`CASE WHEN cond THEN
-/// ... END`), distinct from the "simple CASE" form both other `case_*`
-/// tests exercise (`CASE x WHEN v THEN ... END`). A bare `WHEN` right
-/// after `CASE` used to get swallowed as a bare-identifier subject
-/// expression (pest's `?` doesn't backtrack across a later parse
-/// failure), rejecting every searched-CASE query.
+/// Cypher's "searched CASE" form -- no subject expression, each `WHEN`
+/// carries its own full boolean condition (`CASE WHEN cond THEN ...
+/// END`), distinct from the "simple CASE" form the other `case_*` tests
+/// exercise (`CASE x WHEN v THEN ... END`). A bare `WHEN` right after
+/// `CASE` can get swallowed as a bare-identifier subject expression
+/// (pest's `?` doesn't backtrack across a later parse failure), which
+/// would reject every searched-CASE query.
 #[test]
 fn case_searched_form_has_no_subject_expression() {
     let store = GraphStore::open_memory().unwrap();
@@ -302,11 +302,11 @@ fn min_max_on_non_orderable_errors() {
     );
 }
 
-/// `max()`/`min()` over a list argument -- real Cypher orders a list
+/// `max()`/`min()` over a list argument -- Cypher orders a list
 /// element-by-element (reusing the same `list_cmp_asc` ORDER BY
-/// already uses), found as a real bug: `comparable_ordering` had no
-/// `List` arm at all, so any list argument unconditionally errored
-/// "requires a comparable scalar argument". Aggregation2 [9]/[10].
+/// already uses); `comparable_ordering` had no `List` arm at all, so any
+/// list argument unconditionally errored "requires a comparable scalar
+/// argument". Aggregation2 [9]/[10].
 #[test]
 fn max_min_over_list_values() {
     let store = GraphStore::open_memory().unwrap();
@@ -323,10 +323,9 @@ fn max_min_over_list_values() {
     }
 }
 
-/// `max()`/`min()` over genuinely mixed types (numbers, strings, a
-/// list) -- real Cypher's cross-type orderability ranks `List` *below*
-/// every scalar (sorts first), the opposite of an earlier, unverified
-/// version of `type_rank` that put it last. Aggregation2 [11]/[12].
+/// `max()`/`min()` over mixed types (numbers, strings, a list) --
+/// Cypher's cross-type orderability ranks `List` *below* every scalar
+/// (sorts first). Aggregation2 [11]/[12].
 #[test]
 fn max_min_over_mixed_types_including_a_list() {
     let store = GraphStore::open_memory().unwrap();
@@ -369,25 +368,21 @@ fn string_literal_escaped_backslash_and_common_escapes() {
 
 #[test]
 fn string_literal_unrecognized_escape_errors() {
-    // `\q` isn't one of openCypher.bnf's own closed set of valid escape
-    // sequences (backslash/quote/tab/etc/\uXXXX) -- a real syntax error,
-    // not just a specific message's wording, which legitimately differs
-    // by implementation (a lenient-lex-then-semantic-check parser can
-    // give a precise "unrecognized escape" message; a parser whose lexer
-    // itself only matches real escape sequences, arguably closer to spec,
-    // fails to tokenize the string at all instead -- both are correct
-    // rejections of the same invalid input).
+    // `\q` isn't in openCypher.bnf's closed set of valid escape sequences
+    // (backslash/quote/tab/etc/\uXXXX). A lenient-lex-then-semantic-check
+    // parser and a lexer that only matches valid escapes will report this
+    // differently (a specific message vs. a bare tokenize failure), but
+    // both must reject it.
     let err = parse(r"MATCH (n {x: 'a\qb'}) RETURN n").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("syntax error"));
 }
 
-/// `parse_many`'s `queries` grammar used to have `~ ";"? ~ EOI` at the
-/// end -- with a genuinely-trailing `;`, `(";" ~ statement)*` greedily
-/// consumed it as one more separator, needing a `statement` after it;
-/// since `match_stmt` can match zero-width, an empty string satisfied
-/// that, producing a spurious extra empty statement that then failed its
-/// own "needs a tail" validation. Caught via the TCK's binary-tree named-
-/// graph fixture, a real multi-statement file that ends with `;`.
+/// A trailing `;` must not produce a spurious extra empty statement: a
+/// naive `(";" ~ statement)*` grammar greedily consumes a trailing `;`
+/// as one more separator needing a `statement` after it, and since
+/// `match_stmt` can match zero-width, an empty string satisfies that and
+/// then fails its own "needs a tail" validation. Caught via the TCK's
+/// binary-tree named-graph fixture, a multi-statement file ending in `;`.
 #[test]
 fn parse_many_tolerates_a_trailing_semicolon() {
     assert_eq!(marsdb_query::parse_many("CREATE (a);").unwrap().len(), 1);
@@ -405,12 +400,11 @@ fn parse_many_tolerates_a_trailing_semicolon() {
     );
 }
 
-/// `map['key']` -- real Cypher's dynamic map-field access, previously
-/// rejected at compile time even though `apply_index`'s runtime already
-/// fully supported it. `null['key']` must still be `null`, not an error
-/// (a `null`-valued base types as `Kind::Scalar` in this codebase's
-/// imprecise `Kind` system, deliberately tolerated here the same way
-/// every other `Kind::Scalar` case is).
+/// `map['key']` -- Cypher's dynamic map-field access. `apply_index`'s
+/// runtime already supports it, so the compile-time check must allow it
+/// too. `null['key']` must still be `null`, not an error: `null` types
+/// as `Kind::Scalar` in this codebase's imprecise `Kind` system, same as
+/// every other `Kind::Scalar` case.
 #[test]
 fn map_index_access() {
     let store = GraphStore::open_memory().unwrap();
@@ -424,7 +418,7 @@ fn map_index_access() {
     assert!(matches!(result.rows[0][0], Value::Null));
 }
 
-/// `$1` -- real Cypher's legacy positional-parameter form (a plain
+/// `$1` -- Cypher's legacy positional-parameter form (a plain
 /// non-negative-integer name), not just a `$name` identifier.
 #[test]
 fn numeric_named_parameters() {
@@ -494,8 +488,8 @@ fn list_valued_parameters_substitute_into_a_list_literal_expression() {
     assert_eq!(int(&result.rows[0][0]), 2);
 }
 
-/// The executor's per-statement node decode cache (mars-m79) must not
-/// leak a stale record across statements when one `Executor` is reused
+/// The executor's per-statement node decode cache must not leak a stale
+/// record across statements when one `Executor` is reused
 /// for several (`execute_batch`, group commit) -- a node read in an
 /// earlier statement, then mutated in a later one, must show the new
 /// value on the next read, not the first statement's cached copy.
@@ -529,13 +523,12 @@ fn node_cache_does_not_leak_stale_records_across_statements() {
 }
 
 /// A write statement can intern a brand-new property name mid-statement
-/// and then read it back in a later clause of that SAME statement -- the
-/// per-property read path's name->id memo (`Executor::prop_id_memo`) must
-/// not serve a stale "never interned" for it. This is the exact scenario
-/// that forces the memo to be gated to read-only statements (see the
-/// field's docs): an earlier clause probes `fresh` before any node has it
-/// (memoizing `None` would be tempting), a middle clause creates the
-/// first node carrying it, and a later clause filters on it and must
+/// and then read it back in a later clause of the SAME statement -- the
+/// per-property read path's name->id memo (`Executor::prop_id_memo`)
+/// must not serve a stale "never interned" for it. This is why the memo
+/// is gated to read-only statements (see the field's docs): an earlier
+/// clause probes `fresh` before any node has it, a middle clause creates
+/// the first node carrying it, and a later clause filters on it and must
 /// match.
 #[test]
 fn property_interned_mid_statement_is_visible_to_later_clauses_of_the_same_statement() {
@@ -563,7 +556,7 @@ fn property_interned_mid_statement_is_visible_to_later_clauses_of_the_same_state
 /// "On numeric values" plus Return2 [1]. `^` always produces a `Float`
 /// (even for two `Int`s), binds tighter than `*`/`/`/`%`/`+`/`-` but
 /// looser than unary minus, and is LEFT-associative (`4^(3*2)^3` is
-/// `(4^6)^3`, confirmed against the real TCK fixture -- general math
+/// `(4^6)^3`, confirmed against the TCK fixture -- general math
 /// convention's right-associativity would have been wrong here).
 #[test]
 fn exponentiation_and_unary_minus_precedence() {
@@ -590,22 +583,21 @@ fn exponentiation_and_unary_minus_precedence() {
     let result = run(&store, "RETURN -3 AS x");
     assert_eq!(int(&result.rows[0][0]), -3);
 
-    // General unary minus on a non-literal (a bound variable) -- this is
-    // the actually-new grammar shape (`-3` alone always worked). Chained
-    // unary minus (`--n`) isn't real openCypher -- per
-    // openCypher.bnf's `<arithmetic unary> ::= [<sign>] <postfix
-    // expression>`, the sign is a single optional, not repeatable.
+    // General unary minus on a non-literal (a bound variable) -- the
+    // actually-new grammar shape (`-3` alone always worked). Chained
+    // unary minus (`--n`) isn't valid openCypher -- per openCypher.bnf's
+    // `<arithmetic unary> ::= [<sign>] <postfix expression>`, the sign
+    // is a single optional, not repeatable.
     let result = run(&store, "WITH 3 AS n RETURN -n AS x");
     assert_eq!(int(&result.rows[0][0]), -3);
 }
 
 /// `RETURN 1 AS a, 2 AS a` -- reusing the same explicit alias for two
-/// columns is a real error (`ColumnNameConflict`). An unaliased
-/// expression repeated (`RETURN date(x), date(y)`) is *not* a
-/// conflict, even though both currently fall back to the same generic
-/// placeholder column name (`"date(...)"`, not argument-aware) --
-/// only a genuinely meaningful name (an alias, or a bare variable/
-/// property-access name) can actually collide.
+/// columns is an error (`ColumnNameConflict`). An unaliased expression
+/// repeated (`RETURN date(x), date(y)`) is *not* a conflict, even though
+/// both currently fall back to the same generic placeholder column name
+/// (`"date(...)"`, not argument-aware) -- only a meaningful name (an
+/// alias, or a bare variable/property-access name) can collide.
 #[test]
 fn return_rejects_duplicate_explicit_column_names() {
     let store = GraphStore::open_memory().unwrap();
@@ -721,11 +713,10 @@ fn quantifier_none_on_empty_list_is_true() {
 
 #[test]
 fn quantifier_three_valued_null_propagation() {
-    // Regression: a first version collapsed a null predicate straight to
-    // false, which happened to pass every non-null-list scenario but was
-    // wrong on lists containing nulls -- a definite true/false among the
-    // elements still decides the answer even with nulls present; only
-    // "no definite answer, but at least one unknown" is null.
+    // A null predicate must not collapse straight to false: a definite
+    // true/false among the elements still decides the answer even with
+    // nulls present; only "no definite answer, but at least one unknown"
+    // is null.
     let store = GraphStore::open_memory().unwrap();
 
     let all = run(&store, "RETURN all(x IN [null] WHERE x = 2) AS a, all(x IN [0, null] WHERE x = 2) AS b, all(x IN [2, null] WHERE x = 2) AS c");
@@ -898,7 +889,7 @@ fn chained_comparisons_fold_into_and() {
 
 /// `IS [NOT] NULL` binds *tighter* than a surrounding comparison -- `false
 /// = true IS NULL` is `false = (true IS NULL)`, not `(false = true) IS
-/// NULL`. Real Cypher's own precedence rule (TCK's Precedence1 [8]/[23]).
+/// NULL`. Cypher's own precedence rule (TCK's Precedence1 [8]/[23]).
 #[test]
 fn is_null_binds_tighter_than_comparison() {
     let store = GraphStore::open_memory().unwrap();
@@ -916,9 +907,9 @@ fn is_null_binds_tighter_than_comparison() {
     assert!(bool_val(&result.rows[0][0]));
 }
 
-/// `x IN list` -- real Cypher's list membership test, previously
-/// unsupported as a general expression (only existed inside a list
-/// comprehension/quantifier's own `filter_expr`). Three-valued like `=`,
+/// `x IN list` -- Cypher's list membership test, previously unsupported
+/// as a general expression (only existed inside a list comprehension/
+/// quantifier's own `filter_expr`). Three-valued like `=`,
 /// and binds *tighter* than a surrounding comparison, same precedence
 /// tier as `IS NULL` (TCK's Precedence3 [6]: `[1,2] = [3,4] IN
 /// [[3,4],false]` is `[1,2] = ([3,4] IN [[3,4],false])`).
@@ -959,11 +950,11 @@ fn in_operator_list_membership_and_precedence() {
     ));
 }
 
-/// `+` is also real Cypher's list concatenation/append/prepend operator
+/// `+` is also Cypher's list concatenation/append/prepend operator
 /// (`[1,2] + [3]` concatenates, `[1,2] + 3`/`3 + [1,2]` appends/prepends
-/// the scalar) -- `apply_arith`/`ReturnExpr::Arith`'s semantic check both
-/// only ever handled numbers/strings before this, unconditionally
-/// rejecting any list operand.
+/// the scalar) -- `apply_arith`/`ReturnExpr::Arith`'s semantic check only
+/// ever handled numbers/strings before this, unconditionally rejecting
+/// any list operand.
 #[test]
 fn plus_concatenates_and_appends_lists() {
     let store = GraphStore::open_memory().unwrap();
@@ -1000,7 +991,7 @@ fn plus_concatenates_and_appends_lists() {
     assert!(format!("{err}").contains("cannot use a list"));
 }
 
-/// Real Cypher's integer literal grammar has hex (`0x...`) and octal
+/// Cypher's integer literal grammar has hex (`0x...`) and octal
 /// (`0o...`) forms beyond plain decimal, on both a positive and negative
 /// literal. Also exercises `i64::MIN`'s magnitude (`2^63`), which doesn't
 /// fit in a *positive* `i64` at all -- only `-0x8000000000000000` (the
@@ -1029,7 +1020,7 @@ fn int_literal_accepts_hex_and_octal_forms() {
     assert_eq!(int(&run(&store, "RETURN 42 AS x").rows[0][0]), 42);
 }
 
-/// Real Cypher accepts either quote style for a string literal, not just
+/// Cypher accepts either quote style for a string literal, not just
 /// `'...'` -- and `\uXXXX` (exactly 4 hex digits, a BMP code point) as a
 /// string escape, previously unrecognized.
 #[test]
@@ -1054,7 +1045,7 @@ fn double_quoted_strings_and_unicode_escapes() {
     }
 }
 
-/// Real Cypher's float literal grammar has three shapes beyond plain
+/// Cypher's float literal grammar has three shapes beyond plain
 /// `digits.digits`: a leading-dot form with no integer part (`.1`), and
 /// exponent notation on either form or on a bare integer (`1e9`, `.1e-5`).
 /// `float_literal`'s old grammar only accepted `digits.digits`.
@@ -1092,7 +1083,7 @@ fn float_literal_accepts_leading_dot_and_exponent_forms() {
 }
 
 /// `str::parse::<f64>()` silently returns `f64::INFINITY` for a magnitude
-/// beyond f64's representable range instead of erroring -- real Cypher
+/// beyond f64's representable range instead of erroring -- Cypher
 /// requires this to be a compile-time error, not a silently-produced
 /// `inf` literal.
 #[test]
@@ -1183,7 +1174,7 @@ fn local_time_construct_from_map_and_string() {
     let result = run(&store, "RETURN toString(localtime('21:40:32.142')) AS r");
     assert_eq!(temporal_str(&result.rows[0][0]), "21:40:32.142");
 
-    // No seconds/fraction given -> none printed (real Cypher's rule).
+    // No seconds/fraction given -> none printed (Cypher's rule).
     let result = run(&store, "RETURN toString(localtime('21:40')) AS r");
     assert_eq!(temporal_str(&result.rows[0][0]), "21:40");
 }
@@ -1541,10 +1532,10 @@ fn builtin_to_float_and_to_boolean() {
     ));
 }
 
-/// `toFloat()` on a `Bool` is a real type error, not `null` -- unlike an
-/// unparseable *string*, which real Cypher does treat as `null` (a
-/// string always at least plausibly could be numeric text, a boolean
-/// never could be). TCK's TypeConversion3 [6].
+/// `toFloat()` on a `Bool` is a type error, not `null` -- unlike an
+/// unparseable *string*, which Cypher does treat as `null` (a string
+/// could always at least plausibly be numeric text, a boolean never
+/// could). TCK's TypeConversion3 [6].
 #[test]
 fn to_float_on_a_bool_is_a_type_error_not_null() {
     let store = GraphStore::open_memory().unwrap();
@@ -1559,7 +1550,7 @@ fn to_float_on_a_bool_is_a_type_error_not_null() {
 }
 
 /// Only a node, relationship, map, or temporal value has any `.prop` to
-/// access at all -- a plain scalar or list is a real type error, not a
+/// access at all -- a plain scalar or list is a type error, not a
 /// silent `null`. TCK's Graph6 [9] / Map1 [6].
 #[test]
 fn property_access_on_a_non_graph_scalar_or_list_is_a_type_error() {
@@ -1600,10 +1591,10 @@ fn type_on_a_node_is_a_compile_time_error_even_on_zero_rows() {
 
 #[test]
 fn property_presence_check_via_is_not_null() {
-    // `exists(n.num)` (bare function-call form) isn't real openCypher --
-    // grep against openCypher.bnf/the TCK corpus finds no such function,
-    // only the unrelated `EXISTS { <pattern> }` subquery form. `IS NOT
-    // NULL` is the real, spec-correct way to check property presence.
+    // `exists(n.num)` (bare function-call form) isn't valid openCypher --
+    // openCypher.bnf/the TCK corpus have no such function, only the
+    // unrelated `EXISTS { <pattern> }` subquery form. `IS NOT NULL` is
+    // the spec-correct way to check property presence.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:N {num: 42})");
     assert!(bool_value(
@@ -1619,8 +1610,8 @@ fn builtin_id_returns_an_integer() {
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:N)");
     let result = run(&store, "MATCH (n) RETURN id(n)");
-    // Just needs to be a real, non-negative integer -- the exact value is
-    // an internal id, not something callers should depend on.
+    // Just needs to be a non-negative integer -- the exact value is an
+    // internal id, not something callers should depend on.
     assert!(int_value(&result.rows[0][0]) >= 0);
 }
 
@@ -1779,12 +1770,11 @@ mod call_procedures {
 
     use super::run;
 
-    /// A minimal test-only `ProcedureProvider` -- ignores `args`
-    /// entirely and always returns the same fixed rows, since these
-    /// tests exercise MarsDB's own CALL/YIELD mechanics (arity, renaming,
-    /// WHERE, WITH-chaining, standalone auto-yield), not a real
-    /// table-lookup mock protocol (that's `marsdb-tck`'s own concern, see
-    /// its `TckProcedureProvider`).
+    /// A minimal test-only `ProcedureProvider` -- ignores `args` and
+    /// always returns the same fixed rows, since these tests exercise
+    /// CALL/YIELD mechanics (arity, renaming, WHERE, WITH-chaining,
+    /// standalone auto-yield), not a table-lookup mock protocol (that's
+    /// `marsdb-tck`'s `TckProcedureProvider`).
     /// `(input names, output names, fixed output rows)`.
     type ProcFixture = (Vec<&'static str>, Vec<&'static str>, Vec<Vec<Value>>);
 

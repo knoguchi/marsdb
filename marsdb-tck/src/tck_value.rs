@@ -1,8 +1,7 @@
 //! Structural comparison between a TCK expected-result table cell and a
 //! real `marsdb_query::Value` -- both sides convert into the same
 //! [`TckValue`] shape first, so comparison is structural (label sets and
-//! property maps order-independent) rather than string equality, which
-//! would be fragile against harmless formatting differences.
+//! property maps order-independent) rather than string equality.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,12 +34,11 @@ pub enum TckValue {
     /// `<(:A)-[:T]->(:B)>`-shaped expected cells (TCK's own path-literal
     /// syntax) and real `Value::Path` results, both converted to this
     /// same alternating-element shape. A dedicated `PathTckElem::Edge`
-    /// (not the bare `Rel` variant above) since a path's edges carry a
-    /// real traversal direction that matters for equality
-    /// (`<(:A)-[:T]->(:B)>` != `<(:A)<-[:T]-(:B)>`, same two nodes,
-    /// opposite direction) -- `Rel` on its own (used for a bare
-    /// `[:KNOWS {...}]`-shaped expected value, no path context) has no
-    /// such concept, correctly.
+    /// (not the bare `Rel` variant above) carries traversal direction,
+    /// which matters for equality (`<(:A)-[:T]->(:B)>` !=
+    /// `<(:A)<-[:T]-(:B)>`, same two nodes, opposite direction); a bare
+    /// `[:KNOWS {...}]`-shaped value has no path context and no such
+    /// concept.
     Path(Vec<PathTckElem>),
 }
 
@@ -67,12 +65,10 @@ pub enum PathTckElem {
 /// construction (`BTreeMap`/`BTreeSet`).
 pub fn tck_eq(a: &TckValue, b: &TckValue, list_order_matters: bool) -> bool {
     match (a, b) {
-        // `f64::NAN != f64::NAN` under IEEE 754 (and thus under the
-        // derived `PartialEq` every other arm's `a == b` fallback relies
-        // on) -- TCK's `WithOrderBy1`/`ReturnOrderBy1` "sort distinct
-        // types" scenarios just need "is this classified as NaN", not
-        // IEEE bit-identity, so special-cased here rather than trying to
-        // thread a NaN-aware `Eq` through the derive.
+        // `f64::NAN != f64::NAN` under IEEE 754, which the derived
+        // `PartialEq` every other arm's `a == b` fallback relies on would
+        // inherit -- TCK's "sort distinct types" scenarios just need "is
+        // this classified as NaN", so special-cased here instead.
         (TckValue::Scalar(TckScalar::Float(x)), TckValue::Scalar(TckScalar::Float(y)))
             if x.is_nan() && y.is_nan() =>
         {
@@ -126,10 +122,9 @@ pub fn value_to_tck(v: &Value) -> TckValue {
         Value::Property(p) => property_to_tck(p),
         Value::List(items) => TckValue::List(items.iter().map(value_to_tck).collect()),
         // A bare map literal used as a returned value compares the same
-        // way node props already do -- see `parse_map_value`'s matching
-        // choice on the expected-cell-parsing side. Each value recurses
+        // way node props already do (see `parse_map_value`). Recurses
         // through `value_to_tck` directly (not the narrower
-        // `property_to_tck`) since a map's own values are already full
+        // `property_to_tck`) since a map's values are already full
         // `Value`s, not raw stored `PropertyValue`s.
         Value::Map(m) => TckValue::Node {
             labels: BTreeSet::new(),
@@ -183,10 +178,10 @@ fn path_to_tck(elems: &[PathElem]) -> TckValue {
 
 /// A raw stored `PropertyValue` (a node/edge property, or a top-level
 /// `Value::Property` RETURN result) converted to the same `TckValue`
-/// shape everything else compares through. `Null` maps to `TckValue::
-/// Null` (mirrors `parse_props`'s own convention on the expected-cell
-/// side); `List` recurses per-element -- a node/edge property really can
-/// hold one now (`PropertyValue::List`), not just a scalar.
+/// shape everything else compares through. `Null` maps to
+/// `TckValue::Null` (mirrors `parse_props`'s convention on the
+/// expected-cell side); `List` recurses per-element, since a node/edge
+/// property can hold one (`PropertyValue::List`), not just a scalar.
 fn property_to_tck(p: &PropertyValue) -> TckValue {
     match p {
         PropertyValue::Null => TckValue::Null,
@@ -207,10 +202,10 @@ fn property_to_tck(p: &PropertyValue) -> TckValue {
     }
 }
 
-/// The genuinely-scalar cases of `property_to_tck` -- split out so
+/// The scalar-only cases of `property_to_tck` -- split out so
 /// `property_to_tck` can wrap the result in `TckValue::Scalar` once,
 /// rather than every arm repeating it. Never called directly with
-/// `Null`/`List` (see `property_to_tck`'s own dispatch).
+/// `Null`/`List`/`Map` (see `property_to_tck`'s own dispatch).
 fn property_to_scalar(p: &PropertyValue) -> TckScalar {
     match p {
         PropertyValue::Null | PropertyValue::List(_) | PropertyValue::Map(_) => {
@@ -265,8 +260,8 @@ fn property_to_scalar(p: &PropertyValue) -> TckScalar {
 }
 
 /// `marsdb::TzId` <-> `marsdb::temporal::TzId` -- two independent,
-/// same-shaped types (`temporal.rs` deliberately doesn't depend on
-/// `marsdb_graph`), converted at this formatting boundary.
+/// same-shaped types (`temporal.rs` has no dependency on `marsdb_graph`),
+/// converted at this formatting boundary.
 fn to_temporal_tz(zone: &marsdb::TzId) -> marsdb::temporal::TzId {
     match zone {
         marsdb::TzId::Offset(o) => marsdb::temporal::TzId::Offset(*o),
@@ -391,10 +386,9 @@ impl CellParser {
     }
 
     /// Either `-[:TYPE {props}]->` (forward) or `<-[:TYPE {props}]-`
-    /// (backward) -- the two arrowhead shapes a path's own edges can
-    /// appear in (an *undirected* `-[...]-`, no arrowhead either side,
-    /// never appears in a real matched path's own written form, since a
-    /// concrete walk always has a real traversed direction).
+    /// (backward) -- the two arrowhead shapes a path's edges appear in.
+    /// An undirected `-[...]-` never appears in a matched path's written
+    /// form, since a concrete walk always has a real traversed direction.
     fn parse_path_edge(&mut self) -> Result<PathTckElem, String> {
         self.skip_ws();
         let backward = self.peek() == Some('<');
@@ -463,12 +457,11 @@ impl CellParser {
                 Some('\\') => {
                     self.pos += 1;
                     let escaped = self.peek().ok_or("dangling escape in string")?;
-                    // Real escape decoding, matching MarsDB's own Cypher
-                    // string-literal parser (\' \" \\ \n \r \t \b \f) --
-                    // TCK expected-result cells use the same escapes (e.g.
-                    // `'\nFoo\n'`), and a real query result's actual
-                    // newline/tab won't structurally equal the two-
-                    // character sequence backslash+n otherwise.
+                    // Matches MarsDB's own Cypher string-literal escapes
+                    // (\' \" \\ \n \r \t \b \f) -- without decoding, an
+                    // actual newline/tab in a query result wouldn't
+                    // structurally equal the two-character `\n` sequence
+                    // in the expected cell.
                     let decoded = match escaped {
                         'n' => '\n',
                         'r' => '\r',
@@ -506,12 +499,9 @@ impl CellParser {
             }
         }
         // Scientific notation (`1e308`, `1.23456789e308`, `1e-305`) --
-        // always a float regardless of whether the mantissa itself had a
-        // `.` (`1e308` has none). `e`/`E` followed by an optional sign
-        // and at least one digit; back out to just the mantissa if that
-        // shape isn't actually present (an identifier starting with `e`
-        // right after a bare number isn't valid input here anyway, so no
-        // real ambiguity).
+        // always a float even if the mantissa had no `.`. `e`/`E`
+        // followed by an optional sign and at least one digit; back out
+        // to just the mantissa if that shape isn't present.
         if matches!(self.peek(), Some('e' | 'E')) {
             let exp_start = self.pos;
             self.pos += 1;
@@ -578,7 +568,7 @@ impl CellParser {
             self.skip_ws();
             // A type-union rel literal (`[:A|:B]`) can appear as an
             // expected value shape in a couple of scenarios -- only the
-            // first type is kept, adequate for v1 comparison purposes.
+            // first type is kept.
             while self.peek() == Some('|') {
                 self.pos += 1;
                 self.skip_ws();
@@ -620,7 +610,7 @@ impl CellParser {
         // A bare map literal used as a returned value (not node/rel
         // props) -- represented the same way node props are; there's no
         // separate "Map" TckValue variant since nothing needs to tell
-        // them apart for v1 comparison purposes.
+        // them apart.
         let props = self.parse_props()?;
         Ok(TckValue::Node {
             labels: BTreeSet::new(),
@@ -629,11 +619,9 @@ impl CellParser {
     }
 
     /// `TckValue`, not `TckScalar` -- a node/rel prop (or a bare map
-    /// entry, `parse_map_value` reuses this too) can be any value now,
+    /// entry, `parse_map_value` reuses this too) can be any value,
     /// including a `[...]` list (TCK's WithOrderBy1 `(:B {list: [1,
-    /// 2]})`) or `null` (compares directly as `TckValue::Null`, no
-    /// sentinel-string workaround needed anymore now that `props` isn't
-    /// forced scalar-only).
+    /// 2]})`) or `null`.
     fn parse_props(&mut self) -> Result<BTreeMap<String, TckValue>, String> {
         self.expect('{')?;
         let mut props = BTreeMap::new();

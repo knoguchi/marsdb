@@ -14,15 +14,10 @@ mod viz;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::in_memory()?;
 
-    // One continuous chain, deliberately NOT comma-separated: every node
-    // token CREATE sees always becomes a fresh node, *even* a repeated
-    // variable name across comma-separated patterns in the same
-    // statement -- writing `(a:Person {..Alice..})-[:KNOWS]->(b), (b)
-    // -[:KNOWS]->(c)` looks like it reuses `b` but actually creates a
-    // second, blank `b` instead (a real gap -- see the README's
-    // Cypher-coverage section). A single unbroken chain like this one
-    // sidesteps it -- each hop naturally continues from the node the
-    // previous hop just created.
+    // A repeated variable name across comma-separated CREATE patterns
+    // creates a fresh node each time instead of reusing it (see the
+    // README's Cypher-coverage section). A single unbroken chain avoids
+    // that: each hop continues from the node the previous hop created.
     db.execute(
         "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})\
                 -[:KNOWS]->(c:Person {name: 'Carol'})\
@@ -30,12 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     db.execute("CREATE (:Person {name: 'Eve'})")?;
 
-    // MATCH...CREATE is what connects nodes that already exist, which no
-    // CREATE pattern (chained or not) can do: match `a`, carry it
-    // through WITH, match the target, then CREATE reuses both bindings
-    // instead of creating anything new. Alice ends up connected to Dave
-    // two different ways (direct here, and via Bob then Carol) and to
-    // Eve, who's otherwise unreachable from her.
+    // MATCH...CREATE connects nodes that already exist, which no CREATE
+    // pattern alone can do. Alice ends up linked to Dave two ways and to
+    // Eve, otherwise unreachable from her.
     for target in ["Dave", "Eve"] {
         db.execute(&format!(
             "MATCH (a:Person {{name: 'Alice'}}) WITH a \
@@ -48,12 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS]->(f:Person) RETURN f.name")?;
     println!("Alice's direct friends: {}", names(&direct));
 
-    // Variable-length traversal, 1 to 2 hops out. The executor's
-    // variable-length expansion does a node-visited-set BFS per start
-    // node, so Dave -- reachable two different ways -- only shows up
-    // once here. No RETURN DISTINCT needed (MarsDB doesn't have that as
-    // a general RETURN modifier yet, only inside an aggregate call like
-    // count(DISTINCT x)).
+    // Variable-length traversal, 1-2 hops out. The per-start-node
+    // visited-set BFS means Dave (reachable two ways) shows up once;
+    // MarsDB has no general RETURN DISTINCT, only inside an aggregate
+    // like count(DISTINCT x).
     let network =
         db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) RETURN f.name")?;
     println!("Alice's network within 2 hops: {}", names(&network));

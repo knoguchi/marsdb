@@ -1,8 +1,5 @@
-//! On-disk record encoding: directory format (v2, format version 2).
-//!
-//! Replaces the v1 whole-blob postcard encoding (`BTreeMap<String,
-//! PropertyValue>` serialized as one unit) with a directory layout using
-//! interned `u32` prop-id keys and per-property offsets:
+//! On-disk record encoding: a directory layout using interned `u32`
+//! prop-id keys and per-property offsets (format version 2).
 //!
 //! ```text
 //! node:  [label_count: u8][label_id: u32 LE × n]
@@ -17,12 +14,10 @@
 //! length is `offset[i+1] - offset[i]` (last value runs to the end), which
 //! is why values must be packed in directory order. Reading one property is
 //! a binary search over the directory plus one postcard decode of just that
-//! value — no `BTreeMap` build, no per-property string allocation, no
-//! touching sibling properties (measured 79x @ 1-of-20 props, 7x even at
-//! full materialization, `marsdb-storage/examples/v1_vs_v2_bench.rs`).
-//! Property *names* appear nowhere in the record: encode interns them to
-//! ids (`props::intern_prop`), decode resolves ids back only when a caller
-//! actually needs the name-keyed `NodeRecord`/`EdgeRecord` shape.
+//! value — no full-map decode, no touching sibling properties. Property
+//! *names* appear nowhere in the record: encode interns them to ids
+//! (`props::intern_prop`), decode resolves ids back only when a caller
+//! needs the name-keyed `NodeRecord`/`EdgeRecord` shape.
 //!
 //! Encode/decode take interning/resolution as closures rather than a
 //! transaction type: write paths intern via `&mut WriteCtx`, read paths
@@ -142,7 +137,7 @@ fn value_slice<'a>(
 
 /// Binary-search the tail for one property's raw (still postcard-encoded)
 /// value bytes, without resolving any names or touching other values —
-/// the per-property fast path (v2 step 1b's `get_node_prop_in_txn`).
+/// the per-property fast path used by `get_node_prop_in_txn`.
 fn prop_raw_in(bytes: &[u8], prop_id: u32) -> Result<Option<&[u8]>, GraphError> {
     let count = u16::from_le_bytes(
         bytes

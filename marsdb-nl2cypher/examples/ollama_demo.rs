@@ -1,7 +1,6 @@
-//! Real, runnable NL -> Cypher demo against a local Ollama instance --
-//! nothing in `marsdb-nl2cypher`'s core lib depends on Ollama or any HTTP
-//! client (see the crate's docs); this is just one concrete `LlmClient`
-//! implementation.
+//! Runnable NL -> Cypher demo against a local Ollama instance.
+//! `marsdb-nl2cypher`'s core lib has no dependency on Ollama or any HTTP
+//! client (see the crate's docs); this is just one `LlmClient` impl.
 //!
 //! Setup:
 //!     ollama serve &

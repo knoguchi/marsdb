@@ -5,12 +5,12 @@ use super::*;
 
 /// Three-valued: `None` is Cypher's "unknown", not `false` -- any
 /// comparison touching a null (a missing property, or a literal `null` on
-/// either side) is unknown, always, regardless of operator -- including
-/// `Eq` (`x = null` is unknown, never true, same as real Cypher; it is
-/// *not* how `x`'s own missing-ness is tested -- there's no `IS NULL`
-/// operator yet). Callers combine this with `and3`/`or3`/`Option::map`
-/// (for `NOT`) rather than unwrapping early, so unknown propagates
-/// correctly through `AND`/`OR`/`NOT` instead of collapsing to `false`.
+/// either side) is unknown, always, regardless of operator, including
+/// `Eq` (`x = null` is unknown, never true; that's not how `x`'s own
+/// missing-ness is tested -- see `IsNull`/`GeneralIsNull`). Callers
+/// combine this with `and3`/`or3`/`Option::map` (for `NOT`) rather than
+/// unwrapping early, so unknown propagates correctly through
+/// `AND`/`OR`/`NOT` instead of collapsing to `false`.
 pub(crate) fn compare(prop: &Option<PropertyValue>, op: CompareOp, lit: &Literal) -> Option<bool> {
     let Some(prop) = prop else { return None };
     if matches!(prop, PropertyValue::Null) || matches!(lit, Literal::Null) {
@@ -37,18 +37,14 @@ pub(crate) fn compare_property_pair_opt(
 }
 
 /// The actual per-type comparison rules, shared by `compare()`
-/// (`PropertyValue` vs a `Literal`, reduced to a `PropertyValue` via
-/// `literal_to_value`) and `compare_values` (two arbitrary `Value`s,
-/// each reduced to a `PropertyValue` via `value_to_property_value`) --
-/// both callers have already handled the "either side is null" case
-/// before reaching here. Returns `Option<bool>`, not `bool` -- a
-/// type-mismatched pair (`1 < 'a'`) isn't a uniform "false" the way an
-/// earlier version of this function had it: real Cypher's `=`/`<>` on
-/// mismatched types is a definite `false`/`true` (never equal, so
-/// "not equal" is true), but ordering (`<`/`<=`/`>`/`>=`) on mismatched
-/// types is `null` (no defined ordering exists to be definite about) --
-/// confirmed against real TCK scenarios (`'1.0' < 1.0` is `null`, not
-/// `false`; `NaN <> 'a'` is `true`, not `false`), not assumed.
+/// (`PropertyValue` vs a `Literal`) and `compare_values` (two arbitrary
+/// `Value`s) -- both callers have already handled the "either side is
+/// null" case before reaching here. Returns `Option<bool>`, not `bool`:
+/// `=`/`<>` on mismatched types is a definite `false`/`true` (never
+/// equal, so "not equal" is true), but ordering (`<`/`<=`/`>`/`>=`) on
+/// mismatched types is `null` (no defined ordering exists to be definite
+/// about) -- e.g. `'1.0' < 1.0` is `null`, not `false`; `NaN <> 'a'` is
+/// `true`, not `false`.
 pub(crate) fn compare_property_pair(
     a: &PropertyValue,
     op: CompareOp,
@@ -66,16 +62,8 @@ pub(crate) fn compare_property_pair(
             _ => cmp_ord(op, a.as_str(), b.as_str()),
         }),
         // Real Cypher defines boolean ordering (`false < true`), same as
-        // Rust's own `bool: PartialOrd` -- confirmed via a real TCK
-        // scenario (`Quantifier7 :: [3]`) that specifically compares two
-        // boolean expressions with `<=`.
+        // Rust's own `bool: PartialOrd`.
         (PropertyValue::Bool(a), PropertyValue::Bool(b)) => Some(cmp_ord(op, *a, *b)),
-        // `Date` had no arm here at all before -- fell through to the
-        // generic mismatch fallback below, which always answers
-        // `Eq -> false`/`Ne -> true` regardless of the actual values, so
-        // `WHERE a.date = b.date` on two genuinely-equal stored dates
-        // incorrectly evaluated to `false`. A real, pre-existing gap,
-        // fixed here rather than left alongside the new temporal types.
         (PropertyValue::Date(a), PropertyValue::Date(b)) => Some(cmp_ord(op, *a, *b)),
         (PropertyValue::LocalTime(a), PropertyValue::LocalTime(b)) => Some(cmp_ord(op, *a, *b)),
         // Compares the UTC-equivalent instant-of-day, not the raw
@@ -118,11 +106,10 @@ pub(crate) fn compare_property_pair(
                 ..
             },
         ) => Some(cmp_ord(op, (*sa, *na), (*sb, *nb))),
-        // `Duration` has no defined *ordering* (see its own doc comment)
-        // but `=`/`<>` are still real, component-wise comparisons (the
-        // same bug `Date` had above -- the generic mismatch fallback's
-        // unconditional `Eq -> false` would otherwise make two
-        // genuinely-equal durations compare unequal).
+        // `Duration` has no defined ordering (see its own doc comment)
+        // but `=`/`<>` are still real, component-wise comparisons -- the
+        // generic mismatch fallback's unconditional `Eq -> false` would
+        // otherwise make two genuinely-equal durations compare unequal.
         (PropertyValue::Duration { .. }, PropertyValue::Duration { .. }) => match op {
             CompareOp::Eq => Some(a == b),
             CompareOp::Ne => Some(a != b),
@@ -132,12 +119,9 @@ pub(crate) fn compare_property_pair(
             CompareOp::Eq => Some(false),
             CompareOp::Ne => Some(true),
             // A string predicate on a non-null, non-string operand has no
-            // defined answer (undefined, not "definitely false") -- same
-            // "type mismatch -> null" stance as ordering, confirmed via a
-            // real TCK scenario (`'abc' STARTS WITH true` must be `null`,
-            // not `false`, so `(x STARTS WITH true) <> (x STARTS WITH
-            // true)` correctly stays `null` rather than folding to a
-            // spurious `false`/`true`).
+            // defined answer, not "definitely false" -- same
+            // "type mismatch -> null" stance as ordering (`'abc' STARTS
+            // WITH true` is `null`, not `false`).
             CompareOp::StartsWith
             | CompareOp::EndsWith
             | CompareOp::Contains
@@ -227,15 +211,12 @@ pub(crate) fn cmp_ord<T: PartialOrd>(op: CompareOp, a: T, b: T) -> bool {
 }
 
 /// Value equality for CASE's WHEN-comparison (and, elsewhere, DISTINCT
-/// dedup within an aggregate). Null == Null -> true here deliberately,
-/// unlike `compare()`'s three-valued `WHERE`-filter semantics -- CASE and
-/// DISTINCT need a definite yes/no ("is this the same value as a value
-/// already collected", "does this WHEN branch match") rather than
-/// "unknown", so plain equality is the correct, separate choice here, not
-/// an oversight. `Node`/`Edge` compare by id (graph identity), not
-/// full-struct contents — cheaper, and the correct semantics regardless
-/// (two bindings are "the same node" iff the same node, not iff their
-/// label/prop snapshots happen to match).
+/// dedup within an aggregate). `Null == Null -> true` here, unlike
+/// `compare()`'s three-valued `WHERE`-filter semantics -- CASE and
+/// DISTINCT need a definite yes/no rather than "unknown". `Node`/`Edge`
+/// compare by id (graph identity), not full-struct contents -- cheaper,
+/// and correct regardless (two bindings are "the same node" iff the same
+/// node, not iff their label/prop snapshots happen to match).
 pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
@@ -250,13 +231,8 @@ pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
             la.len() == lb.len() && la.iter().zip(lb).all(|(x, y)| value_eq(x, y))
         }
         // Two paths are equal iff they visit the same nodes/relationships
-        // in the same order (real Cypher's own path-equality rule) --
-        // element-wise identity, same `.id` comparison `Value::Node`/
-        // `Value::Edge` above already use. Previously fell through to the
-        // catch-all `_ => false` (any two paths were unconditionally
-        // unequal, even two bindings of the identical path) -- unreachable
-        // until two independently-MATCHed paths could be compared via `=`
-        // in one statement (TCK's Comparison1 [14]).
+        // in the same order -- element-wise identity, same `.id`
+        // comparison `Value::Node`/`Value::Edge` above already use.
         (Value::Path(pa), Value::Path(pb)) => {
             pa.len() == pb.len()
                 && pa.iter().zip(pb).all(|(x, y)| match (x, y) {
@@ -319,13 +295,11 @@ pub(crate) fn apply_order_by(
     // (`RETURN n.name, count(*) AS foo ORDER BY n.name`) names a real
     // output column by its default name -- match it directly by position
     // rather than re-evaluating the expression, which would need bindings
-    // (e.g. `n`) that only the pre-aggregation rows had and are gone by
-    // this post-projection point. That name-based match only works for an
-    // *unaliased* item (its column name literally is its default name) --
-    // an aliased item repeated verbatim (`RETURN sum(x) AS s ORDER BY
-    // sum(x)`, TCK's WithOrderBy4 [11]) needs a structural match against
-    // the item's own expression instead, falling back to position in
-    // `items` (1:1 with `columns`, one column per return item).
+    // (e.g. `n`) that only the pre-aggregation rows had. That name-based
+    // match only works for an unaliased item -- an aliased item repeated
+    // verbatim (`RETURN sum(x) AS s ORDER BY sum(x)`) needs a structural
+    // match against the item's own expression instead, falling back to
+    // position in `items` (1:1 with `columns`).
     let order_by_col: Vec<Option<usize>> = order_by
         .iter()
         .map(|(expr, _)| {
@@ -422,11 +396,10 @@ pub(crate) fn eval_projected_expr(
                 .collect::<Result<Vec<_>, _>>()?;
             // No `Executor` (and so no cached `now_snapshot()`) reachable
             // from this post-projection/ORDER BY path -- a fresh capture
-            // here is a real, narrow inconsistency (a no-arg `date()`/
-            // etc re-evaluated from *inside* an ORDER BY expression could
-            // in principle read a different instant than the same call
-            // during `RETURN`'s own projection), but reaching this
-            // specific shape at all is a rare, arguably degenerate query.
+            // here is a narrow inconsistency (a no-arg `date()`/etc
+            // re-evaluated inside an ORDER BY expression could read a
+            // different instant than the same call during RETURN's
+            // projection), but reaching this shape at all is rare.
             call_builtin(name, &arg_values, temporal::capture_now())
         }
         ReturnExpr::CountStar => Err(QueryError::Semantic(
@@ -606,10 +579,9 @@ pub(crate) fn eval_projected_expr(
         // -- a pattern comprehension needs a real graph traversal to
         // re-evaluate, which this function structurally can't do. Only
         // reachable for an ORDER BY key that references a pattern
-        // comprehension *without* repeating a RETURN/WITH item verbatim
+        // comprehension without repeating a RETURN/WITH item verbatim
         // (the verbatim case matches by column position before ever
-        // reaching here -- see `apply_order_by`'s `order_by_col`) --
-        // not exercised by any current TCK scenario.
+        // reaching here -- see `apply_order_by`'s `order_by_col`).
         ReturnExpr::PatternComprehension { .. } => Err(QueryError::Semantic(
             "a pattern comprehension can only be used in RETURN/WITH position, or as an ORDER BY \
              key that repeats one of their items verbatim"
@@ -624,10 +596,9 @@ pub(crate) fn eval_projected_expr(
 /// `RETURN DISTINCT`'s result-set-level dedup -- structural equality of
 /// the whole row (same `HashKey` machinery `DISTINCT` inside an aggregate
 /// call and `resolve_grouped_rows`' grouping already use, not `value_eq`'s
-/// definite-equality-only comparison, since a `HashSet` needs `Hash` too).
-/// Keeps the first occurrence of each distinct row, preserving order --
-/// what every other DB's `DISTINCT` does, and what a human reading the
-/// query would expect.
+/// definite-equality-only comparison, since a `HashSet` needs `Hash`
+/// too). Keeps the first occurrence of each distinct row, preserving
+/// order.
 pub(crate) fn dedup_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, QueryError> {
     let mut seen: HashSet<Vec<HashKey>> = HashSet::with_capacity(rows.len());
     let mut out = Vec::with_capacity(rows.len());
@@ -681,17 +652,14 @@ pub(crate) fn dedup_binding_rows(
 /// when one is given and smaller than the row count. When it is, uses
 /// `select_nth_unstable_by` to partition around the k-th smallest element
 /// (O(n) average) and sorts only that k-sized prefix (O(k log k)), instead
-/// of a full O(n log n) sort of every row just to immediately discard all
-/// but the first few -- the "ORDER BY + LIMIT -> TOP-K" rewrite real query
-/// engines apply. Shared by all three ORDER BY sites (`WITH`'s own,
-/// non-aggregating `RETURN`'s, and aggregating `RETURN`'s), which otherwise
-/// each build the identical `keyed`-then-sort shape around a different row
-/// type.
-/// Selects the top `skip + limit` elements by `order_by` (the
-/// `select_nth_unstable_by` partial-selection optimization still applies
-/// to that combined bound, not just `limit` alone), sorts just that
-/// prefix, then drops the first `skip` of it — real Cypher's own
-/// "SKIP applies after ORDER BY, LIMIT applies after SKIP" rule.
+/// of a full O(n log n) sort just to discard all but the first few.
+/// Shared by all three ORDER BY sites (`WITH`'s own, non-aggregating
+/// `RETURN`'s, and aggregating `RETURN`'s).
+///
+/// Selects the top `skip + limit` elements by `order_by` (the partial-
+/// selection optimization still applies to that combined bound), sorts
+/// just that prefix, then drops the first `skip` of it -- SKIP applies
+/// after ORDER BY, LIMIT applies after SKIP.
 pub(crate) fn top_k_by<T>(
     mut keyed: Vec<(Vec<Value>, T)>,
     order_by: &[(ReturnExpr, SortDir)],
@@ -730,13 +698,9 @@ pub(crate) fn top_k_by<T>(
 }
 
 /// `Null` is just the highest-ranked type in `type_rank`'s total order
-/// (see its docs), not a special case here -- confirmed via TCK's
-/// `ReturnOrderBy1 [12]`/`WithOrderBy1 [22]` ("sort distinct types...
-/// descending"), which expect `null` to sort *first* under `DESC`, not
-/// last. An earlier version of this function hardcoded nulls-last
-/// regardless of direction (citing Neo4j's docs); that's wrong per the
-/// TCK's own evidence -- `DESC` is a real reversal of the whole order,
-/// `null` included, not just of the non-null comparisons.
+/// (see its docs), not a special case here: `DESC` must put `null`
+/// *first*, since it's a real reversal of the whole order, `null`
+/// included, not just of the non-null comparisons.
 pub(crate) fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::Ordering {
     let ord = compare_non_null(a, b);
     if dir == SortDir::Desc {
@@ -746,18 +710,15 @@ pub(crate) fn compare_with_dir(a: &Value, b: &Value, dir: SortDir) -> std::cmp::
     }
 }
 
-/// Real Cypher regards `NaN` as larger than every other number (confirmed
-/// via TCK's `ReturnOrderBy1 [11]`/`[12]`: `NaN` sorts directly below
-/// `null`, above every finite float, both ASC and DESC) -- plain
-/// `f64::partial_cmp` returns `None` for any comparison involving `NaN`,
-/// which `.unwrap_or(Ordering::Equal)` used to paper over by treating
-/// `NaN` as *equal* to every number. That's not just cosmetically wrong:
-/// a stable sort over a comparator that calls two genuinely-different
-/// values "equal" preserves their original relative order instead of
-/// actually ordering them, and `DESC`'s blanket `.reverse()` of an
-/// "equal" result is still "equal" -- so `1.5`/`NaN` kept the same
-/// relative order under both ASC and DESC, when DESC should have
-/// swapped them.
+/// Real Cypher regards `NaN` as larger than every other number: it sorts
+/// directly below `null`, above every finite float, both ASC and DESC.
+/// Plain `f64::partial_cmp` returns `None` for any comparison involving
+/// `NaN`; treating that as `Ordering::Equal` would be wrong, not just
+/// imprecise -- a stable sort over a comparator that calls two
+/// genuinely-different values "equal" preserves their original relative
+/// order instead of ordering them, and `DESC`'s blanket `.reverse()` of
+/// an "equal" result is still "equal", so `NaN` would fail to move under
+/// both ASC and DESC.
 pub(crate) fn cmp_f64_nan_greatest(x: f64, y: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (x.is_nan(), y.is_nan()) {
@@ -774,10 +735,8 @@ pub(crate) fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
     // shorter-is-less on a common prefix), a genuinely different rule
     // from any single scalar comparison -- delegate to its own recursive
     // comparator before reaching the scalar-only match below, which would
-    // otherwise silently treat every pair of lists as "equal" (found via
-    // TCK's ReturnOrderBy1 `[10]`/WithOrderBy1 `[10]`: `ORDER BY <list
-    // column>` produced no reordering at all, ASC and DESC alike -- a
-    // stable sort over an always-`Equal` comparator is a no-op).
+    // otherwise silently treat every pair of lists as "equal" (a stable
+    // sort over an always-`Equal` comparator is a no-op).
     if let (Value::List(_), Value::List(_)) = (a, b) {
         return list_cmp_asc(a, b);
     }
@@ -848,30 +807,14 @@ pub(crate) fn compare_non_null(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// `WHERE`'s three-valued comparison semantics) -- only covers the types
 /// that can actually reach here with no same-type match already handling
 /// them (see `compare_non_null`'s cross-type fallback and `list_cmp_asc`).
-/// Order confirmed against a real TCK scenario (`ReturnOrderBy1`/
-/// `WithOrderBy1`'s "sort distinct types" scenarios, only reachable once
-/// `marsdb-tck`'s own harness could parse a path-shaped expected cell --
-/// previously these scenarios could never even run): `Map < Node <
-/// Relationship < List < Path < String < Boolean < Number`, `Null` always
-/// last regardless (`compare_with_dir`'s own separate check). This is
-/// also a fix, not just an addition -- `Bool`/`String` were previously
-/// ranked in the wrong relative order (`Bool` before `String`; real
-/// Cypher has `String` before `Bool`), and `List` sorting before every
-/// scalar (confirmed separately, `max()`/`min()` over `[1, 'a', null,
-/// [1, 2], 0.2, 'b']` picks `1` for max and `[1, 2]` for min) still
-/// holds with `Map`/`Node`/`Relationship` now ranking below it too.
-/// Temporal types (`Date`.../`Duration`) have no TCK evidence placing
-/// them anywhere in this cross-type order -- kept after `Number` in
-/// their pre-existing relative order among themselves, arbitrarily but
-/// harmlessly (nothing tests a temporal-vs-Map-shaped ORDER BY column).
-/// `Null` ranks highest of all -- also TCK-confirmed
-/// (`ReturnOrderBy1 [11]`'s own expected order ends with `null` last),
-/// and, critically, ranking it here rather than special-casing it in
-/// `compare_with_dir` is what makes `DESC` correctly put `null` *first*
-/// (`ReturnOrderBy1 [12]`/`WithOrderBy1 [22]`) -- a hardcoded
-/// "nulls always last" rule would get the ascending case right and the
-/// descending case wrong, since real Cypher's `DESC` is a genuine
-/// reversal of the total order, not just of the non-null comparisons.
+/// Order: `Map < Node < Relationship < List < Path < String < Boolean <
+/// Number`, temporal types after `Number` in their own relative order,
+/// `Null` ranked highest of all. Ranking `Null` here rather than
+/// special-casing it in `compare_with_dir` is what makes `DESC` correctly
+/// put `null` first -- a hardcoded "nulls always last" rule would get the
+/// ascending case right and the descending case wrong, since `DESC` is a
+/// genuine reversal of the total order, not just of the non-null
+/// comparisons.
 pub(crate) fn type_rank(v: &Value) -> Option<u8> {
     match v {
         Value::Map(_) => Some(0),
@@ -899,15 +842,12 @@ pub(crate) fn type_rank(v: &Value) -> Option<u8> {
 
 /// Ascending, element-by-element list comparison for ORDER BY, mirroring
 /// `compare_with_dir`'s "null sorts last" rule recursively at every
-/// position (deliberately *not* `value_partial_cmp`'s WHERE-filter
+/// position -- deliberately not `value_partial_cmp`'s WHERE-filter
 /// three-valued semantics, where a null anywhere makes the whole
-/// comparison undecided instead of a definite presentation order) — a
-/// shorter list that's a prefix of a longer one sorts first, same
-/// convention `value_partial_cmp` already uses. `compare_with_dir`
-/// reverses the *overall* result for `DESC`, not each element
-/// individually — verified element-by-element against TCK's
-/// ReturnOrderBy1 `[10]` ("ORDER BY DESC should order lists in the
-/// expected order").
+/// comparison undecided instead of a definite presentation order. A
+/// shorter list that's a prefix of a longer one sorts first.
+/// `compare_with_dir` reverses the overall result for `DESC`, not each
+/// element individually.
 pub(crate) fn list_cmp_asc(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let a_null = matches!(a, Value::Null);
@@ -938,21 +878,19 @@ pub(crate) fn value_to_comparable(v: &Value) -> Option<PropertyValue> {
     }
 }
 
-/// Ordering for `min`/`max` aggregate folding — `None` for values with no
-/// natural order (`Node`/`Edge`/`Map`/`Path`, or a `Null`, which
-/// `AggAcc::fold` never passes here anyway since null contributions are
-/// skipped before folding). The caller turns `None` into a clear error
-/// rather than an arbitrary "always equal" fallback — unlike ORDER BY's
-/// `compare_non_null`, which tolerates that for presentation ordering
-/// (see its docs), silently treating two nodes as "equal" inside an
-/// aggregate would be a wrong-answer failure mode, not just an
-/// unhelpful sort order.
+/// Ordering for `min`/`max` aggregate folding -- `None` for values with
+/// no natural order (`Node`/`Edge`/`Map`/`Path`, or a `Null`, which
+/// `AggAcc::fold` never passes here since null contributions are skipped
+/// before folding). The caller turns `None` into a clear error rather
+/// than an arbitrary "always equal" fallback -- unlike ORDER BY's
+/// `compare_non_null`, which tolerates that for presentation ordering,
+/// silently treating two nodes as "equal" inside an aggregate would be a
+/// wrong-answer failure mode.
 ///
-/// `List` *is* comparable here (real Cypher's `max()`/`min()` handle a
-/// list argument, ordered element-by-element the same way ORDER BY
-/// does — reuses `list_cmp_asc`), and so is a genuine cross-type pair
-/// (`max()` over `[1, 'a', [1, 2]]`-shaped input), via the same
-/// `type_rank` fallback `compare_non_null` uses.
+/// `List` is comparable here too (`max()`/`min()` handle a list
+/// argument, ordered element-by-element via `list_cmp_asc`), and so is a
+/// genuine cross-type pair, via the same `type_rank` fallback
+/// `compare_non_null` uses.
 pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     if let (Value::List(_), Value::List(_)) = (a, b) {
         return Some(list_cmp_asc(a, b));
@@ -966,16 +904,11 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
                 // order by rank.
                 (Some(ra), Some(rb)) if ra != rb => Some(ra.cmp(&rb)),
                 // Same rank only ever means both are `Map`/`Node`/`Edge`/
-                // `Path` here (every type with a real per-value order
-                // already matched via `value_to_comparable`'s `Some` case
-                // above, `List` is handled separately at the top) --
-                // those have no defined per-value order at all. Real for
-                // ORDER BY's own use of `type_rank` (`compare_non_null`,
-                // which tolerates "equal" for presentation purposes), but
-                // silently treating two different `Map`s (or `Node`s,
-                // ...) as "equal" here would be a wrong-answer failure
-                // mode for an aggregate, not just an unhelpful sort
-                // order -- `None` instead (see this function's own docs).
+                // `Path` here, which have no defined per-value order at
+                // all. Unlike ORDER BY's `compare_non_null`, which
+                // tolerates "equal" for presentation purposes, `None`
+                // here avoids a wrong-answer failure mode in an
+                // aggregate (see this function's own docs).
                 _ => None,
             };
         }
@@ -1032,9 +965,8 @@ pub(crate) fn comparable_ordering(a: &Value, b: &Value) -> Option<std::cmp::Orde
 /// General `lhs op rhs` for `ReturnExpr::Compare` -- unlike `compare()`
 /// (a `PropertyValue`-vs-`Literal` comparison for pattern-level `WHERE`,
 /// where the RHS is always a literal), both sides here are already-
-/// evaluated `Value`s, since either can be a *computed* result (e.g. two
-/// `date(...)` calls) with no `Literal` able to stand in for it.
-/// Three-valued like `compare()`: `None` (Cypher's "unknown") for a null
+/// evaluated `Value`s, since either can be a computed result (e.g. two
+/// `date(...)` calls). Three-valued like `compare()`: `None` for a null
 /// operand, an operator with no meaning for the operands' types (e.g. `<`
 /// between two `Duration`s), or a type mismatch.
 pub(crate) fn compare_values(a: &Value, op: CompareOp, b: &Value) -> Option<bool> {
@@ -1064,15 +996,12 @@ pub(crate) fn compare_values(a: &Value, op: CompareOp, b: &Value) -> Option<bool
 
 /// `<`/`<=`/`>`/`>=` -- numeric operands are special-cased (not folded
 /// into `value_partial_cmp` below) specifically so `NaN` compares as a
-/// definite `false` on every operator, matching real Cypher (`0.0/0.0 >
-/// 1` is `false`, not `null`) -- verified against Comparison2's
-/// "Comparing NaN" scenario, which is what exposed `comparable_ordering`'s
-/// `unwrap_or(Equal)` silently making `NaN >= x`/`NaN <= x` both `true`.
-/// Every other type (`List`, `Date`, `String`, `Bool`, ...) has no NaN-like
-/// "exists but is unorderable" value, so `None` there really does mean
-/// Cypher's ordinary "unknown" (a null operand, a null found while
-/// lexicographically comparing two lists, or a genuine type mismatch),
-/// not something to special-case to `false`.
+/// definite `false` on every operator (`0.0/0.0 > 1` is `false`, not
+/// `null`). Every other type (`List`, `Date`, `String`, `Bool`, ...) has
+/// no NaN-like "exists but is unorderable" value, so `None` there really
+/// does mean Cypher's ordinary "unknown" (a null operand, a null found
+/// while lexicographically comparing two lists, or a genuine type
+/// mismatch), not something to special-case to `false`.
 pub(crate) fn ordered_compare(
     a: &Value,
     b: &Value,
@@ -1088,15 +1017,12 @@ pub(crate) fn ordered_compare(
 /// lexicographically: the first position where the two lists differ
 /// decides the result; if every position up to the shorter list's length
 /// is equal, the shorter list is "less". A `null` found at a
-/// not-yet-decided position makes the *whole* comparison unknown (`None`)
+/// not-yet-decided position makes the whole comparison unknown (`None`)
 /// -- lexicographic order can't skip past an undecided position to look
 /// for a later one that happens to differ, since whether that later
 /// position is even reached depends on what the undecided one turns out
-/// to be. Verified element-by-element against every row of Comparison2's
-/// "Comparing lists" scenario (`[1, 2] >= [1, null]` is `null`, not
-/// `false`, even though `2 >= null` alone would also be `null` -- the
-/// point is *why*: position 0 is equal, so position 1 is where the
-/// answer would come from, and it's undecided). Delegates to
+/// to be (`[1, 2] >= [1, null]` is `null`: position 0 is equal, so
+/// position 1 decides, and it's undecided). Delegates to
 /// `comparable_ordering` for every non-list, non-numeric pair (`Date`,
 /// `String`, `Bool`, ...), which has no list case to get wrong.
 pub(crate) fn value_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
@@ -1114,18 +1040,13 @@ pub(crate) fn value_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Orderi
         return Some(xs.len().cmp(&ys.len()));
     }
     // Real Cypher's `<`/`<=`/`>`/`>=` (unlike ORDER BY/`min`/`max`, which
-    // need a *total* order across every type for presentation purposes --
+    // need a total order across every type for presentation purposes --
     // see `comparable_ordering`'s own docs) is only ever defined within a
     // single comparable type. A genuine cross-type pair (a list against a
     // string, a node against a number, ...) must be `null`, not
     // `comparable_ordering`'s type-rank fallback -- that fallback exists
     // purely for `list_cmp_asc`/`min`/`max`'s total-order needs and must
-    // not leak into a real WHERE-predicate comparison. Verified against
-    // Comparison2's own "Comparing across types yields null, except
-    // numbers" scenario (`[] < 1`/`[] < ''`/`[] < true` were all wrongly
-    // `true` before this check, since `[]` alone -- not both sides --
-    // isn't `Value`-to-`PropertyValue` representable, falling through to
-    // the type-rank fallback).
+    // not leak into a real WHERE-predicate comparison.
     if value_to_comparable(a).is_none() || value_to_comparable(b).is_none() {
         return None;
     }
@@ -1133,18 +1054,16 @@ pub(crate) fn value_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Orderi
 }
 
 /// `=`/`<>`'s equality -- three-valued (`None` is Cypher's "unknown"),
-/// recursing into `List`/`Map` element-by-element so a `null` *inside* a
+/// recursing into `List`/`Map` element-by-element so a `null` inside a
 /// list/map only makes the overall result unknown when it actually
-/// matters, not automatically `false`/`true`: a length/key-set mismatch
-/// is `false` outright (definite, regardless of any null present --
-/// `{k: null} = {}` is `false`, not `null`, since the key sets alone
-/// already prove inequality), a definite element mismatch anywhere makes
-/// the whole comparison `false` (short-circuits, `false` outranks
-/// `unknown` the same way `and3`/`or3` already rank them), and only once
-/// every element is confirmed equal or unknown (never definitely
-/// unequal) does an unknown element propagate to an unknown overall
-/// result. Verified against every row of List3's and Comparison1's
-/// list/map equality scenarios. Scalars fall back to numeric-cross-type-
+/// matters: a length/key-set mismatch is `false` outright (definite,
+/// regardless of any null present -- `{k: null} = {}` is `false`, not
+/// `null`, since the key sets alone already prove inequality), a
+/// definite element mismatch anywhere makes the whole comparison `false`
+/// (short-circuits, `false` outranks `unknown` the same way `and3`/`or3`
+/// rank them), and only once every element is confirmed equal or
+/// unknown (never definitely unequal) does an unknown element propagate
+/// to an unknown overall result. Scalars fall back to numeric-cross-type-
 /// aware equality (`1 = 1.0` is `true`, unlike `value_eq`'s plain
 /// `PropertyValue` equality, which doesn't promote `Int`/`Float` against
 /// each other) or plain `value_eq` for everything else (`Date`,
@@ -1173,13 +1092,13 @@ pub(crate) fn value_equal_ternary(a: &Value, b: &Value) -> Option<bool> {
 /// `null` element (short-circuits, matching `and3`/`or3`'s "false/true
 /// outranks unknown" convention), no match with at least one `null`
 /// element compared along the way is "unknown" (not `false` -- that
-/// element *might* have matched), no match and no `null` anywhere is a
+/// element might have matched), no match and no `null` anywhere is a
 /// definite `false`. An empty list is always a definite `false`
 /// regardless of `needle`'s own nullness (nothing to compare against, no
-/// unknown comparisons ever happened) -- verified against Comparison5's
-/// exact empty-list scenarios. `haystack` being `Null` itself (not an
-/// empty list) is "unknown", matching `=`'s own null-operand rule;
-/// anything else on the right isn't a list at all, a real type error.
+/// unknown comparisons ever happened). `haystack` being `Null` itself
+/// (not an empty list) is "unknown", matching `=`'s own null-operand
+/// rule; anything else on the right isn't a list at all, a real type
+/// error.
 pub(crate) fn list_membership_ternary(
     needle: &Value,
     haystack: &Value,

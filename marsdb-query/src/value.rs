@@ -5,9 +5,8 @@ use marsdb_graph::{Edge, Node, PropertyValue};
 use crate::ast::Literal;
 
 /// One element of a `Value::Path` — a path is `node, edge, node, edge,
-/// ..., node`, alternating, as a single `Vec`, not two parallel node/edge
-/// vecs (which would create an unenforced `nodes.len() == edges.len() +
-/// 1` invariant across every place a path gets built or read).
+/// ..., node`, alternating, as a single `Vec` rather than parallel
+/// node/edge vecs, avoiding an unenforced length-relationship invariant.
 #[derive(Debug, Clone)]
 pub enum PathElem {
     Node(Node),
@@ -20,30 +19,19 @@ pub enum Value {
     Edge(Edge),
     Property(PropertyValue),
     Literal(Literal),
-    /// A list literal, `collect()` result, or a list-valued node/edge
-    /// property read back from storage (`PropertyValue::List` converts to
-    /// this, never a raw `Value::Property(PropertyValue::List(_))` — see
-    /// `executor::property_value_to_value`) — every existing list
-    /// operation (indexing, `size()`, `IN`, `UNWIND`, ...) pattern-matches
-    /// on this variant specifically, not on a property-sourced list
-    /// separately.
+    /// A list literal, `collect()` result, or a list-valued property read
+    /// back from storage (`PropertyValue::List` always converts to this,
+    /// see `executor::property_value_to_value`), so list operations
+    /// (indexing, `size()`, `IN`, `UNWIND`, ...) match one variant.
     List(Vec<Value>),
     /// A named path (`MATCH p = (a)-->(b) RETURN p`) or a `shortestPath()`
-    /// result — see `Binding::Path`'s docs (executor.rs) for how this
-    /// gets assembled during MATCH evaluation.
+    /// result — see `Binding::Path`'s docs (executor.rs).
     Path(Vec<PathElem>),
-    /// A map literal (`{a: 1, b: 2}`) — like `List`, a query-layer-only
-    /// concept, never persisted as a `PropertyValue` (nothing in the
-    /// grammar can construct a map literal to store as a node/edge
-    /// property directly; a `CREATE {...}` prop map's *values* are each
-    /// evaluated and stored individually as their own scalar
-    /// `PropertyValue` — see `Executor::eval_props_to_values` — a `Value::
-    /// Map` reaching there is a real error, not silently dropped). Its
-    /// other main real use is as a `date(...)`/`duration(...)`
-    /// construction function's argument, e.g. `date({year: 1984, month:
-    /// 10, day: 11})` — see `Executor::call_builtin`. `BTreeMap`, not
-    /// `HashMap` — canonical key order makes display/comparison
-    /// deterministic without a separate sort step.
+    /// A map literal (`{a: 1, b: 2}`) — query-layer-only, never persisted
+    /// as a `PropertyValue`; a `CREATE {...}` prop map stores each value
+    /// as its own scalar `PropertyValue` (`Executor::eval_props_to_values`).
+    /// Also used as `date(...)`/`duration(...)` constructor arguments.
+    /// `BTreeMap` for deterministic key order in display/comparison.
     Map(BTreeMap<String, Value>),
     Null,
 }

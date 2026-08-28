@@ -1,4 +1,4 @@
-//! Smoke tests: MATCH patterns: traversal, var-length, paths, OPTIONAL MATCH, EXISTS -- split from the original smoke.rs.
+//! Smoke tests: MATCH patterns -- traversal, var-length, paths, OPTIONAL MATCH, EXISTS.
 
 mod common;
 #[allow(unused_imports)]
@@ -34,8 +34,8 @@ fn exists_full_subquery_form_runs_an_arbitrary_correlated_statement() {
     // TCK ExistentialSubquery2 [1]/[2], ExistentialSubquery3 [1]:
     // `exists { MATCH ... RETURN ... }` -- unlike the simple pattern-only
     // form, this can carry its own aggregation/WHERE, and nest another
-    // `exists {}` inside it. Only `a` has any outgoing edge at all in this
-    // graph, so every assertion below narrows down to exactly that one row.
+    // `exists {}` inside it. Only `a` has any outgoing edge in this graph,
+    // so every assertion below narrows to exactly that one row.
     let store = GraphStore::open_memory().unwrap();
     run(
         &store,
@@ -86,19 +86,18 @@ fn exists_full_subquery_form_runs_an_arbitrary_correlated_statement() {
 
 #[test]
 fn exists_full_subquery_form_rejects_a_mutating_clause() {
-    // TCK ExistentialSubquery2 [3]: real Cypher's `InvalidClauseComposition`
-    // -- an updating clause inside `exists {}` is a compile-time error,
-    // checked regardless of whether any row would ever reach it.
+    // TCK ExistentialSubquery2 [3]: an updating clause inside `exists {}`
+    // is a compile-time error (`InvalidClauseComposition`), checked
+    // regardless of whether any row would reach it.
     let store = GraphStore::open_memory().unwrap();
     let stmt =
         parse("MATCH (n) WHERE exists { MATCH (n)-->(m) SET m.prop = 'fail' } RETURN n").unwrap();
     assert!(Executor::new(&store).execute(&stmt).is_err());
 }
 
-/// A bare `RETURN <expr>` with no `MATCH`/`UNWIND`/`MERGE` at all is real
-/// Cypher (`match_stmt`'s `clause*`, not `clause+`) -- needs no graph
-/// access, just the one synthetic empty row `execute_match` already seeds
-/// `current_rows` with by default.
+/// A bare `RETURN <expr>` with no `MATCH`/`UNWIND`/`MERGE` is valid
+/// (`match_stmt`'s `clause*`, not `clause+`) -- needs no graph access,
+/// just the synthetic empty row `execute_match` seeds `current_rows` with.
 #[test]
 fn bare_return_needs_no_match_clause() {
     let store = GraphStore::open_memory().unwrap();
@@ -151,17 +150,14 @@ fn pattern_comprehension_introduces_new_node_and_rel_vars() {
 
 #[test]
 fn variable_length_hop_cannot_reuse_an_earlier_fixed_hops_edge() {
-    // TCK clauses/match Match5 [27]: real Cypher's edge-isomorphism rule
-    // (no relationship repeated within one MATCH pattern) applies across a
-    // whole pattern, not just within one variable-length hop's own BFS --
-    // a var-length hop mustn't walk back over an edge an earlier fixed hop
-    // in the *same* pattern already used.
+    // TCK clauses/match Match5 [27]: edge-isomorphism (no relationship
+    // repeated within one MATCH pattern) applies across the whole pattern,
+    // not just within one variable-length hop's own BFS -- a var-length
+    // hop mustn't walk back over an edge an earlier fixed hop already used.
     //
     // A -[:R]-> B <-[:R]- C (both edges point into B). `(a:A)-[:R]->(b)`
-    // must use the A-B edge; a subsequent `<-[:R*1]->` from `b` can then
-    // only reach `C` via the B-C edge -- walking back to `A` would replay
-    // the already-used A-B edge, and (with only one real path to `C`)
-    // reusing it is the *only* way to get a second row.
+    // uses the A-B edge; `<-[:R*1]->` from `b` can then only reach `C` via
+    // the B-C edge, since walking back to `A` would replay the A-B edge.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:A {name: 'A'})-[:R]->(:B {name: 'B'})");
     run(&store, "MATCH (b:B) CREATE (:C {name: 'C'})-[:R]->(b)");
@@ -227,11 +223,11 @@ fn undirected_pattern_dedupes_self_loop() {
 
 #[test]
 fn hop_node_first_label_is_actually_filtered() {
-    // Regression test: the planner used to unconditionally skip the FIRST
-    // label when filtering a node reached via Expand/VarExpand (only
+    // A node reached via Expand/VarExpand must have every label filtered,
+    // not just labels after the first -- skipping the first is only
     // correct for the pattern's start node, where NodeByLabelScan already
-    // handles the first label) -- so `(a)-[:R]->(b:Post)` would match ANY
-    // labeled node at the far end of the hop, not just :Post ones.
+    // handles it. Otherwise `(a)-[:R]->(b:Post)` would match any labeled
+    // node at the far end of the hop.
     let store = GraphStore::open_memory().unwrap();
     run(
         &store,
@@ -258,11 +254,9 @@ fn hop_node_first_label_is_actually_filtered() {
 fn variable_length_pattern_walks_reply_chain_to_root() {
     use std::collections::BTreeMap;
 
-    // Mirrors IS6's shape: MATCH (m:Message {id})-[:REPLY_OF*0..]->(p:Post) ...
-    // Chain c2 -[:REPLY_OF]-> c1 -[:REPLY_OF]-> p. Cypher CREATE always
-    // makes fresh nodes per pattern position (no MATCH+CREATE combo in
-    // v1), so build this directly via GraphStore to get real shared node
-    // identity across the chain.
+    // Mirrors IS6's shape: MATCH (m:Message {id})-[:REPLY_OF*0..]->(p:Post).
+    // Chain c2 -[:REPLY_OF]-> c1 -[:REPLY_OF]-> p, built directly via
+    // GraphStore since chained CREATE can't share node identity here.
     let store = GraphStore::open_memory().unwrap();
     let mut props_p = BTreeMap::new();
     props_p.insert("id".to_string(), marsdb_graph::PropertyValue::Int(1));
@@ -294,10 +288,9 @@ fn variable_length_pattern_walks_reply_chain_to_root() {
         other => panic!("unexpected value {other:?}"),
     }
 
-    // min_hops = 0 also includes the start node itself if it happens to
-    // match the target label — not exercised by IS6 (a Comment never
-    // has :Post too) but worth confirming: starting FROM the post with
-    // *0.. must return the post itself at hop 0.
+    // min_hops = 0 also includes the start node itself if it matches the
+    // target label: starting FROM the post with *0.. must return the post
+    // itself at hop 0.
     let from_post = run(
         &store,
         "MATCH (m:Message {id: 1})-[:REPLY_OF*0..]->(p:Post) RETURN p.id",
@@ -340,12 +333,10 @@ fn variable_length_bounded_range_respects_max_hops() {
     assert_eq!(reached, vec![1, 2]);
 }
 
-/// A bare `[*]` (no explicit bounds) defaults to `min_hops = 1`, not 0 --
-/// the destination is never the start node itself, same as `[*1..]`
-/// already correctly behaved. A real bug found via the TCK: `parse_
-/// rel_range` defaulted the *omitted* min (both the fully bare `*` case
-/// and the `*..M` case with an empty min before `..`) to 0, incorrectly
-/// including the zero-hop "reached myself" row. TCK's Match4 [2].
+/// A bare `[*]` (no explicit bounds) defaults to `min_hops = 1`, not 0,
+/// same as `[*1..]` -- the destination is never the start node itself.
+/// Covers both the fully bare `*` case and `*..M` with an empty min
+/// before `..`. TCK's Match4 [2].
 #[test]
 fn variable_length_bare_star_defaults_to_min_hops_one() {
     use std::collections::BTreeMap;
@@ -379,8 +370,8 @@ fn variable_length_bare_star_defaults_to_min_hops_one() {
         assert_eq!(reached, vec![1, 2, 3], "query: {query}");
     }
 
-    // `*0..` (explicit zero lower bound) still legitimately includes the
-    // start node itself -- only the *omitted*-min cases default to 1.
+    // `*0..` (explicit zero lower bound) still includes the start node
+    // itself -- only the omitted-min cases default to 1.
     let result = run(
         &store,
         "MATCH (n:Item {idx: 0})-[:NEXT*0..2]->(m:Item) RETURN m.idx",
@@ -412,15 +403,11 @@ fn variable_length_does_not_reuse_relationship_in_same_path() {
     assert!(result.rows.is_empty());
 }
 
-/// Real Cypher allows chained plain `MATCH` clauses with no `WITH`
-/// between them (an implicit join on any shared variable, e.g. TCK's
-/// Match5 `[1]`: `MATCH (a:A) MATCH (a)-[:LIKES*]->(c) RETURN c.name`) --
-/// an earlier version of this parser wrongly required `WITH` there,
-/// based on a mistaken assumption about real Cypher's own rule (only
-/// OPTIONAL MATCH/UNWIND were exempted, when in fact plain MATCH needs no
-/// exemption at all). The executor's `carried_vars` threading already
-/// handled this correctly regardless -- the parser-level check was the
-/// only thing blocking it.
+/// Chained plain `MATCH` clauses with no `WITH` between them are valid
+/// Cypher (an implicit join on any shared variable, e.g. TCK's Match5
+/// `[1]`: `MATCH (a:A) MATCH (a)-[:LIKES*]->(c) RETURN c.name`). The
+/// executor's `carried_vars` threading already handles this; only a
+/// parser-level check needed to stop requiring `WITH` there.
 #[test]
 fn multiple_match_without_with_is_allowed() {
     let store = GraphStore::open_memory().unwrap();
@@ -445,11 +432,9 @@ fn multiple_match_without_with_is_allowed() {
 }
 
 /// Two paths are equal iff they visit the same nodes/relationships in the
-/// same order -- `value_eq` had no `Value::Path` arm at all before this,
-/// so any two paths were unconditionally unequal via `=` (fell through to
-/// the catch-all `_ => false`). TCK's Comparison1 [14]: a self-loop
-/// traversed forward vs backward is the same path (same single node,
-/// same single relationship) either way.
+/// same order -- `value_eq` needs a `Value::Path` arm, not the catch-all
+/// `_ => false`. TCK's Comparison1 [14]: a self-loop traversed forward vs
+/// backward is the same path either way.
 #[test]
 fn path_equality_compares_nodes_and_relationships_not_always_false() {
     let store = GraphStore::open_memory().unwrap();
@@ -469,11 +454,10 @@ fn path_equality_compares_nodes_and_relationships_not_always_false() {
     assert!(!bool_val(&result.rows[0][0]));
 }
 
-/// `MATCH (a:A), (b:B)` -- a genuine disjoint cross join, not a
-/// continuation (`b` doesn't continue from `a`'s pattern). Real Cypher's
-/// own implicit-join shape (TCK's Merge6/Merge7), previously rejected
-/// outright since `group_into_linear_patterns` used to require every
-/// comma-separated pattern to continue the previous one.
+/// `MATCH (a:A), (b:B)` -- a disjoint cross join, not a continuation (`b`
+/// doesn't continue from `a`'s pattern). `group_into_linear_patterns`
+/// must not require every comma-separated pattern to continue the
+/// previous one (TCK's Merge6/Merge7 implicit-join shape).
 #[test]
 fn comma_separated_match_patterns_cross_join() {
     let store = GraphStore::open_memory().unwrap();
@@ -491,11 +475,10 @@ fn optional_match_with_var_eq_mirrors_is7_shape() {
     //              OPTIONAL MATCH (m)-[:HAS_CREATOR]->(a)-[r:KNOWS]-(p)
     //              RETURN ... CASE r WHEN null THEN false ELSE true END
     //
-    // p is bound by the first MATCH (comment author) then reappears as the
-    // endpoint of the OPTIONAL pattern -- must mean "KNOWS THIS p", not
-    // "KNOWS anyone" (Expr::VarEq). c1's author knows the original
-    // message's author; c2's author doesn't -- so the two rows must get
-    // different CASE results, not both true/both false.
+    // `p` is bound by the first MATCH then reappears as the OPTIONAL
+    // pattern's endpoint -- must mean "KNOWS THIS p", not "KNOWS anyone"
+    // (Expr::VarEq). c1's author knows the original message's author;
+    // c2's author doesn't, so the two rows must get different CASE results.
     let store = GraphStore::open_memory().unwrap();
 
     let mut m_props = BTreeMap::new();
@@ -628,12 +611,10 @@ fn optional_match_without_with_shares_scope() {
 /// `VariableAlreadyBound` is a compile-time/structural error, not a
 /// data-dependent one -- it must fire even when the preceding `MATCH`
 /// produces *zero* rows, since the check is about variable scope, not
-/// runtime data. A real bug found and fixed: the check used to live only
-/// in the per-row runtime path (`materialize_create`/`merge_one_row`),
-/// which a zero-row MATCH skips entirely, silently no-op'ing instead of
-/// erroring. Now duplicated at compile time in `semantic.rs`. TCK's
-/// Create1 [13]/[14], Merge1 [15], Merge5 [26] ("any graph" -- MarsDB's
-/// own harness exercises the empty-graph case).
+/// runtime data. The per-row runtime path
+/// (`materialize_create`/`merge_one_row`) alone can't catch this, since a
+/// zero-row MATCH skips it entirely; `semantic.rs` duplicates the check
+/// at compile time. TCK's Create1 [13]/[14], Merge1 [15], Merge5 [26].
 #[test]
 fn already_bound_rejection_fires_even_on_a_zero_row_match() {
     let store = GraphStore::open_memory().unwrap();
@@ -661,9 +642,8 @@ fn already_bound_rejection_fires_even_on_a_zero_row_match() {
 
 #[test]
 fn with_chaining_disjoint_second_match_cross_joins_carried_var() {
-    // `b`'s pattern doesn't chain from `a` at all -- before the scan/seed
-    // cross-join fix, this silently dropped `a` instead of producing the
-    // 2x2 cross join real Cypher semantics require here.
+    // `b`'s pattern doesn't chain from `a` at all -- the scan/seed cross-
+    // join must still produce a 2x2 cross join, not silently drop `a`.
     let store = GraphStore::open_memory().unwrap();
     for name in ["Alice", "Bob"] {
         run(&store, &format!("CREATE (:Left {{name: '{name}'}})"));
@@ -701,10 +681,8 @@ fn with_chaining_disjoint_second_match_cross_joins_carried_var() {
 #[test]
 fn optional_match_disjoint_pattern_does_not_panic() {
     // The OPTIONAL pattern doesn't chain from the outer `a` either -- same
-    // root cause as the cross-join test above, but through
-    // eval_optional_part's __seed_idx tagging instead of a plain MATCH.
-    // Before the fix, scan() silently dropped that tag and
-    // eval_optional_part's `unreachable!` fired.
+    // shape as the cross-join test above, through eval_optional_part's
+    // __seed_idx tagging, which scan() must preserve.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Left {name: 'Alice'})");
     run(&store, "CREATE (:Right {name: 'X'})");
@@ -722,7 +700,7 @@ fn optional_match_disjoint_pattern_does_not_panic() {
 /// expression, not just a literal -- a bound variable (TCK's Merge1 [8])
 /// compiles to `Expr::GeneralCompare` (a generic post-scan filter,
 /// evaluated per-row) instead of the index-seek-eligible
-/// `Expr::Compare(_, _, Literal)` shape a real literal still gets.
+/// `Expr::Compare(_, _, Literal)` shape a literal still gets.
 #[test]
 fn pattern_property_accepts_a_bound_variable() {
     let store = GraphStore::open_memory().unwrap();
@@ -787,10 +765,9 @@ fn pattern_predicate_introducing_new_variable_is_rejected() {
 
 /// `a:Label` as a general boolean expression, usable anywhere a
 /// `return_expr` is (RETURN/WITH items, not just pattern-level WHERE) --
-/// TCK's Graph5 "Node and edge label expressions". Reuses the existing
-/// `ReturnExpr::HasLabel` (previously only reachable via the
-/// parenthesized `(n:Foo)` general-expression form) through a new bare
-/// grammar alternative.
+/// TCK's Graph5 "Node and edge label expressions". A new bare grammar
+/// alternative reuses `ReturnExpr::HasLabel`, previously only reachable
+/// via the parenthesized `(n:Foo)` form.
 #[test]
 fn bare_label_predicate_as_return_expr() {
     let store = GraphStore::open_memory().unwrap();
@@ -815,9 +792,8 @@ fn bare_label_predicate_as_return_expr() {
     );
 
     // A DELETE target must never be a label predicate (TCK's Delete1
-    // [8]) -- a boolean can never be a node/relationship/path, and this
-    // must be rejected at compile time regardless of whether any row
-    // actually matches (an empty MATCH would otherwise let it through).
+    // [8]): a boolean can never be a node/relationship/path, so this must
+    // be rejected at compile time even when the MATCH matches nothing.
     let stmt = parse("MATCH (n) DELETE n:Person").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(
@@ -913,12 +889,9 @@ fn shortest_path_finds_the_actual_shortest_not_just_a_path() {
         &store,
         "CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Dave'})",
     );
-    // Longer 3-hop route between the *same* two people -- MATCH...CREATE,
-    // not a chained plain CREATE, so the trailing (:Person{name:'Dave'})
-    // token reuses the existing Dave instead of silently creating a 2nd
-    // one (a chained CREATE never reuses an unbound token, even one that
-    // matches an existing node by props -- exactly the gap MATCH...CREATE
-    // exists to work around).
+    // Longer 3-hop route between the *same* two people -- MATCH...CREATE
+    // so the trailing `(:Person{name:'Dave'})` token reuses the existing
+    // Dave instead of creating a 2nd one, unlike a chained plain CREATE.
     run(
         &store,
         "MATCH (a:Person {name: 'Alice'}) WITH a MATCH (d:Person {name: 'Dave'}) \
@@ -967,9 +940,9 @@ fn shortest_path_requires_both_endpoints_already_bound() {
 }
 
 /// Named-path capture over a *single* variable-length hop -- TCK's
-/// Quantifier1-4 [8]/[9], ReturnOrderBy2 [12], Pattern2 [9]. Assembles the
-/// path from `expand_variable_row`'s own internally-traversed edge/node
-/// sequence (deposited under that hop's own synthesized `rel.var`, see
+/// Quantifier1-4 [8]/[9], ReturnOrderBy2 [12], Pattern2 [9]. Assembled
+/// from `expand_variable_row`'s internally-traversed edge/node sequence
+/// (deposited under the hop's synthesized `rel.var`, see
 /// `assemble_path`'s docs), not a plain fixed-hop token.
 #[test]
 fn named_path_over_a_single_variable_length_hop() {
@@ -999,11 +972,10 @@ fn named_path_over_a_single_variable_length_hop() {
 }
 
 /// Named-path capture over a pattern *mixing* variable-length hops with
-/// other hops -- was rejected until a `LogicalPlan::VarExpand`
-/// edge-isomorphism gap was fixed (TCK's Match4 `[7]`: an earlier
-/// double-count bug in exactly this shape). Two `*0..1` hops
-/// around a fixed middle hop -- each of `a`, `b`, `c` optionally coincide,
-/// so this must not silently drop or duplicate rows.
+/// other hops -- exercises a `LogicalPlan::VarExpand` edge-isomorphism
+/// case that previously double-counted rows (TCK's Match4 `[7]`). Two
+/// `*0..1` hops around a fixed middle hop, where `a`, `b`, `c` can
+/// optionally coincide, must not silently drop or duplicate rows.
 #[test]
 fn named_path_mixing_variable_length_and_fixed_hops() {
     let store = GraphStore::open_memory().unwrap();
@@ -1044,9 +1016,8 @@ fn standalone_with_no_preceding_match() {
 
 #[test]
 fn type_mismatch_comparison_semantics_differ_by_operator() {
-    // Regression: a single blanket "type mismatch -> false" was wrong for
-    // three different operator families -- confirmed against real TCK
-    // scenarios: `=` on mismatched types is false, `<>` is true (never
+    // A blanket "type mismatch -> false" is wrong for three operator
+    // families: `=` on mismatched types is false, `<>` is true (never
     // equal, so "not equal" holds), ordering is null (no defined order),
     // and STARTS WITH/ENDS WITH/CONTAINS on a non-string operand is also
     // null, not false.
@@ -1063,10 +1034,10 @@ fn type_mismatch_comparison_semantics_differ_by_operator() {
 
 #[test]
 fn match_without_declared_index_still_works() {
-    // Regression guard: a plain node-pattern-property match with no
-    // index declared must still hit the ordinary Filter-over-scan path,
-    // not error or silently return nothing just because `apply_index_seeks`
-    // now runs over every plan.
+    // A plain node-pattern-property match with no index declared must
+    // still hit the ordinary Filter-over-scan path, not error or
+    // silently return nothing, even though `apply_index_seeks` runs over
+    // every plan.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:Person {email: 'alice@x.com'})");
     let result = run(
@@ -1098,10 +1069,9 @@ fn explain_shows_expand_between_two_scans() {
 
 #[test]
 fn type_error_for_a_runtime_value_shape_mismatch() {
-    // The query is syntactically and structurally fine (both operands
-    // are "a scalar" as far as the pre-execution semantic pass can tell)
-    // -- the mismatch only exists once the actual values are in hand and
-    // one turns out to be a bool, not a number.
+    // Both operands type as "a scalar" to the pre-execution semantic
+    // pass; the mismatch only surfaces once the actual values are in
+    // hand and one turns out to be a bool, not a number.
     let store = GraphStore::open_memory().unwrap();
     let stmt = parse("RETURN 1 + true").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
@@ -1110,9 +1080,9 @@ fn type_error_for_a_runtime_value_shape_mismatch() {
 
 #[test]
 fn bracketless_relationship_arrows_match_the_bracketed_forms() {
-    // `-->`/`<--`/`--` are real Cypher's shorthand for an anonymous,
-    // untyped, propertyless relationship -- brackets are only needed at
-    // all to carry a var/type/range/props. Must behave identically to
+    // `-->`/`<--`/`--` are shorthand for an anonymous, untyped,
+    // propertyless relationship -- brackets are only needed to carry a
+    // var/type/range/props. Must behave identically to
     // `-[]->`/`<-[]-`/`-[]-`, not just parse.
     let store = GraphStore::open_memory().unwrap();
     run(&store, "CREATE (:A {n: 'a'})-[:X]->(:B {n: 'b'})");
@@ -1222,9 +1192,9 @@ fn union_combines_two_match_clauses() {
     assert_eq!(result.rows.len(), 2);
 }
 
-/// `r.name` where `r` is bound to a path -- real Cypher's
-/// `InvalidArgumentType`, not a silent null (a path was never a valid
-/// property-access target). TCK's MatchWhere1 [14].
+/// `r.name` where `r` is bound to a path -- `InvalidArgumentType`, not a
+/// silent null; a path is never a valid property-access target. TCK's
+/// MatchWhere1 [14].
 #[test]
 fn property_access_on_a_path_is_a_type_error() {
     let store = GraphStore::open_memory().unwrap();
@@ -1236,9 +1206,9 @@ fn property_access_on_a_path_is_a_type_error() {
     );
 }
 
-/// `size(p)` where `p` is a path -- real Cypher rejects this at compile
-/// time, not just at runtime (a zero-row MATCH could otherwise silently
-/// skip ever evaluating it). TCK's List6 [5].
+/// `size(p)` where `p` is a path -- rejected at compile time, not just at
+/// runtime, since a zero-row MATCH could otherwise silently skip
+/// evaluating it. TCK's List6 [5].
 #[test]
 fn size_on_a_path_is_a_compile_time_error() {
     let store = GraphStore::open_memory().unwrap();
@@ -1292,8 +1262,8 @@ fn variable_length_relationship_binds_a_list_of_edges() {
 
     // Matching a variable-length pattern against an *already-bound* list
     // variable (TCK's Match4 [8]) means "match a path whose edges equal
-    // this list" -- deterministic (the edges are already concrete, so
-    // there's exactly one possible walk to check), not a fresh BFS search.
+    // this list" -- deterministic, not a fresh BFS search, since the
+    // edges are already concrete.
     let result = run(
         &store,
         "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
@@ -1312,9 +1282,9 @@ fn variable_length_relationship_binds_a_list_of_edges() {
 /// `WITH null AS a OPTIONAL MATCH p = (a)-[r]->()` -- reusing an
 /// already-bound-to-`null` variable as a node/relationship pattern token
 /// is legal (matches nothing, same as any other `OPTIONAL MATCH` miss),
-/// unlike reusing a variable bound to a real, wrong-typed value (`WITH 1
-/// AS x MATCH (x)-->()`, still a real compile-time type error). TCK's
-/// Path1 [1], Path2 [3].
+/// unlike reusing a variable bound to a wrong-typed value (`WITH 1 AS x
+/// MATCH (x)-->()`, still a compile-time type error). TCK's Path1 [1],
+/// Path2 [3].
 #[test]
 fn null_bound_variable_reused_as_pattern_token_is_legal() {
     let store = GraphStore::open_memory().unwrap();
@@ -1328,17 +1298,16 @@ fn null_bound_variable_reused_as_pattern_token_is_legal() {
         assert!(matches!(cell, Value::Null), "expected null, got {cell:?}");
     }
 
-    // A real, non-null, wrong-typed reused variable must still error.
+    // A non-null, wrong-typed reused variable must still error.
     let stmt = parse("WITH 1 AS x MATCH (x)-[:R]->(n) RETURN n").unwrap();
     let err = Executor::new(&store).execute(&stmt).unwrap_err();
     assert!(err.to_string().to_lowercase().contains("node"));
 }
 
 /// `MATCH (a)-[:TYPE* {prop: 'x'}]->(b)` -- filters *every* hop of the
-/// variable-length traversal by the same inline property map, not just
-/// the final one. A 2-hop path where only the second hop matches doesn't
-/// survive as a 1-hop match either -- the whole path from the first
-/// non-matching hop onward is excluded. TCK's Match4 [5].
+/// variable-length traversal by the inline property map, not just the
+/// final one; a 2-hop path where only the second hop matches doesn't
+/// survive as a 1-hop match either. TCK's Match4 [5].
 #[test]
 fn inline_properties_on_a_variable_length_relationship_pattern() {
     let store = GraphStore::open_memory().unwrap();
@@ -1368,12 +1337,9 @@ fn inline_properties_on_a_variable_length_relationship_pattern() {
 // --- comma-separated MATCH patterns: cross joins, correlated parts, and
 // clause-wide relationship uniqueness ------------------------------------
 
-/// `MATCH (a:A), (b:B)` is a genuine cross join: every combination of the
-/// two disjoint parts, exactly the Cartesian product. (Split into
-/// separate `QueryPart`s by `group_into_linear_patterns`; found working
-/// while porting a third-party Northwind benchmark whose loader depends
-/// on this shape, previously listed as "not verified" in
-/// CYPHER_COVERAGE.md.)
+/// `MATCH (a:A), (b:B)` is a cross join: every combination of the two
+/// disjoint parts, the Cartesian product. Split into separate
+/// `QueryPart`s by `group_into_linear_patterns`.
 #[test]
 fn comma_separated_disjoint_match_is_a_cross_join() {
     let store = GraphStore::open_memory().unwrap();
@@ -1394,13 +1360,11 @@ fn comma_separated_disjoint_match_is_a_cross_join() {
     );
 }
 
-/// Real Cypher's relationship-uniqueness rule spans the *whole* MATCH
-/// clause pattern, comma-separated parts included: two parts sharing a
-/// start node may not bind the same relationship instance, so the
-/// tag-co-occurrence shape yields only the (a,b)/(b,a) cross pairs, never
-/// the (a,a)/(b,b) self-pairs that reusing one HAS_TAG edge for both hops
-/// would produce. (The bug this guards against was masked in the
-/// benchmark that surfaced it by a `WHERE t1.id < t2.id` filter.)
+/// Relationship-uniqueness spans the *whole* MATCH clause pattern,
+/// comma-separated parts included: two parts sharing a start node may
+/// not bind the same relationship instance, so the tag-co-occurrence
+/// shape yields only the (a,b)/(b,a) cross pairs, never the (a,a)/(b,b)
+/// self-pairs that reusing one HAS_TAG edge for both hops would produce.
 #[test]
 fn comma_separated_parts_of_one_match_share_relationship_uniqueness() {
     let store = GraphStore::open_memory().unwrap();
@@ -1477,8 +1441,7 @@ fn relationship_variable_reuse_across_comma_parts_errors_across_clauses_verifies
 }
 
 /// Comma-separated CREATE patterns: disjoint node groups and disjoint
-/// relationship chains in one clause each create independently (also a
-/// previously "not verified" CYPHER_COVERAGE.md shape).
+/// relationship chains in one clause each create independently.
 #[test]
 fn comma_separated_create_patterns() {
     let store = GraphStore::open_memory().unwrap();
@@ -1496,9 +1459,8 @@ fn comma_separated_create_patterns() {
 // traversal (lazy VarExpandIter + collect_rows_until_distinct) ----------
 
 /// The pipeline must stop pulling as soon as LIMIT-many distinct
-/// projected rows exist — proven the same way the plain-LIMIT laziness
-/// test in smoke_filtering.rs does: a relationship-expansion budget too
-/// small for full enumeration but ample for the early stop. A 6-node
+/// projected rows exist -- proven with a relationship-expansion budget
+/// too small for full enumeration but ample for the early stop. A 6-node
 /// :K clique enumerates ~85 edge-distinct paths for `*1..3` from any
 /// node, while the first handful of DFS steps already yield 2 distinct
 /// endpoints.
@@ -1538,8 +1500,8 @@ fn distinct_limit_terminates_var_length_traversal_early() {
     assert_eq!(result.rows.len(), 2);
 
     // Without the LIMIT the same budget is exhausted by full enumeration
-    // — the early stop above genuinely skipped that work rather than
-    // doing it and discarding rows.
+    // -- the early stop above skipped that work rather than doing it and
+    // discarding rows.
     let unlimited = parse("MATCH (s:Start)-[:K*1..3]-(m) RETURN DISTINCT m").unwrap();
     let err = executor
         .execute_with_options(&unlimited, &budget)

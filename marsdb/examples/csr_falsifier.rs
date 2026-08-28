@@ -96,9 +96,8 @@ fn top5_btree(txn: Txn, crimson: NodeId) -> Result<Vec<(u64, u32)>, Box<dyn std:
     Ok(top5(counts.into_iter()))
 }
 
-/// Dense-id CSR over RATED, both directions. Node ids are dense (next_id
-/// counter, never reused), so plain Vec indexing by id works -- the same
-/// property the direct-addressing discussion identified.
+/// Dense-id CSR over RATED, both directions. Node ids are dense (never
+/// reused), so plain Vec indexing by id works.
 struct RatedCsr {
     /// movie id -> [user ids] (incoming RATED)
     movie_offsets: Vec<u32>,

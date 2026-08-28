@@ -2,15 +2,14 @@
 //! LDBC-style social-network workload (see `ldbc_support/mod.rs` for the
 //! generator and its third-party provenance).
 //!
-//! The method: pull the raw graph back out of the database with primitive
-//! single-edge scans, recompute every complex query's answer independently
-//! in Rust (BFS, grouping, joins), and assert the Cypher pipeline returns
-//! exactly that. Nothing is a golden value — a generator change reflows
-//! into both sides. This validates precisely the multi-stage shapes the
-//! TCK covers only at toy scale (OPTIONAL MATCH + WITH-grouped count fed
-//! into avg, correlated comma patterns with clause-wide relationship
-//! uniqueness, var-length DISTINCT counting) and where another engine
-//! measured against the same dataset returned silently wrong answers.
+//! Method: pull the raw graph back out with primitive single-edge scans,
+//! recompute each complex query's answer independently in Rust (BFS,
+//! grouping, joins), and assert the Cypher pipeline matches. Nothing is
+//! a golden value: a generator change reflows into both sides. Covers
+//! multi-stage shapes the TCK only exercises at toy scale (OPTIONAL
+//! MATCH + WITH-grouped count fed into avg, correlated comma patterns
+//! with clause-wide relationship uniqueness, var-length DISTINCT
+//! counting).
 //!
 //! `ldbc_style_workload` (SF 0.005, ~800 nodes / ~5k rels, ~2s debug)
 //! runs in the default suite; `ldbc_style_workload_large` (SF 0.1, ~16k
@@ -49,7 +48,7 @@ fn float(v: &Value) -> f64 {
     }
 }
 
-/// The raw graph, read back through primitive single-hop scans only —
+/// The raw graph, read back through primitive single-hop scans only:
 /// the trusted baseline every pipeline assertion below recomputes from.
 struct Primitives {
     /// person id -> (firstName, lastName)
@@ -139,7 +138,7 @@ fn undirected_adjacency(knows: &[(i64, i64)]) -> HashMap<i64, Vec<i64>> {
 fn verify(db: &Database, ds: &Dataset) {
     let g = read_primitives(db);
 
-    // The stored graph is exactly what the generator emitted — storage
+    // The stored graph is exactly what the generator emitted: a storage
     // round-trip check, and the license for everything below to treat
     // the primitives as ground truth.
     assert_eq!(g.person_names.len(), ds.persons);
@@ -176,9 +175,9 @@ fn verify(db: &Database, ds: &Dataset) {
         assert_eq!(int(&row[1]), expected_posts[&int(&row[0])]);
     }
 
-    // --- average friends per city: the OPTIONAL MATCH + WITH-grouped
-    // count fed into avg()/count() — the shape another engine got wrong
-    // (null averages, counts inflated by the pre-grouping row expansion).
+    // --- average friends per city: OPTIONAL MATCH + WITH-grouped count
+    // fed into avg()/count(). Wrong pre-grouping produces null averages
+    // or counts inflated by the row expansion.
     let adj = undirected_adjacency(&g.knows);
     let mut city_degrees: HashMap<&str, Vec<i64>> = HashMap::new();
     for (person, city) in &g.person_city {
@@ -238,9 +237,9 @@ fn verify(db: &Database, ds: &Dataset) {
     assert_eq!(got_pairs, expected_pairs);
 
     // Clause-wide relationship uniqueness, unmasked: with no WHERE filter
-    // the match count must be exactly the ordered distinct-tag pairs —
-    // one t1 = t2 self-pair (both hops binding the same HAS_TAG edge)
-    // would inflate it.
+    // the match count must equal the ordered distinct-tag pairs exactly.
+    // A t1 = t2 self-pair (both hops binding the same HAS_TAG edge) would
+    // inflate it.
     let result = db
         .execute(
             "MATCH (post:Post)-[:HAS_TAG]->(t1:Tag), (post)-[:HAS_TAG]->(t2:Tag) \

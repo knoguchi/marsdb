@@ -1,7 +1,5 @@
-//! Pure, grammar-agnostic parsing helpers shared by `antlr_visitor.rs` --
-//! extracted from the old pest-based `parser.rs` at cutover (see
-//! `grammar/README.md`), which reused these as-is rather than re-deriving
-//! them. None of these ever touched `pest::Pair`/`Rule` directly.
+//! Pure, grammar-agnostic parsing helpers shared by `antlr_visitor.rs`.
+//! None of these touch ANTLR parse-tree types directly.
 
 use crate::ast::*;
 use crate::error::QueryError;
@@ -23,34 +21,27 @@ pub(crate) fn validate_shortest_path_pattern(pattern: &Pattern) -> Result<(), Qu
 
 /// General named-path capture (`p = (a)-->(b)`, no `shortestPath()`).
 /// Fixed-hop patterns of any length are fine; variable-length hops
-/// (`p = (a)-[*1..3]->(b)`, TCK's Quantifier1-4 `[8]`/`[9]`), including
-/// *mixed* with other hops (fixed or variable-length) in the same
-/// pattern, are also supported -- `executor::name_pattern_for_path`/
-/// `assemble_path` capture each hop's own segment independently, and
+/// (`p = (a)-[*1..3]->(b)`), including mixed with other hops in the same
+/// pattern, are also supported: `executor::name_pattern_for_path`/
+/// `assemble_path` capture each hop's segment independently, and
 /// `LogicalPlan::VarExpand`'s edge-isomorphism handling
-/// (`exclude_edge_sets`/`exclude_edge_var`) now tracks a variable-length
-/// hop's internally-traversed edges in both directions (an earlier fixed
-/// hop excluding a later `VarExpand`, and vice versa) -- fixed via TCK's
-/// Match4 `[7]`.
+/// (`exclude_edge_sets`/`exclude_edge_var`) tracks a variable-length
+/// hop's internally-traversed edges against both earlier and later hops.
 pub(crate) fn validate_named_path_pattern(_pattern: &Pattern) -> Result<(), QueryError> {
     Ok(())
 }
 
 /// Groups comma-separated patterns within one `MATCH` into linear
-/// `Pattern` chains -- when a later pattern's start variable is exactly
-/// the previous one's last-introduced variable (e.g. IS2's `MATCH
-/// (message)-[...]->(post:Post), (post)-[...]->(person)`, where `post` is
-/// both the first pattern's end and the second's start), it's spliced
-/// into the same chain (any labels/props it restates on that shared
-/// variable merge in as additional filters); otherwise it starts a new
-/// group -- a genuine disjoint cross join (`MATCH (a:A), (b:B)`), which
-/// becomes its own separate `QueryPart`/`QueryClause::Match`. A later
-/// group referencing an even-earlier group's variable (not the
-/// immediately-preceding one) doesn't need special-casing here either --
-/// it just starts its own new group, and the executor's existing
-/// already-bound-variable handling (used for chained MATCH clauses
-/// generally) resolves the reference correctly once both clauses run in
-/// order.
+/// `Pattern` chains: when a later pattern's start variable is exactly the
+/// previous one's last-introduced variable (e.g. `MATCH
+/// (message)-[...]->(post:Post), (post)-[...]->(person)`), it's spliced
+/// into the same chain, with any labels/props it restates on that shared
+/// variable merged in as additional filters. Otherwise it starts a new
+/// group — a genuine disjoint cross join (`MATCH (a:A), (b:B)`) — its
+/// own separate `QueryPart`/`QueryClause::Match`. A group referencing an
+/// even-earlier group's variable doesn't need special-casing: it starts
+/// its own new group, and the executor's already-bound-variable handling
+/// resolves the reference once both clauses run in order.
 pub(crate) fn group_into_linear_patterns(
     mut patterns: Vec<Pattern>,
 ) -> Result<Vec<Pattern>, QueryError> {
@@ -86,10 +77,8 @@ pub(crate) fn group_into_linear_patterns(
 /// more).
 pub(crate) fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryError> {
     let rest = &text[1..]; // strip leading '*'
-                           // Real Cypher's default minimum is 1, not 0 -- a variable-length
-                           // pattern always requires at least one real relationship unless a
-                           // zero-length lower bound is written explicitly (`*0..`); `x` in
-                           // `(a)-[*]->(x)` is never `a` itself.
+                           // Default minimum is 1: a variable-length pattern requires at least
+                           // one relationship unless a zero-length lower bound is explicit (`*0..`).
     if rest.is_empty() {
         return Ok((1, None));
     }
@@ -121,12 +110,9 @@ pub(crate) fn parse_rel_range(text: &str) -> Result<(u32, Option<u32>), QueryErr
 }
 
 /// Resolves `\`-escapes in a string literal's already-quote-stripped
-/// inner text. Only a fixed recognized set actually means something -- an
-/// unrecognized escape (e.g. `\q`) errors here rather than silently
-/// dropping the backslash or passing it through, matching this codebase's
-/// stance elsewhere (error on an untested shape, don't guess). `\uXXXX`
-/// is exactly 4 hex digits (a BMP code point, real Cypher's own escape
-/// width -- not the 8-digit `\UXXXXXXXX` some other languages have).
+/// inner text. An unrecognized escape (e.g. `\q`) errors rather than
+/// silently dropping the backslash. `\uXXXX` is exactly 4 hex digits (a
+/// BMP code point), not the 8-digit `\UXXXXXXXX` some other languages have.
 pub(crate) fn unescape_string(s: &str) -> Result<String, QueryError> {
     if !s.contains('\\') {
         return Ok(s.to_string());
@@ -179,14 +165,10 @@ pub(crate) fn unescape_string(s: &str) -> Result<String, QueryError> {
 
 /// Parses a (possibly `-`-prefixed, possibly `0x`/`0o`-prefixed) integer
 /// literal's text, magnitude first regardless of base, then applies the
-/// sign, rather than handing the whole string straight to
-/// `str::parse::<i64>()` (which only understands plain decimal).
-/// Magnitude-first also correctly handles `i64::MIN`
-/// (`-9223372036854775808`/`-0x8000000000000000`): its magnitude, `2^63`,
-/// doesn't fit in a *positive* `i64` at all, only in `u64`, and
-/// `i64::MIN`'s own negation would itself overflow (`i64`'s range is
-/// asymmetric) -- special-cased via the two's-complement identity instead
-/// of negating.
+/// sign. Magnitude-first correctly handles `i64::MIN`: its magnitude,
+/// `2^63`, doesn't fit in a positive `i64`, only in `u64`, and negating
+/// `i64::MIN` directly would itself overflow — handled via the
+/// two's-complement identity instead.
 pub(crate) fn parse_int_literal(s: &str) -> Result<i64, QueryError> {
     let (neg, rest) = match s.strip_prefix('-') {
         Some(r) => (true, r),

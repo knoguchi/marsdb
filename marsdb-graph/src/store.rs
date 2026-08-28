@@ -47,15 +47,13 @@ impl GraphStore {
         })
     }
 
-    /// One-time `REL_TYPE_COUNTS` rebuild for a file written by a build
-    /// that predates the table: counts empty while `EDGES` isn't can only
-    /// mean the maintaining writes never ran, so scan every edge header
-    /// once (no property decode) and commit the tallies. A fresh or
-    /// up-to-date file exits on the first check without writing anything.
-    /// A file this build writes and an *older* build later mutates would
-    /// go stale with no way to detect it here -- tolerable by
-    /// construction, since the table is a planner statistic that can cost
-    /// a suboptimal plan but never a wrong result (see its definition).
+    /// One-time `REL_TYPE_COUNTS` rebuild for a file written before the
+    /// table existed: counts empty while `EDGES` isn't can only mean the
+    /// maintaining writes never ran, so scan every edge header once (no
+    /// property decode) and commit the tallies. A fresh or up-to-date
+    /// file exits on the first check without writing anything. The table
+    /// is a planner statistic only -- staleness can cost a suboptimal
+    /// plan but never a wrong result.
     fn backfill_rel_type_counts(&self) -> Result<(), GraphError> {
         let write_txn = self.begin_write()?;
         let up_to_date = {
@@ -287,27 +285,16 @@ impl GraphStore {
     /// Open a write transaction spanning multiple graph operations. Callers
     /// (e.g. the query executor) drive an entire Cypher statement through
     /// the `*_in_txn` methods below using this one transaction, then call
-    /// `write_txn.commit()` themselves — this is the crash-safety boundary
-    /// from the plan: one statement = one transaction, not one transaction
-    /// per individual node/edge write.
-    ///
-    /// v1 uses a write transaction even for pure-read statements (rather
-    /// than a separate read-only path) to keep one code path and guarantee
-    /// every statement — reads included — sees one consistent snapshot.
-    /// Trade-off: this serializes concurrent readers behind redb's
-    /// single-writer lock instead of allowing true concurrent reads; a
-    /// read-only transaction path is the natural follow-up if read
-    /// concurrency becomes a bottleneck.
+    /// `write_txn.commit()` themselves — the crash-safety boundary is one
+    /// statement per transaction, not one transaction per node/edge write.
     pub fn begin_write(&self) -> Result<WriteTransaction, GraphError> {
         Ok(self.storage.begin_write()?)
     }
 
-    /// Open a read transaction for a statement that never mutates
-    /// anything (`MATCH ... RETURN`) — a consistent point-in-time
-    /// snapshot that runs alongside any concurrent readers or a
-    /// concurrent writer without contending for redb's single-writer
-    /// lock. No commit/abort: a read transaction has nothing to roll
-    /// back, it just releases on drop.
+    /// Open a read transaction for a statement that never mutates anything
+    /// (`MATCH ... RETURN`) — a consistent snapshot that runs alongside
+    /// concurrent readers or a writer without contending for redb's
+    /// single-writer lock. No commit/abort: it releases on drop.
     pub fn begin_read(&self) -> Result<ReadTransaction, GraphError> {
         Ok(self.storage.begin_read()?)
     }
@@ -403,22 +390,21 @@ impl GraphStore {
 
     /// The id interned for a property name, if any -- `None` means the
     /// name has never been written anywhere, so no record can hold it.
-    /// Exposed for the query layer's per-property read path: names resolve
-    /// to ids once per statement there, then every row access goes through
-    /// `get_node_prop_in_txn`/`get_edge_prop_in_txn` by id.
+    /// The query layer resolves names to ids once per statement, then
+    /// every row access goes through `get_node_prop_in_txn`/
+    /// `get_edge_prop_in_txn` by id.
     pub fn lookup_prop_id_in_txn(txn: Txn, prop: &str) -> Result<Option<u32>, GraphError> {
         crate::props::lookup_prop_id(txn, prop)
     }
 
     /// One property of one node, by interned prop id, without decoding the
     /// rest of the record or resolving any names — a directory binary
-    /// search plus one value decode (the v2 read fast path; the codec
-    /// mechanism measured 79x over whole-record decode at 1-of-20 props).
+    /// search plus one value decode.
     ///
-    /// Nested `Option` distinguishes the two kinds of missing the executor
-    /// must not collapse (`lookup_prop`'s own docs): outer `None` = the
-    /// node record doesn't exist (deleted-entity error at the call site),
-    /// inner `None` = node exists, property absent (legal null).
+    /// Nested `Option` distinguishes two kinds of missing the executor
+    /// must not collapse: outer `None` = the node record doesn't exist
+    /// (deleted-entity error at the call site), inner `None` = node
+    /// exists, property absent (legal null).
     pub fn get_node_prop_in_txn(
         txn: Txn,
         id: NodeId,
@@ -453,9 +439,9 @@ impl GraphStore {
 
     /// Per-property reader over ONE pre-opened `NODES` handle -- for a
     /// caller probing many nodes' properties in a loop, where
-    /// `get_node_prop_in_txn`'s per-call table open would dominate (the
-    /// mars-3va lesson: opens measured 23.67% of a bulk load). Same
-    /// nested-`Option` contract as `get_node_prop_in_txn`.
+    /// `get_node_prop_in_txn`'s per-call table open would dominate (table
+    /// opens are a measured hot cost on bulk loads). Same nested-`Option`
+    /// contract as `get_node_prop_in_txn`.
     #[allow(clippy::type_complexity)] // the nested Option IS the contract (see get_node_prop_in_txn)
     pub fn node_prop_reader(
         txn: Txn<'_>,
@@ -548,12 +534,10 @@ impl GraphStore {
         Ok(EdgeId(id))
     }
 
-    /// Adjust `REL_TYPE_COUNTS` for one edge born (`+1`) or dying (`-1`)
-    /// -- called from the only two such places, `create_edge_ctx` and
-    /// `delete_edge_ctx`. Saturating on the way down: a file written by
-    /// a build that predates the table (or the backfill racing nothing
-    /// -- see `backfill_rel_type_counts`) must degrade to a wrong
-    /// *estimate*, never an underflow panic.
+    /// Adjust `REL_TYPE_COUNTS` for one edge born (`+1`) or dying (`-1`).
+    /// Saturating on the way down: a file predating the table (see
+    /// `backfill_rel_type_counts`) must degrade to a wrong *estimate*,
+    /// never an underflow panic.
     fn bump_rel_type_count(
         ctx: &mut WriteCtx,
         label_id: u32,
@@ -657,16 +641,10 @@ impl GraphStore {
         Ok(Self::delete_edge_ctx(&mut ctx, id)?.is_some())
     }
 
-    /// Batch form of `delete_edge_in_txn`: one `WriteCtx` across every
-    /// id instead of a fresh one (and its table opens) per edge, and the
-    /// deleted edges' label names resolved here — once per distinct
-    /// label id, while the ctx is already open — instead of a separate
-    /// whole-edge fetch per id on the caller's side. Measured ~neutral
-    /// on wall time vs the per-edge path (a scattered bulk delete's cost
-    /// lives in the executor's match phase, not here — sorting the ids
-    /// into per-table passes was tried too and moved nothing), so this
-    /// exists for the API shape: one call for a `DELETE r` statement's
-    /// whole edge set, doing strictly less redundant work. Returns
+    /// Batch form of `delete_edge_in_txn`: one `WriteCtx` across every id
+    /// instead of a fresh one (and its table opens) per edge, and label
+    /// names resolved once per distinct label id instead of once per edge.
+    /// One call for a `DELETE r` statement's whole edge set. Returns
     /// `(id, label name)` for each edge that actually existed — an id
     /// already gone (a duplicate in `ids`, or deleted by an earlier
     /// statement) is silently skipped, same contract as the single-edge
@@ -706,8 +684,7 @@ impl GraphStore {
     /// Internal, `WriteCtx`-based logic -- `delete_node_in_txn` calls this
     /// directly (not the public `delete_edge_in_txn` wrapper) for each of a
     /// deleted node's incident edges, since it already has its own `ctx`
-    /// open for the same transaction; opening a second `WriteCtx` on top of
-    /// it would try to open every table twice and hit redb's
+    /// open for the same transaction; a second `WriteCtx` would hit redb's
     /// `TableAlreadyOpen`. Returns the deleted edge's label id, `None` if
     /// the edge didn't exist.
     fn delete_edge_ctx(ctx: &mut WriteCtx, id: EdgeId) -> Result<Option<u32>, GraphError> {
@@ -843,14 +820,12 @@ impl GraphStore {
         crate::index::lookup_exact(txn, label, prop, value, None)
     }
 
-    /// Same as `lookup_by_index_in_txn`, but stops once `limit` nodes are
-    /// found — the storage-level end of `LIMIT` push-down through an
-    /// `IndexSeek` (see `marsdb_query::planner`/`executor::stream_index_seek`).
     /// Range counterpart of `lookup_by_index_in_txn` — every node whose
     /// indexed value falls within the bounds (`(value, inclusive)` per
-    /// side, either side open). Returns a SUPERSET for numeric bounds
-    /// (int/float regions both scanned, lossy conversions widened
-    /// outward) — callers must re-check the original predicate; see
+    /// side, either side open), optionally stopping once `limit` nodes
+    /// are found. Returns a SUPERSET for numeric bounds (int/float
+    /// regions both scanned, lossy conversions widened outward) —
+    /// callers must re-check the original predicate; see
     /// `index::lookup_range`.
     pub fn lookup_by_index_range_in_txn(
         txn: Txn,
@@ -886,10 +861,9 @@ impl GraphStore {
     }
 
     /// Cheap, exact count of nodes under `(label, prop) = value` — for the
-    /// query planner to compare selectivity between several indexed
-    /// equality candidates, not for fetching the nodes themselves (see
-    /// `lookup_by_index_in_txn`). O(1), same contract as `lookup_by_index`
-    /// re: "no index" vs "index, no match" both reading as `0`.
+    /// query planner to compare selectivity between indexed equality
+    /// candidates, not for fetching the nodes (see `lookup_by_index_in_txn`).
+    /// O(1). "No index" and "index, no match" both read as `0`.
     pub fn index_match_count_in_txn(
         txn: Txn,
         label: &str,
@@ -1104,10 +1078,9 @@ impl GraphStore {
     /// `(label, node count)` sorted by label — the substance behind
     /// `CALL db.labels()`. Node labels and relationship types share one
     /// intern namespace (`intern_label` serves both), so membership here
-    /// is decided by live *use* (a nonzero label-index count), not by
+    /// is decided by live *use* (a nonzero label-index count), not
     /// interning: a name whose nodes were all deleted drops out, same as
-    /// a name only ever used as a relationship type never appears.
-    /// O(interned names), each with an O(1) count read.
+    /// a name only ever used as a relationship type.
     pub fn list_node_labels_in_txn(txn: Txn) -> Result<Vec<(String, u64)>, GraphError> {
         let l2i = txn.open_table(marsdb_storage::tables::LABEL_TO_ID)?;
         let index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
@@ -1206,11 +1179,10 @@ impl GraphStore {
         }
     }
 
-    /// Resumable chunked sweep over the whole `EDGES` table in id
-    /// order — the sequential-scan primitive behind the planner's
-    /// `EdgeTypeScan`. Same demand-driven shape as `IndexRangeCursor`:
-    /// each `next_chunk` re-seeks past the last returned id (O(log n))
-    /// and copies at most `chunk_size` raw records out, so a `LIMIT`ed
+    /// Resumable chunked sweep over the whole `EDGES` table in id order —
+    /// the sequential-scan primitive behind the planner's `EdgeTypeScan`.
+    /// Each `next_chunk` re-seeks past the last returned id (O(log n))
+    /// and copies at most `chunk_size` raw records, so a `LIMIT`ed
     /// consumer that stops early never pays for the rest of the table.
     pub fn edge_scan_cursor() -> EdgeScanCursor {
         EdgeScanCursor { resume_after: None }
@@ -1225,8 +1197,7 @@ impl GraphStore {
     }
 
     /// Number of live edges of relationship type `rel_type` — O(1) via
-    /// `REL_TYPE_COUNTS` (see its definition in `tables.rs` for the
-    /// maintenance/backfill story). An unknown type reads as 0, same as
+    /// `REL_TYPE_COUNTS`. An unknown type reads as 0, same as
     /// `label_count_in_txn`. Planner cardinality use only.
     pub fn rel_type_count_in_txn(txn: Txn, rel_type: &str) -> Result<u64, GraphError> {
         let Some(label_id) = lookup_label_id(txn, rel_type)? else {
@@ -1237,8 +1208,7 @@ impl GraphStore {
         Ok(count)
     }
 
-    /// Full scan of all nodes, optionally filtered by label. v1 has no
-    /// secondary index on label, so this is a linear scan of the table.
+    /// All nodes, optionally filtered by label via `NODE_LABEL_INDEX`.
     pub fn all_nodes(&self, label_filter: Option<&str>) -> Result<Vec<Node>, GraphError> {
         let read_txn = self.begin_read()?;
         Self::all_nodes_in_txn(Txn::Read(&read_txn), label_filter)
@@ -1291,11 +1261,9 @@ impl GraphStore {
     }
 
     /// Same as `all_nodes_in_txn`, but stops once `limit` nodes are found --
-    /// the storage-level end of `LIMIT` push-down (see the executor's
-    /// `scan()`/`eval_plan` docs for the query-level half): a query whose
-    /// entire plan is a bare scan feeding straight into a `LIMIT` doesn't
-    /// need to touch rows past the first `limit`, whether or not a label
-    /// filter narrows it first.
+    /// the storage-level end of `LIMIT` push-down: a query whose entire
+    /// plan is a bare scan feeding straight into a `LIMIT` doesn't need to
+    /// touch rows past the first `limit`, with or without a label filter.
     pub fn all_nodes_limited_in_txn(
         txn: Txn,
         label_filter: Option<&str>,
@@ -1310,8 +1278,8 @@ impl GraphStore {
             let mut result = Vec::new();
             let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
             // Resolver hoisted out of the loop: one ID_TO_PROP open for the
-            // whole scan, not one per record (table opens were themselves a
-            // measured hot cost -- mars-3va).
+            // whole scan, not one per record (table opens are a measured
+            // hot cost).
             let mut resolve = prop_resolver(txn)?;
             for item in nodes.iter()? {
                 if result.len() >= limit {
@@ -1339,10 +1307,9 @@ impl GraphStore {
             let label_index = txn.open_multimap_table(marsdb_storage::tables::NODE_LABEL_INDEX)?;
             // `.take(limit)` here, not a `.truncate()` after collecting --
             // stops walking the multimap's own entries past `limit`, not
-            // just the (more expensive) per-id NODES point-reads below.
-            // Measured difference: without this, a labeled LIMIT query's
-            // cost still scaled with the *matching* row count, not `limit`
-            // (see BENCHMARKS.md's `execute_scan_limit_pushdown` numbers).
+            // just the per-id NODES point-reads below. Without this, a
+            // labeled LIMIT query's cost still scales with the matching
+            // row count, not `limit`.
             let ids: Vec<u64> = label_index
                 .get(label_id)?
                 .take(limit)

@@ -15,32 +15,22 @@ pub const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 /// edge_id -> postcard-encoded EdgeRecord.
 pub const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 
-/// Outgoing adjacency as a composite-key plain table (v2 step 2):
-/// `(src_node_id, label_id, edge_id)` -> dst node_id. redb tuple keys are
-/// FIXED-WIDTH (mars-am7: erasing fixed-width keys to `&[u8]` measured
-/// +34% file size on this exact codebase — a first cut of this change
-/// repeated that mistake with byte-packed keys and doubled the db file;
-/// tuples keep redb's fixed-slot packing) and order component-wise, so
-/// one node's edges cluster together grouped by label: a typed expansion
-/// (`-[:KNOWS]->`) is a `range()` over the `(node, label, *)` prefix,
-/// touching only matching entries (`O(matching degree)`), and an untyped
-/// expansion is the wider `(node, *, *)` prefix. Replaces a
-/// `node_id -> {20-byte AdjEntry}` multimap whose per-node entries were
-/// ordered by edge id, forcing every typed expansion to decode and
-/// label-check the node's entire entry set (`O(total degree)`).
+/// Outgoing adjacency: `(src_node_id, label_id, edge_id)` -> dst node_id.
+/// Tuple keys keep redb's fixed-width slot packing (erasing to `&[u8]`
+/// costs +34% file size) and sort component-wise, so a typed expansion
+/// (`-[:KNOWS]->`) is a `range()` over the `(node, label, *)` prefix —
+/// `O(matching degree)` instead of scanning and label-checking the
+/// node's full entry set.
 pub const ADJ_OUT: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new("adj_out");
 
 /// Incoming mirror of `ADJ_OUT`: `dst ++ label ++ edge` -> src node_id.
 pub const ADJ_IN: TableDefinition<(u64, u32, u64), u64> = TableDefinition::new("adj_in");
 
 /// label_id -> number of live edges of that relationship type. Planner
-/// statistic only (the expand-cost half of start-point reversal — see
-/// `plan_reversed_pattern`), never consulted to answer a query, so a
-/// wrong value can cost a suboptimal plan but never a wrong result.
-/// Maintained by the only two places an edge is born or dies
-/// (`create_edge_ctx`/`delete_edge_ctx`), and rebuilt from a one-time
-/// `EDGES` scan at open for files that predate the table
-/// (`GraphStore::backfill_rel_type_counts`).
+/// statistic only (see `plan_reversed_pattern`), never consulted to
+/// answer a query, so a wrong value can cost a suboptimal plan but never
+/// a wrong result. Maintained in `create_edge_ctx`/`delete_edge_ctx`;
+/// backfilled from a one-time `EDGES` scan for files that predate it.
 pub const REL_TYPE_COUNTS: TableDefinition<u32, u64> = TableDefinition::new("rel_type_counts");
 
 /// label_id -> set of node_ids carrying that label. Secondary index so a
@@ -66,13 +56,10 @@ pub const ID_TO_PROP: TableDefinition<u32, &str> = TableDefinition::new("id_to_p
 pub const INDEX_DEFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("index_defs");
 
 /// `label_id(4 bytes BE) ++ property_id(4 bytes BE) ++ encoded_value` ->
-/// set of node_ids. One shared table for every declared property index
-/// (not one table per index) — keeps schema/table lifecycle management
-/// simple; the label_id+property_id prefix keeps each index's entries
-/// contiguous under redb's own key ordering, which is what a future range
-/// scan (`WHERE n.prop > x`) would need anyway. `encoded_value` uses an
-/// order-preserving byte encoding (see `marsdb-graph::index_key`) so
-/// lexicographic byte comparison matches the real value ordering within one
-/// type — cross-type ordering isn't meaningful and isn't relied on.
+/// set of node_ids. One shared table for every declared property index,
+/// keyed so each index's entries stay contiguous under redb's ordering.
+/// `encoded_value` uses an order-preserving byte encoding (see
+/// `marsdb-graph::index_key`) so byte comparison matches value ordering
+/// within one type; cross-type ordering isn't relied on.
 pub const PROPERTY_INDEX: MultimapTableDefinition<&[u8], u64> =
     MultimapTableDefinition::new("property_index");

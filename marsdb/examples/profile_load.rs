@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `UNWIND $rows AS row CREATE ...` for a given node/edge type is
     // byte-identical, only $rows differs) -- parse each unique text once,
     // substitute into a clone of the pristine AST per use, instead of
-    // re-parsing text on every iteration (mars-afi).
+    // re-parsing text on every iteration.
     let mut template_cache: HashMap<&str, marsdb_query::Statement> = HashMap::new();
     for group in rewritten.chunks(group_size) {
         let write_txn = store.begin_write()?;
