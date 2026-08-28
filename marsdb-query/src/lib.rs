@@ -13,6 +13,7 @@ mod planner;
 mod procedure;
 mod result;
 mod semantic;
+mod slots;
 pub mod temporal;
 mod value;
 

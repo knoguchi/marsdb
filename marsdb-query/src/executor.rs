@@ -28,6 +28,7 @@ use crate::planner::{
 };
 use crate::procedure::{ProcedureProvider, ProcedureSignature};
 use crate::result::{QueryResult, QueryStats};
+use crate::slots::{try_compile_slotted, SlotExpr, SlotTable, SlottedPlan};
 use crate::temporal;
 use crate::value::{PathElem, Value};
 
@@ -531,6 +532,43 @@ type BindingRow = HashMap<String, Binding>;
 type FastCountResult = (Vec<BindingRow>, HashSet<String>);
 type RowStream<'a> = Box<dyn Iterator<Item = Result<BindingRow, QueryError>> + 'a>;
 
+/// A `BindingRow` with names resolved to fixed positions — see
+/// `slots::try_compile_slotted`. A `SlotTable` covers both the incoming
+/// seed row's own ("passenger") keys and every variable the plan itself
+/// will bind as it runs — the same split `HashMap::insert` expresses
+/// implicitly today (a fresh key appearing partway through a scan/expand
+/// chain). A `SlotRow` converted from a seed row is therefore always
+/// fully sized to `table.len()`, but a slot the plan hasn't reached yet
+/// holds a `Binding::Value(PropertyValue::Null)` placeholder until the
+/// node that owns it overwrites it by index — never read before that
+/// happens, by the same well-formedness the `HashMap` version already
+/// relies on (a variable is never referenced before the plan node that
+/// binds it).
+type SlotRow = Vec<Binding>;
+type SlotRowStream<'a> = Box<dyn Iterator<Item = Result<SlotRow, QueryError>> + 'a>;
+
+/// Boundary conversion into the slotted engine — see `stream_plan_auto`.
+/// A name not yet present in `row` is a slot the plan will bind later,
+/// not seeded passenger state — see `SlotRow`'s docs.
+fn binding_row_to_slots(row: &BindingRow, table: &SlotTable) -> SlotRow {
+    table
+        .names()
+        .iter()
+        .map(|name| {
+            row.get(name)
+                .cloned()
+                .unwrap_or(Binding::Value(PropertyValue::Null))
+        })
+        .collect()
+}
+
+/// Boundary conversion back out of the slotted engine — see
+/// `stream_plan_auto`.
+fn slots_to_binding_row(row: SlotRow, table: &SlotTable) -> BindingRow {
+    debug_assert_eq!(row.len(), table.len());
+    table.names().iter().cloned().zip(row).collect()
+}
+
 /// Borrowed field bundle for `stream_edge_type_scan` (clippy's
 /// too-many-arguments, structured).
 struct EdgeTypeScanSpec<'s> {
@@ -928,7 +966,7 @@ impl<'a> Executor<'a> {
 
         let seed = [BindingRow::new()];
         let stream_cap = limit_n.map(|l| skip_n + l);
-        let stream = self.stream_plan(txn, &plan, &seed, &guard, stream_cap);
+        let stream = self.stream_plan_auto(txn, &plan, &seed, &guard, stream_cap);
         let mut skipped = 0usize;
         let mut emitted = 0usize;
         for row in stream {
@@ -3535,7 +3573,7 @@ impl<'a> Executor<'a> {
         guard: &ExecutionGuard<'_>,
         limit: Option<usize>,
     ) -> Result<Vec<BindingRow>, QueryError> {
-        let stream = self.stream_plan(txn, plan, seed, guard, limit);
+        let stream = self.stream_plan_auto(txn, plan, seed, guard, limit);
         match limit {
             Some(limit) => stream.take(limit).collect(),
             None => stream.collect(),
@@ -3565,7 +3603,7 @@ impl<'a> Executor<'a> {
         }
         let mut kept = Vec::new();
         let mut seen: HashSet<Vec<HashKey>> = HashSet::new();
-        for res in self.stream_plan(txn, plan, seed, guard, None) {
+        for res in self.stream_plan_auto(txn, plan, seed, guard, None) {
             let row = res?;
             let mut key = Vec::with_capacity(items.len());
             for item in items {
@@ -3806,7 +3844,18 @@ impl<'a> Executor<'a> {
     /// again. The operator closures in `stream_plan` rely on this instead
     /// of each tracking its own post-error `done` flag: after they emit an
     /// `Err`, this wrapper guarantees they're not resumed.
-    fn count_stream<'s>(mut stream: RowStream<'s>, guard: &'s ExecutionGuard<'_>) -> RowStream<'s> {
+    fn count_stream<'s>(stream: RowStream<'s>, guard: &'s ExecutionGuard<'_>) -> RowStream<'s> {
+        Self::count_stream_generic(stream, guard)
+    }
+
+    /// `count_stream`'s row-shape-agnostic core — the counting/overflow/
+    /// fuse-after-error logic never touches `BindingRow`'s shape, so this
+    /// is shared verbatim by both the `BindingRow`-typed `count_stream`
+    /// and the `SlotRow`-typed `count_stream_slotted`.
+    fn count_stream_generic<'s, T: 's>(
+        mut stream: Box<dyn Iterator<Item = Result<T, QueryError>> + 's>,
+        guard: &'s ExecutionGuard<'_>,
+    ) -> Box<dyn Iterator<Item = Result<T, QueryError>> + 's> {
         let mut produced = 0usize;
         let mut done = false;
         Box::new(std::iter::from_fn(move || {
@@ -3833,6 +3882,571 @@ impl<'a> Executor<'a> {
             }
             Some(item)
         }))
+    }
+
+    fn count_stream_slotted<'s>(
+        stream: SlotRowStream<'s>,
+        guard: &'s ExecutionGuard<'_>,
+    ) -> SlotRowStream<'s> {
+        Self::count_stream_generic(stream, guard)
+    }
+
+    /// Tries the slot-indexed fast path (`slots::try_compile_slotted`)
+    /// for `plan`, falling back to the unmodified `stream_plan` whenever
+    /// the plan shape doesn't qualify (`VarExpand`/`MatchRelList`
+    /// anywhere, a row-dependent `IndexSeek`, or a predicate built from
+    /// anything beyond the nine simple/combinator `Expr` leaves). Used at
+    /// every external `stream_plan` call site; `stream_plan`'s own
+    /// recursive calls on a sub-node's `input` are untouched — when a
+    /// top-level plan is eligible, `stream_plan_slotted` recurses into
+    /// itself, never back into this dispatcher or the legacy path.
+    fn stream_plan_auto<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        plan: &'s LogicalPlan,
+        seed: &'s [BindingRow],
+        guard: &'s ExecutionGuard<'_>,
+        scan_limit: Option<usize>,
+    ) -> RowStream<'s> {
+        let seed_keys: Vec<&str> = match seed.first() {
+            Some(row) => row.keys().map(String::as_str).collect(),
+            None => Vec::new(),
+        };
+        match try_compile_slotted(plan, seed_keys.into_iter()) {
+            None => self.stream_plan(txn, plan, seed, guard, scan_limit),
+            Some((slotted, table)) => {
+                let table = Rc::new(table);
+                let slot_seed: Vec<SlotRow> = seed
+                    .iter()
+                    .map(|row| binding_row_to_slots(row, &table))
+                    .collect();
+                let table_for_map = Rc::clone(&table);
+                let inner = self.stream_plan_slotted(
+                    txn,
+                    Rc::new(slotted),
+                    table,
+                    slot_seed,
+                    guard,
+                    scan_limit,
+                );
+                Box::new(
+                    inner.map(move |res| res.map(|row| slots_to_binding_row(row, &table_for_map))),
+                )
+            }
+        }
+    }
+
+    /// `stream_plan`'s slot-indexed counterpart — mirrors its match arms
+    /// 1:1 for the subset of `LogicalPlan` shapes `SlottedPlan` can
+    /// represent. `plan`/`table` are `Rc`-shared (not deep-cloned) across
+    /// this function's own recursive calls; `seed` is owned outright and
+    /// moved down the single input chain (this IR has no join node, so
+    /// exactly one leaf ever consumes it).
+    fn stream_plan_slotted<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        plan: Rc<SlottedPlan>,
+        table: Rc<SlotTable>,
+        seed: Vec<SlotRow>,
+        guard: &'s ExecutionGuard<'_>,
+        scan_limit: Option<usize>,
+    ) -> SlotRowStream<'s> {
+        match &*plan {
+            SlottedPlan::Seed { slot } => {
+                debug_assert!(
+                    seed.first().is_none_or(|row| *slot < row.len()),
+                    "Seed{{slot: {slot}}} planned for a slot not present in the carried-forward rows"
+                );
+                Self::count_stream_slotted(Box::new(seed.into_iter().map(Ok)), guard)
+            }
+            SlottedPlan::AllNodesScan { slot } => {
+                self.stream_scan_slotted(txn, *slot, None, seed, guard, scan_limit)
+            }
+            SlottedPlan::NodeByLabelScan { slot, label } => {
+                self.stream_scan_slotted(txn, *slot, Some(label.clone()), seed, guard, scan_limit)
+            }
+            SlottedPlan::IndexSeek {
+                slot,
+                label,
+                prop,
+                value,
+            } => self.stream_index_seek_slotted(
+                txn,
+                *slot,
+                label.clone(),
+                prop.clone(),
+                value.clone(),
+                seed,
+                guard,
+                scan_limit,
+            ),
+            SlottedPlan::IndexRangeSeek {
+                slot,
+                label,
+                prop,
+                lo,
+                hi,
+            } => self.stream_index_range_seek_slotted(
+                txn,
+                *slot,
+                label.clone(),
+                prop.clone(),
+                lo.clone(),
+                hi.clone(),
+                seed,
+                guard,
+            ),
+            SlottedPlan::EdgeTypeScan {
+                src_slot,
+                rel_slot,
+                dst_slot,
+                rel_types,
+                src_label,
+                dst_label,
+                rel_predicate,
+            } => self.stream_edge_type_scan_slotted(
+                txn,
+                *src_slot,
+                *rel_slot,
+                *dst_slot,
+                rel_types.clone(),
+                src_label.clone(),
+                dst_label.clone(),
+                rel_predicate.clone(),
+                seed,
+                guard,
+            ),
+            SlottedPlan::Expand {
+                input,
+                from_slot,
+                to_slot,
+                rel_slot,
+                rel_labels,
+                direction,
+            } => {
+                let from_slot = *from_slot;
+                let to_slot = *to_slot;
+                let rel_slot = *rel_slot;
+                let rel_labels = rel_labels.clone();
+                let direction = *direction;
+                let table_for_err = Rc::clone(&table);
+                let input_stream = self.stream_plan_slotted(
+                    txn,
+                    Rc::clone(input),
+                    Rc::clone(&table),
+                    seed,
+                    guard,
+                    None,
+                );
+                let stream = input_stream.flat_map(move |res| -> SlotRowStream<'s> {
+                    let row = match res {
+                        Ok(row) => row,
+                        Err(error) => return Box::new(std::iter::once(Err(error))),
+                    };
+                    let from_id = match &row[from_slot] {
+                        Binding::Node(id) => *id,
+                        Binding::Value(PropertyValue::Null) => return Box::new(std::iter::empty()),
+                        _ => {
+                            return Box::new(std::iter::once(Err(QueryError::UnboundVariable(
+                                table_for_err.name_of(from_slot).to_string(),
+                            ))))
+                        }
+                    };
+                    match neighbors_for_direction(txn, from_id, direction, &rel_labels) {
+                        Ok(entries) => Box::new(entries.into_iter().map(move |entry| {
+                            guard.relationship_expansion()?;
+                            let mut new_row = row.clone();
+                            new_row[to_slot] = Binding::Node(entry.other);
+                            if let Some(rel_slot) = rel_slot {
+                                new_row[rel_slot] = Binding::Edge(entry.edge_id);
+                            }
+                            Ok(new_row)
+                        })),
+                        Err(error) => Box::new(std::iter::once(Err(error))),
+                    }
+                });
+                Self::count_stream_slotted(Box::new(stream), guard)
+            }
+            SlottedPlan::Filter { input, predicate } => {
+                let predicate = predicate.clone();
+                let table_for_pred = Rc::clone(&table);
+                let input_stream = self.stream_plan_slotted(
+                    txn,
+                    Rc::clone(input),
+                    Rc::clone(&table),
+                    seed,
+                    guard,
+                    None,
+                );
+                let stream = input_stream.filter_map(move |res| {
+                    let row = match res {
+                        Ok(row) => row,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    if let Err(error) = guard.checkpoint() {
+                        return Some(Err(error));
+                    }
+                    match self.eval_slot_expr(txn, &predicate, &row, &table_for_pred) {
+                        Ok(Some(true)) => Some(Ok(row)),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                });
+                Self::count_stream_slotted(Box::new(stream), guard)
+            }
+        }
+    }
+
+    fn stream_scan_slotted<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        slot: usize,
+        label: Option<String>,
+        seed: Vec<SlotRow>,
+        guard: &'s ExecutionGuard<'_>,
+        row_limit: Option<usize>,
+    ) -> SlotRowStream<'s> {
+        let mut initialized = false;
+        let mut node_ids = Vec::new();
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            if !initialized {
+                initialized = true;
+                let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+                    max_rows
+                        .checked_div(seed.len())
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                });
+                let storage_limit = match (row_limit, budget_node_limit) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let storage_limit = storage_limit.unwrap_or(usize::MAX);
+                match GraphStore::all_node_ids_limited_in_txn(txn, label.as_deref(), storage_limit)
+                {
+                    Ok(ids) => node_ids = ids,
+                    Err(error) => {
+                        done = true;
+                        return Some(Err(error.into()));
+                    }
+                }
+            }
+            if node_ids.is_empty() || seed_index >= seed.len() {
+                return None;
+            }
+            if let Err(error) = guard.checkpoint() {
+                done = true;
+                return Some(Err(error));
+            }
+            let mut row = seed[seed_index].clone();
+            row[slot] = Binding::Node(node_ids[node_index]);
+            node_index += 1;
+            if node_index == node_ids.len() {
+                node_index = 0;
+                seed_index += 1;
+            }
+            Some(Ok(row))
+        });
+        Self::count_stream_slotted(Box::new(stream), guard)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_index_range_seek_slotted<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        slot: usize,
+        label: String,
+        prop: String,
+        lo: Option<(PropertyValue, bool)>,
+        hi: Option<(PropertyValue, bool)>,
+        seed: Vec<SlotRow>,
+        guard: &'s ExecutionGuard<'_>,
+    ) -> SlotRowStream<'s> {
+        const CHUNK: usize = 512;
+        let mut cursor: Option<Option<marsdb_graph::IndexRangeCursor>> = None;
+        let mut ids: Vec<NodeId> = Vec::new();
+        let mut exhausted = false;
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            loop {
+                if !exhausted && node_index >= ids.len() && seed_index == 0 {
+                    let cur = match &mut cursor {
+                        Some(c) => c,
+                        None => {
+                            let created = GraphStore::index_range_cursor_in_txn(
+                                txn,
+                                &label,
+                                &prop,
+                                lo.as_ref().map(|(v, incl)| (v, *incl)),
+                                hi.as_ref().map(|(v, incl)| (v, *incl)),
+                            );
+                            match created {
+                                Ok(c) => cursor.insert(c),
+                                Err(error) => {
+                                    done = true;
+                                    return Some(Err(error.into()));
+                                }
+                            }
+                        }
+                    };
+                    match cur {
+                        None => exhausted = true,
+                        Some(c) => match c.next_chunk(txn, CHUNK) {
+                            Ok(chunk) => {
+                                if chunk.len() < CHUNK {
+                                    exhausted = true;
+                                }
+                                ids.extend(chunk);
+                            }
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error.into()));
+                            }
+                        },
+                    }
+                }
+                if node_index >= ids.len() {
+                    if exhausted {
+                        seed_index += 1;
+                        node_index = 0;
+                        if seed_index >= seed.len() || ids.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if let Err(error) = guard.checkpoint() {
+                    done = true;
+                    return Some(Err(error));
+                }
+                let mut row = seed[seed_index].clone();
+                row[slot] = Binding::Node(ids[node_index]);
+                node_index += 1;
+                return Some(Ok(row));
+            }
+        });
+        Self::count_stream_slotted(Box::new(stream), guard)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_index_seek_slotted<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        slot: usize,
+        label: String,
+        prop: String,
+        value: PropertyValue,
+        seed: Vec<SlotRow>,
+        guard: &'s ExecutionGuard<'_>,
+        row_limit: Option<usize>,
+    ) -> SlotRowStream<'s> {
+        let budget_node_limit = guard.options.max_intermediate_rows.map(|max_rows| {
+            max_rows
+                .checked_div(seed.len().max(1))
+                .unwrap_or(0)
+                .saturating_add(1)
+        });
+        let storage_limit = match (row_limit, budget_node_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let mut node_ids: Option<Vec<NodeId>> = None;
+        let mut seed_index = 0usize;
+        let mut node_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            let ids = match &node_ids {
+                Some(ids) => ids,
+                None => {
+                    let looked = match storage_limit {
+                        Some(limit) => GraphStore::lookup_by_index_limited_in_txn(
+                            txn, &label, &prop, &value, limit,
+                        )
+                        .map_err(Into::into),
+                        None => GraphStore::lookup_by_index_in_txn(txn, &label, &prop, &value)
+                            .map_err(Into::into),
+                    };
+                    match looked {
+                        Ok(ids) => node_ids.insert(ids),
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    }
+                }
+            };
+            if ids.is_empty() || seed_index >= seed.len() {
+                return None;
+            }
+            if let Err(error) = guard.checkpoint() {
+                done = true;
+                return Some(Err(error));
+            }
+            let mut row = seed[seed_index].clone();
+            row[slot] = Binding::Node(ids[node_index]);
+            node_index += 1;
+            if node_index == ids.len() {
+                node_index = 0;
+                seed_index += 1;
+            }
+            Some(Ok(row))
+        });
+        Self::count_stream_slotted(Box::new(stream), guard)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_edge_type_scan_slotted<'s>(
+        &'s self,
+        txn: Txn<'s>,
+        src_slot: usize,
+        rel_slot: usize,
+        dst_slot: usize,
+        rel_types: Vec<String>,
+        src_label: Option<String>,
+        dst_label: Option<String>,
+        rel_predicate: Option<Expr>,
+        seed: Vec<SlotRow>,
+        guard: &'s ExecutionGuard<'_>,
+    ) -> SlotRowStream<'s> {
+        const CHUNK: usize = 512;
+        struct ScanPrep {
+            type_ids: Option<Vec<u32>>,
+            prop_ids: HashMap<String, Option<u32>>,
+        }
+        let mut prepared: Option<ScanPrep> = None;
+        let mut cursor = GraphStore::edge_scan_cursor();
+        let mut matched: Vec<(u64, u64, u64)> = Vec::new();
+        let mut exhausted = false;
+        let mut seed_index = 0usize;
+        let mut match_index = 0usize;
+        let mut done = false;
+        let stream = std::iter::from_fn(move || {
+            if done || seed.is_empty() {
+                return None;
+            }
+            loop {
+                if prepared.is_none() {
+                    let type_ids = match resolve_type_ids(txn, &rel_types) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    };
+                    let mut prop_ids = HashMap::new();
+                    if let Some(pred) = &rel_predicate {
+                        if let Err(error) = self.collect_scan_prop_ids(txn, pred, &mut prop_ids) {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                    }
+                    prepared = Some(ScanPrep { type_ids, prop_ids });
+                }
+                let ScanPrep { type_ids, prop_ids } = prepared.as_ref().expect("set above");
+                if type_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
+                    return None;
+                }
+
+                if !exhausted && match_index >= matched.len() && seed_index == 0 {
+                    let chunk = match cursor.next_chunk(txn, CHUNK) {
+                        Ok(c) => c,
+                        Err(error) => {
+                            done = true;
+                            return Some(Err(error.into()));
+                        }
+                    };
+                    if chunk.len() < CHUNK {
+                        exhausted = true;
+                    }
+                    for (id, bytes) in chunk {
+                        if let Err(error) = guard.checkpoint() {
+                            done = true;
+                            return Some(Err(error));
+                        }
+                        let (label_id, src, dst) = match GraphStore::edge_record_header(&bytes) {
+                            Ok(h) => h,
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error.into()));
+                            }
+                        };
+                        if type_ids
+                            .as_ref()
+                            .is_some_and(|ids| !ids.contains(&label_id))
+                        {
+                            continue;
+                        }
+                        if let Some(pred) = &rel_predicate {
+                            match eval_scan_predicate(&bytes, pred, prop_ids) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => {
+                                    done = true;
+                                    return Some(Err(error));
+                                }
+                            }
+                        }
+                        match self.scan_endpoints_pass(
+                            txn,
+                            src,
+                            dst,
+                            src_label.as_deref(),
+                            dst_label.as_deref(),
+                        ) {
+                            Ok(true) => matched.push((id, src, dst)),
+                            Ok(false) => {}
+                            Err(error) => {
+                                done = true;
+                                return Some(Err(error));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if match_index >= matched.len() {
+                    if exhausted {
+                        seed_index += 1;
+                        match_index = 0;
+                        if seed_index >= seed.len() || matched.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if let Err(error) = guard.checkpoint() {
+                    done = true;
+                    return Some(Err(error));
+                }
+                let (edge, src, dst) = matched[match_index];
+                match_index += 1;
+                let mut row = seed[seed_index].clone();
+                row[src_slot] = Binding::Node(NodeId(src));
+                row[rel_slot] = Binding::Edge(EdgeId(edge));
+                row[dst_slot] = Binding::Node(NodeId(dst));
+                return Some(Ok(row));
+            }
+        });
+        Self::count_stream_slotted(Box::new(stream), guard)
     }
 
     /// Fast path for aggregating expansion chains -- one or two `Expand`
@@ -5260,6 +5874,124 @@ impl<'a> Executor<'a> {
                 pa.var
             ))),
         }
+    }
+
+    /// `lookup_prop`'s slot-indexed counterpart — identical logic,
+    /// indexing `row[slot]` (always present) instead of a
+    /// `row.get(&pa.var)` lookup that can miss. `table` is only consulted
+    /// for the `Binding::Path` type-error message's variable name.
+    fn lookup_prop_slot(
+        &self,
+        txn: Txn,
+        slot: usize,
+        prop: &str,
+        row: &SlotRow,
+        table: &SlotTable,
+    ) -> Result<Option<PropertyValue>, QueryError> {
+        match &row[slot] {
+            Binding::Node(id) => {
+                if let Some(cached) = self.node_cache.borrow().get(id) {
+                    return Ok(cached.props.get(prop).cloned());
+                }
+                match self.prop_id_for(txn, prop)? {
+                    Some(prop_id) => Ok(deleted_entity_access(GraphStore::get_node_prop_in_txn(
+                        txn, *id, prop_id,
+                    )?)?),
+                    None => {
+                        deleted_entity_access(
+                            GraphStore::node_exists_in_txn(txn, *id)?.then_some(()),
+                        )?;
+                        Ok(None)
+                    }
+                }
+            }
+            Binding::Edge(id) => match self.prop_id_for(txn, prop)? {
+                Some(prop_id) => Ok(deleted_entity_access(GraphStore::get_edge_prop_in_txn(
+                    txn, *id, prop_id,
+                )?)?),
+                None => {
+                    deleted_entity_access(GraphStore::edge_exists_in_txn(txn, *id)?.then_some(()))?;
+                    Ok(None)
+                }
+            },
+            Binding::Value(_) | Binding::List(_) | Binding::Map(_) => Ok(None),
+            Binding::Path(_) => Err(QueryError::Type(format!(
+                "'{}' is a path — property access requires a node, relationship, or map",
+                table.name_of(slot)
+            ))),
+        }
+    }
+
+    /// `eval_expr`'s slot-indexed counterpart, mirroring its handling of
+    /// the 9 simple/combinator `Expr` variants (`SlotExpr`'s full
+    /// coverage) against `row[slot]` instead of `row.get(var)`. Reuses
+    /// the same comparison helpers (`and3`/`or3`/`compare`/
+    /// `compare_property_pair_opt`) unchanged.
+    fn eval_slot_expr(
+        &self,
+        txn: Txn,
+        e: &SlotExpr,
+        row: &SlotRow,
+        table: &SlotTable,
+    ) -> Result<Option<bool>, QueryError> {
+        Ok(match e {
+            SlotExpr::And(l, r) => and3(
+                self.eval_slot_expr(txn, l, row, table)?,
+                self.eval_slot_expr(txn, r, row, table)?,
+            ),
+            SlotExpr::Or(l, r) => or3(
+                self.eval_slot_expr(txn, l, row, table)?,
+                self.eval_slot_expr(txn, r, row, table)?,
+            ),
+            SlotExpr::Not(e) => self.eval_slot_expr(txn, e, row, table)?.map(|b| !b),
+            SlotExpr::Compare(slot, prop, op, lit) => {
+                let prop_value = self.lookup_prop_slot(txn, *slot, prop, row, table)?;
+                compare(&prop_value, *op, lit)
+            }
+            SlotExpr::PropCompare(left_slot, left_prop, op, right_slot, right_prop) => {
+                let a = self.lookup_prop_slot(txn, *left_slot, left_prop, row, table)?;
+                let b = self.lookup_prop_slot(txn, *right_slot, right_prop, row, table)?;
+                compare_property_pair_opt(&a, *op, &b)
+            }
+            SlotExpr::IsNull(slot, prop) => Some(matches!(
+                self.lookup_prop_slot(txn, *slot, prop, row, table)?,
+                None | Some(PropertyValue::Null)
+            )),
+            SlotExpr::HasLabel(slot, label) => {
+                let Binding::Node(id) = &row[*slot] else {
+                    return Err(QueryError::UnboundVariable(
+                        table.name_of(*slot).to_string(),
+                    ));
+                };
+                let has = match self.label_id_for(txn, label)? {
+                    Some(label_id) => GraphStore::node_has_label_in_txn(txn, *id, label_id)?,
+                    None => false,
+                };
+                Some(has)
+            }
+            SlotExpr::VarEq(a, b) => Some(match (&row[*a], &row[*b]) {
+                (Binding::Node(x), Binding::Node(y)) => x == y,
+                (Binding::Edge(x), Binding::Edge(y)) => x == y,
+                _ => false,
+            }),
+            SlotExpr::EdgeNotInSet(edge_slot, set_slot) => {
+                let Binding::Edge(edge_id) = &row[*edge_slot] else {
+                    return Err(QueryError::UnboundVariable(
+                        table.name_of(*edge_slot).to_string(),
+                    ));
+                };
+                let Binding::Path(segment) = &row[*set_slot] else {
+                    return Err(QueryError::UnboundVariable(
+                        table.name_of(*set_slot).to_string(),
+                    ));
+                };
+                Some(
+                    !segment
+                        .iter()
+                        .any(|elem| matches!(elem, PathBinding::Edge(id) if id == edge_id)),
+                )
+            }
+        })
     }
 
     /// `ReturnExpr::Prop`'s own lookup -- unlike `lookup_prop` (used by
