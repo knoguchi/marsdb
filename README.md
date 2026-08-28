@@ -92,49 +92,9 @@ source in [`marsdb/examples/`](./marsdb/examples). Each also writes an SVG
 chart of its query result (via [plotters](https://github.com/plotters-rs/plotters))
 to the current directory.
 
-**Python**:
-
-```
-pip install marsdb
-```
-
-```python
-import marsdb
-db = marsdb.Database.in_memory()  # or .open(path)
-db.execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
-db.execute("MATCH (n:Person) RETURN n.name")
-# -> [{'n.name': 'Alice'}, {'n.name': 'Bob'}]
-```
-
-Prebuilt wheels cover macOS (arm64, x86_64) and Linux (x86_64, manylinux);
-other platforms install from the source distribution and need a Rust
-toolchain. To build from source directly:
-
-```
-cd marsdb-python
-python3 -m venv .venv && source .venv/bin/activate
-pip install maturin && maturin develop
-```
-
-**Go**:
-
-```
-go get github.com/knoguchi/marsdb-go
-```
-
-Bindings live in their own repository,
-[`marsdb-go`](https://github.com/knoguchi/marsdb-go) (cgo, via a C ABI
-crate, [`marsdb-capi`](./marsdb-capi)), with a companion
-`marsdb-go/arrow` module for zero-copy Arrow results; see that repo's
-README for the two-step build (Rust cdylib, then `go build`) and a full
-example.
-
-```go
-db, _ := marsdb.InMemory() // or marsdb.Open(path)
-db.Execute("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
-rows, _ := db.Execute("MATCH (n:Person) RETURN n.name AS name")
-// rows -> []map[string]any{{"name": "Alice"}, {"name": "Bob"}}
-```
+Python and Go bindings also exist:
+[Python](https://knoguchi.github.io/marsdb/python.html),
+[Go](https://knoguchi.github.io/marsdb/go.html).
 
 ## CLI usage
 
