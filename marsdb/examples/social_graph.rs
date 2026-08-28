@@ -41,9 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Alice's direct friends: {}", names(&direct));
 
     // Variable-length traversal, 1-2 hops out. The per-start-node
-    // visited-set BFS means Dave (reachable two ways) shows up once;
-    // MarsDB has no general RETURN DISTINCT, only inside an aggregate
-    // like count(DISTINCT x).
+    // visited-set BFS means Dave (reachable two ways) shows up once.
     let network =
         db.execute("MATCH (:Person {name: 'Alice'})-[:KNOWS*1..2]->(f:Person) RETURN f.name")?;
     println!("Alice's network within 2 hops: {}", names(&network));

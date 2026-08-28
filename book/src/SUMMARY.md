@@ -2,21 +2,31 @@
 
 [Introduction](./intro.md)
 
-# Getting Started
+# Guide
 
-- [Install & CLI](./cli.md)
+- [Getting Started](./getting-started.md)
+- [The Cypher Guide](./cypher-guide.md)
+
+# Embedding
+
 - [Embedding in Rust](./embedding-rust.md)
-- [C API](./c-api.md)
 - [Python bindings](./python.md)
 - [Go bindings](./go.md)
+- [C API](./c-api.md)
+- [CLI Reference](./cli.md)
 
 # Reference
 
-- [Cypher Language Support](./cypher-support.md)
+- [Cypher Language Reference](./cypher-support.md)
+- [Operations](./operations.md)
+- [Performance](./benchmarks.md)
 - [Architecture](./architecture.md)
-- [Benchmarks](./benchmarks.md)
 
-# Internals
+# Contributing
+
+- [Contributing](./contributing.md)
+
+# Appendix
 
 - [MarsDB Internals](./internals/index.md)
 - [Design Overview](./internals/design-overview.md)
@@ -29,7 +39,3 @@
 - [Results and Language Boundaries](./internals/results-and-boundaries.md)
 - [Testing and Measurement](./internals/testing-and-measurement.md)
 - [Case Studies in Measured Trade-offs](./internals/case-studies.md)
-
-# Contributing
-
-- [Contributing](./contributing.md)

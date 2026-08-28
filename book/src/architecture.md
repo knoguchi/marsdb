@@ -63,5 +63,5 @@ benchmarks](./benchmarks.md#property-indexes).
 
 ## Cypher coverage
 
-See [Cypher Language Support](./cypher-support.md) for the full,
+See the [Cypher Language Reference](./cypher-support.md) for the full,
 TCK-measured breakdown.

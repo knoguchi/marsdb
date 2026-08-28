@@ -49,9 +49,9 @@ correct outcome for most fuzzer-generated input.
 ## openCypher TCK conformance
 
 Changes that touch `marsdb-query` should be checked against the real
-openCypher TCK, not just the crate's own unit/smoke tests — see
-[Cypher Language Support](./cypher-support.md) for what this measures and
-why:
+openCypher TCK, not just the crate's own unit/smoke tests — see the
+[Cypher Language Reference](./cypher-support.md) for what this measures
+and why:
 
 ```
 git submodule update --init marsdb-tck/openCypher
@@ -67,8 +67,8 @@ TCK_FILTER="clauses/create" cargo run -p marsdb-tck --release
 If a change moves the conformance numbers, update the table in
 [`CYPHER_COVERAGE.md`](https://github.com/knoguchi/marsdb/blob/main/CYPHER_COVERAGE.md)
 (exact row numbers + the `TOTAL` row) in the same PR — it's the ground
-truth this book's own [Cypher Language Support](./cypher-support.md)
-page is condensed from.
+truth behind the summary on this book's own
+[Cypher Language Reference](./cypher-support.md) page.
 
 ## License
 
