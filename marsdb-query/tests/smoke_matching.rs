@@ -251,6 +251,55 @@ fn hop_node_first_label_is_actually_filtered() {
 }
 
 #[test]
+fn hop_node_label_filter_short_circuits_a_never_interned_label() {
+    // `Expr::HasLabel` resolves the target label to an interned id
+    // before touching storage; a label that was never interned anywhere
+    // in the database can't be on any node, so this should short-circuit
+    // to `false` without even fetching the node record -- verified here
+    // by correctness (the never-interned label matches nothing), not by
+    // instrumentation.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Root)-[:R]->(b:Post {name: 'post'})");
+
+    let result = run(
+        &store,
+        "MATCH (a:Root)-[:R]->(b:NeverCreated) RETURN b.name",
+    );
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn hop_node_label_filter_sees_a_label_interned_earlier_in_the_same_write_statement() {
+    // `Expr::HasLabel`'s label-id memo mirrors `prop_id_for`'s staleness
+    // gating: a `None` ("never interned") answer must not be cached
+    // during a write statement, because a label created by an earlier
+    // clause in the *same* statement can be checked by a later one.
+    let store = GraphStore::open_memory().unwrap();
+    run(&store, "CREATE (a:Root)-[:R]->(b:Post {name: 'post'})");
+
+    // `:BrandNew` has never been interned anywhere before this
+    // statement runs. Everything below is *one* statement (chained via
+    // `WITH`, not two separate `run()` calls) so the label-id memo
+    // persists across both label checks: the first (`NOT x:BrandNew`,
+    // pre-CREATE) resolves "never interned" -> `None`; the `CREATE`
+    // then interns it; the second (`b:BrandNew`, post-CREATE) must see
+    // the fresh id, not a wrongly-cached stale `None` from the first
+    // check -- which is exactly what the write-statement gating on
+    // `label_id_for`'s memo exists to prevent.
+    let result = run(
+        &store,
+        "MATCH (x:Root) WHERE NOT x:BrandNew \
+         CREATE (x)-[:TAG]->(:BrandNew {name: 'tag'}) \
+         WITH x MATCH (x)-[:TAG]->(b:BrandNew) RETURN b.name",
+    );
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Property(marsdb_graph::PropertyValue::String(s)) => assert_eq!(s, "tag"),
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[test]
 fn variable_length_pattern_walks_reply_chain_to_root() {
     use std::collections::BTreeMap;
 
