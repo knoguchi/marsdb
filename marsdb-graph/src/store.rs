@@ -388,6 +388,23 @@ impl GraphStore {
         }))
     }
 
+    /// Whether `id` currently has `label_id` (already-interned, from
+    /// `label_id_for`) -- `false` for a missing node, same as
+    /// `get_node_in_txn(..).labels.contains(..)` would give. Reads only
+    /// the label-id prefix of the node's record (`node_label_ids`),
+    /// skipping the property directory walk and every property-name
+    /// resolution `get_node_in_txn` pays for even when the properties
+    /// are never used, and needs no label-name resolution either since
+    /// both sides of the comparison are already interned ids.
+    pub fn node_has_label_in_txn(txn: Txn, id: NodeId, label_id: u32) -> Result<bool, GraphError> {
+        let nodes = txn.open_table(marsdb_storage::tables::NODES)?;
+        let found = match nodes.get(id.0)? {
+            Some(guard) => node_label_ids(guard.value())?.contains(&label_id),
+            None => false,
+        };
+        Ok(found)
+    }
+
     /// The id interned for a property name, if any -- `None` means the
     /// name has never been written anywhere, so no record can hold it.
     /// The query layer resolves names to ids once per statement, then

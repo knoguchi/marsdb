@@ -656,6 +656,11 @@ pub struct Executor<'a> {
     /// (`lookup_prop`), cleared at every statement entry point alongside
     /// `node_cache`. See `read_only_stmt` for the `None`-entry gating.
     prop_id_memo: RefCell<HashMap<String, Option<u32>>>,
+    /// Same memoization as `prop_id_memo`, for label names -- backs
+    /// `Expr::HasLabel`'s cheap path (`label_id_for` +
+    /// `GraphStore::node_has_label_in_txn`), which never decodes a
+    /// node's property directory at all.
+    label_id_memo: RefCell<HashMap<String, Option<u32>>>,
     /// Per-statement write counters (`QueryResult::stats`), accumulated
     /// at every mutation site, reset at both statement entry points
     /// (same lifecycle as `node_cache`), and taken into the returned
@@ -671,6 +676,7 @@ impl<'a> Executor<'a> {
             node_cache: RefCell::new(HashMap::new()),
             read_only_stmt: Cell::new(false),
             prop_id_memo: RefCell::new(HashMap::new()),
+            label_id_memo: RefCell::new(HashMap::new()),
             stats: RefCell::new(QueryStats::default()),
         }
     }
@@ -758,6 +764,7 @@ impl<'a> Executor<'a> {
         // for a node a *later* statement mutated.
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
+        self.label_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(is_read_only(stmt));
         *self.stats.borrow_mut() = QueryStats::default();
         if let Statement::Explain(inner) = stmt {
@@ -846,6 +853,7 @@ impl<'a> Executor<'a> {
         let guard = ExecutionGuard::new(options);
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
+        self.label_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(true);
         *self.stats.borrow_mut() = QueryStats::default();
 
@@ -989,6 +997,7 @@ impl<'a> Executor<'a> {
         // `node_cache` is shared by both entry points.
         self.node_cache.borrow_mut().clear();
         self.prop_id_memo.borrow_mut().clear();
+        self.label_id_memo.borrow_mut().clear();
         self.read_only_stmt.set(is_read_only(stmt));
         *self.stats.borrow_mut() = QueryStats::default();
         if let Statement::Explain(inner) = stmt {
@@ -5054,8 +5063,15 @@ impl<'a> Executor<'a> {
                 let Binding::Node(id) = binding else {
                     return Err(QueryError::UnboundVariable(var.clone()));
                 };
-                let node = self.get_node_cached(txn, *id)?;
-                Some(node.is_some_and(|n| n.labels.iter().any(|l| l == label)))
+                // A label id that was never interned can't be on any
+                // node -- skips the storage lookup entirely rather than
+                // fetching a record just to find an empty label set
+                // could never have matched.
+                let has = match self.label_id_for(txn, label)? {
+                    Some(label_id) => GraphStore::node_has_label_in_txn(txn, *id, label_id)?,
+                    None => false,
+                };
+                Some(has)
             }
             Expr::VarEq(a, b) => {
                 let ba = row
@@ -5156,6 +5172,20 @@ impl<'a> Executor<'a> {
         // memoized where nothing can intern: a read-only statement.
         if id.is_some() || self.read_only_stmt.get() {
             self.prop_id_memo.borrow_mut().insert(name.to_string(), id);
+        }
+        Ok(id)
+    }
+
+    /// Label name -> interned id, same memoization and the same
+    /// `None`-entry staleness gating as `prop_id_for` (a label can be
+    /// interned mid-statement too, via `CREATE`/`SET n:Label`).
+    fn label_id_for(&self, txn: Txn, name: &str) -> Result<Option<u32>, QueryError> {
+        if let Some(cached) = self.label_id_memo.borrow().get(name) {
+            return Ok(*cached);
+        }
+        let id = GraphStore::label_id_for(txn, name)?;
+        if id.is_some() || self.read_only_stmt.get() {
+            self.label_id_memo.borrow_mut().insert(name.to_string(), id);
         }
         Ok(id)
     }
@@ -7692,5 +7722,215 @@ fn property_of_value(v: &Value, prop: &str) -> Result<Value, QueryError> {
         Value::Literal(_) => Err(QueryError::Type(
             "property access requires a node, relationship, map, or temporal value".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod row_slots_diagnostic {
+    //! Diagnostic, not a correctness test: isolates whether HashMap
+    //! row-cloning during `Expand` is actually the dominant per-call
+    //! cost in a simple 1-hop query, before committing to the
+    //! row-slots refactor. `cargo test -p marsdb-query row_slots_diagnostic --release -- --ignored --nocapture`.
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use marsdb_graph::{GraphStore, PropertyValue};
+
+    use super::{Binding, BindingRow, Executor};
+    use crate::ExecutionOptions;
+
+    #[test]
+    #[ignore]
+    fn isolate_clone_cost_vs_decode_cost() {
+        let store = GraphStore::open_memory().unwrap();
+        {
+            let idx = crate::antlr_visitor::parse_antlr("CREATE INDEX ON :Person(idx)").unwrap();
+            let write = store.begin_write().unwrap();
+            let crate::ast::Statement::CreateIndex {
+                label,
+                prop,
+                unique,
+            } = idx
+            else {
+                panic!()
+            };
+            GraphStore::create_index_in_txn(&write, &label, &prop, unique).unwrap();
+            write.commit().unwrap();
+        }
+        let n = 10_000usize;
+        {
+            let write = store.begin_write().unwrap();
+            let executor = Executor::new(&store);
+            for i in 0..n {
+                let stmt = crate::antlr_visitor::parse_antlr("CREATE (:Person {idx: $i})").unwrap();
+                let mut params = HashMap::new();
+                params.insert("i".to_string(), PropertyValue::Int(i as i64));
+                let mut stmt = stmt;
+                crate::params::substitute_params(&mut stmt, &params).unwrap();
+                executor
+                    .execute_in_write_transaction_with_options(
+                        &stmt,
+                        &write,
+                        &ExecutionOptions::default(),
+                    )
+                    .unwrap();
+            }
+            drop(executor);
+            GraphStore::commit(write).unwrap();
+        }
+        let mut degree = 0usize;
+        {
+            let write = store.begin_write().unwrap();
+            let executor = Executor::new(&store);
+            let mut rng_state = 42u64;
+            for _ in 0..(n * 5) {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let src = (rng_state >> 33) as usize % n;
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let dst = (rng_state >> 33) as usize % n;
+                if src == dst {
+                    continue;
+                }
+                if src == 1 {
+                    degree += 1;
+                }
+                let stmt = crate::antlr_visitor::parse_antlr(
+                    "MATCH (a:Person {idx: $s}), (b:Person {idx: $d}) CREATE (a)-[:FOLLOWS]->(b)",
+                )
+                .unwrap();
+                let mut params = HashMap::new();
+                params.insert("s".to_string(), PropertyValue::Int(src as i64));
+                params.insert("d".to_string(), PropertyValue::Int(dst as i64));
+                let mut stmt = stmt;
+                crate::params::substitute_params(&mut stmt, &params).unwrap();
+                executor
+                    .execute_in_write_transaction_with_options(
+                        &stmt,
+                        &write,
+                        &ExecutionOptions::default(),
+                    )
+                    .unwrap();
+            }
+            drop(executor);
+            GraphStore::commit(write).unwrap();
+        }
+
+        let iters = 3000u32;
+        let executor = Executor::new(&store);
+
+        // (a) transaction begin/end alone
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let read = store.begin_read().unwrap();
+            std::hint::black_box(&read);
+        }
+        let begin_read_ns = t0.elapsed().as_nanos() as u64 / u64::from(iters);
+
+        // (b) point lookup only, no Expand
+        let point_stmt =
+            crate::antlr_visitor::parse_antlr("MATCH (n1:Person {idx: $start}) RETURN n1.idx")
+                .unwrap();
+        let mut params = HashMap::new();
+        params.insert("start".to_string(), PropertyValue::Int(1));
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut stmt = point_stmt.clone();
+            crate::params::substitute_params(&mut stmt, &params).unwrap();
+            let _ = executor
+                .execute_with_options(&stmt, &ExecutionOptions::default())
+                .unwrap();
+        }
+        let point_ns = t0.elapsed().as_nanos() as u64 / u64::from(iters);
+
+        // (c) point lookup + 1 Expand hop (the query the earlier
+        // phase-breakdown diagnostic measured at ~18.2us total)
+        let hop_stmt = crate::antlr_visitor::parse_antlr(
+            "MATCH (n1:Person {idx: $start})-[:FOLLOWS]->(n2:Person) RETURN n2.idx",
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut stmt = hop_stmt.clone();
+            crate::params::substitute_params(&mut stmt, &params).unwrap();
+            let _ = executor
+                .execute_with_options(&stmt, &ExecutionOptions::default())
+                .unwrap();
+        }
+        let hop_ns = t0.elapsed().as_nanos() as u64 / u64::from(iters);
+
+        // (c2) same hop, but RETURN count(*) instead of n2.idx -- no
+        // property lookup/decode on the target node's property map, no
+        // Value conversion for output; still verifies the :Person label
+        // on n2 and still runs the Expand + row-streaming machinery.
+        let count_stmt = crate::antlr_visitor::parse_antlr(
+            "MATCH (n1:Person {idx: $start})-[:FOLLOWS]->(n2:Person) RETURN count(*)",
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut stmt = count_stmt.clone();
+            crate::params::substitute_params(&mut stmt, &params).unwrap();
+            let _ = executor
+                .execute_with_options(&stmt, &ExecutionOptions::default())
+                .unwrap();
+        }
+        let count_ns = t0.elapsed().as_nanos() as u64 / u64::from(iters);
+
+        // (c3) same hop, no label filter on n2 at all (bare `()`) and
+        // RETURN count(*) -- isolates raw Expand-and-stream cost with
+        // no node decode needed at all (no label to check, nothing to
+        // project).
+        let bare_stmt = crate::antlr_visitor::parse_antlr(
+            "MATCH (n1:Person {idx: $start})-[:FOLLOWS]->() RETURN count(*)",
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let mut stmt = bare_stmt.clone();
+            crate::params::substitute_params(&mut stmt, &params).unwrap();
+            let _ = executor
+                .execute_with_options(&stmt, &ExecutionOptions::default())
+                .unwrap();
+        }
+        let bare_ns = t0.elapsed().as_nanos() as u64 / u64::from(iters);
+
+        // (d) raw BindingRow clone+insert cost in isolation -- no
+        // storage, no decode, just the HashMap operation Expand does
+        // once per neighbor (executor.rs's `let mut new_row = row.clone(); new_row.insert(...)`).
+        let mut row: BindingRow = HashMap::new();
+        row.insert("n1".to_string(), Binding::Node(marsdb_graph::NodeId(1)));
+        let clone_iters = 100_000u32;
+        let t0 = Instant::now();
+        for i in 0..clone_iters {
+            let mut new_row = row.clone();
+            new_row.insert(
+                "n2".to_string(),
+                Binding::Node(marsdb_graph::NodeId(u64::from(i))),
+            );
+            std::hint::black_box(&new_row);
+        }
+        let clone_ns = t0.elapsed().as_nanos() as u64 / u64::from(clone_iters);
+
+        println!("\n=== row-slots diagnostic, {n} nodes, node idx=1 has out-degree {degree} ===");
+        println!("begin_read() alone:                             {begin_read_ns} ns");
+        println!("point lookup (IndexSeek, no hop):                {point_ns} ns");
+        println!("+ Expand hop, no label filter, count(*):         {bare_ns} ns  (hop, no decode at all: {} ns)", bare_ns.saturating_sub(point_ns));
+        println!("+ Expand hop, :Person label filter, count(*):    {count_ns} ns  (label-check decode cost: {} ns)", count_ns.saturating_sub(bare_ns));
+        println!("+ Expand hop, RETURN n2.idx:                     {hop_ns} ns  (RETURN-projection cost beyond label check: {} ns)", hop_ns.saturating_sub(count_ns));
+        println!(
+            "  => incremental cost of the hop:    {} ns for ~{degree} neighbors ({} ns/neighbor)",
+            hop_ns.saturating_sub(point_ns),
+            if degree > 0 {
+                hop_ns.saturating_sub(point_ns) / degree as u64
+            } else {
+                0
+            }
+        );
+        println!("raw BindingRow clone+insert (isolated, no storage/decode): {clone_ns} ns");
+        println!(
+            "  => {} neighbors' worth of pure clone+insert cost: {} ns",
+            degree,
+            clone_ns * degree as u64
+        );
     }
 }
