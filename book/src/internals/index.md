@@ -1,18 +1,15 @@
 # MarsDB Internals
 
-This part of the book is for a different reader than the chapters before
-it. The earlier chapters tell you how to *use* MarsDB; this part tells
-you how it *works* — the on-disk layout, the transaction machinery, the
-path a Cypher statement takes from text to rows, and the reasoning
-behind the design decisions along the way.
+This part of the book is for developers, or anyone curious about
+MarsDB's internals. The earlier chapters tell you how to *use* MarsDB;
+this part tells you how it *works*: the on-disk layout, the transaction
+machinery, the path a Cypher statement takes from text to rows, and the
+reasoning behind the design decisions along the way.
 
-It is written for developers who want to understand or build graph
-databases, using MarsDB as a complete, readable case study. MarsDB is
-small enough to hold in your head — a few crates, one storage engine,
-one query pipeline — while still providing ACID transactions,
+A few crates, one storage engine, one query pipeline: ACID transactions,
 crash safety, secondary indexes, a cost-aware planner, streaming
-execution, and zero-copy results across three language boundaries. Every
-performance figures in these chapters come from this repository's
+execution, and zero-copy results across three language boundaries.
+Every performance figure in these chapters comes from this repository's
 benchmark suite.
 
 ## Chapters
@@ -38,9 +35,3 @@ benchmark suite.
    the crash harness, the benchmark ledger.
 10. [Case Studies in Measured Trade-offs](./case-studies.md) — the
     measurements that made (and unmade) design decisions.
-
-## How to read this part
-
-Each chapter names the source files it describes. The code is the
-authority; the chapters are the map. File paths are given relative to
-the repository root, e.g. `marsdb-graph/src/store.rs`.
