@@ -27,13 +27,6 @@ tx.execute("CREATE (:Person {name: 'Bob'})")?;
 tx.execute("CREATE (:Person {name: 'Carol'})")?;
 tx.commit()?;
 
-// Operational checks and crash-consistent backup. The backup destination
-// must be new, so an existing file is never overwritten.
-db.backup_to("path/to-backup.db")?;
-let mut db = db;
-let report = db.check_integrity()?;
-assert_eq!(report.nodes, 3);
-
 // Or run a `;`-separated batch, one transaction per statement, one
 // QueryResult per statement back:
 let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
@@ -45,6 +38,10 @@ read/write classification, result-row count, and relationship expansions;
 they deliberately exclude query text and error messages. Syntax and
 missing-parameter rejections are reported too, and observer panics are
 contained.
+
+Backup, integrity checks, and other operational concerns that apply
+regardless of which language you're calling from are covered in
+[Operations](./operations.md).
 
 ## Stored procedures (`CALL`)
 
@@ -122,7 +119,7 @@ something unparseable. The prompt tells the model what's supported *and*
 what to avoid (no bare `-->` shorthand, `MERGE` capped at one hop, etc.)
 — see `marsdb-nl2cypher/src/lib.rs`'s `CAPABILITIES` constant.
 
-A real, runnable example against a local [Ollama](https://ollama.com)
+A runnable example against a local [Ollama](https://ollama.com)
 instance:
 
 ```

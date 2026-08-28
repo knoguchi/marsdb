@@ -15,34 +15,41 @@ a.name | b.name
 Alice | Bob
 ```
 
-## Why MarsDB
+## Why a graph database
 
-- **openCypher subset, measured against the real spec.** MarsDB is
-  checked against the [openCypher Technology Compatibility Kit
-  (TCK)](https://github.com/opencypher/openCypher) — 3,880 real
-  conformance scenarios — not just its own test suite. See [Cypher
-  Language Support](./cypher-support.md) for the exact, current
-  pass rate and what's covered.
+Relational databases model connections as foreign keys and join tables;
+finding them back out means more joins, one per hop, and the query gets
+harder to write and slower to run as the path gets longer. A graph
+database stores the connection itself as a first-class thing, so
+"friends of friends," "the shortest path between these two people," or
+"everyone reachable within three hops" are direct pattern matches, not
+a chain of joins.
+
+## Why MarsDB specifically
+
+- **A real subset of openCypher, not a lookalike.** Checked against the
+  [openCypher Technology Compatibility Kit](https://github.com/opencypher/openCypher)
+  on every push. See the [Cypher Language Reference](./cypher-support.md)
+  for exactly what's covered.
 - **Embeddable, not a server.** `Database::open("path/to.db")` or
   `Database::in_memory()` and you're running queries — no daemon to
   manage, no port to bind, no client/server protocol.
 - **Crash-safe by construction.** Every Cypher statement runs inside one
-  transaction; `marsdb-storage` runs on [redb](https://github.com/cberner/redb),
-  a pure-Rust MVCC single-file engine, and a `SIGKILL`-and-reopen crash
-  harness checks that every acknowledged commit survives intact.
+  transaction; storage runs on [redb](https://github.com/cberner/redb),
+  a pure-Rust MVCC single-file engine.
 - **Bindings, not just a Rust crate.** Python (PyO3, prebuilt wheels) and
-  Go (cgo against a small C ABI crate) both work today — see [Python
-  bindings](./python.md) and [Go bindings](./go.md).
+  Go (cgo against a small C ABI) both work today.
 
 ## Where to go next
 
-- New to MarsDB? Start with [Install & CLI](./cli.md), or jump straight
-  to [Embedding in Rust](./embedding-rust.md) if you're integrating it
-  into a program.
-- Wondering exactly which Cypher features are supported? See [Cypher
-  Language Support](./cypher-support.md).
-- Curious how it's built? See [Architecture](./architecture.md) and
-  [Benchmarks](./benchmarks.md).
+- New to MarsDB? Start with [Getting Started](./getting-started.md).
+- Want a Cypher walkthrough? [The Cypher Guide](./cypher-guide.md).
+- Integrating into a program? [Embedding in Rust](./embedding-rust.md),
+  [Python bindings](./python.md), or [Go bindings](./go.md).
+- Wondering exactly which Cypher features are supported? See the
+  [Cypher Language Reference](./cypher-support.md).
+- Curious how it's built? See [Performance](./benchmarks.md), or the
+  [Internals](./internals/index.md) appendix.
 
 ## License
 
