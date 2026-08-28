@@ -46,9 +46,9 @@ If a change moves the conformance numbers, update the table in
 
 ## Commit style
 
-Small, focused PRs — one fix or feature per PR, not a bundle. Commit
-messages explain *why*, not just what changed (the diff already shows
-what). See recent history for the convention this repo follows.
+One fix or feature per PR, not a bundle. Commit messages explain *why*,
+not just what changed. See recent history for the convention this repo
+follows.
 
 ## Reporting bugs / requesting features
 

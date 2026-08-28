@@ -6,8 +6,15 @@ single file on disk (or fully in-memory), no server, ACID transactions.
 In-process via PyO3 — no C ABI, no sockets, queries run on the calling
 thread.
 
-**Not published to PyPI yet** — build from the repo with
-[maturin](https://github.com/PyO3/maturin):
+```
+pip install marsdb
+```
+
+Prebuilt wheels cover macOS (arm64, x86_64) and Linux (x86_64, manylinux);
+other platforms install from the source distribution and need a Rust
+toolchain.
+
+To build from source instead:
 
 ```
 cd marsdb-python

@@ -1,9 +1,9 @@
 # Cypher Language Support
 
-MarsDB implements a real subset of openCypher, checked against the
+MarsDB implements a subset of openCypher, checked against the
 [openCypher Technology Compatibility Kit (TCK)](https://github.com/opencypher/openCypher)
 — 220 feature files, 3,880 scenarios, vendored as a git submodule and run
-for real (not just claimed) on every push. The full, exhaustive
+on every push. The full, exhaustive
 breakdown — every supported clause/expression/temporal-type shape, the
 error taxonomy, and this same table with contributor-level detail — lives
 in [`CYPHER_COVERAGE.md`](https://github.com/knoguchi/marsdb/blob/main/CYPHER_COVERAGE.md)
@@ -46,15 +46,11 @@ in the repo root. This page is the condensed, end-user version.
 | expressions/precedence | 104 | 104 | 100.0% |
 | expressions/quantifier | 604 | 604 | 100.0% |
 | expressions/string | 32 | 32 | 100.0% |
-| expressions/temporal* | 1004 | 1002 | 99.8% |
+| expressions/temporal | 1004 | 1004 | 100.0% |
 | expressions/typeConversion | 47 | 47 | 100.0% |
 | useCases/countingSubgraphMatches | 11 | 11 | 100.0% |
 | useCases/triadicSelection | 19 | 19 | 100.0% |
-| **TOTAL** | **3880** | **3878** | **99.9%** |
-
-\* The 2 non-passing `expressions/temporal` scenarios need dates at year
-±999,999,999 — a real, structural storage/library-range limitation (not
-a bug), explained in full in [`CYPHER_COVERAGE.md`](https://github.com/knoguchi/marsdb/blob/main/CYPHER_COVERAGE.md#temporal-types).
+| **TOTAL** | **3880** | **3880** | **100.0%** |
 
 Reproduce this table yourself:
 
@@ -100,13 +96,12 @@ cargo run --release -p marsdb-tck
 
 ## Known limitations
 
-- **Extreme-year temporal values** (year beyond roughly ±262,000):
-  a real storage/library range limit, not planned to change without a
-  breaking on-disk format migration — see the table footnote above.
-- **Node/relationship-valued `$parameters`** aren't supported (a
-  map-valued parameter is).
-- **No cost-based query optimizer** — index seeks and top-k `ORDER BY
+- **Node/relationship-valued `$parameters`** aren't supported. Scalar,
+  list, and map parameters already work. This is on the
+  [roadmap](https://github.com/knoguchi/marsdb#roadmap).
+- **No cost-based query optimizer**. Index seeks and top-k `ORDER BY
   ... LIMIT` selection exist, but join/traversal ordering isn't
-  cost-estimated. See [Architecture](./architecture.md).
+  cost-estimated. See [Architecture](./architecture.md). This is on the
+  [roadmap](https://github.com/knoguchi/marsdb#roadmap).
 - **`CALL` needs an embedder-supplied `ProcedureProvider`** — there's no
   built-in procedure catalog.

@@ -46,4 +46,4 @@ under `target/{debug,release}/`.
 This is intentionally minimal (`Open`/`Execute`/`Close`, JSON results) —
 enough to build a real language binding on top, which is exactly what
 [`marsdb-go`](./go.md) does. `execute_batch`/`execute_with_params` exist
-on the Rust side but aren't exposed through this C ABI yet.
+on the Rust side but aren't exposed through this C ABI.

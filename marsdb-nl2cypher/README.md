@@ -56,10 +56,9 @@ anything else that turns a prompt into text.
    `prior_attempt` turns this into a repair prompt instead of a fresh one.
 3. **`translate(&client, &schema, question)`** — calls the LLM, strips a
    markdown code fence if present, then parses and semantically binds the
-   statement. If that fails, feeds the *exact* validation error back for one repair
-   attempt (this codebase's parse errors are written to be genuinely
-   readable, which this leans on directly) — not an open-ended retry loop.
-   Fails with both attempts included if the repair also doesn't parse.
+   statement. If that fails, feeds the *exact* validation error back for
+   one repair attempt, not an open-ended retry loop. Fails with both
+   attempts included if the repair also doesn't parse.
 4. **`translate_and_run(&db, &client, question)`** — the common case in one
    call: introspect, translate, execute. This helper is read-only by default:
    generated CREATE/MERGE/SET/REMOVE/DELETE statements are rejected before
@@ -90,10 +89,10 @@ accuracy limitation, not something a syntax-validation loop can fix; it
 would need a fundamentally different mechanism (few-shot examples, data
 normalization, a correctness oracle) to address, and isn't attempted here.
 
-There's also no list-valued `$parameter` support yet (tracked in the main
-README's roadmap), so schema values can't currently be handed to the LLM's
-generated query as a batch parameter — the LLM has to inline literals
-directly into the Cypher text it produces.
+Node/relationship-valued `$parameters` aren't supported. Scalar,
+list, and map parameters already work; this gap is tracked in the main
+README's roadmap. The LLM has to inline node/relationship values as
+literals directly in the Cypher text it produces.
 
 ## License
 

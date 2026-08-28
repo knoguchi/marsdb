@@ -228,19 +228,19 @@ to open a database written by a newer unsupported format.
 Numbers: [`BENCHMARKS.md`](./BENCHMARKS.md).
 
 The logical read plan runs as a pull-based row stream through node-ID scans,
-filters, relationship expansions, and variable-length traversals (each
-input row's paths enumerate lazily too). A non-aggregating
-`RETURN ... LIMIT k` without `ORDER BY` stops that pipeline after `k` rows
-— or, with `DISTINCT`, after `k` *distinct projected* rows, so
+filters, relationship expansions, and variable-length traversals. Each
+input row's paths enumerate lazily too. A non-aggregating
+`RETURN ... LIMIT k` without `ORDER BY` stops that pipeline after `k` rows,
+or, with `DISTINCT`, after `k` *distinct projected* rows. So
 `MATCH (p)-[:KNOWS*1..3]-(f) RETURN DISTINCT f ... LIMIT 20` stops
-traversing the moment 20 distinct endpoints exist instead of enumerating
+traversing the moment 20 distinct endpoints exist, instead of enumerating
 every path first. Clause boundaries and inherently blocking operations
 still materialize: `WITH`, optional-match reconciliation, aggregation,
 anything under `ORDER BY`, mutations, and the public `QueryResult`. Use
 `ExecutionOptions` to put hard ceilings on intermediate rows, result rows,
 relationship expansions, and elapsed time.
 
-There is not yet a general cost-based optimizer. Two targeted optimizations
+There is no general cost-based optimizer. Two targeted optimizations
 complement streaming: a direct `MATCH (n[:Label]) RETURN ... LIMIT k` scan
 pushes the limit into storage; and every `ORDER BY ... LIMIT k` site
 (`WITH`'s own, non-aggregating
@@ -260,8 +260,6 @@ Recent changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 
-- From-scratch storage engine (page format, B-tree, crash recovery) as an
-  alternate `marsdb-storage` backend, independent of redb
 - Gremlin frontend targeting the existing IR
 - Composite indexes (single-property indexes already exist) with
   transactional maintenance
@@ -316,11 +314,11 @@ git submodule update --init marsdb-tck/openCypher
 cargo run --release -p marsdb-tck
 ```
 
-Attempts every scenario in the vendored TCK — currently 3880/3880 pass.
-A failing scenario would report as a distinct "unexpected" outcome, not
-lumped in with genuine wrong answers — the real, checked-for-real signal
-this exists to produce, not the flat pass-rate over the whole suite. Side-effect assertions and the TCK's typed error taxonomy aren't
-checked (see the crate's doc comments for why).
+Attempts every scenario in the vendored TCK. Currently 3880/3880 pass.
+A failing scenario reports as a distinct "unexpected" outcome, not
+lumped in with genuine wrong answers. Side-effect assertions and the
+TCK's typed error taxonomy aren't checked. See the crate's doc comments
+for why.
 
 ## Contributing
 

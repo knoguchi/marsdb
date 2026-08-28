@@ -59,7 +59,7 @@ Not upstream-worthy — no basis in `openCypher.bnf`. Present here because
 MarsDB supports them:
 
 - **`EXPLAIN <statement>`** — describe the plan without running it. Grammar
-  only; `EXPLAIN` doesn't yet wrap `CALL`.
+  only; `EXPLAIN` doesn't wrap `CALL`.
 - **`CREATE INDEX ON :Label(prop) [UNIQUE]`** — the older single-property
   index syntax, not real Cypher's newer `CREATE INDEX FOR (n:Label) ON
   (n.prop)`.
