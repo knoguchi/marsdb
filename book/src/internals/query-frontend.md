@@ -102,9 +102,9 @@ is added.
 
 ## Semantic validation: what a statement can promise before running
 
-`validate_statement` runs after substitution and — deliberately —
-before any storage transaction exists. It checks what is knowable from
-the statement alone:
+`validate_statement` deliberately runs after substitution and before
+any storage transaction exists. It checks what is knowable from the
+statement alone:
 
 - **Name binding.** Every referenced variable is bound by some pattern
   or projection before use; `WITH` boundaries reset scope to exactly

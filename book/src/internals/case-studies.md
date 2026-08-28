@@ -37,10 +37,8 @@ from the design alone: encoding the composite key as a packed byte string
 instead of a native fixed-width tuple *doubled* the database file in
 one measurement, and a related erasure to `&[u8]` measured +34% —
 redb keeps fixed-width tuple keys in fixed slots, and byte-erasing
-them forfeits that packing. Measurement showed that byte erasure
-disabled redb's fixed-slot packing.
-The first cut of the composite-key change made exactly this mistake,
-and the number is what sent it back.
+them forfeits that packing. The first cut of the composite-key change
+made exactly this mistake, and the number is what sent it back.
 
 ## The record directory: optimize the read you actually do
 
@@ -114,9 +112,7 @@ and the measurement was kept: knowing where the cost *is not* is what
 directed later work at the decode and traversal paths, where the
 directory encoding and the edge sweep found their wins.
 
-The optimization worked as designed, but its measured effect was too
-small to justify the added complexity. A
-database, like any long-lived system, is shaped as much by the
+A database, like any long-lived system, is shaped as much by the
 features it declined to keep as by the ones it kept.
 
 ## Neutral results get recorded too
