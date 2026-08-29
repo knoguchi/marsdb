@@ -77,6 +77,18 @@ assert_eq!(report.nodes, 3);
 // Or run a `;`-separated batch, one transaction per statement, one
 // QueryResult per statement back:
 let results = db.execute_batch("CREATE (a:Person {name: 'Alice'}); CREATE (b:Person {name: 'Bob'})")?;
+
+// Parse once, run many times with different parameters. Skips semantic
+// validation on repeat calls once it's confirmed safe for the parameter
+// shape in use; query planning still runs every call.
+let prepared = db.prepare("MATCH (n:Person {name: $name}) RETURN n")?;
+for name in ["Alice", "Bob"] {
+    let params = std::collections::HashMap::from([(
+        "name".to_string(),
+        marsdb::PropertyValue::String(name.to_string()),
+    )]);
+    let result = db.execute_prepared_plan(&prepared, &params, &Default::default())?;
+}
 ```
 
 `ExecutionOptions::observer` accepts an `ExecutionObserver` callback for
