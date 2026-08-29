@@ -19,6 +19,13 @@ use crate::write_ctx::WriteCtx;
 
 pub struct GraphStore {
     storage: StorageEngine,
+    /// Bumped whenever a new index is declared, so a caller holding a
+    /// `PreparedPlan` can tell its cached query plan might now be
+    /// missing an index that didn't exist when the plan was built.
+    /// In-process only, not persisted -- advisory cache invalidation,
+    /// not a correctness gate (an index can only ever be added, never
+    /// dropped, so a stale plan is at worst suboptimal, never wrong).
+    schema_generation: std::sync::atomic::AtomicU64,
 }
 
 /// Successful physical and logical integrity-check summary.
@@ -36,6 +43,7 @@ impl GraphStore {
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, GraphError> {
         let store = Self {
             storage: StorageEngine::open_file(path)?,
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
         };
         store.backfill_rel_type_counts()?;
         Ok(store)
@@ -44,7 +52,21 @@ impl GraphStore {
     pub fn open_memory() -> Result<Self, GraphError> {
         Ok(Self {
             storage: StorageEngine::open_memory()?,
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Current schema generation -- see the field's own doc comment.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Advances the schema generation. Called after a new index is
+    /// declared, from every path that can create one.
+    pub fn bump_schema_generation(&self) {
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// One-time `REL_TYPE_COUNTS` rebuild for a file written before the
@@ -788,6 +810,7 @@ impl GraphStore {
         let write_txn = self.begin_write()?;
         Self::create_index_in_txn(&write_txn, label, prop, unique)?;
         write_txn.commit()?;
+        self.bump_schema_generation();
         Ok(())
     }
 

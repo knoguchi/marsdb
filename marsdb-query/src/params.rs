@@ -9,6 +9,38 @@ use crate::ast::{
 };
 use crate::error::QueryError;
 
+/// One step descending one field/Vec-index toward a `$param` leaf,
+/// mirroring the existing `substitute_*` functions' own recursion
+/// structure below. Recorded while walking, so the same leaf can be
+/// found again later without re-walking the whole tree.
+///
+/// Two variants cover every descent in this file: `Index` for stepping
+/// into the Nth element of a `Vec`-typed child (a pattern in a list of
+/// patterns, a hop in a pattern's chain, an item in a `RETURN` list,
+/// ...), and `Field` for stepping into a named, non-`Vec` child (a
+/// struct field like `where_clause`/`with`, an enum operand like the
+/// left/right side of `And`/`Or`, or a name that disambiguates which of
+/// several same-shaped `Vec`s an `Index` that follows belongs to --
+/// e.g. `MergeClause`'s `on_create` vs `on_match`, each indexed
+/// separately). A `Field` immediately followed by an `Index` reads as
+/// "the Nth element of that named Vec".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathStep {
+    /// Descend into a named, non-`Vec` child, or name the `Vec` that an
+    /// immediately following `Index` indexes into.
+    Field(&'static str),
+    /// Descend into the Nth element of a `Vec`-typed child.
+    Index(usize),
+}
+
+/// One resolved `$param` occurrence: which parameter, and where in the
+/// `Statement` tree it landed.
+#[derive(Debug, Clone)]
+pub struct ParamSite {
+    pub name: String,
+    pub path: Vec<PathStep>,
+}
+
 /// Resolves every `$name` placeholder in `stmt` to a concrete `Literal`
 /// using `params`, in place. Called before execution so the executor never
 /// sees `Literal::Param` — see the `unreachable!` in
@@ -17,18 +49,48 @@ pub fn substitute_params(
     stmt: &mut Statement,
     params: &HashMap<String, PropertyValue>,
 ) -> Result<(), QueryError> {
+    substitute_params_tracked(stmt, params)?;
+    Ok(())
+}
+
+/// Same as `substitute_params`, but also returns a `ParamSite` for
+/// every `$name` occurrence resolved, recording the path to reach it.
+pub fn substitute_params_tracked(
+    stmt: &mut Statement,
+    params: &HashMap<String, PropertyValue>,
+) -> Result<Vec<ParamSite>, QueryError> {
+    let mut sites = Vec::new();
+    let mut path = Vec::new();
+    substitute_params_inner(stmt, params, &mut path, &mut sites)?;
+    Ok(sites)
+}
+
+fn substitute_params_inner(
+    stmt: &mut Statement,
+    params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
+) -> Result<(), QueryError> {
     match stmt {
         // Bare keywords, nothing to substitute into.
         Statement::Begin | Statement::Commit | Statement::Rollback => {}
         Statement::Create(patterns) => {
-            for pattern in patterns {
-                substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("patterns"));
+            for (i, pattern) in patterns.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_pattern_inner(pattern, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
         // No `$param`-able position -- label/prop are identifiers, not
         // expressions.
         Statement::CreateIndex { .. } => {}
-        Statement::Explain(inner) => substitute_params(inner, params)?,
+        Statement::Explain(inner) => {
+            path.push(PathStep::Field("inner"));
+            substitute_params_inner(inner, params, path, sites)?;
+            path.pop();
+        }
         Statement::Match {
             clauses,
             tail,
@@ -36,30 +98,52 @@ pub fn substitute_params(
             skip,
             limit,
         } => {
-            for clause in clauses {
-                substitute_query_clause(clause, params)?;
+            path.push(PathStep::Field("clauses"));
+            for (i, clause) in clauses.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_query_clause_inner(clause, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
             if let Some(tail) = tail {
-                substitute_tail(tail, params)?;
+                path.push(PathStep::Field("tail"));
+                substitute_tail_inner(tail, params, path, sites)?;
+                path.pop();
             }
             if let Some(items) = order_by {
-                for (expr, _) in items {
-                    substitute_return_expr(expr, params)?;
+                path.push(PathStep::Field("order_by"));
+                for (i, (expr, _)) in items.iter_mut().enumerate() {
+                    path.push(PathStep::Index(i));
+                    substitute_return_expr_inner(expr, params, path, sites)?;
+                    path.pop();
                 }
+                path.pop();
             }
             if let Some(expr) = skip {
-                substitute_return_expr(expr, params)?;
+                path.push(PathStep::Field("skip"));
+                substitute_return_expr_inner(expr, params, path, sites)?;
+                path.pop();
             }
             if let Some(expr) = limit {
-                substitute_return_expr(expr, params)?;
+                path.push(PathStep::Field("limit"));
+                substitute_return_expr_inner(expr, params, path, sites)?;
+                path.pop();
             }
         }
         Statement::Union { parts, .. } => {
-            for part in parts {
-                substitute_params(part, params)?;
+            path.push(PathStep::Field("parts"));
+            for (i, part) in parts.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_params_inner(part, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
-        Statement::StandaloneCall(call) => substitute_call_clause(call, params)?,
+        Statement::StandaloneCall(call) => {
+            path.push(PathStep::Field("call"));
+            substitute_call_clause_inner(call, params, path, sites)?;
+            path.pop();
+        }
     }
     Ok(())
 }
@@ -68,52 +152,74 @@ pub fn substitute_params(
 /// no parens) has nothing to substitute here — each declared input
 /// resolves from a same-named `$param` at execution time instead, once
 /// the procedure's signature is known.
-fn substitute_call_clause(
+fn substitute_call_clause_inner(
     call: &mut CallClause,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     if let Some(args) = &mut call.args {
-        for arg in args {
-            substitute_return_expr(arg, params)?;
+        path.push(PathStep::Field("args"));
+        for (i, arg) in args.iter_mut().enumerate() {
+            path.push(PathStep::Index(i));
+            substitute_return_expr_inner(arg, params, path, sites)?;
+            path.pop();
         }
+        path.pop();
     }
     if let Some(CallYield::Items(_, Some(where_expr))) = &mut call.yield_items {
-        substitute_expr(where_expr, params)?;
+        path.push(PathStep::Field("yield_where"));
+        substitute_expr_inner(where_expr, params, path, sites)?;
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_query_clause(
+fn substitute_query_clause_inner(
     clause: &mut QueryClause,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match clause {
-        QueryClause::Match(part) => substitute_query_part(part, params),
-        QueryClause::Unwind(u) => substitute_unwind_clause(u, params),
-        QueryClause::Merge(m) => substitute_merge_clause(m, params),
-        QueryClause::With(with) => substitute_with_clause(with, params),
+        QueryClause::Match(part) => substitute_query_part_inner(part, params, path, sites),
+        QueryClause::Unwind(u) => substitute_unwind_clause_inner(u, params, path, sites),
+        QueryClause::Merge(m) => substitute_merge_clause_inner(m, params, path, sites),
+        QueryClause::With(with) => substitute_with_clause_inner(with, params, path, sites),
         QueryClause::Set(items) => {
-            for item in items {
-                substitute_set_item(item, params)?;
+            path.push(PathStep::Field("items"));
+            for (i, item) in items.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_set_item_inner(item, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
             Ok(())
         }
         QueryClause::Delete { items, detach: _ } => {
-            for expr in items {
-                substitute_return_expr(expr, params)?;
+            path.push(PathStep::Field("items"));
+            for (i, expr) in items.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(expr, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
             Ok(())
         }
         // No `$param`-able position -- `RemoveItem` is a bare prop/label
         // path, not a value expression.
         QueryClause::Remove(_) => Ok(()),
         QueryClause::Create(patterns) => {
-            for pattern in patterns {
-                substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("patterns"));
+            for (i, pattern) in patterns.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_pattern_inner(pattern, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
             Ok(())
         }
-        QueryClause::Call(call) => substitute_call_clause(call, params),
+        QueryClause::Call(call) => substitute_call_clause_inner(call, params, path, sites),
     }
 }
 
@@ -121,139 +227,254 @@ fn substitute_query_clause(
 /// `QueryClause`/`Tail` forms, and `MERGE`'s `ON CREATE`/`ON MATCH SET`).
 /// `Labels` has no `$param`-able position; `Prop`/`MapAssign` each carry
 /// one `ReturnExpr` value to recurse into.
-fn substitute_set_item(
+fn substitute_set_item_inner(
     item: &mut SetItem,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match item {
         SetItem::Prop(_, value) | SetItem::MapAssign { value, .. } => {
-            substitute_return_expr(value, params)
+            path.push(PathStep::Field("value"));
+            let r = substitute_return_expr_inner(value, params, path, sites);
+            path.pop();
+            r
         }
         SetItem::Labels(..) => Ok(()),
     }
 }
 
-fn substitute_merge_clause(
+fn substitute_merge_clause_inner(
     m: &mut MergeClause,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    substitute_pattern(&mut m.pattern, params)?;
-    for item in m.on_create.iter_mut().chain(m.on_match.iter_mut()) {
-        substitute_set_item(item, params)?;
+    path.push(PathStep::Field("pattern"));
+    substitute_pattern_inner(&mut m.pattern, params, path, sites)?;
+    path.pop();
+    // Split from the original `on_create.iter_mut().chain(on_match.iter_mut())`
+    // into two separate loops so each item's path names which of the two
+    // Vecs it came from -- same iteration order (all of `on_create` then
+    // all of `on_match`), so substitution order (and thus which error
+    // surfaces first on a missing param) is unchanged.
+    path.push(PathStep::Field("on_create"));
+    for (i, item) in m.on_create.iter_mut().enumerate() {
+        path.push(PathStep::Index(i));
+        substitute_set_item_inner(item, params, path, sites)?;
+        path.pop();
     }
+    path.pop();
+    path.push(PathStep::Field("on_match"));
+    for (i, item) in m.on_match.iter_mut().enumerate() {
+        path.push(PathStep::Index(i));
+        substitute_set_item_inner(item, params, path, sites)?;
+        path.pop();
+    }
+    path.pop();
     if let Some(with) = &mut m.with {
-        substitute_with_clause(with, params)?;
+        path.push(PathStep::Field("with"));
+        substitute_with_clause_inner(with, params, path, sites)?;
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_query_part(
+fn substitute_query_part_inner(
     part: &mut QueryPart,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    substitute_pattern(&mut part.pattern, params)?;
+    path.push(PathStep::Field("pattern"));
+    substitute_pattern_inner(&mut part.pattern, params, path, sites)?;
+    path.pop();
     if let Some(expr) = &mut part.where_clause {
-        substitute_expr(expr, params)?;
+        path.push(PathStep::Field("where_clause"));
+        substitute_expr_inner(expr, params, path, sites)?;
+        path.pop();
     }
     if let Some(with) = &mut part.with {
-        substitute_with_clause(with, params)?;
+        path.push(PathStep::Field("with"));
+        substitute_with_clause_inner(with, params, path, sites)?;
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_unwind_clause(
+fn substitute_unwind_clause_inner(
     u: &mut UnwindClause,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    substitute_return_expr(&mut u.source.0, params)?;
+    path.push(PathStep::Field("source"));
+    substitute_return_expr_inner(&mut u.source.0, params, path, sites)?;
+    path.pop();
     if let Some(expr) = &mut u.where_clause {
-        substitute_with_expr(expr, params)?;
+        path.push(PathStep::Field("where_clause"));
+        substitute_with_expr_inner(expr, params, path, sites)?;
+        path.pop();
     }
     if let Some(with) = &mut u.with {
-        substitute_with_clause(with, params)?;
+        path.push(PathStep::Field("with"));
+        substitute_with_clause_inner(with, params, path, sites)?;
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_with_clause(
+fn substitute_with_clause_inner(
     with: &mut WithClause,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    for item in &mut with.items {
-        substitute_return_expr(&mut item.expr, params)?;
+    path.push(PathStep::Field("items"));
+    for (i, item) in with.items.iter_mut().enumerate() {
+        path.push(PathStep::Index(i));
+        substitute_return_expr_inner(&mut item.expr, params, path, sites)?;
+        path.pop();
     }
+    path.pop();
     if let Some(where_clause) = &mut with.where_clause {
-        substitute_with_expr(where_clause, params)?;
+        path.push(PathStep::Field("where_clause"));
+        substitute_with_expr_inner(where_clause, params, path, sites)?;
+        path.pop();
     }
     if let Some(items) = &mut with.order_by {
-        for (expr, _) in items {
-            substitute_return_expr(expr, params)?;
+        path.push(PathStep::Field("order_by"));
+        for (i, (expr, _)) in items.iter_mut().enumerate() {
+            path.push(PathStep::Index(i));
+            substitute_return_expr_inner(expr, params, path, sites)?;
+            path.pop();
         }
+        path.pop();
     }
     if let Some(expr) = &mut with.skip {
-        substitute_return_expr(expr, params)?;
+        path.push(PathStep::Field("skip"));
+        substitute_return_expr_inner(expr, params, path, sites)?;
+        path.pop();
     }
     if let Some(expr) = &mut with.limit {
-        substitute_return_expr(expr, params)?;
+        path.push(PathStep::Field("limit"));
+        substitute_return_expr_inner(expr, params, path, sites)?;
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_with_expr(
+fn substitute_with_expr_inner(
     expr: &mut WithExpr,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match expr {
         WithExpr::And(l, r) | WithExpr::Or(l, r) => {
-            substitute_with_expr(l, params)?;
-            substitute_with_expr(r, params)?;
+            path.push(PathStep::Field("left"));
+            substitute_with_expr_inner(l, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("right"));
+            substitute_with_expr_inner(r, params, path, sites)?;
+            path.pop();
         }
-        WithExpr::Not(e) => substitute_with_expr(e, params)?,
+        WithExpr::Not(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_with_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
         WithExpr::Compare(lhs, _, rhs) => {
-            substitute_return_expr(lhs, params)?;
-            substitute_return_expr(rhs, params)?;
+            path.push(PathStep::Field("lhs"));
+            substitute_return_expr_inner(lhs, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("rhs"));
+            substitute_return_expr_inner(rhs, params, path, sites)?;
+            path.pop();
         }
-        WithExpr::IsNull(e) => substitute_return_expr(e, params)?,
-        WithExpr::Bare(e) => substitute_return_expr(e, params)?,
+        WithExpr::IsNull(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
+        WithExpr::Bare(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
     }
     Ok(())
 }
 
-fn substitute_pattern(
+fn substitute_pattern_inner(
     pattern: &mut Pattern,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    substitute_node(&mut pattern.start, params)?;
-    for (rel, node) in &mut pattern.hops {
-        for (_, expr) in &mut rel.props {
-            substitute_return_expr(expr, params)?;
+    path.push(PathStep::Field("start"));
+    substitute_node_inner(&mut pattern.start, params, path, sites)?;
+    path.pop();
+    path.push(PathStep::Field("hops"));
+    for (i, (rel, node)) in pattern.hops.iter_mut().enumerate() {
+        path.push(PathStep::Index(i));
+        path.push(PathStep::Field("rel_props"));
+        for (j, (_, expr)) in rel.props.iter_mut().enumerate() {
+            path.push(PathStep::Index(j));
+            substitute_return_expr_inner(expr, params, path, sites)?;
+            path.pop();
         }
-        substitute_node(node, params)?;
+        path.pop();
+        path.push(PathStep::Field("node"));
+        substitute_node_inner(node, params, path, sites)?;
+        path.pop();
+        path.pop();
     }
+    path.pop();
     Ok(())
 }
 
-fn substitute_node(
+fn substitute_node_inner(
     node: &mut NodePattern,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
-    for (_, expr) in &mut node.props {
-        substitute_return_expr(expr, params)?;
+    path.push(PathStep::Field("props"));
+    for (i, (_, expr)) in node.props.iter_mut().enumerate() {
+        path.push(PathStep::Index(i));
+        substitute_return_expr_inner(expr, params, path, sites)?;
+        path.pop();
     }
+    path.pop();
     Ok(())
 }
 
-fn substitute_expr(
+fn substitute_expr_inner(
     expr: &mut Expr,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match expr {
         Expr::And(l, r) | Expr::Or(l, r) => {
-            substitute_expr(l, params)?;
-            substitute_expr(r, params)?;
+            path.push(PathStep::Field("left"));
+            substitute_expr_inner(l, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("right"));
+            substitute_expr_inner(r, params, path, sites)?;
+            path.pop();
         }
-        Expr::Not(e) => substitute_expr(e, params)?,
-        Expr::Compare(_, _, lit) => substitute_literal(lit, params)?,
+        Expr::Not(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
+        Expr::Compare(_, _, lit) => {
+            path.push(PathStep::Field("lit"));
+            substitute_literal_inner(lit, params, path, sites)?;
+            path.pop();
+        }
         Expr::PropCompare(_, _, _) => {}
         Expr::IsNull(_) => {}
         Expr::HasLabel(_, _) => {}
@@ -262,58 +483,108 @@ fn substitute_expr(
         // only, never present in the AST this pass runs against.
         Expr::EdgeNotInSet { .. } => {}
         Expr::GeneralCompare(lhs, _, rhs) => {
-            substitute_return_expr(lhs, params)?;
-            substitute_return_expr(rhs, params)?;
+            path.push(PathStep::Field("lhs"));
+            substitute_return_expr_inner(lhs, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("rhs"));
+            substitute_return_expr_inner(rhs, params, path, sites)?;
+            path.pop();
         }
-        Expr::GeneralIsNull(e) => substitute_return_expr(e, params)?,
-        Expr::GeneralBare(e) => substitute_return_expr(e, params)?,
-        Expr::Pattern(pattern) => substitute_pattern(pattern, params)?,
+        Expr::GeneralIsNull(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
+        Expr::GeneralBare(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
+        Expr::Pattern(pattern) => {
+            path.push(PathStep::Field("pattern"));
+            substitute_pattern_inner(pattern, params, path, sites)?;
+            path.pop();
+        }
         Expr::Exists {
             pattern,
             where_clause,
         } => {
-            substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("pattern"));
+            substitute_pattern_inner(pattern, params, path, sites)?;
+            path.pop();
             if let Some(w) = where_clause {
-                substitute_expr(w, params)?;
+                path.push(PathStep::Field("where_clause"));
+                substitute_expr_inner(w, params, path, sites)?;
+                path.pop();
             }
         }
-        Expr::ExistsSubquery(stmt) => substitute_params(stmt, params)?,
+        Expr::ExistsSubquery(stmt) => {
+            path.push(PathStep::Field("subquery"));
+            substitute_params_inner(stmt, params, path, sites)?;
+            path.pop();
+        }
     }
     Ok(())
 }
 
-fn substitute_tail(
+fn substitute_tail_inner(
     tail: &mut Tail,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match tail {
         Tail::Return(items, _) => {
-            for item in items {
-                substitute_return_expr(&mut item.expr, params)?;
+            path.push(PathStep::Field("items"));
+            for (i, item) in items.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(&mut item.expr, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
         // No `$param`-able position -- a bare `*`, nothing to substitute.
         Tail::ReturnStar(_) => {}
         Tail::Delete(exprs, ret) | Tail::DetachDelete(exprs, ret) => {
-            for expr in exprs {
-                substitute_return_expr(expr, params)?;
+            path.push(PathStep::Field("exprs"));
+            for (i, expr) in exprs.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(expr, params, path, sites)?;
+                path.pop();
             }
-            substitute_return_tail(ret, params)?;
+            path.pop();
+            path.push(PathStep::Field("ret"));
+            substitute_return_tail_inner(ret, params, path, sites)?;
+            path.pop();
         }
         Tail::Remove(_, ret) => {
-            substitute_return_tail(ret, params)?;
+            path.push(PathStep::Field("ret"));
+            substitute_return_tail_inner(ret, params, path, sites)?;
+            path.pop();
         }
         Tail::Set(items, ret) => {
-            for item in items {
-                substitute_set_item(item, params)?;
+            path.push(PathStep::Field("items"));
+            for (i, item) in items.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_set_item_inner(item, params, path, sites)?;
+                path.pop();
             }
-            substitute_return_tail(ret, params)?;
+            path.pop();
+            path.push(PathStep::Field("ret"));
+            substitute_return_tail_inner(ret, params, path, sites)?;
+            path.pop();
         }
         Tail::Create(patterns, ret) => {
-            for pattern in patterns {
-                substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("patterns"));
+            for (i, pattern) in patterns.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_pattern_inner(pattern, params, path, sites)?;
+                path.pop();
             }
-            substitute_return_tail(ret, params)?;
+            path.pop();
+            path.push(PathStep::Field("ret"));
+            substitute_return_tail_inner(ret, params, path, sites)?;
+            path.pop();
         }
     }
     Ok(())
@@ -323,25 +594,37 @@ fn substitute_tail(
 /// (`MATCH (n) SET n.x = $x RETURN n` needs both the `SET`'s own `$x` *and*
 /// nothing extra here since this RETURN has none — but `MATCH (n) DELETE n
 /// RETURN $y` does).
-fn substitute_return_tail(
+fn substitute_return_tail_inner(
     ret: &mut Option<ReturnTail>,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     if let Some(rt) = ret {
-        for item in &mut rt.items {
-            substitute_return_expr(&mut item.expr, params)?;
+        path.push(PathStep::Field("items"));
+        for (i, item) in rt.items.iter_mut().enumerate() {
+            path.push(PathStep::Index(i));
+            substitute_return_expr_inner(&mut item.expr, params, path, sites)?;
+            path.pop();
         }
+        path.pop();
     }
     Ok(())
 }
 
-fn substitute_return_expr(
+fn substitute_return_expr_inner(
     expr: &mut ReturnExpr,
     params: &HashMap<String, PropertyValue>,
+    path: &mut Vec<PathStep>,
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     match expr {
         ReturnExpr::Var(_) | ReturnExpr::Prop(_) | ReturnExpr::CountStar => {}
-        ReturnExpr::PatternPredicate(pattern) => substitute_pattern(pattern, params)?,
+        ReturnExpr::PatternPredicate(pattern) => {
+            path.push(PathStep::Field("pattern"));
+            substitute_pattern_inner(pattern, params, path, sites)?;
+            path.pop();
+        }
         // No `Literal::List` (no list-literal syntax in Cypher), so a
         // list-valued `$param` replaces the whole node with a
         // `ReturnExpr::ListLit` instead, recursively — everything
@@ -351,48 +634,94 @@ fn substitute_return_expr(
                 .get(name)
                 .ok_or_else(|| QueryError::MissingParam(name.clone()))?
                 .clone();
+            sites.push(ParamSite {
+                name: name.clone(),
+                path: path.clone(),
+            });
             *expr = property_value_to_return_expr(name, &value)?;
         }
         ReturnExpr::Lit(_) => {}
         ReturnExpr::Call { args, .. } => {
-            for arg in args {
-                substitute_return_expr(arg, params)?;
+            path.push(PathStep::Field("args"));
+            for (i, arg) in args.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(arg, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
         ReturnExpr::Case { test, whens, else_ } => {
             if let Some(t) = test {
-                substitute_return_expr(t, params)?;
+                path.push(PathStep::Field("test"));
+                substitute_return_expr_inner(t, params, path, sites)?;
+                path.pop();
             }
-            for (when, then) in whens {
-                substitute_return_expr(when, params)?;
-                substitute_return_expr(then, params)?;
+            path.push(PathStep::Field("whens"));
+            for (i, (when, then)) in whens.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                path.push(PathStep::Field("when"));
+                substitute_return_expr_inner(when, params, path, sites)?;
+                path.pop();
+                path.push(PathStep::Field("then"));
+                substitute_return_expr_inner(then, params, path, sites)?;
+                path.pop();
+                path.pop();
             }
+            path.pop();
             if let Some(e) = else_ {
-                substitute_return_expr(e, params)?;
+                path.push(PathStep::Field("else"));
+                substitute_return_expr_inner(e, params, path, sites)?;
+                path.pop();
             }
         }
         ReturnExpr::Arith(l, _, r) => {
-            substitute_return_expr(l, params)?;
-            substitute_return_expr(r, params)?;
+            path.push(PathStep::Field("left"));
+            substitute_return_expr_inner(l, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("right"));
+            substitute_return_expr_inner(r, params, path, sites)?;
+            path.pop();
         }
-        ReturnExpr::Neg(e) => substitute_return_expr(e, params)?,
+        ReturnExpr::Neg(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
         ReturnExpr::ListLit(items) => {
-            for item in items {
-                substitute_return_expr(item, params)?;
+            path.push(PathStep::Field("items"));
+            for (i, item) in items.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(item, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
         ReturnExpr::Index(base, index) => {
-            substitute_return_expr(base, params)?;
-            substitute_return_expr(index, params)?;
+            path.push(PathStep::Field("base"));
+            substitute_return_expr_inner(base, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("index"));
+            substitute_return_expr_inner(index, params, path, sites)?;
+            path.pop();
         }
-        ReturnExpr::PropOf(base, _) => substitute_return_expr(base, params)?,
+        ReturnExpr::PropOf(base, _) => {
+            path.push(PathStep::Field("base"));
+            substitute_return_expr_inner(base, params, path, sites)?;
+            path.pop();
+        }
         ReturnExpr::Slice(base, start, end) => {
-            substitute_return_expr(base, params)?;
+            path.push(PathStep::Field("base"));
+            substitute_return_expr_inner(base, params, path, sites)?;
+            path.pop();
             if let Some(s) = start {
-                substitute_return_expr(s, params)?;
+                path.push(PathStep::Field("start"));
+                substitute_return_expr_inner(s, params, path, sites)?;
+                path.pop();
             }
             if let Some(e) = end {
-                substitute_return_expr(e, params)?;
+                path.push(PathStep::Field("end"));
+                substitute_return_expr_inner(e, params, path, sites)?;
+                path.pop();
             }
         }
         ReturnExpr::ListComp {
@@ -401,12 +730,18 @@ fn substitute_return_expr(
             project,
             ..
         } => {
-            substitute_return_expr(source, params)?;
+            path.push(PathStep::Field("source"));
+            substitute_return_expr_inner(source, params, path, sites)?;
+            path.pop();
             if let Some(w) = where_clause {
-                substitute_return_expr(w, params)?;
+                path.push(PathStep::Field("where_clause"));
+                substitute_return_expr_inner(w, params, path, sites)?;
+                path.pop();
             }
             if let Some(p) = project {
-                substitute_return_expr(p, params)?;
+                path.push(PathStep::Field("project"));
+                substitute_return_expr_inner(p, params, path, sites)?;
+                path.pop();
             }
         }
         ReturnExpr::Quantifier {
@@ -414,29 +749,57 @@ fn substitute_return_expr(
             where_clause,
             ..
         } => {
-            substitute_return_expr(source, params)?;
+            path.push(PathStep::Field("source"));
+            substitute_return_expr_inner(source, params, path, sites)?;
+            path.pop();
             if let Some(w) = where_clause {
-                substitute_return_expr(w, params)?;
+                path.push(PathStep::Field("where_clause"));
+                substitute_return_expr_inner(w, params, path, sites)?;
+                path.pop();
             }
         }
         ReturnExpr::MapLit(entries) => {
-            for (_, v) in entries {
-                substitute_return_expr(v, params)?;
+            path.push(PathStep::Field("entries"));
+            for (i, (_, v)) in entries.iter_mut().enumerate() {
+                path.push(PathStep::Index(i));
+                substitute_return_expr_inner(v, params, path, sites)?;
+                path.pop();
             }
+            path.pop();
         }
         ReturnExpr::And(l, r) | ReturnExpr::Or(l, r) | ReturnExpr::Xor(l, r) => {
-            substitute_return_expr(l, params)?;
-            substitute_return_expr(r, params)?;
+            path.push(PathStep::Field("left"));
+            substitute_return_expr_inner(l, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("right"));
+            substitute_return_expr_inner(r, params, path, sites)?;
+            path.pop();
         }
-        ReturnExpr::Not(e) => substitute_return_expr(e, params)?,
+        ReturnExpr::Not(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
         ReturnExpr::Compare(l, _, r) => {
-            substitute_return_expr(l, params)?;
-            substitute_return_expr(r, params)?;
+            path.push(PathStep::Field("left"));
+            substitute_return_expr_inner(l, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("right"));
+            substitute_return_expr_inner(r, params, path, sites)?;
+            path.pop();
         }
-        ReturnExpr::IsNull(e) => substitute_return_expr(e, params)?,
+        ReturnExpr::IsNull(e) => {
+            path.push(PathStep::Field("inner"));
+            substitute_return_expr_inner(e, params, path, sites)?;
+            path.pop();
+        }
         ReturnExpr::In(needle, haystack) => {
-            substitute_return_expr(needle, params)?;
-            substitute_return_expr(haystack, params)?;
+            path.push(PathStep::Field("needle"));
+            substitute_return_expr_inner(needle, params, path, sites)?;
+            path.pop();
+            path.push(PathStep::Field("haystack"));
+            substitute_return_expr_inner(haystack, params, path, sites)?;
+            path.pop();
         }
         // No `$param`-able position -- var/labels are identifiers, not
         // expressions.
@@ -447,34 +810,54 @@ fn substitute_return_expr(
             projection,
             ..
         } => {
-            substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("pattern"));
+            substitute_pattern_inner(pattern, params, path, sites)?;
+            path.pop();
             if let Some(w) = where_clause {
-                substitute_expr(w, params)?;
+                path.push(PathStep::Field("where_clause"));
+                substitute_expr_inner(w, params, path, sites)?;
+                path.pop();
             }
-            substitute_return_expr(projection, params)?;
+            path.push(PathStep::Field("projection"));
+            substitute_return_expr_inner(projection, params, path, sites)?;
+            path.pop();
         }
         ReturnExpr::ExistsPattern {
             pattern,
             where_clause,
         } => {
-            substitute_pattern(pattern, params)?;
+            path.push(PathStep::Field("pattern"));
+            substitute_pattern_inner(pattern, params, path, sites)?;
+            path.pop();
             if let Some(w) = where_clause {
-                substitute_expr(w, params)?;
+                path.push(PathStep::Field("where_clause"));
+                substitute_expr_inner(w, params, path, sites)?;
+                path.pop();
             }
         }
-        ReturnExpr::ExistsSubquery(stmt) => substitute_params(stmt, params)?,
+        ReturnExpr::ExistsSubquery(stmt) => {
+            path.push(PathStep::Field("subquery"));
+            substitute_params_inner(stmt, params, path, sites)?;
+            path.pop();
+        }
     }
     Ok(())
 }
 
-fn substitute_literal(
+fn substitute_literal_inner(
     lit: &mut Literal,
     params: &HashMap<String, PropertyValue>,
+    path: &[PathStep],
+    sites: &mut Vec<ParamSite>,
 ) -> Result<(), QueryError> {
     if let Literal::Param(name) = lit {
         let value = params
             .get(name)
             .ok_or_else(|| QueryError::MissingParam(name.clone()))?;
+        sites.push(ParamSite {
+            name: name.clone(),
+            path: path.to_vec(),
+        });
         *lit = property_value_to_literal(name, value)?;
     }
     Ok(())

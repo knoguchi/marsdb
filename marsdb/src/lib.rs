@@ -181,6 +181,39 @@ impl Database {
         self.execute_prepared(&stmt, &options)
     }
 
+    /// Parses `cypher` into a reusable prepared-statement handle. Pass
+    /// it to `execute_prepared_plan` to run it, any number of times with
+    /// different `params`.
+    pub fn prepare(&self, cypher: &str) -> Result<marsdb_query::PreparedPlan, Error> {
+        Ok(marsdb_query::PreparedPlan::new(marsdb_query::parse(
+            cypher,
+        )?))
+    }
+
+    /// Runs a `PreparedPlan` with `params` bound. Behaves exactly like
+    /// `execute_prepared_statement(prepared.statement(), params, options)`,
+    /// except that when `prepared` has already validated an equivalent
+    /// call (same parameter-category fingerprint, no index declared
+    /// since — see `PreparedPlan::can_skip_validation`), semantic
+    /// validation is skipped. Query planning still reruns every call.
+    pub fn execute_prepared_plan(
+        &self,
+        prepared: &marsdb_query::PreparedPlan,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        let mut stmt = prepared.statement().clone();
+        marsdb_query::substitute_params(&mut stmt, params)?;
+        let options = with_call_params(options, params);
+        let schema_generation = self.store.schema_generation();
+        let trusted = prepared.can_skip_validation(params, schema_generation);
+        let result = self.execute_prepared_inner(&stmt, &options, trusted);
+        if result.is_ok() {
+            prepared.record_validated(params, schema_generation);
+        }
+        result
+    }
+
     /// One already-parsed statement, session-aware: `BEGIN`/`COMMIT`/
     /// `ROLLBACK` act on `session_txn` (see its docs for the whole
     /// model), anything else runs inside the open session transaction
@@ -194,6 +227,25 @@ impl Database {
         &self,
         stmt: &Statement,
         options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        self.execute_prepared_inner(stmt, options, false)
+    }
+
+    /// Same dispatch as `execute_prepared`, with an extra `trusted` flag:
+    /// when true, the `_` catch-all arm below skips `validate_statement`
+    /// (`Executor::execute_with_options_trusted`/
+    /// `execute_in_write_transaction_with_options_trusted`) instead of
+    /// the normal validating entry points. Only `Database::execute_prepared_plan`
+    /// passes `true`, and only after `PreparedPlan::can_skip_validation`
+    /// confirms it's safe for this call's parameters -- see that
+    /// method's doc comment for the exact condition. `BEGIN`/`COMMIT`/
+    /// `ROLLBACK` never reach `Executor` at all, so `trusted` has no
+    /// effect on them.
+    fn execute_prepared_inner(
+        &self,
+        stmt: &Statement,
+        options: &ExecutionOptions,
+        trusted: bool,
     ) -> Result<QueryResult, Error> {
         let empty = QueryResult::default;
         {
@@ -264,8 +316,15 @@ impl Database {
                 }
                 _ => {
                     if let Some(open) = session.as_mut() {
-                        let result = marsdb_query::Executor::new(&self.store)
-                            .execute_in_write_transaction_with_options(stmt, &open.txn, options);
+                        let executor = marsdb_query::Executor::new(&self.store);
+                        let result = if trusted {
+                            executor.execute_in_write_transaction_with_options_trusted(
+                                stmt, &open.txn, options,
+                            )
+                        } else {
+                            executor
+                                .execute_in_write_transaction_with_options(stmt, &open.txn, options)
+                        };
                         // Same stance as `Transaction`: an execution error
                         // may have applied partial effects, which must
                         // never be committable -- abort the whole session
@@ -282,7 +341,12 @@ impl Database {
                 }
             }
         }
-        Ok(marsdb_query::Executor::new(&self.store).execute_with_options(stmt, options)?)
+        let executor = marsdb_query::Executor::new(&self.store);
+        Ok(if trusted {
+            executor.execute_with_options_trusted(stmt, options)?
+        } else {
+            executor.execute_with_options(stmt, options)?
+        })
     }
 
     /// Idle limit for the Cypher-level session transaction
@@ -507,6 +571,44 @@ impl Transaction<'_> {
             let options = with_call_params(options, params);
             Ok(marsdb_query::Executor::new(&self.db.store)
                 .execute_in_write_transaction_with_options(&stmt, write_txn, &options)?)
+        })();
+        if outcome.is_err() {
+            if let Some(write_txn) = self.inner.take() {
+                marsdb_graph::GraphStore::abort(write_txn)?;
+            }
+        }
+        outcome
+    }
+
+    /// `execute_prepared_statement`'s `PreparedPlan` twin -- see
+    /// `Database::execute_prepared_plan`'s doc comment for the
+    /// validation-skip condition.
+    pub fn execute_prepared_plan(
+        &mut self,
+        prepared: &marsdb_query::PreparedPlan,
+        params: &HashMap<String, PropertyValue>,
+        options: &ExecutionOptions,
+    ) -> Result<QueryResult, Error> {
+        let Some(write_txn) = self.inner.as_ref() else {
+            return Err(Error::TransactionClosed);
+        };
+        let outcome = (|| {
+            let mut stmt = prepared.statement().clone();
+            marsdb_query::substitute_params(&mut stmt, params)?;
+            let options = with_call_params(options, params);
+            let schema_generation = self.db.store.schema_generation();
+            let trusted = prepared.can_skip_validation(params, schema_generation);
+            let executor = marsdb_query::Executor::new(&self.db.store);
+            let result = if trusted {
+                executor
+                    .execute_in_write_transaction_with_options_trusted(&stmt, write_txn, &options)
+            } else {
+                executor.execute_in_write_transaction_with_options(&stmt, write_txn, &options)
+            };
+            if result.is_ok() {
+                prepared.record_validated(params, schema_generation);
+            }
+            Ok(result?)
         })();
         if outcome.is_err() {
             if let Some(write_txn) = self.inner.take() {

@@ -993,6 +993,22 @@ fn reverse_pattern(pattern: &Pattern) -> Pattern {
     Pattern { start, hops }
 }
 
+/// Result of `apply_index_seeks`, annotated with whether the seek
+/// choice(s) it made are value-independent (safe to reuse verbatim
+/// across different bound parameter values in a future call) or not.
+pub struct IndexSeekOutcome {
+    pub plan: LogicalPlan,
+    /// true iff at least one scan visited had 2+ eligible indexed-
+    /// equality literal candidates, meaning `index_match_count_in_txn`
+    /// was consulted to break a tie — so which property got seeked
+    /// depended on the concrete bound values at plan-build time, and
+    /// could differ for a different set of bound values against the
+    /// same query shape. false means every seek choice in this plan
+    /// is structurally forced (0 or 1 candidate per scan) and safe to
+    /// treat as value-independent.
+    pub sniffing_risk: bool,
+}
+
 /// Post-processing pass over an already-built plan: fuses a
 /// `Filter(Compare(var.prop = literal))` sitting directly over a
 /// `NodeByLabelScan{var, label}` into a single `IndexSeek`, if a real
@@ -1005,6 +1021,30 @@ fn reverse_pattern(pattern: &Pattern) -> Pattern {
 /// index candidate buried under an `Expand`, is `rule-based pushdown`'s
 /// job (a separate, later change), not this fusion's.
 pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, QueryError> {
+    let mut risk = false;
+    apply_index_seeks_inner(plan, txn, &mut risk)
+}
+
+/// Same fusion as `apply_index_seeks`, but also reports whether any scan
+/// it visited had 2+ eligible indexed-equality literal candidates -- see
+/// `IndexSeekOutcome::sniffing_risk` for what that means.
+pub fn apply_index_seeks_tracked(
+    plan: LogicalPlan,
+    txn: Txn,
+) -> Result<IndexSeekOutcome, QueryError> {
+    let mut risk = false;
+    let plan = apply_index_seeks_inner(plan, txn, &mut risk)?;
+    Ok(IndexSeekOutcome {
+        plan,
+        sniffing_risk: risk,
+    })
+}
+
+fn apply_index_seeks_inner(
+    plan: LogicalPlan,
+    txn: Txn,
+    risk: &mut bool,
+) -> Result<LogicalPlan, QueryError> {
     Ok(match plan {
         LogicalPlan::Filter { .. } => {
             // Peel every directly-nested `Filter` down to whatever
@@ -1030,7 +1070,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                     other => break other,
                 }
             };
-            let base = apply_index_seeks(base, txn)?;
+            let base = apply_index_seeks_inner(base, txn, risk)?;
             if let LogicalPlan::NodeByLabelScan { var, label } = &base {
                 // Among every `var.prop = literal` equality conjunct that
                 // *has* a declared index, pick the one with the smallest
@@ -1044,6 +1084,10 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                 // counts, including the common "both empty/unbacked" case)
                 // keep the first-encountered candidate for determinism.
                 let mut chosen: Option<(usize, u64)> = None;
+                // How many candidates actually reached the cardinality
+                // comparison below (had a declared index) -- 2+ means the
+                // choice among them was value-dependent (see `risk`).
+                let mut eligible = 0u32;
                 for (i, c) in candidates.iter().enumerate() {
                     let Expr::Compare(pa, CompareOp::Eq, lit) = c else {
                         continue;
@@ -1052,6 +1096,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                         continue;
                     }
                     if GraphStore::index_def_in_txn(txn, label, &pa.prop)?.is_some() {
+                        eligible += 1;
                         let value = literal_to_value(lit);
                         let count =
                             GraphStore::index_match_count_in_txn(txn, label, &pa.prop, &value)?;
@@ -1059,6 +1104,9 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
                             chosen = Some((i, count));
                         }
                     }
+                }
+                if eligible >= 2 {
+                    *risk = true;
                 }
                 if let Some((i, _)) = chosen {
                     let Expr::Compare(pa, _, lit) = candidates.remove(i) else {
@@ -1206,7 +1254,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             rel_labels,
             direction,
         } => LogicalPlan::Expand {
-            input: Box::new(apply_index_seeks(*input, txn)?),
+            input: Box::new(apply_index_seeks_inner(*input, txn, risk)?),
             from_var,
             to_var,
             rel_var,
@@ -1228,7 +1276,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             rel_list_var,
             rel_props,
         } => LogicalPlan::VarExpand {
-            input: Box::new(apply_index_seeks(*input, txn)?),
+            input: Box::new(apply_index_seeks_inner(*input, txn, risk)?),
             from_var,
             to_var,
             rel_labels,
@@ -1252,7 +1300,7 @@ pub fn apply_index_seeks(plan: LogicalPlan, txn: Txn) -> Result<LogicalPlan, Que
             min_hops,
             max_hops,
         } => LogicalPlan::MatchRelList {
-            input: Box::new(apply_index_seeks(*input, txn)?),
+            input: Box::new(apply_index_seeks_inner(*input, txn, risk)?),
             from_var,
             to_var,
             rel_list_var,
