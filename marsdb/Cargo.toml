@@ -23,9 +23,9 @@ marsdb-query = { path = "../marsdb-query", version = "0.9.1" }
 thiserror.workspace = true
 # `arrow` feature only -- heavyweight, off by default. The feature is
 # exempt from the workspace MSRV (arrow-rs tracks recent stable).
-arrow-array = { version = "59", optional = true, features = ["ffi"] }
-arrow-schema = { version = "59", optional = true }
-arrow-buffer = { version = "59", optional = true }
+arrow-array = { version = "60", optional = true, features = ["ffi"] }
+arrow-schema = { version = "60", optional = true }
+arrow-buffer = { version = "60", optional = true }
 
 [features]
 # Arrow result export: Database::query_arrow + RecordBatchReader/FFI
