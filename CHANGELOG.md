@@ -3,9 +3,36 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.10.0] - 2026-10-25
+
+### Added
+- `Database::prepare(cypher) -> PreparedPlan`: a genuine prepared
+  statement that parses and validates once. Execute it any number of
+  times with `Database::execute_prepared_plan(&prepared, &params,
+  &options)` or the `Transaction::execute_prepared_plan` twin; repeat
+  calls skip re-validation. The existing `execute_prepared_statement`
+  path (pre-parsed text, re-validated per call) is unchanged (#216).
 
 ### Changed
+- Label checks on an expansion's far endpoint (`(a)-->(b:Person)`) read
+  the node's label ids directly instead of decoding its whole property
+  map and throwing it away. Measured on a 10K-node, 5-edges-per-node
+  graph: label-filtered 1-hop with `count(*)` 18.1 µs → 13.9 µs
+  (−23.5%), with a property projection 17.8 µs → 16.1 µs (−9.6%) (#214).
+- The `LogicalPlan`-driven read path (scans, `Expand`, `Filter`)
+  resolves Cypher variables to fixed row-slot indices at plan-build
+  time instead of hashing a `HashMap<String, Binding>` per row. Slot
+  compilation still runs once per execution, so very small result sets
+  pay a few hundred nanoseconds more up front; larger expansions
+  amortize it (#215).
+- Dependencies: redb 4.2 → 4.4, antlr4rust 0.5 → 0.6 (parser
+  regenerated), rustls → 0.23.46 (RUSTSEC-2026-0285/0346/0348/0349),
+  and, for the `arrow` feature, arrow-array/schema/buffer 59 → 60, so
+  `Database::query_arrow` callers must be on arrow 60 (#226).
+- Book rewritten around an end-user journey (Getting Started, The
+  Cypher Guide, Embedding, Reference, Operations), with Internals
+  demoted to an appendix; stale roadmap items and essay-length comments
+  trimmed across the workspace (#211, #212, #213).
 - `RETURN DISTINCT ... LIMIT k` with no ORDER BY and no aggregation now
   stops the read pipeline as soon as `k` (plus SKIP) distinct projected
   rows exist, and variable-length traversals enumerate their paths
