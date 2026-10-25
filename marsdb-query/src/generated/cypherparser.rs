@@ -6,6 +6,7 @@
 #![allow(unused_imports)]
 #![allow(unused_mut)]
 #![allow(unused_braces)]
+#![allow(unused_parens)]
 use super::cypherparserlistener::*;
 use super::cypherparservisitor::*;
 use antlr4rust::atn::{ATN, INVALID_ALT};
@@ -38,6 +39,13 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
+
+const _: () = {
+    assert!(
+        antlr4rust::const_check::version("0", "6"),
+        "Incompatible version: either switch to v0.6 or regenerate with this version"
+    );
+};
 
 pub const CypherParser_ASSIGN: i32 = 1;
 pub const CypherParser_ADD_ASSIGN: i32 = 2;
@@ -568,7 +576,7 @@ where
     I: TokenStream<'input, TF = LocalTokenFactory<'input>> + TidAble<'input>,
 {
     base: BaseParserType<'input, I>,
-    interpreter: Arc<ParserATNSimulator>,
+    interpreter: Rc<ParserATNSimulator>,
     _shared_context_cache: Box<PredictionContextCache>,
     pub err_handler: Box<dyn ErrorStrategy<'input, BaseParserType<'input, I>>>,
 }
@@ -588,8 +596,7 @@ where
         input: I,
         strategy: Box<dyn ErrorStrategy<'input, BaseParserType<'input, I>>>,
     ) -> Self {
-        antlr4rust::recognizer::check_version("0", "5");
-        let interpreter = Arc::new(ParserATNSimulator::new(
+        let interpreter = Rc::new(ParserATNSimulator::new(
             _ATN.clone(),
             _decision_to_DFA.clone(),
             _shared_context_cache.clone(),
@@ -597,7 +604,7 @@ where
         Self {
             base: BaseParser::new_base_parser(
                 input,
-                Arc::clone(&interpreter),
+                Rc::clone(&interpreter),
                 CypherParserExt {
                     _pd: Default::default(),
                 },

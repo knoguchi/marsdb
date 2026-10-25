@@ -82,7 +82,7 @@ Mainline ANTLR4 has no Rust code-generation target. This project uses the
 actively maintained fork that adds one:
 
 - Generator (Java tool): [`antlr4rust/antlr4`](https://github.com/antlr4rust/antlr4)
-  `v0.5.0`, targeting ANTLR 4.13.3.
+  `v0.6.0`, targeting ANTLR 4.13.3.
 - Runtime (Rust crate): [`antlr4rust`](https://crates.io/crates/antlr4rust)
   — not the older, unmaintained `antlr-rust` crate.
 
@@ -93,9 +93,9 @@ is committed to `marsdb-query/src/generated/` — this is not part of the
 normal build.
 
 ```sh
-# One-time: fetch the generator jar (pinned: v0.5.0 / ANTLR 4.13.3)
+# One-time: fetch the generator jar (pinned: v0.6.0 / ANTLR 4.13.3)
 curl -sL -o /tmp/antlr4.jar \
-  https://github.com/antlr4rust/antlr4/releases/download/v0.5.0/antlr4-4.13.3-SNAPSHOT-complete.jar
+  https://github.com/antlr4rust/antlr4/releases/download/v0.6.0/antlr4-4.13.3-SNAPSHOT-complete.jar
 
 # Generate into a scratch dir, not straight into src/generated: the parser
 # grammar's `tokenVocab` import looks for CypherLexer.tokens next to the
@@ -129,4 +129,4 @@ perl -pi -e 's/1usize <</1u64 <</g'   marsdb-query/src/generated/cypherparser.rs
 
 Commit the resulting `marsdb-query/src/generated/*.rs` alongside the `.g4`
 change. `marsdb-query/Cargo.toml` pins the matching runtime version
-(`antlr4rust = "0.5.2"`).
+(`antlr4rust = "0.6.0"`).
