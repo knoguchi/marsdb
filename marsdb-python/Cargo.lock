@@ -464,7 +464,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "marsdb"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-graph"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "marsdb-storage",
  "postcard",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-python"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "marsdb",
  "marsdb-graph",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-query"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "antlr4rust",
  "chrono",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-storage"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "redb",
  "thiserror",
