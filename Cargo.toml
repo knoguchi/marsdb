@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-rustyline = "18"
+rustyline = "19"
 criterion = "0.8"
 tempfile = "3"
 # Calendar math (leap years, month lengths) plus the system clock (`date()`
