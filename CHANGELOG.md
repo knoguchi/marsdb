@@ -3,6 +3,49 @@
 All notable changes to MarsDB are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-11-26
+
+A dependency release: security fixes, and the storage engine moves to
+redb 5. No query-language or result changes.
+
+### Breaking
+- **`marsdb-storage`'s range API follows redb 5.** `TableHandle::range`
+  and `MultimapTableHandle::range` take a `redb::KeyRange` instead of a
+  `RangeBounds` and no longer have a key type parameter:
+  `table.range::<u64>(..)` becomes `table.range(..)`. The redb types the
+  crate re-exports are now redb 5's. Only code that uses `marsdb-storage`
+  directly is affected (#237).
+
+### Changed
+- **MSRV 1.82 → 1.90.** redb 5 requires Rust 1.90. The declared 1.82 was
+  already out of date: `uuid`, `time` and `cookie_store` in the 0.10.0
+  lockfile needed 1.88 or later.
+- **redb 4 → 5.** Database files are unaffected: redb 5 changes the
+  encoding of `Option<&str>`, `Option<String>`, `Option<bool>` and
+  `Option<char>`, and no MarsDB table uses those types. Checked both
+  ways against a redb 4.4 build — a file written by either is read and
+  written by the other with identical results. redb 5 locks files
+  differently: a read-only open fails with `LockProtocolMismatch` while
+  a process built on MarsDB 0.10 or earlier holds the same file open
+  read-only (#237).
+- `marsdb::arrow` re-exports arrow-rs's `RecordBatchStreamReader`, the
+  new name of `ArrowArrayStreamReader` since arrow-rs 60.1. The old name
+  stays as a deprecated alias. The `arrow` feature now needs
+  `arrow-array` 60.1 or later (#234).
+- `postcard` is built without its default features, which drops
+  `heapless` and six other crates from the dependency tree (#234).
+- `postcard` 1.1.3 → 1.2.0. The encoding is unchanged; files written by
+  either version read identically under the other (#239).
+- `clap` 4.6.9 and `ureq` 3.5.2 (#236).
+
+### Fixed
+- **Security**: `cookie` 0.18.3 (RUSTSEC-2026-0594) and `url` 2.5.9
+  (RUSTSEC-2026-0592), both reached through `ureq` in `marsdb-cli` and
+  `marsdb-nl2cypher` (#234).
+- `arrow-data` 60.2.0 fixes an out-of-bounds read on malformed
+  run-end-encoded arrays (RUSTSEC-2026-0442); `rustix` 1.1.6 fixes an
+  unsoundness advisory (#234).
+
 ## [0.10.0] - 2026-10-25
 
 ### Added

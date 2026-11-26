@@ -955,7 +955,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "marsdb"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-capi"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "marsdb",
  "marsdb-graph",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "marsdb",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-graph"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "criterion",
  "marsdb-storage",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-nl2cypher"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "marsdb",
  "marsdb-query",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-query"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "antlr4rust",
  "chrono",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "marsdb-storage"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "redb",
  "tempfile",
