@@ -44,7 +44,12 @@ use crate::{Error, Literal, PropertyValue, QueryError, QueryResult, Value};
 // Re-exported so downstream crates (marsdb-capi, marsdb-python) can
 // build C Data Interface streams without their own arrow-rs dependency
 // (which would risk a version split against our arrays).
-pub use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+pub use arrow_array::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
+
+/// Former name of [`RecordBatchStreamReader`], kept so existing callers
+/// keep compiling; arrow-rs renamed the type in 60.1.
+#[deprecated(note = "Use `RecordBatchStreamReader` instead")]
+pub type ArrowArrayStreamReader = RecordBatchStreamReader;
 pub use {arrow_array, arrow_schema};
 
 /// The inferred scalar kind of one column (pre-Arrow-mapping).
