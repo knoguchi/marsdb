@@ -143,7 +143,8 @@ impl StorageEngine {
 
         let result = (|| {
             let source = self.db.begin_read()?;
-            let destination = redb::Database::builder().create_file(file)?;
+            let destination = redb::Database::builder()
+                .create_with_backend(redb::backends::FileBackend::new(file))?;
             let write = destination.begin_write()?;
 
             macro_rules! copy_table {

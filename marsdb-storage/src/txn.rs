@@ -1,9 +1,10 @@
 use std::borrow::Borrow;
 
 use redb::{
-    AccessGuard, Key, MultimapRange, MultimapTable, MultimapTableDefinition, MultimapValue, Range,
-    ReadOnlyMultimapTable, ReadOnlyTable, ReadTransaction, ReadableMultimapTable, ReadableTable,
-    ReadableTableMetadata, Table, TableDefinition, Value, WriteTransaction,
+    AccessGuard, Key, KeyRange, MultimapRange, MultimapTable, MultimapTableDefinition,
+    MultimapValue, Range, ReadOnlyMultimapTable, ReadOnlyTable, ReadTransaction,
+    ReadableMultimapTable, ReadableTable, ReadableTableMetadata, Table, TableDefinition, Value,
+    WriteTransaction,
 };
 
 use crate::error::StorageError;
@@ -83,10 +84,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableHandle<'a, K, V> {
 
     /// Key-ordered scan over a sub-range — backs composite-key prefix
     /// reads (`ADJ_OUT`/`ADJ_IN`'s `node ++ label` expansion).
-    pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
-        &self,
-        range: impl std::ops::RangeBounds<KR> + 'k,
-    ) -> Result<Range<'_, K, V>, StorageError> {
+    pub fn range(&self, range: impl KeyRange<K>) -> Result<Range<'_, K, V>, StorageError> {
         Ok(match self {
             TableHandle::Write(t) => t.range(range)?,
             TableHandle::Read(t) => t.range(range)?,
@@ -121,10 +119,7 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableHandle<'a, K, V> {
     /// Key-ordered scan over a sub-range of keys — the multimap
     /// counterpart of `TableHandle::range`, backing `PROPERTY_INDEX`
     /// range predicates.
-    pub fn range<'k, KR: Borrow<K::SelfType<'k>> + 'k>(
-        &self,
-        range: impl std::ops::RangeBounds<KR> + 'k,
-    ) -> Result<MultimapRange<'_, K, V>, StorageError> {
+    pub fn range(&self, range: impl KeyRange<K>) -> Result<MultimapRange<'_, K, V>, StorageError> {
         Ok(match self {
             MultimapTableHandle::Write(t) => t.range(range)?,
             MultimapTableHandle::Read(t) => t.range(range)?,
