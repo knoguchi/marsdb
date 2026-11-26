@@ -27,12 +27,13 @@ exclude = ["marsdb-python"]
 [workspace.package]
 version = "0.11.0"
 edition = "2021"
-# Verified via clippy's own `incompatible_msrv` lint (not guessed) --
-# `Option::is_none_or` (stable since 1.82.0) is the newest stdlib item
-# actually used anywhere in the workspace. Not tested against every
-# toolchain above that; CI just runs whatever stable each GitHub-hosted
-# runner ships.
-rust-version = "1.82"
+# Set by the dependencies, not by this workspace's own code: redb 5
+# declares rust-version 1.90, the highest in the lockfile. (The newest
+# stdlib item the workspace itself uses is `Option::is_none_or`, stable
+# since 1.82.0, per clippy's `incompatible_msrv` lint.) Not tested
+# against every toolchain above that; CI just runs whatever stable each
+# GitHub-hosted runner ships.
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/knoguchi/marsdb"
 homepage = "https://github.com/knoguchi/marsdb"

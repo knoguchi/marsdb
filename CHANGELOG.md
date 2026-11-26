@@ -17,6 +17,9 @@ redb 5. No query-language or result changes.
   directly is affected (#237).
 
 ### Changed
+- **MSRV 1.82 → 1.90.** redb 5 requires Rust 1.90. The declared 1.82 was
+  already out of date: `uuid`, `time` and `cookie_store` in the 0.10.0
+  lockfile needed 1.88 or later.
 - **redb 4 → 5.** Database files are unaffected: redb 5 changes the
   encoding of `Option<&str>`, `Option<String>`, `Option<bool>` and
   `Option<char>`, and no MarsDB table uses those types. Checked both
