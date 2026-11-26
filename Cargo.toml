@@ -47,7 +47,7 @@ keywords = ["graph-database", "cypher", "opencypher", "embedded", "database"]
 categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]
-redb = "4"
+redb = "5"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = "2"

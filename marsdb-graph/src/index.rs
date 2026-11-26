@@ -361,7 +361,7 @@ impl IndexRangeCursor {
                 Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
                 Bound::Unbounded => Bound::Unbounded,
             };
-            for entry in index.range::<&[u8]>((start_bound, end_bound))? {
+            for entry in index.range((start_bound, end_bound))? {
                 let (key, values) = entry?;
                 let key_bytes = key.value().to_vec();
                 let skip_through = match &self.resume {

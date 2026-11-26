@@ -1403,7 +1403,7 @@ impl EdgeScanCursor {
         let mut out = Vec::with_capacity(chunk_size.min(1024));
         let iter = match self.resume_after {
             Some(last) => {
-                edges.range::<u64>((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))?
+                edges.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))?
             }
             None => edges.iter()?,
         };
