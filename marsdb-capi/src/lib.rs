@@ -1973,7 +1973,7 @@ mod tests {
     mod arrow {
         use super::*;
         use marsdb::arrow::arrow_array::{Array, Int64Array, RecordBatch};
-        use marsdb::arrow::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+        use marsdb::arrow::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 
         /// Export through the C stream, import back with Arrow -- the
         /// exact round-trip a pyarrow / arrow-go consumer performs.
@@ -1993,7 +1993,7 @@ mod tests {
                     MARSDB_OK
                 );
                 let mut stream = stream.assume_init();
-                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let reader = RecordBatchStreamReader::from_raw(&mut stream).unwrap();
                 let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
                 // 3 rows at batch_rows=2 -> two batches.
                 assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
@@ -2033,7 +2033,7 @@ mod tests {
                     MARSDB_OK
                 );
                 let mut stream = stream.assume_init();
-                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let reader = RecordBatchStreamReader::from_raw(&mut stream).unwrap();
                 let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
                 assert_eq!(batches.len(), 1);
                 assert_eq!(

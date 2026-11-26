@@ -162,7 +162,7 @@ fn stats_ride_along_and_options_apply() {
 fn ffi_stream_round_trips() {
     // Export through the C Data Interface stream and import it back --
     // the exact contract marsdb-capi and the PyCapsule protocol expose.
-    use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+    use arrow_array::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 
     let db = Database::in_memory().unwrap();
     db.execute("CREATE (:N {i: 9223372036854775807}), (:N {i: 2})")
@@ -176,7 +176,7 @@ fn ffi_stream_round_trips() {
         )
         .unwrap();
     let mut ffi = FFI_ArrowArrayStream::new(Box::new(reader));
-    let imported = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi) }.unwrap();
+    let imported = unsafe { RecordBatchStreamReader::from_raw(&mut ffi) }.unwrap();
     let batches: Vec<RecordBatch> = imported.collect::<Result<_, _>>().unwrap();
     assert_eq!(batches.len(), 2);
     let all: Vec<i64> = batches
