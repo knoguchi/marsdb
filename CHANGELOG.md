@@ -34,6 +34,8 @@ redb 5. No query-language or result changes.
   `arrow-array` 60.1 or later (#234).
 - `postcard` is built without its default features, which drops
   `heapless` and six other crates from the dependency tree (#234).
+- `postcard` 1.1.3 → 1.2.0. The encoding is unchanged; files written by
+  either version read identically under the other (#239).
 - `clap` 4.6.9 and `ureq` 3.5.2 (#236).
 
 ### Fixed
